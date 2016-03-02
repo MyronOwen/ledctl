@@ -1371,3 +1371,215 @@ SQLITE_API int sqlite3_config(int, ...);
 ** the call is considered successful.
 */
 SQLITE_API int sqlite3_db_config(sqlite3*, int op, ...);
+
+/*
+** CAPI3REF: Memory Allocation Routines
+**
+** An instance of this object defines the interface between SQLite
+** and low-level memory allocation routines.
+**
+** This object is used in only one place in the SQLite interface.
+** A pointer to an instance of this object is the argument to
+** [sqlite3_config()] when the configuration option is
+** [SQLITE_CONFIG_MALLOC] or [SQLITE_CONFIG_GETMALLOC].  
+** By creating an instance of this object
+** and passing it to [sqlite3_config]([SQLITE_CONFIG_MALLOC])
+** during configuration, an application can specify an alternative
+** memory allocation subsystem for SQLite to use for all of its
+** dynamic memory needs.
+**
+** Note that SQLite comes with several [built-in memory allocators]
+** that are perfectly adequate for the overwhelming majority of applications
+** and that this object is only useful to a tiny minority of applications
+** with specialized memory allocation requirements.  This object is
+** also used during testing of SQLite in order to specify an alternative
+** memory allocator that simulates memory out-of-memory conditions in
+** order to verify that SQLite recovers gracefully from such
+** conditions.
+**
+** The xMalloc, xRealloc, and xFree methods must work like the
+** malloc(), realloc() and free() functions from the standard C library.
+** ^SQLite guarantees that the second argument to
+** xRealloc is always a value returned by a prior call to xRoundup.
+**
+** xSize should return the allocated size of a memory allocation
+** previously obtained from xMalloc or xRealloc.  The allocated size
+** is always at least as big as the requested size but may be larger.
+**
+** The xRoundup method returns what would be the allocated size of
+** a memory allocation given a particular requested size.  Most memory
+** allocators round up memory allocations at least to the next multiple
+** of 8.  Some allocators round up to a larger multiple or to a power of 2.
+** Every memory allocation request coming in through [sqlite3_malloc()]
+** or [sqlite3_realloc()] first calls xRoundup.  If xRoundup returns 0, 
+** that causes the corresponding memory allocation to fail.
+**
+** The xInit method initializes the memory allocator.  For example,
+** it might allocate any require mutexes or initialize internal data
+** structures.  The xShutdown method is invoked (indirectly) by
+** [sqlite3_shutdown()] and should deallocate any resources acquired
+** by xInit.  The pAppData pointer is used as the only parameter to
+** xInit and xShutdown.
+**
+** SQLite holds the [SQLITE_MUTEX_STATIC_MASTER] mutex when it invokes
+** the xInit method, so the xInit method need not be threadsafe.  The
+** xShutdown method is only called from [sqlite3_shutdown()] so it does
+** not need to be threadsafe either.  For all other methods, SQLite
+** holds the [SQLITE_MUTEX_STATIC_MEM] mutex as long as the
+** [SQLITE_CONFIG_MEMSTATUS] configuration option is turned on (which
+** it is by default) and so the methods are automatically serialized.
+** However, if [SQLITE_CONFIG_MEMSTATUS] is disabled, then the other
+** methods must be threadsafe or else make their own arrangements for
+** serialization.
+**
+** SQLite will never invoke xInit() more than once without an intervening
+** call to xShutdown().
+*/
+typedef struct sqlite3_mem_methods sqlite3_mem_methods;
+struct sqlite3_mem_methods {
+  void *(*xMalloc)(int);         /* Memory allocation function */
+  void (*xFree)(void*);          /* Free a prior allocation */
+  void *(*xRealloc)(void*,int);  /* Resize an allocation */
+  int (*xSize)(void*);           /* Return the size of an allocation */
+  int (*xRoundup)(int);          /* Round up request size to allocation size */
+  int (*xInit)(void*);           /* Initialize the memory allocator */
+  void (*xShutdown)(void*);      /* Deinitialize the memory allocator */
+  void *pAppData;                /* Argument to xInit() and xShutdown() */
+};
+
+/*
+** CAPI3REF: Configuration Options
+** KEYWORDS: {configuration option}
+**
+** These constants are the available integer configuration options that
+** can be passed as the first argument to the [sqlite3_config()] interface.
+**
+** New configuration options may be added in future releases of SQLite.
+** Existing configuration options might be discontinued.  Applications
+** should check the return code from [sqlite3_config()] to make sure that
+** the call worked.  The [sqlite3_config()] interface will return a
+** non-zero [error code] if a discontinued or unsupported configuration option
+** is invoked.
+**
+** <dl>
+** [[SQLITE_CONFIG_SINGLETHREAD]] <dt>SQLITE_CONFIG_SINGLETHREAD</dt>
+** <dd>There are no arguments to this option.  ^This option sets the
+** [threading mode] to Single-thread.  In other words, it disables
+** all mutexing and puts SQLite into a mode where it can only be used
+** by a single thread.   ^If SQLite is compiled with
+** the [SQLITE_THREADSAFE | SQLITE_THREADSAFE=0] compile-time option then
+** it is not possible to change the [threading mode] from its default
+** value of Single-thread and so [sqlite3_config()] will return 
+** [SQLITE_ERROR] if called with the SQLITE_CONFIG_SINGLETHREAD
+** configuration option.</dd>
+**
+** [[SQLITE_CONFIG_MULTITHREAD]] <dt>SQLITE_CONFIG_MULTITHREAD</dt>
+** <dd>There are no arguments to this option.  ^This option sets the
+** [threading mode] to Multi-thread.  In other words, it disables
+** mutexing on [database connection] and [prepared statement] objects.
+** The application is responsible for serializing access to
+** [database connections] and [prepared statements].  But other mutexes
+** are enabled so that SQLite will be safe to use in a multi-threaded
+** environment as long as no two threads attempt to use the same
+** [database connection] at the same time.  ^If SQLite is compiled with
+** the [SQLITE_THREADSAFE | SQLITE_THREADSAFE=0] compile-time option then
+** it is not possible to set the Multi-thread [threading mode] and
+** [sqlite3_config()] will return [SQLITE_ERROR] if called with the
+** SQLITE_CONFIG_MULTITHREAD configuration option.</dd>
+**
+** [[SQLITE_CONFIG_SERIALIZED]] <dt>SQLITE_CONFIG_SERIALIZED</dt>
+** <dd>There are no arguments to this option.  ^This option sets the
+** [threading mode] to Serialized. In other words, this option enables
+** all mutexes including the recursive
+** mutexes on [database connection] and [prepared statement] objects.
+** In this mode (which is the default when SQLite is compiled with
+** [SQLITE_THREADSAFE=1]) the SQLite library will itself serialize access
+** to [database connections] and [prepared statements] so that the
+** application is free to use the same [database connection] or the
+** same [prepared statement] in different threads at the same time.
+** ^If SQLite is compiled with
+** the [SQLITE_THREADSAFE | SQLITE_THREADSAFE=0] compile-time option then
+** it is not possible to set the Serialized [threading mode] and
+** [sqlite3_config()] will return [SQLITE_ERROR] if called with the
+** SQLITE_CONFIG_SERIALIZED configuration option.</dd>
+**
+** [[SQLITE_CONFIG_MALLOC]] <dt>SQLITE_CONFIG_MALLOC</dt>
+** <dd> ^(The SQLITE_CONFIG_MALLOC option takes a single argument which is 
+** a pointer to an instance of the [sqlite3_mem_methods] structure.
+** The argument specifies
+** alternative low-level memory allocation routines to be used in place of
+** the memory allocation routines built into SQLite.)^ ^SQLite makes
+** its own private copy of the content of the [sqlite3_mem_methods] structure
+** before the [sqlite3_config()] call returns.</dd>
+**
+** [[SQLITE_CONFIG_GETMALLOC]] <dt>SQLITE_CONFIG_GETMALLOC</dt>
+** <dd> ^(The SQLITE_CONFIG_GETMALLOC option takes a single argument which
+** is a pointer to an instance of the [sqlite3_mem_methods] structure.
+** The [sqlite3_mem_methods]
+** structure is filled with the currently defined memory allocation routines.)^
+** This option can be used to overload the default memory allocation
+** routines with a wrapper that simulations memory allocation failure or
+** tracks memory usage, for example. </dd>
+**
+** [[SQLITE_CONFIG_MEMSTATUS]] <dt>SQLITE_CONFIG_MEMSTATUS</dt>
+** <dd> ^The SQLITE_CONFIG_MEMSTATUS option takes single argument of type int,
+** interpreted as a boolean, which enables or disables the collection of
+** memory allocation statistics. ^(When memory allocation statistics are
+** disabled, the following SQLite interfaces become non-operational:
+**   <ul>
+**   <li> [sqlite3_memory_used()]
+**   <li> [sqlite3_memory_highwater()]
+**   <li> [sqlite3_soft_heap_limit64()]
+**   <li> [sqlite3_status()]
+**   </ul>)^
+** ^Memory allocation statistics are enabled by default unless SQLite is
+** compiled with [SQLITE_DEFAULT_MEMSTATUS]=0 in which case memory
+** allocation statistics are disabled by default.
+** </dd>
+**
+** [[SQLITE_CONFIG_SCRATCH]] <dt>SQLITE_CONFIG_SCRATCH</dt>
+** <dd> ^The SQLITE_CONFIG_SCRATCH option specifies a static memory buffer
+** that SQLite can use for scratch memory.  ^(There are three arguments
+** to SQLITE_CONFIG_SCRATCH:  A pointer an 8-byte
+** aligned memory buffer from which the scratch allocations will be
+** drawn, the size of each scratch allocation (sz),
+** and the maximum number of scratch allocations (N).)^
+** The first argument must be a pointer to an 8-byte aligned buffer
+** of at least sz*N bytes of memory.
+** ^SQLite will not use more than one scratch buffers per thread.
+** ^SQLite will never request a scratch buffer that is more than 6
+** times the database page size.
+** ^If SQLite needs needs additional
+** scratch memory beyond what is provided by this configuration option, then 
+** [sqlite3_malloc()] will be used to obtain the memory needed.<p>
+** ^When the application provides any amount of scratch memory using
+** SQLITE_CONFIG_SCRATCH, SQLite avoids unnecessary large
+** [sqlite3_malloc|heap allocations].
+** This can help [Robson proof|prevent memory allocation failures] due to heap
+** fragmentation in low-memory embedded systems.
+** </dd>
+**
+** [[SQLITE_CONFIG_PAGECACHE]] <dt>SQLITE_CONFIG_PAGECACHE</dt>
+** <dd> ^The SQLITE_CONFIG_PAGECACHE option specifies a static memory buffer
+** that SQLite can use for the database page cache with the default page
+** cache implementation.  
+** This configuration should not be used if an application-define page
+** cache implementation is loaded using the [SQLITE_CONFIG_PCACHE2]
+** configuration option.
+** ^There are three arguments to SQLITE_CONFIG_PAGECACHE: A pointer to
+** 8-byte aligned
+** memory, the size of each page buffer (sz), and the number of pages (N).
+** The sz argument should be the size of the largest database page
+** (a power of two between 512 and 65536) plus some extra bytes for each
+** page header.  ^The number of extra bytes needed by the page header
+** can be determined using the [SQLITE_CONFIG_PCACHE_HDRSZ] option 
+** to [sqlite3_config()].
+** ^It is harmless, apart from the wasted memory,
+** for the sz parameter to be larger than necessary.  The first
+** argument should pointer to an 8-byte aligned block of memory that
+** is at least sz*N bytes of memory, otherwise subsequent behavior is
+** undefined.
+** ^SQLite will use the memory provided by the first argument to satisfy its
+** memory needs for the first N pages that it adds to cache.  ^If additional
+** page cache memory is needed beyond what is provided by this option, then
+** SQLite goes to [sqlite3_malloc()] for the additional storage space.</dd>
