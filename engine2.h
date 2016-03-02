@@ -1129,3 +1129,245 @@ typedef struct sqlite3_mutex sqlite3_mutex;
 ** to xCurrentTime() if xCurrentTimeInt64() is unavailable.
 **
 ** ^The xSetSystemCall(), xGetSystemCall(), and xNestSystemCall() interfaces
+** are not used by the SQLite core.  These optional interfaces are provided
+** by some VFSes to facilitate testing of the VFS code. By overriding 
+** system calls with functions under its control, a test program can
+** simulate faults and error conditions that would otherwise be difficult
+** or impossible to induce.  The set of system calls that can be overridden
+** varies from one VFS to another, and from one version of the same VFS to the
+** next.  Applications that use these interfaces must be prepared for any
+** or all of these interfaces to be NULL or for their behavior to change
+** from one release to the next.  Applications must not attempt to access
+** any of these methods if the iVersion of the VFS is less than 3.
+*/
+typedef struct sqlite3_vfs sqlite3_vfs;
+typedef void (*sqlite3_syscall_ptr)(void);
+struct sqlite3_vfs {
+  int iVersion;            /* Structure version number (currently 3) */
+  int szOsFile;            /* Size of subclassed sqlite3_file */
+  int mxPathname;          /* Maximum file pathname length */
+  sqlite3_vfs *pNext;      /* Next registered VFS */
+  const char *zName;       /* Name of this virtual file system */
+  void *pAppData;          /* Pointer to application-specific data */
+  int (*xOpen)(sqlite3_vfs*, const char *zName, sqlite3_file*,
+               int flags, int *pOutFlags);
+  int (*xDelete)(sqlite3_vfs*, const char *zName, int syncDir);
+  int (*xAccess)(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
+  int (*xFullPathname)(sqlite3_vfs*, const char *zName, int nOut, char *zOut);
+  void *(*xDlOpen)(sqlite3_vfs*, const char *zFilename);
+  void (*xDlError)(sqlite3_vfs*, int nByte, char *zErrMsg);
+  void (*(*xDlSym)(sqlite3_vfs*,void*, const char *zSymbol))(void);
+  void (*xDlClose)(sqlite3_vfs*, void*);
+  int (*xRandomness)(sqlite3_vfs*, int nByte, char *zOut);
+  int (*xSleep)(sqlite3_vfs*, int microseconds);
+  int (*xCurrentTime)(sqlite3_vfs*, double*);
+  int (*xGetLastError)(sqlite3_vfs*, int, char *);
+  /*
+  ** The methods above are in version 1 of the sqlite_vfs object
+  ** definition.  Those that follow are added in version 2 or later
+  */
+  int (*xCurrentTimeInt64)(sqlite3_vfs*, sqlite3_int64*);
+  /*
+  ** The methods above are in versions 1 and 2 of the sqlite_vfs object.
+  ** Those below are for version 3 and greater.
+  */
+  int (*xSetSystemCall)(sqlite3_vfs*, const char *zName, sqlite3_syscall_ptr);
+  sqlite3_syscall_ptr (*xGetSystemCall)(sqlite3_vfs*, const char *zName);
+  const char *(*xNextSystemCall)(sqlite3_vfs*, const char *zName);
+  /*
+  ** The methods above are in versions 1 through 3 of the sqlite_vfs object.
+  ** New fields may be appended in figure versions.  The iVersion
+  ** value will increment whenever this happens. 
+  */
+};
+
+/*
+** CAPI3REF: Flags for the xAccess VFS method
+**
+** These integer constants can be used as the third parameter to
+** the xAccess method of an [sqlite3_vfs] object.  They determine
+** what kind of permissions the xAccess method is looking for.
+** With SQLITE_ACCESS_EXISTS, the xAccess method
+** simply checks whether the file exists.
+** With SQLITE_ACCESS_READWRITE, the xAccess method
+** checks whether the named directory is both readable and writable
+** (in other words, if files can be added, removed, and renamed within
+** the directory).
+** The SQLITE_ACCESS_READWRITE constant is currently used only by the
+** [temp_store_directory pragma], though this could change in a future
+** release of SQLite.
+** With SQLITE_ACCESS_READ, the xAccess method
+** checks whether the file is readable.  The SQLITE_ACCESS_READ constant is
+** currently unused, though it might be used in a future release of
+** SQLite.
+*/
+#define SQLITE_ACCESS_EXISTS    0
+#define SQLITE_ACCESS_READWRITE 1   /* Used by PRAGMA temp_store_directory */
+#define SQLITE_ACCESS_READ      2   /* Unused */
+
+/*
+** CAPI3REF: Flags for the xShmLock VFS method
+**
+** These integer constants define the various locking operations
+** allowed by the xShmLock method of [sqlite3_io_methods].  The
+** following are the only legal combinations of flags to the
+** xShmLock method:
+**
+** <ul>
+** <li>  SQLITE_SHM_LOCK | SQLITE_SHM_SHARED
+** <li>  SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE
+** <li>  SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED
+** <li>  SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE
+** </ul>
+**
+** When unlocking, the same SHARED or EXCLUSIVE flag must be supplied as
+** was given on the corresponding lock.  
+**
+** The xShmLock method can transition between unlocked and SHARED or
+** between unlocked and EXCLUSIVE.  It cannot transition between SHARED
+** and EXCLUSIVE.
+*/
+#define SQLITE_SHM_UNLOCK       1
+#define SQLITE_SHM_LOCK         2
+#define SQLITE_SHM_SHARED       4
+#define SQLITE_SHM_EXCLUSIVE    8
+
+/*
+** CAPI3REF: Maximum xShmLock index
+**
+** The xShmLock method on [sqlite3_io_methods] may use values
+** between 0 and this upper bound as its "offset" argument.
+** The SQLite core will never attempt to acquire or release a
+** lock outside of this range
+*/
+#define SQLITE_SHM_NLOCK        8
+
+
+/*
+** CAPI3REF: Initialize The SQLite Library
+**
+** ^The sqlite3_initialize() routine initializes the
+** SQLite library.  ^The sqlite3_shutdown() routine
+** deallocates any resources that were allocated by sqlite3_initialize().
+** These routines are designed to aid in process initialization and
+** shutdown on embedded systems.  Workstation applications using
+** SQLite normally do not need to invoke either of these routines.
+**
+** A call to sqlite3_initialize() is an "effective" call if it is
+** the first time sqlite3_initialize() is invoked during the lifetime of
+** the process, or if it is the first time sqlite3_initialize() is invoked
+** following a call to sqlite3_shutdown().  ^(Only an effective call
+** of sqlite3_initialize() does any initialization.  All other calls
+** are harmless no-ops.)^
+**
+** A call to sqlite3_shutdown() is an "effective" call if it is the first
+** call to sqlite3_shutdown() since the last sqlite3_initialize().  ^(Only
+** an effective call to sqlite3_shutdown() does any deinitialization.
+** All other valid calls to sqlite3_shutdown() are harmless no-ops.)^
+**
+** The sqlite3_initialize() interface is threadsafe, but sqlite3_shutdown()
+** is not.  The sqlite3_shutdown() interface must only be called from a
+** single thread.  All open [database connections] must be closed and all
+** other SQLite resources must be deallocated prior to invoking
+** sqlite3_shutdown().
+**
+** Among other things, ^sqlite3_initialize() will invoke
+** sqlite3_os_init().  Similarly, ^sqlite3_shutdown()
+** will invoke sqlite3_os_end().
+**
+** ^The sqlite3_initialize() routine returns [SQLITE_OK] on success.
+** ^If for some reason, sqlite3_initialize() is unable to initialize
+** the library (perhaps it is unable to allocate a needed resource such
+** as a mutex) it returns an [error code] other than [SQLITE_OK].
+**
+** ^The sqlite3_initialize() routine is called internally by many other
+** SQLite interfaces so that an application usually does not need to
+** invoke sqlite3_initialize() directly.  For example, [sqlite3_open()]
+** calls sqlite3_initialize() so the SQLite library will be automatically
+** initialized when [sqlite3_open()] is called if it has not be initialized
+** already.  ^However, if SQLite is compiled with the [SQLITE_OMIT_AUTOINIT]
+** compile-time option, then the automatic calls to sqlite3_initialize()
+** are omitted and the application must call sqlite3_initialize() directly
+** prior to using any other SQLite interface.  For maximum portability,
+** it is recommended that applications always invoke sqlite3_initialize()
+** directly prior to using any other SQLite interface.  Future releases
+** of SQLite may require this.  In other words, the behavior exhibited
+** when SQLite is compiled with [SQLITE_OMIT_AUTOINIT] might become the
+** default behavior in some future release of SQLite.
+**
+** The sqlite3_os_init() routine does operating-system specific
+** initialization of the SQLite library.  The sqlite3_os_end()
+** routine undoes the effect of sqlite3_os_init().  Typical tasks
+** performed by these routines include allocation or deallocation
+** of static resources, initialization of global variables,
+** setting up a default [sqlite3_vfs] module, or setting up
+** a default configuration using [sqlite3_config()].
+**
+** The application should never invoke either sqlite3_os_init()
+** or sqlite3_os_end() directly.  The application should only invoke
+** sqlite3_initialize() and sqlite3_shutdown().  The sqlite3_os_init()
+** interface is called automatically by sqlite3_initialize() and
+** sqlite3_os_end() is called by sqlite3_shutdown().  Appropriate
+** implementations for sqlite3_os_init() and sqlite3_os_end()
+** are built into SQLite when it is compiled for Unix, Windows, or OS/2.
+** When [custom builds | built for other platforms]
+** (using the [SQLITE_OS_OTHER=1] compile-time
+** option) the application must supply a suitable implementation for
+** sqlite3_os_init() and sqlite3_os_end().  An application-supplied
+** implementation of sqlite3_os_init() or sqlite3_os_end()
+** must return [SQLITE_OK] on success and some other [error code] upon
+** failure.
+*/
+SQLITE_API int sqlite3_initialize(void);
+SQLITE_API int sqlite3_shutdown(void);
+SQLITE_API int sqlite3_os_init(void);
+SQLITE_API int sqlite3_os_end(void);
+
+/*
+** CAPI3REF: Configuring The SQLite Library
+**
+** The sqlite3_config() interface is used to make global configuration
+** changes to SQLite in order to tune SQLite to the specific needs of
+** the application.  The default configuration is recommended for most
+** applications and so this routine is usually not necessary.  It is
+** provided to support rare applications with unusual needs.
+**
+** The sqlite3_config() interface is not threadsafe.  The application
+** must insure that no other SQLite interfaces are invoked by other
+** threads while sqlite3_config() is running.  Furthermore, sqlite3_config()
+** may only be invoked prior to library initialization using
+** [sqlite3_initialize()] or after shutdown by [sqlite3_shutdown()].
+** ^If sqlite3_config() is called after [sqlite3_initialize()] and before
+** [sqlite3_shutdown()] then it will return SQLITE_MISUSE.
+** Note, however, that ^sqlite3_config() can be called as part of the
+** implementation of an application-defined [sqlite3_os_init()].
+**
+** The first argument to sqlite3_config() is an integer
+** [configuration option] that determines
+** what property of SQLite is to be configured.  Subsequent arguments
+** vary depending on the [configuration option]
+** in the first argument.
+**
+** ^When a configuration option is set, sqlite3_config() returns [SQLITE_OK].
+** ^If the option is unknown or SQLite is unable to set the option
+** then this routine returns a non-zero [error code].
+*/
+SQLITE_API int sqlite3_config(int, ...);
+
+/*
+** CAPI3REF: Configure database connections
+**
+** The sqlite3_db_config() interface is used to make configuration
+** changes to a [database connection].  The interface is similar to
+** [sqlite3_config()] except that the changes apply to a single
+** [database connection] (specified in the first argument).
+**
+** The second argument to sqlite3_db_config(D,V,...)  is the
+** [SQLITE_DBCONFIG_LOOKASIDE | configuration verb] - an integer code 
+** that indicates what aspect of the [database connection] is being configured.
+** Subsequent arguments vary depending on the configuration verb.
+**
+** ^Calls to sqlite3_db_config() return SQLITE_OK if and only if
+** the call is considered successful.
+*/
+SQLITE_API int sqlite3_db_config(sqlite3*, int op, ...);
