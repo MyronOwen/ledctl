@@ -2254,3 +2254,242 @@ SQLITE_API void sqlite3_free_table(char **result);
 **
 ** ^As long as the buffer size is greater than zero, sqlite3_snprintf()
 ** guarantees that the buffer is always zero-terminated.  ^The first
+** parameter "n" is the total size of the buffer, including space for
+** the zero terminator.  So the longest string that can be completely
+** written will be n-1 characters.
+**
+** ^The sqlite3_vsnprintf() routine is a varargs version of sqlite3_snprintf().
+**
+** These routines all implement some additional formatting
+** options that are useful for constructing SQL statements.
+** All of the usual printf() formatting options apply.  In addition, there
+** is are "%q", "%Q", and "%z" options.
+**
+** ^(The %q option works like %s in that it substitutes a nul-terminated
+** string from the argument list.  But %q also doubles every '\'' character.
+** %q is designed for use inside a string literal.)^  By doubling each '\''
+** character it escapes that character and allows it to be inserted into
+** the string.
+**
+** For example, assume the string variable zText contains text as follows:
+**
+** <blockquote><pre>
+**  char *zText = "It's a happy day!";
+** </pre></blockquote>
+**
+** One can use this text in an SQL statement as follows:
+**
+** <blockquote><pre>
+**  char *zSQL = sqlite3_mprintf("INSERT INTO table VALUES('%q')", zText);
+**  sqlite3_exec(db, zSQL, 0, 0, 0);
+**  sqlite3_free(zSQL);
+** </pre></blockquote>
+**
+** Because the %q format string is used, the '\'' character in zText
+** is escaped and the SQL generated is as follows:
+**
+** <blockquote><pre>
+**  INSERT INTO table1 VALUES('It''s a happy day!')
+** </pre></blockquote>
+**
+** This is correct.  Had we used %s instead of %q, the generated SQL
+** would have looked like this:
+**
+** <blockquote><pre>
+**  INSERT INTO table1 VALUES('It's a happy day!');
+** </pre></blockquote>
+**
+** This second example is an SQL syntax error.  As a general rule you should
+** always use %q instead of %s when inserting text into a string literal.
+**
+** ^(The %Q option works like %q except it also adds single quotes around
+** the outside of the total string.  Additionally, if the parameter in the
+** argument list is a NULL pointer, %Q substitutes the text "NULL" (without
+** single quotes).)^  So, for example, one could say:
+**
+** <blockquote><pre>
+**  char *zSQL = sqlite3_mprintf("INSERT INTO table VALUES(%Q)", zText);
+**  sqlite3_exec(db, zSQL, 0, 0, 0);
+**  sqlite3_free(zSQL);
+** </pre></blockquote>
+**
+** The code above will render a correct SQL statement in the zSQL
+** variable even if the zText variable is a NULL pointer.
+**
+** ^(The "%z" formatting option works like "%s" but with the
+** addition that after the string has been read and copied into
+** the result, [sqlite3_free()] is called on the input string.)^
+*/
+SQLITE_API char *sqlite3_mprintf(const char*,...);
+SQLITE_API char *sqlite3_vmprintf(const char*, va_list);
+SQLITE_API char *sqlite3_snprintf(int,char*,const char*, ...);
+SQLITE_API char *sqlite3_vsnprintf(int,char*,const char*, va_list);
+
+/*
+** CAPI3REF: Memory Allocation Subsystem
+**
+** The SQLite core uses these three routines for all of its own
+** internal memory allocation needs. "Core" in the previous sentence
+** does not include operating-system specific VFS implementation.  The
+** Windows VFS uses native malloc() and free() for some operations.
+**
+** ^The sqlite3_malloc() routine returns a pointer to a block
+** of memory at least N bytes in length, where N is the parameter.
+** ^If sqlite3_malloc() is unable to obtain sufficient free
+** memory, it returns a NULL pointer.  ^If the parameter N to
+** sqlite3_malloc() is zero or negative then sqlite3_malloc() returns
+** a NULL pointer.
+**
+** ^The sqlite3_malloc64(N) routine works just like
+** sqlite3_malloc(N) except that N is an unsigned 64-bit integer instead
+** of a signed 32-bit integer.
+**
+** ^Calling sqlite3_free() with a pointer previously returned
+** by sqlite3_malloc() or sqlite3_realloc() releases that memory so
+** that it might be reused.  ^The sqlite3_free() routine is
+** a no-op if is called with a NULL pointer.  Passing a NULL pointer
+** to sqlite3_free() is harmless.  After being freed, memory
+** should neither be read nor written.  Even reading previously freed
+** memory might result in a segmentation fault or other severe error.
+** Memory corruption, a segmentation fault, or other severe error
+** might result if sqlite3_free() is called with a non-NULL pointer that
+** was not obtained from sqlite3_malloc() or sqlite3_realloc().
+**
+** ^The sqlite3_realloc(X,N) interface attempts to resize a
+** prior memory allocation X to be at least N bytes.
+** ^If the X parameter to sqlite3_realloc(X,N)
+** is a NULL pointer then its behavior is identical to calling
+** sqlite3_malloc(N).
+** ^If the N parameter to sqlite3_realloc(X,N) is zero or
+** negative then the behavior is exactly the same as calling
+** sqlite3_free(X).
+** ^sqlite3_realloc(X,N) returns a pointer to a memory allocation
+** of at least N bytes in size or NULL if insufficient memory is available.
+** ^If M is the size of the prior allocation, then min(N,M) bytes
+** of the prior allocation are copied into the beginning of buffer returned
+** by sqlite3_realloc(X,N) and the prior allocation is freed.
+** ^If sqlite3_realloc(X,N) returns NULL and N is positive, then the
+** prior allocation is not freed.
+**
+** ^The sqlite3_realloc64(X,N) interfaces works the same as
+** sqlite3_realloc(X,N) except that N is a 64-bit unsigned integer instead
+** of a 32-bit signed integer.
+**
+** ^If X is a memory allocation previously obtained from sqlite3_malloc(),
+** sqlite3_malloc64(), sqlite3_realloc(), or sqlite3_realloc64(), then
+** sqlite3_msize(X) returns the size of that memory allocation in bytes.
+** ^The value returned by sqlite3_msize(X) might be larger than the number
+** of bytes requested when X was allocated.  ^If X is a NULL pointer then
+** sqlite3_msize(X) returns zero.  If X points to something that is not
+** the beginning of memory allocation, or if it points to a formerly
+** valid memory allocation that has now been freed, then the behavior
+** of sqlite3_msize(X) is undefined and possibly harmful.
+**
+** ^The memory returned by sqlite3_malloc(), sqlite3_realloc(),
+** sqlite3_malloc64(), and sqlite3_realloc64()
+** is always aligned to at least an 8 byte boundary, or to a
+** 4 byte boundary if the [SQLITE_4_BYTE_ALIGNED_MALLOC] compile-time
+** option is used.
+**
+** In SQLite version 3.5.0 and 3.5.1, it was possible to define
+** the SQLITE_OMIT_MEMORY_ALLOCATION which would cause the built-in
+** implementation of these routines to be omitted.  That capability
+** is no longer provided.  Only built-in memory allocators can be used.
+**
+** Prior to SQLite version 3.7.10, the Windows OS interface layer called
+** the system malloc() and free() directly when converting
+** filenames between the UTF-8 encoding used by SQLite
+** and whatever filename encoding is used by the particular Windows
+** installation.  Memory allocation errors were detected, but
+** they were reported back as [SQLITE_CANTOPEN] or
+** [SQLITE_IOERR] rather than [SQLITE_NOMEM].
+**
+** The pointer arguments to [sqlite3_free()] and [sqlite3_realloc()]
+** must be either NULL or else pointers obtained from a prior
+** invocation of [sqlite3_malloc()] or [sqlite3_realloc()] that have
+** not yet been released.
+**
+** The application must not read or write any part of
+** a block of memory after it has been released using
+** [sqlite3_free()] or [sqlite3_realloc()].
+*/
+SQLITE_API void *sqlite3_malloc(int);
+SQLITE_API void *sqlite3_malloc64(sqlite3_uint64);
+SQLITE_API void *sqlite3_realloc(void*, int);
+SQLITE_API void *sqlite3_realloc64(void*, sqlite3_uint64);
+SQLITE_API void sqlite3_free(void*);
+SQLITE_API sqlite3_uint64 sqlite3_msize(void*);
+
+/*
+** CAPI3REF: Memory Allocator Statistics
+**
+** SQLite provides these two interfaces for reporting on the status
+** of the [sqlite3_malloc()], [sqlite3_free()], and [sqlite3_realloc()]
+** routines, which form the built-in memory allocation subsystem.
+**
+** ^The [sqlite3_memory_used()] routine returns the number of bytes
+** of memory currently outstanding (malloced but not freed).
+** ^The [sqlite3_memory_highwater()] routine returns the maximum
+** value of [sqlite3_memory_used()] since the high-water mark
+** was last reset.  ^The values returned by [sqlite3_memory_used()] and
+** [sqlite3_memory_highwater()] include any overhead
+** added by SQLite in its implementation of [sqlite3_malloc()],
+** but not overhead added by the any underlying system library
+** routines that [sqlite3_malloc()] may call.
+**
+** ^The memory high-water mark is reset to the current value of
+** [sqlite3_memory_used()] if and only if the parameter to
+** [sqlite3_memory_highwater()] is true.  ^The value returned
+** by [sqlite3_memory_highwater(1)] is the high-water mark
+** prior to the reset.
+*/
+SQLITE_API sqlite3_int64 sqlite3_memory_used(void);
+SQLITE_API sqlite3_int64 sqlite3_memory_highwater(int resetFlag);
+
+/*
+** CAPI3REF: Pseudo-Random Number Generator
+**
+** SQLite contains a high-quality pseudo-random number generator (PRNG) used to
+** select random [ROWID | ROWIDs] when inserting new records into a table that
+** already uses the largest possible [ROWID].  The PRNG is also used for
+** the build-in random() and randomblob() SQL functions.  This interface allows
+** applications to access the same PRNG for other purposes.
+**
+** ^A call to this routine stores N bytes of randomness into buffer P.
+** ^The P parameter can be a NULL pointer.
+**
+** ^If this routine has not been previously called or if the previous
+** call had N less than one or a NULL pointer for P, then the PRNG is
+** seeded using randomness obtained from the xRandomness method of
+** the default [sqlite3_vfs] object.
+** ^If the previous call to this routine had an N of 1 or more and a
+** non-NULL P then the pseudo-randomness is generated
+** internally and without recourse to the [sqlite3_vfs] xRandomness
+** method.
+*/
+SQLITE_API void sqlite3_randomness(int N, void *P);
+
+/*
+** CAPI3REF: Compile-Time Authorization Callbacks
+**
+** ^This routine registers an authorizer callback with a particular
+** [database connection], supplied in the first argument.
+** ^The authorizer callback is invoked as SQL statements are being compiled
+** by [sqlite3_prepare()] or its variants [sqlite3_prepare_v2()],
+** [sqlite3_prepare16()] and [sqlite3_prepare16_v2()].  ^At various
+** points during the compilation process, as logic is being created
+** to perform various actions, the authorizer callback is invoked to
+** see if those actions are allowed.  ^The authorizer callback should
+** return [SQLITE_OK] to allow the action, [SQLITE_IGNORE] to disallow the
+** specific action but allow the SQL statement to continue to be
+** compiled, or [SQLITE_DENY] to cause the entire SQL statement to be
+** rejected with an error.  ^If the authorizer callback returns
+** any value other than [SQLITE_IGNORE], [SQLITE_OK], or [SQLITE_DENY]
+** then the [sqlite3_prepare_v2()] or equivalent call that triggered
+** the authorizer will fail with an error message.
+**
+** When the callback returns [SQLITE_OK], that means the operation
+** requested is ok.  ^When the callback returns [SQLITE_DENY], the
+** [sqlite3_prepare_v2()] or equivalent call that triggered the
+** authorizer will fail with an error message explaining that
+** access is denied. 
