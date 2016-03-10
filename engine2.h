@@ -2493,3 +2493,193 @@ SQLITE_API void sqlite3_randomness(int N, void *P);
 ** [sqlite3_prepare_v2()] or equivalent call that triggered the
 ** authorizer will fail with an error message explaining that
 ** access is denied. 
+**
+** ^The first parameter to the authorizer callback is a copy of the third
+** parameter to the sqlite3_set_authorizer() interface. ^The second parameter
+** to the callback is an integer [SQLITE_COPY | action code] that specifies
+** the particular action to be authorized. ^The third through sixth parameters
+** to the callback are zero-terminated strings that contain additional
+** details about the action to be authorized.
+**
+** ^If the action code is [SQLITE_READ]
+** and the callback returns [SQLITE_IGNORE] then the
+** [prepared statement] statement is constructed to substitute
+** a NULL value in place of the table column that would have
+** been read if [SQLITE_OK] had been returned.  The [SQLITE_IGNORE]
+** return can be used to deny an untrusted user access to individual
+** columns of a table.
+** ^If the action code is [SQLITE_DELETE] and the callback returns
+** [SQLITE_IGNORE] then the [DELETE] operation proceeds but the
+** [truncate optimization] is disabled and all rows are deleted individually.
+**
+** An authorizer is used when [sqlite3_prepare | preparing]
+** SQL statements from an untrusted source, to ensure that the SQL statements
+** do not try to access data they are not allowed to see, or that they do not
+** try to execute malicious statements that damage the database.  For
+** example, an application may allow a user to enter arbitrary
+** SQL queries for evaluation by a database.  But the application does
+** not want the user to be able to make arbitrary changes to the
+** database.  An authorizer could then be put in place while the
+** user-entered SQL is being [sqlite3_prepare | prepared] that
+** disallows everything except [SELECT] statements.
+**
+** Applications that need to process SQL from untrusted sources
+** might also consider lowering resource limits using [sqlite3_limit()]
+** and limiting database size using the [max_page_count] [PRAGMA]
+** in addition to using an authorizer.
+**
+** ^(Only a single authorizer can be in place on a database connection
+** at a time.  Each call to sqlite3_set_authorizer overrides the
+** previous call.)^  ^Disable the authorizer by installing a NULL callback.
+** The authorizer is disabled by default.
+**
+** The authorizer callback must not do anything that will modify
+** the database connection that invoked the authorizer callback.
+** Note that [sqlite3_prepare_v2()] and [sqlite3_step()] both modify their
+** database connections for the meaning of "modify" in this paragraph.
+**
+** ^When [sqlite3_prepare_v2()] is used to prepare a statement, the
+** statement might be re-prepared during [sqlite3_step()] due to a 
+** schema change.  Hence, the application should ensure that the
+** correct authorizer callback remains in place during the [sqlite3_step()].
+**
+** ^Note that the authorizer callback is invoked only during
+** [sqlite3_prepare()] or its variants.  Authorization is not
+** performed during statement evaluation in [sqlite3_step()], unless
+** as stated in the previous paragraph, sqlite3_step() invokes
+** sqlite3_prepare_v2() to reprepare a statement after a schema change.
+*/
+SQLITE_API int sqlite3_set_authorizer(
+  sqlite3*,
+  int (*xAuth)(void*,int,const char*,const char*,const char*,const char*),
+  void *pUserData
+);
+
+/*
+** CAPI3REF: Authorizer Return Codes
+**
+** The [sqlite3_set_authorizer | authorizer callback function] must
+** return either [SQLITE_OK] or one of these two constants in order
+** to signal SQLite whether or not the action is permitted.  See the
+** [sqlite3_set_authorizer | authorizer documentation] for additional
+** information.
+**
+** Note that SQLITE_IGNORE is also used as a [conflict resolution mode]
+** returned from the [sqlite3_vtab_on_conflict()] interface.
+*/
+#define SQLITE_DENY   1   /* Abort the SQL statement with an error */
+#define SQLITE_IGNORE 2   /* Don't allow access, but don't generate an error */
+
+/*
+** CAPI3REF: Authorizer Action Codes
+**
+** The [sqlite3_set_authorizer()] interface registers a callback function
+** that is invoked to authorize certain SQL statement actions.  The
+** second parameter to the callback is an integer code that specifies
+** what action is being authorized.  These are the integer action codes that
+** the authorizer callback may be passed.
+**
+** These action code values signify what kind of operation is to be
+** authorized.  The 3rd and 4th parameters to the authorization
+** callback function will be parameters or NULL depending on which of these
+** codes is used as the second parameter.  ^(The 5th parameter to the
+** authorizer callback is the name of the database ("main", "temp",
+** etc.) if applicable.)^  ^The 6th parameter to the authorizer callback
+** is the name of the inner-most trigger or view that is responsible for
+** the access attempt or NULL if this access attempt is directly from
+** top-level SQL code.
+*/
+/******************************************* 3rd ************ 4th ***********/
+#define SQLITE_CREATE_INDEX          1   /* Index Name      Table Name      */
+#define SQLITE_CREATE_TABLE          2   /* Table Name      NULL            */
+#define SQLITE_CREATE_TEMP_INDEX     3   /* Index Name      Table Name      */
+#define SQLITE_CREATE_TEMP_TABLE     4   /* Table Name      NULL            */
+#define SQLITE_CREATE_TEMP_TRIGGER   5   /* Trigger Name    Table Name      */
+#define SQLITE_CREATE_TEMP_VIEW      6   /* View Name       NULL            */
+#define SQLITE_CREATE_TRIGGER        7   /* Trigger Name    Table Name      */
+#define SQLITE_CREATE_VIEW           8   /* View Name       NULL            */
+#define SQLITE_DELETE                9   /* Table Name      NULL            */
+#define SQLITE_DROP_INDEX           10   /* Index Name      Table Name      */
+#define SQLITE_DROP_TABLE           11   /* Table Name      NULL            */
+#define SQLITE_DROP_TEMP_INDEX      12   /* Index Name      Table Name      */
+#define SQLITE_DROP_TEMP_TABLE      13   /* Table Name      NULL            */
+#define SQLITE_DROP_TEMP_TRIGGER    14   /* Trigger Name    Table Name      */
+#define SQLITE_DROP_TEMP_VIEW       15   /* View Name       NULL            */
+#define SQLITE_DROP_TRIGGER         16   /* Trigger Name    Table Name      */
+#define SQLITE_DROP_VIEW            17   /* View Name       NULL            */
+#define SQLITE_INSERT               18   /* Table Name      NULL            */
+#define SQLITE_PRAGMA               19   /* Pragma Name     1st arg or NULL */
+#define SQLITE_READ                 20   /* Table Name      Column Name     */
+#define SQLITE_SELECT               21   /* NULL            NULL            */
+#define SQLITE_TRANSACTION          22   /* Operation       NULL            */
+#define SQLITE_UPDATE               23   /* Table Name      Column Name     */
+#define SQLITE_ATTACH               24   /* Filename        NULL            */
+#define SQLITE_DETACH               25   /* Database Name   NULL            */
+#define SQLITE_ALTER_TABLE          26   /* Database Name   Table Name      */
+#define SQLITE_REINDEX              27   /* Index Name      NULL            */
+#define SQLITE_ANALYZE              28   /* Table Name      NULL            */
+#define SQLITE_CREATE_VTABLE        29   /* Table Name      Module Name     */
+#define SQLITE_DROP_VTABLE          30   /* Table Name      Module Name     */
+#define SQLITE_FUNCTION             31   /* NULL            Function Name   */
+#define SQLITE_SAVEPOINT            32   /* Operation       Savepoint Name  */
+#define SQLITE_COPY                  0   /* No longer used */
+#define SQLITE_RECURSIVE            33   /* NULL            NULL            */
+
+/*
+** CAPI3REF: Tracing And Profiling Functions
+**
+** These routines register callback functions that can be used for
+** tracing and profiling the execution of SQL statements.
+**
+** ^The callback function registered by sqlite3_trace() is invoked at
+** various times when an SQL statement is being run by [sqlite3_step()].
+** ^The sqlite3_trace() callback is invoked with a UTF-8 rendering of the
+** SQL statement text as the statement first begins executing.
+** ^(Additional sqlite3_trace() callbacks might occur
+** as each triggered subprogram is entered.  The callbacks for triggers
+** contain a UTF-8 SQL comment that identifies the trigger.)^
+**
+** The [SQLITE_TRACE_SIZE_LIMIT] compile-time option can be used to limit
+** the length of [bound parameter] expansion in the output of sqlite3_trace().
+**
+** ^The callback function registered by sqlite3_profile() is invoked
+** as each SQL statement finishes.  ^The profile callback contains
+** the original statement text and an estimate of wall-clock time
+** of how long that statement took to run.  ^The profile callback
+** time is in units of nanoseconds, however the current implementation
+** is only capable of millisecond resolution so the six least significant
+** digits in the time are meaningless.  Future versions of SQLite
+** might provide greater resolution on the profiler callback.  The
+** sqlite3_profile() function is considered experimental and is
+** subject to change in future versions of SQLite.
+*/
+SQLITE_API void *sqlite3_trace(sqlite3*, void(*xTrace)(void*,const char*), void*);
+SQLITE_API SQLITE_EXPERIMENTAL void *sqlite3_profile(sqlite3*,
+   void(*xProfile)(void*,const char*,sqlite3_uint64), void*);
+
+/*
+** CAPI3REF: Query Progress Callbacks
+**
+** ^The sqlite3_progress_handler(D,N,X,P) interface causes the callback
+** function X to be invoked periodically during long running calls to
+** [sqlite3_exec()], [sqlite3_step()] and [sqlite3_get_table()] for
+** database connection D.  An example use for this
+** interface is to keep a GUI updated during a large query.
+**
+** ^The parameter P is passed through as the only parameter to the 
+** callback function X.  ^The parameter N is the approximate number of 
+** [virtual machine instructions] that are evaluated between successive
+** invocations of the callback X.  ^If N is less than one then the progress
+** handler is disabled.
+**
+** ^Only a single progress handler may be defined at one time per
+** [database connection]; setting a new progress handler cancels the
+** old one.  ^Setting parameter X to NULL disables the progress handler.
+** ^The progress handler is also disabled by setting N to a value less
+** than 1.
+**
+** ^If the progress callback returns non-zero, the operation is
+** interrupted.  This feature can be used to implement a
+** "Cancel" button on a GUI progress dialog box.
+**
+** The progress handler callback must not do anything that will modify
