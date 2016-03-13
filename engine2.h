@@ -3144,3 +3144,249 @@ SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
 */
 #define SQLITE_LIMIT_LENGTH                    0
 #define SQLITE_LIMIT_SQL_LENGTH                1
+#define SQLITE_LIMIT_COLUMN                    2
+#define SQLITE_LIMIT_EXPR_DEPTH                3
+#define SQLITE_LIMIT_COMPOUND_SELECT           4
+#define SQLITE_LIMIT_VDBE_OP                   5
+#define SQLITE_LIMIT_FUNCTION_ARG              6
+#define SQLITE_LIMIT_ATTACHED                  7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH       8
+#define SQLITE_LIMIT_VARIABLE_NUMBER           9
+#define SQLITE_LIMIT_TRIGGER_DEPTH            10
+#define SQLITE_LIMIT_WORKER_THREADS           11
+
+/*
+** CAPI3REF: Compiling An SQL Statement
+** KEYWORDS: {SQL statement compiler}
+**
+** To execute an SQL query, it must first be compiled into a byte-code
+** program using one of these routines.
+**
+** The first argument, "db", is a [database connection] obtained from a
+** prior successful call to [sqlite3_open()], [sqlite3_open_v2()] or
+** [sqlite3_open16()].  The database connection must not have been closed.
+**
+** The second argument, "zSql", is the statement to be compiled, encoded
+** as either UTF-8 or UTF-16.  The sqlite3_prepare() and sqlite3_prepare_v2()
+** interfaces use UTF-8, and sqlite3_prepare16() and sqlite3_prepare16_v2()
+** use UTF-16.
+**
+** ^If the nByte argument is less than zero, then zSql is read up to the
+** first zero terminator. ^If nByte is non-negative, then it is the maximum
+** number of  bytes read from zSql.  ^When nByte is non-negative, the
+** zSql string ends at either the first '\000' or '\u0000' character or
+** the nByte-th byte, whichever comes first. If the caller knows
+** that the supplied string is nul-terminated, then there is a small
+** performance advantage to be gained by passing an nByte parameter that
+** is equal to the number of bytes in the input string <i>including</i>
+** the nul-terminator bytes as this saves SQLite from having to
+** make a copy of the input string.
+**
+** ^If pzTail is not NULL then *pzTail is made to point to the first byte
+** past the end of the first SQL statement in zSql.  These routines only
+** compile the first statement in zSql, so *pzTail is left pointing to
+** what remains uncompiled.
+**
+** ^*ppStmt is left pointing to a compiled [prepared statement] that can be
+** executed using [sqlite3_step()].  ^If there is an error, *ppStmt is set
+** to NULL.  ^If the input text contains no SQL (if the input is an empty
+** string or a comment) then *ppStmt is set to NULL.
+** The calling procedure is responsible for deleting the compiled
+** SQL statement using [sqlite3_finalize()] after it has finished with it.
+** ppStmt may not be NULL.
+**
+** ^On success, the sqlite3_prepare() family of routines return [SQLITE_OK];
+** otherwise an [error code] is returned.
+**
+** The sqlite3_prepare_v2() and sqlite3_prepare16_v2() interfaces are
+** recommended for all new programs. The two older interfaces are retained
+** for backwards compatibility, but their use is discouraged.
+** ^In the "v2" interfaces, the prepared statement
+** that is returned (the [sqlite3_stmt] object) contains a copy of the
+** original SQL text. This causes the [sqlite3_step()] interface to
+** behave differently in three ways:
+**
+** <ol>
+** <li>
+** ^If the database schema changes, instead of returning [SQLITE_SCHEMA] as it
+** always used to do, [sqlite3_step()] will automatically recompile the SQL
+** statement and try to run it again. As many as [SQLITE_MAX_SCHEMA_RETRY]
+** retries will occur before sqlite3_step() gives up and returns an error.
+** </li>
+**
+** <li>
+** ^When an error occurs, [sqlite3_step()] will return one of the detailed
+** [error codes] or [extended error codes].  ^The legacy behavior was that
+** [sqlite3_step()] would only return a generic [SQLITE_ERROR] result code
+** and the application would have to make a second call to [sqlite3_reset()]
+** in order to find the underlying cause of the problem. With the "v2" prepare
+** interfaces, the underlying reason for the error is returned immediately.
+** </li>
+**
+** <li>
+** ^If the specific value bound to [parameter | host parameter] in the 
+** WHERE clause might influence the choice of query plan for a statement,
+** then the statement will be automatically recompiled, as if there had been 
+** a schema change, on the first  [sqlite3_step()] call following any change
+** to the [sqlite3_bind_text | bindings] of that [parameter]. 
+** ^The specific value of WHERE-clause [parameter] might influence the 
+** choice of query plan if the parameter is the left-hand side of a [LIKE]
+** or [GLOB] operator or if the parameter is compared to an indexed column
+** and the [SQLITE_ENABLE_STAT3] compile-time option is enabled.
+** </li>
+** </ol>
+*/
+SQLITE_API int sqlite3_prepare(
+  sqlite3 *db,            /* Database handle */
+  const char *zSql,       /* SQL statement, UTF-8 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+SQLITE_API int sqlite3_prepare_v2(
+  sqlite3 *db,            /* Database handle */
+  const char *zSql,       /* SQL statement, UTF-8 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+SQLITE_API int sqlite3_prepare16(
+  sqlite3 *db,            /* Database handle */
+  const void *zSql,       /* SQL statement, UTF-16 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const void **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+SQLITE_API int sqlite3_prepare16_v2(
+  sqlite3 *db,            /* Database handle */
+  const void *zSql,       /* SQL statement, UTF-16 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const void **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+
+/*
+** CAPI3REF: Retrieving Statement SQL
+**
+** ^This interface can be used to retrieve a saved copy of the original
+** SQL text used to create a [prepared statement] if that statement was
+** compiled using either [sqlite3_prepare_v2()] or [sqlite3_prepare16_v2()].
+*/
+SQLITE_API const char *sqlite3_sql(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Determine If An SQL Statement Writes The Database
+**
+** ^The sqlite3_stmt_readonly(X) interface returns true (non-zero) if
+** and only if the [prepared statement] X makes no direct changes to
+** the content of the database file.
+**
+** Note that [application-defined SQL functions] or
+** [virtual tables] might change the database indirectly as a side effect.  
+** ^(For example, if an application defines a function "eval()" that 
+** calls [sqlite3_exec()], then the following SQL statement would
+** change the database file through side-effects:
+**
+** <blockquote><pre>
+**    SELECT eval('DELETE FROM t1') FROM t2;
+** </pre></blockquote>
+**
+** But because the [SELECT] statement does not change the database file
+** directly, sqlite3_stmt_readonly() would still return true.)^
+**
+** ^Transaction control statements such as [BEGIN], [COMMIT], [ROLLBACK],
+** [SAVEPOINT], and [RELEASE] cause sqlite3_stmt_readonly() to return true,
+** since the statements themselves do not actually modify the database but
+** rather they control the timing of when other statements modify the 
+** database.  ^The [ATTACH] and [DETACH] statements also cause
+** sqlite3_stmt_readonly() to return true since, while those statements
+** change the configuration of a database connection, they do not make 
+** changes to the content of the database files on disk.
+*/
+SQLITE_API int sqlite3_stmt_readonly(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Determine If A Prepared Statement Has Been Reset
+**
+** ^The sqlite3_stmt_busy(S) interface returns true (non-zero) if the
+** [prepared statement] S has been stepped at least once using 
+** [sqlite3_step(S)] but has not run to completion and/or has not 
+** been reset using [sqlite3_reset(S)].  ^The sqlite3_stmt_busy(S)
+** interface returns false if S is a NULL pointer.  If S is not a 
+** NULL pointer and is not a pointer to a valid [prepared statement]
+** object, then the behavior is undefined and probably undesirable.
+**
+** This interface can be used in combination [sqlite3_next_stmt()]
+** to locate all prepared statements associated with a database 
+** connection that are in need of being reset.  This can be used,
+** for example, in diagnostic routines to search for prepared 
+** statements that are holding a transaction open.
+*/
+SQLITE_API int sqlite3_stmt_busy(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Dynamically Typed Value Object
+** KEYWORDS: {protected sqlite3_value} {unprotected sqlite3_value}
+**
+** SQLite uses the sqlite3_value object to represent all values
+** that can be stored in a database table. SQLite uses dynamic typing
+** for the values it stores.  ^Values stored in sqlite3_value objects
+** can be integers, floating point values, strings, BLOBs, or NULL.
+**
+** An sqlite3_value object may be either "protected" or "unprotected".
+** Some interfaces require a protected sqlite3_value.  Other interfaces
+** will accept either a protected or an unprotected sqlite3_value.
+** Every interface that accepts sqlite3_value arguments specifies
+** whether or not it requires a protected sqlite3_value.
+**
+** The terms "protected" and "unprotected" refer to whether or not
+** a mutex is held.  An internal mutex is held for a protected
+** sqlite3_value object but no mutex is held for an unprotected
+** sqlite3_value object.  If SQLite is compiled to be single-threaded
+** (with [SQLITE_THREADSAFE=0] and with [sqlite3_threadsafe()] returning 0)
+** or if SQLite is run in one of reduced mutex modes 
+** [SQLITE_CONFIG_SINGLETHREAD] or [SQLITE_CONFIG_MULTITHREAD]
+** then there is no distinction between protected and unprotected
+** sqlite3_value objects and they can be used interchangeably.  However,
+** for maximum code portability it is recommended that applications
+** still make the distinction between protected and unprotected
+** sqlite3_value objects even when not strictly required.
+**
+** ^The sqlite3_value objects that are passed as parameters into the
+** implementation of [application-defined SQL functions] are protected.
+** ^The sqlite3_value object returned by
+** [sqlite3_column_value()] is unprotected.
+** Unprotected sqlite3_value objects may only be used with
+** [sqlite3_result_value()] and [sqlite3_bind_value()].
+** The [sqlite3_value_blob | sqlite3_value_type()] family of
+** interfaces require protected sqlite3_value objects.
+*/
+typedef struct Mem sqlite3_value;
+
+/*
+** CAPI3REF: SQL Function Context Object
+**
+** The context in which an SQL function executes is stored in an
+** sqlite3_context object.  ^A pointer to an sqlite3_context object
+** is always first parameter to [application-defined SQL functions].
+** The application-defined SQL function implementation will pass this
+** pointer through into calls to [sqlite3_result_int | sqlite3_result()],
+** [sqlite3_aggregate_context()], [sqlite3_user_data()],
+** [sqlite3_context_db_handle()], [sqlite3_get_auxdata()],
+** and/or [sqlite3_set_auxdata()].
+*/
+typedef struct sqlite3_context sqlite3_context;
+
+/*
+** CAPI3REF: Binding Values To Prepared Statements
+** KEYWORDS: {host parameter} {host parameters} {host parameter name}
+** KEYWORDS: {SQL parameter} {SQL parameters} {parameter binding}
+**
+** ^(In the SQL statement text input to [sqlite3_prepare_v2()] and its variants,
+** literals may be replaced by a [parameter] that matches one of following
+** templates:
+**
+** <ul>
+** <li>  ?
+** <li>  ?NNN
+** <li>  :VVV
