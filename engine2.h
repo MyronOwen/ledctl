@@ -2909,3 +2909,238 @@ SQLITE_API void sqlite3_progress_handler(sqlite3*, int, int(*)(void*), void*);
 ** codepage is currently defined.  Filenames containing international
 ** characters must be converted to UTF-8 prior to passing them into
 ** sqlite3_open() or sqlite3_open_v2().
+**
+** <b>Note to Windows Runtime users:</b>  The temporary directory must be set
+** prior to calling sqlite3_open() or sqlite3_open_v2().  Otherwise, various
+** features that require the use of temporary files may fail.
+**
+** See also: [sqlite3_temp_directory]
+*/
+SQLITE_API int sqlite3_open(
+  const char *filename,   /* Database filename (UTF-8) */
+  sqlite3 **ppDb          /* OUT: SQLite db handle */
+);
+SQLITE_API int sqlite3_open16(
+  const void *filename,   /* Database filename (UTF-16) */
+  sqlite3 **ppDb          /* OUT: SQLite db handle */
+);
+SQLITE_API int sqlite3_open_v2(
+  const char *filename,   /* Database filename (UTF-8) */
+  sqlite3 **ppDb,         /* OUT: SQLite db handle */
+  int flags,              /* Flags */
+  const char *zVfs        /* Name of VFS module to use */
+);
+
+/*
+** CAPI3REF: Obtain Values For URI Parameters
+**
+** These are utility routines, useful to VFS implementations, that check
+** to see if a database file was a URI that contained a specific query 
+** parameter, and if so obtains the value of that query parameter.
+**
+** If F is the database filename pointer passed into the xOpen() method of 
+** a VFS implementation when the flags parameter to xOpen() has one or 
+** more of the [SQLITE_OPEN_URI] or [SQLITE_OPEN_MAIN_DB] bits set and
+** P is the name of the query parameter, then
+** sqlite3_uri_parameter(F,P) returns the value of the P
+** parameter if it exists or a NULL pointer if P does not appear as a 
+** query parameter on F.  If P is a query parameter of F
+** has no explicit value, then sqlite3_uri_parameter(F,P) returns
+** a pointer to an empty string.
+**
+** The sqlite3_uri_boolean(F,P,B) routine assumes that P is a boolean
+** parameter and returns true (1) or false (0) according to the value
+** of P.  The sqlite3_uri_boolean(F,P,B) routine returns true (1) if the
+** value of query parameter P is one of "yes", "true", or "on" in any
+** case or if the value begins with a non-zero number.  The 
+** sqlite3_uri_boolean(F,P,B) routines returns false (0) if the value of
+** query parameter P is one of "no", "false", or "off" in any case or
+** if the value begins with a numeric zero.  If P is not a query
+** parameter on F or if the value of P is does not match any of the
+** above, then sqlite3_uri_boolean(F,P,B) returns (B!=0).
+**
+** The sqlite3_uri_int64(F,P,D) routine converts the value of P into a
+** 64-bit signed integer and returns that integer, or D if P does not
+** exist.  If the value of P is something other than an integer, then
+** zero is returned.
+** 
+** If F is a NULL pointer, then sqlite3_uri_parameter(F,P) returns NULL and
+** sqlite3_uri_boolean(F,P,B) returns B.  If F is not a NULL pointer and
+** is not a database file pathname pointer that SQLite passed into the xOpen
+** VFS method, then the behavior of this routine is undefined and probably
+** undesirable.
+*/
+SQLITE_API const char *sqlite3_uri_parameter(const char *zFilename, const char *zParam);
+SQLITE_API int sqlite3_uri_boolean(const char *zFile, const char *zParam, int bDefault);
+SQLITE_API sqlite3_int64 sqlite3_uri_int64(const char*, const char*, sqlite3_int64);
+
+
+/*
+** CAPI3REF: Error Codes And Messages
+**
+** ^The sqlite3_errcode() interface returns the numeric [result code] or
+** [extended result code] for the most recent failed sqlite3_* API call
+** associated with a [database connection]. If a prior API call failed
+** but the most recent API call succeeded, the return value from
+** sqlite3_errcode() is undefined.  ^The sqlite3_extended_errcode()
+** interface is the same except that it always returns the 
+** [extended result code] even when extended result codes are
+** disabled.
+**
+** ^The sqlite3_errmsg() and sqlite3_errmsg16() return English-language
+** text that describes the error, as either UTF-8 or UTF-16 respectively.
+** ^(Memory to hold the error message string is managed internally.
+** The application does not need to worry about freeing the result.
+** However, the error string might be overwritten or deallocated by
+** subsequent calls to other SQLite interface functions.)^
+**
+** ^The sqlite3_errstr() interface returns the English-language text
+** that describes the [result code], as UTF-8.
+** ^(Memory to hold the error message string is managed internally
+** and must not be freed by the application)^.
+**
+** When the serialized [threading mode] is in use, it might be the
+** case that a second error occurs on a separate thread in between
+** the time of the first error and the call to these interfaces.
+** When that happens, the second error will be reported since these
+** interfaces always report the most recent result.  To avoid
+** this, each thread can obtain exclusive use of the [database connection] D
+** by invoking [sqlite3_mutex_enter]([sqlite3_db_mutex](D)) before beginning
+** to use D and invoking [sqlite3_mutex_leave]([sqlite3_db_mutex](D)) after
+** all calls to the interfaces listed here are completed.
+**
+** If an interface fails with SQLITE_MISUSE, that means the interface
+** was invoked incorrectly by the application.  In that case, the
+** error code and message may or may not be set.
+*/
+SQLITE_API int sqlite3_errcode(sqlite3 *db);
+SQLITE_API int sqlite3_extended_errcode(sqlite3 *db);
+SQLITE_API const char *sqlite3_errmsg(sqlite3*);
+SQLITE_API const void *sqlite3_errmsg16(sqlite3*);
+SQLITE_API const char *sqlite3_errstr(int);
+
+/*
+** CAPI3REF: SQL Statement Object
+** KEYWORDS: {prepared statement} {prepared statements}
+**
+** An instance of this object represents a single SQL statement.
+** This object is variously known as a "prepared statement" or a
+** "compiled SQL statement" or simply as a "statement".
+**
+** The life of a statement object goes something like this:
+**
+** <ol>
+** <li> Create the object using [sqlite3_prepare_v2()] or a related
+**      function.
+** <li> Bind values to [host parameters] using the sqlite3_bind_*()
+**      interfaces.
+** <li> Run the SQL by calling [sqlite3_step()] one or more times.
+** <li> Reset the statement using [sqlite3_reset()] then go back
+**      to step 2.  Do this zero or more times.
+** <li> Destroy the object using [sqlite3_finalize()].
+** </ol>
+**
+** Refer to documentation on individual methods above for additional
+** information.
+*/
+typedef struct sqlite3_stmt sqlite3_stmt;
+
+/*
+** CAPI3REF: Run-time Limits
+**
+** ^(This interface allows the size of various constructs to be limited
+** on a connection by connection basis.  The first parameter is the
+** [database connection] whose limit is to be set or queried.  The
+** second parameter is one of the [limit categories] that define a
+** class of constructs to be size limited.  The third parameter is the
+** new limit for that construct.)^
+**
+** ^If the new limit is a negative number, the limit is unchanged.
+** ^(For each limit category SQLITE_LIMIT_<i>NAME</i> there is a 
+** [limits | hard upper bound]
+** set at compile-time by a C preprocessor macro called
+** [limits | SQLITE_MAX_<i>NAME</i>].
+** (The "_LIMIT_" in the name is changed to "_MAX_".))^
+** ^Attempts to increase a limit above its hard upper bound are
+** silently truncated to the hard upper bound.
+**
+** ^Regardless of whether or not the limit was changed, the 
+** [sqlite3_limit()] interface returns the prior value of the limit.
+** ^Hence, to find the current value of a limit without changing it,
+** simply invoke this interface with the third parameter set to -1.
+**
+** Run-time limits are intended for use in applications that manage
+** both their own internal database and also databases that are controlled
+** by untrusted external sources.  An example application might be a
+** web browser that has its own databases for storing history and
+** separate databases controlled by JavaScript applications downloaded
+** off the Internet.  The internal databases can be given the
+** large, default limits.  Databases managed by external sources can
+** be given much smaller limits designed to prevent a denial of service
+** attack.  Developers might also want to use the [sqlite3_set_authorizer()]
+** interface to further control untrusted SQL.  The size of the database
+** created by an untrusted script can be contained using the
+** [max_page_count] [PRAGMA].
+**
+** New run-time limit categories may be added in future releases.
+*/
+SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
+
+/*
+** CAPI3REF: Run-Time Limit Categories
+** KEYWORDS: {limit category} {*limit categories}
+**
+** These constants define various performance limits
+** that can be lowered at run-time using [sqlite3_limit()].
+** The synopsis of the meanings of the various limits is shown below.
+** Additional information is available at [limits | Limits in SQLite].
+**
+** <dl>
+** [[SQLITE_LIMIT_LENGTH]] ^(<dt>SQLITE_LIMIT_LENGTH</dt>
+** <dd>The maximum size of any string or BLOB or table row, in bytes.<dd>)^
+**
+** [[SQLITE_LIMIT_SQL_LENGTH]] ^(<dt>SQLITE_LIMIT_SQL_LENGTH</dt>
+** <dd>The maximum length of an SQL statement, in bytes.</dd>)^
+**
+** [[SQLITE_LIMIT_COLUMN]] ^(<dt>SQLITE_LIMIT_COLUMN</dt>
+** <dd>The maximum number of columns in a table definition or in the
+** result set of a [SELECT] or the maximum number of columns in an index
+** or in an ORDER BY or GROUP BY clause.</dd>)^
+**
+** [[SQLITE_LIMIT_EXPR_DEPTH]] ^(<dt>SQLITE_LIMIT_EXPR_DEPTH</dt>
+** <dd>The maximum depth of the parse tree on any expression.</dd>)^
+**
+** [[SQLITE_LIMIT_COMPOUND_SELECT]] ^(<dt>SQLITE_LIMIT_COMPOUND_SELECT</dt>
+** <dd>The maximum number of terms in a compound SELECT statement.</dd>)^
+**
+** [[SQLITE_LIMIT_VDBE_OP]] ^(<dt>SQLITE_LIMIT_VDBE_OP</dt>
+** <dd>The maximum number of instructions in a virtual machine program
+** used to implement an SQL statement.  This limit is not currently
+** enforced, though that might be added in some future release of
+** SQLite.</dd>)^
+**
+** [[SQLITE_LIMIT_FUNCTION_ARG]] ^(<dt>SQLITE_LIMIT_FUNCTION_ARG</dt>
+** <dd>The maximum number of arguments on a function.</dd>)^
+**
+** [[SQLITE_LIMIT_ATTACHED]] ^(<dt>SQLITE_LIMIT_ATTACHED</dt>
+** <dd>The maximum number of [ATTACH | attached databases].)^</dd>
+**
+** [[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]]
+** ^(<dt>SQLITE_LIMIT_LIKE_PATTERN_LENGTH</dt>
+** <dd>The maximum length of the pattern argument to the [LIKE] or
+** [GLOB] operators.</dd>)^
+**
+** [[SQLITE_LIMIT_VARIABLE_NUMBER]]
+** ^(<dt>SQLITE_LIMIT_VARIABLE_NUMBER</dt>
+** <dd>The maximum index number of any [parameter] in an SQL statement.)^
+**
+** [[SQLITE_LIMIT_TRIGGER_DEPTH]] ^(<dt>SQLITE_LIMIT_TRIGGER_DEPTH</dt>
+** <dd>The maximum depth of recursion for triggers.</dd>)^
+**
+** [[SQLITE_LIMIT_WORKER_THREADS]] ^(<dt>SQLITE_LIMIT_WORKER_THREADS</dt>
+** <dd>The maximum number of auxiliary worker threads that a single
+** [prepared statement] may start.</dd>)^
+** </dl>
+*/
+#define SQLITE_LIMIT_LENGTH                    0
+#define SQLITE_LIMIT_SQL_LENGTH                1
