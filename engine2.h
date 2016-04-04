@@ -3390,3 +3390,228 @@ typedef struct sqlite3_context sqlite3_context;
 ** <li>  ?
 ** <li>  ?NNN
 ** <li>  :VVV
+** <li>  @VVV
+** <li>  $VVV
+** </ul>
+**
+** In the templates above, NNN represents an integer literal,
+** and VVV represents an alphanumeric identifier.)^  ^The values of these
+** parameters (also called "host parameter names" or "SQL parameters")
+** can be set using the sqlite3_bind_*() routines defined here.
+**
+** ^The first argument to the sqlite3_bind_*() routines is always
+** a pointer to the [sqlite3_stmt] object returned from
+** [sqlite3_prepare_v2()] or its variants.
+**
+** ^The second argument is the index of the SQL parameter to be set.
+** ^The leftmost SQL parameter has an index of 1.  ^When the same named
+** SQL parameter is used more than once, second and subsequent
+** occurrences have the same index as the first occurrence.
+** ^The index for named parameters can be looked up using the
+** [sqlite3_bind_parameter_index()] API if desired.  ^The index
+** for "?NNN" parameters is the value of NNN.
+** ^The NNN value must be between 1 and the [sqlite3_limit()]
+** parameter [SQLITE_LIMIT_VARIABLE_NUMBER] (default value: 999).
+**
+** ^The third argument is the value to bind to the parameter.
+** ^If the third parameter to sqlite3_bind_text() or sqlite3_bind_text16()
+** or sqlite3_bind_blob() is a NULL pointer then the fourth parameter
+** is ignored and the end result is the same as sqlite3_bind_null().
+**
+** ^(In those routines that have a fourth argument, its value is the
+** number of bytes in the parameter.  To be clear: the value is the
+** number of <u>bytes</u> in the value, not the number of characters.)^
+** ^If the fourth parameter to sqlite3_bind_text() or sqlite3_bind_text16()
+** is negative, then the length of the string is
+** the number of bytes up to the first zero terminator.
+** If the fourth parameter to sqlite3_bind_blob() is negative, then
+** the behavior is undefined.
+** If a non-negative fourth parameter is provided to sqlite3_bind_text()
+** or sqlite3_bind_text16() or sqlite3_bind_text64() then
+** that parameter must be the byte offset
+** where the NUL terminator would occur assuming the string were NUL
+** terminated.  If any NUL characters occur at byte offsets less than 
+** the value of the fourth parameter then the resulting string value will
+** contain embedded NULs.  The result of expressions involving strings
+** with embedded NULs is undefined.
+**
+** ^The fifth argument to the BLOB and string binding interfaces
+** is a destructor used to dispose of the BLOB or
+** string after SQLite has finished with it.  ^The destructor is called
+** to dispose of the BLOB or string even if the call to bind API fails.
+** ^If the fifth argument is
+** the special value [SQLITE_STATIC], then SQLite assumes that the
+** information is in static, unmanaged space and does not need to be freed.
+** ^If the fifth argument has the value [SQLITE_TRANSIENT], then
+** SQLite makes its own private copy of the data immediately, before
+** the sqlite3_bind_*() routine returns.
+**
+** ^The sixth argument to sqlite3_bind_text64() must be one of
+** [SQLITE_UTF8], [SQLITE_UTF16], [SQLITE_UTF16BE], or [SQLITE_UTF16LE]
+** to specify the encoding of the text in the third parameter.  If
+** the sixth argument to sqlite3_bind_text64() is not one of the
+** allowed values shown above, or if the text encoding is different
+** from the encoding specified by the sixth parameter, then the behavior
+** is undefined.
+**
+** ^The sqlite3_bind_zeroblob() routine binds a BLOB of length N that
+** is filled with zeroes.  ^A zeroblob uses a fixed amount of memory
+** (just an integer to hold its size) while it is being processed.
+** Zeroblobs are intended to serve as placeholders for BLOBs whose
+** content is later written using
+** [sqlite3_blob_open | incremental BLOB I/O] routines.
+** ^A negative value for the zeroblob results in a zero-length BLOB.
+**
+** ^If any of the sqlite3_bind_*() routines are called with a NULL pointer
+** for the [prepared statement] or with a prepared statement for which
+** [sqlite3_step()] has been called more recently than [sqlite3_reset()],
+** then the call will return [SQLITE_MISUSE].  If any sqlite3_bind_()
+** routine is passed a [prepared statement] that has been finalized, the
+** result is undefined and probably harmful.
+**
+** ^Bindings are not cleared by the [sqlite3_reset()] routine.
+** ^Unbound parameters are interpreted as NULL.
+**
+** ^The sqlite3_bind_* routines return [SQLITE_OK] on success or an
+** [error code] if anything goes wrong.
+** ^[SQLITE_TOOBIG] might be returned if the size of a string or BLOB
+** exceeds limits imposed by [sqlite3_limit]([SQLITE_LIMIT_LENGTH]) or
+** [SQLITE_MAX_LENGTH].
+** ^[SQLITE_RANGE] is returned if the parameter
+** index is out of range.  ^[SQLITE_NOMEM] is returned if malloc() fails.
+**
+** See also: [sqlite3_bind_parameter_count()],
+** [sqlite3_bind_parameter_name()], and [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API int sqlite3_bind_blob(sqlite3_stmt*, int, const void*, int n, void(*)(void*));
+SQLITE_API int sqlite3_bind_blob64(sqlite3_stmt*, int, const void*, sqlite3_uint64,
+                        void(*)(void*));
+SQLITE_API int sqlite3_bind_double(sqlite3_stmt*, int, double);
+SQLITE_API int sqlite3_bind_int(sqlite3_stmt*, int, int);
+SQLITE_API int sqlite3_bind_int64(sqlite3_stmt*, int, sqlite3_int64);
+SQLITE_API int sqlite3_bind_null(sqlite3_stmt*, int);
+SQLITE_API int sqlite3_bind_text(sqlite3_stmt*,int,const char*,int,void(*)(void*));
+SQLITE_API int sqlite3_bind_text16(sqlite3_stmt*, int, const void*, int, void(*)(void*));
+SQLITE_API int sqlite3_bind_text64(sqlite3_stmt*, int, const char*, sqlite3_uint64,
+                         void(*)(void*), unsigned char encoding);
+SQLITE_API int sqlite3_bind_value(sqlite3_stmt*, int, const sqlite3_value*);
+SQLITE_API int sqlite3_bind_zeroblob(sqlite3_stmt*, int, int n);
+
+/*
+** CAPI3REF: Number Of SQL Parameters
+**
+** ^This routine can be used to find the number of [SQL parameters]
+** in a [prepared statement].  SQL parameters are tokens of the
+** form "?", "?NNN", ":AAA", "$AAA", or "@AAA" that serve as
+** placeholders for values that are [sqlite3_bind_blob | bound]
+** to the parameters at a later time.
+**
+** ^(This routine actually returns the index of the largest (rightmost)
+** parameter. For all forms except ?NNN, this will correspond to the
+** number of unique parameters.  If parameters of the ?NNN form are used,
+** there may be gaps in the list.)^
+**
+** See also: [sqlite3_bind_blob|sqlite3_bind()],
+** [sqlite3_bind_parameter_name()], and
+** [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API int sqlite3_bind_parameter_count(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Name Of A Host Parameter
+**
+** ^The sqlite3_bind_parameter_name(P,N) interface returns
+** the name of the N-th [SQL parameter] in the [prepared statement] P.
+** ^(SQL parameters of the form "?NNN" or ":AAA" or "@AAA" or "$AAA"
+** have a name which is the string "?NNN" or ":AAA" or "@AAA" or "$AAA"
+** respectively.
+** In other words, the initial ":" or "$" or "@" or "?"
+** is included as part of the name.)^
+** ^Parameters of the form "?" without a following integer have no name
+** and are referred to as "nameless" or "anonymous parameters".
+**
+** ^The first host parameter has an index of 1, not 0.
+**
+** ^If the value N is out of range or if the N-th parameter is
+** nameless, then NULL is returned.  ^The returned string is
+** always in UTF-8 encoding even if the named parameter was
+** originally specified as UTF-16 in [sqlite3_prepare16()] or
+** [sqlite3_prepare16_v2()].
+**
+** See also: [sqlite3_bind_blob|sqlite3_bind()],
+** [sqlite3_bind_parameter_count()], and
+** [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API const char *sqlite3_bind_parameter_name(sqlite3_stmt*, int);
+
+/*
+** CAPI3REF: Index Of A Parameter With A Given Name
+**
+** ^Return the index of an SQL parameter given its name.  ^The
+** index value returned is suitable for use as the second
+** parameter to [sqlite3_bind_blob|sqlite3_bind()].  ^A zero
+** is returned if no matching parameter is found.  ^The parameter
+** name must be given in UTF-8 even if the original statement
+** was prepared from UTF-16 text using [sqlite3_prepare16_v2()].
+**
+** See also: [sqlite3_bind_blob|sqlite3_bind()],
+** [sqlite3_bind_parameter_count()], and
+** [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API int sqlite3_bind_parameter_index(sqlite3_stmt*, const char *zName);
+
+/*
+** CAPI3REF: Reset All Bindings On A Prepared Statement
+**
+** ^Contrary to the intuition of many, [sqlite3_reset()] does not reset
+** the [sqlite3_bind_blob | bindings] on a [prepared statement].
+** ^Use this routine to reset all host parameters to NULL.
+*/
+SQLITE_API int sqlite3_clear_bindings(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Number Of Columns In A Result Set
+**
+** ^Return the number of columns in the result set returned by the
+** [prepared statement]. ^This routine returns 0 if pStmt is an SQL
+** statement that does not return data (for example an [UPDATE]).
+**
+** See also: [sqlite3_data_count()]
+*/
+SQLITE_API int sqlite3_column_count(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Column Names In A Result Set
+**
+** ^These routines return the name assigned to a particular column
+** in the result set of a [SELECT] statement.  ^The sqlite3_column_name()
+** interface returns a pointer to a zero-terminated UTF-8 string
+** and sqlite3_column_name16() returns a pointer to a zero-terminated
+** UTF-16 string.  ^The first parameter is the [prepared statement]
+** that implements the [SELECT] statement. ^The second parameter is the
+** column number.  ^The leftmost column is number 0.
+**
+** ^The returned string pointer is valid until either the [prepared statement]
+** is destroyed by [sqlite3_finalize()] or until the statement is automatically
+** reprepared by the first call to [sqlite3_step()] for a particular run
+** or until the next call to
+** sqlite3_column_name() or sqlite3_column_name16() on the same column.
+**
+** ^If sqlite3_malloc() fails during the processing of either routine
+** (for example during a conversion from UTF-8 to UTF-16) then a
+** NULL pointer is returned.
+**
+** ^The name of a result column is the value of the "AS" clause for
+** that column, if there is an AS clause.  If there is no AS clause
+** then the name of the column is unspecified and may change from
+** one release of SQLite to the next.
+*/
+SQLITE_API const char *sqlite3_column_name(sqlite3_stmt*, int N);
+SQLITE_API const void *sqlite3_column_name16(sqlite3_stmt*, int N);
+
+/*
+** CAPI3REF: Source Of Data In A Query Result
+**
+** ^These routines provide a means to determine the database, table, and
+** table column that is the origin of a particular result column in
+** [SELECT] statement.
