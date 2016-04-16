@@ -5211,3 +5211,241 @@ SQLITE_API SQLITE_DEPRECATED void sqlite3_soft_heap_limit(int N);
 ** declaration type and collation sequence is valid until the next
 ** call to any SQLite API function.
 **
+** ^If the specified table is actually a view, an [error code] is returned.
+**
+** ^If the specified column is "rowid", "oid" or "_rowid_" and the table 
+** is not a [WITHOUT ROWID] table and an
+** [INTEGER PRIMARY KEY] column has been explicitly declared, then the output
+** parameters are set for the explicitly declared column. ^(If there is no
+** [INTEGER PRIMARY KEY] column, then the outputs
+** for the [rowid] are set as follows:
+**
+** <pre>
+**     data type: "INTEGER"
+**     collation sequence: "BINARY"
+**     not null: 0
+**     primary key: 1
+**     auto increment: 0
+** </pre>)^
+**
+** ^This function causes all database schemas to be read from disk and
+** parsed, if that has not already been done, and returns an error if
+** any errors are encountered while loading the schema.
+*/
+SQLITE_API int sqlite3_table_column_metadata(
+  sqlite3 *db,                /* Connection handle */
+  const char *zDbName,        /* Database name or NULL */
+  const char *zTableName,     /* Table name */
+  const char *zColumnName,    /* Column name */
+  char const **pzDataType,    /* OUTPUT: Declared data type */
+  char const **pzCollSeq,     /* OUTPUT: Collation sequence name */
+  int *pNotNull,              /* OUTPUT: True if NOT NULL constraint exists */
+  int *pPrimaryKey,           /* OUTPUT: True if column part of PK */
+  int *pAutoinc               /* OUTPUT: True if column is auto-increment */
+);
+
+/*
+** CAPI3REF: Load An Extension
+**
+** ^This interface loads an SQLite extension library from the named file.
+**
+** ^The sqlite3_load_extension() interface attempts to load an
+** [SQLite extension] library contained in the file zFile.  If
+** the file cannot be loaded directly, attempts are made to load
+** with various operating-system specific extensions added.
+** So for example, if "samplelib" cannot be loaded, then names like
+** "samplelib.so" or "samplelib.dylib" or "samplelib.dll" might
+** be tried also.
+**
+** ^The entry point is zProc.
+** ^(zProc may be 0, in which case SQLite will try to come up with an
+** entry point name on its own.  It first tries "sqlite3_extension_init".
+** If that does not work, it constructs a name "sqlite3_X_init" where the
+** X is consists of the lower-case equivalent of all ASCII alphabetic
+** characters in the filename from the last "/" to the first following
+** "." and omitting any initial "lib".)^
+** ^The sqlite3_load_extension() interface returns
+** [SQLITE_OK] on success and [SQLITE_ERROR] if something goes wrong.
+** ^If an error occurs and pzErrMsg is not 0, then the
+** [sqlite3_load_extension()] interface shall attempt to
+** fill *pzErrMsg with error message text stored in memory
+** obtained from [sqlite3_malloc()]. The calling function
+** should free this memory by calling [sqlite3_free()].
+**
+** ^Extension loading must be enabled using
+** [sqlite3_enable_load_extension()] prior to calling this API,
+** otherwise an error will be returned.
+**
+** See also the [load_extension() SQL function].
+*/
+SQLITE_API int sqlite3_load_extension(
+  sqlite3 *db,          /* Load the extension into this database connection */
+  const char *zFile,    /* Name of the shared library containing extension */
+  const char *zProc,    /* Entry point.  Derived from zFile if 0 */
+  char **pzErrMsg       /* Put error message here if not 0 */
+);
+
+/*
+** CAPI3REF: Enable Or Disable Extension Loading
+**
+** ^So as not to open security holes in older applications that are
+** unprepared to deal with [extension loading], and as a means of disabling
+** [extension loading] while evaluating user-entered SQL, the following API
+** is provided to turn the [sqlite3_load_extension()] mechanism on and off.
+**
+** ^Extension loading is off by default.
+** ^Call the sqlite3_enable_load_extension() routine with onoff==1
+** to turn extension loading on and call it with onoff==0 to turn
+** it back off again.
+*/
+SQLITE_API int sqlite3_enable_load_extension(sqlite3 *db, int onoff);
+
+/*
+** CAPI3REF: Automatically Load Statically Linked Extensions
+**
+** ^This interface causes the xEntryPoint() function to be invoked for
+** each new [database connection] that is created.  The idea here is that
+** xEntryPoint() is the entry point for a statically linked [SQLite extension]
+** that is to be automatically loaded into all new database connections.
+**
+** ^(Even though the function prototype shows that xEntryPoint() takes
+** no arguments and returns void, SQLite invokes xEntryPoint() with three
+** arguments and expects and integer result as if the signature of the
+** entry point where as follows:
+**
+** <blockquote><pre>
+** &nbsp;  int xEntryPoint(
+** &nbsp;    sqlite3 *db,
+** &nbsp;    const char **pzErrMsg,
+** &nbsp;    const struct sqlite3_api_routines *pThunk
+** &nbsp;  );
+** </pre></blockquote>)^
+**
+** If the xEntryPoint routine encounters an error, it should make *pzErrMsg
+** point to an appropriate error message (obtained from [sqlite3_mprintf()])
+** and return an appropriate [error code].  ^SQLite ensures that *pzErrMsg
+** is NULL before calling the xEntryPoint().  ^SQLite will invoke
+** [sqlite3_free()] on *pzErrMsg after xEntryPoint() returns.  ^If any
+** xEntryPoint() returns an error, the [sqlite3_open()], [sqlite3_open16()],
+** or [sqlite3_open_v2()] call that provoked the xEntryPoint() will fail.
+**
+** ^Calling sqlite3_auto_extension(X) with an entry point X that is already
+** on the list of automatic extensions is a harmless no-op. ^No entry point
+** will be called more than once for each database connection that is opened.
+**
+** See also: [sqlite3_reset_auto_extension()]
+** and [sqlite3_cancel_auto_extension()]
+*/
+SQLITE_API int sqlite3_auto_extension(void (*xEntryPoint)(void));
+
+/*
+** CAPI3REF: Cancel Automatic Extension Loading
+**
+** ^The [sqlite3_cancel_auto_extension(X)] interface unregisters the
+** initialization routine X that was registered using a prior call to
+** [sqlite3_auto_extension(X)].  ^The [sqlite3_cancel_auto_extension(X)]
+** routine returns 1 if initialization routine X was successfully 
+** unregistered and it returns 0 if X was not on the list of initialization
+** routines.
+*/
+SQLITE_API int sqlite3_cancel_auto_extension(void (*xEntryPoint)(void));
+
+/*
+** CAPI3REF: Reset Automatic Extension Loading
+**
+** ^This interface disables all automatic extensions previously
+** registered using [sqlite3_auto_extension()].
+*/
+SQLITE_API void sqlite3_reset_auto_extension(void);
+
+/*
+** The interface to the virtual-table mechanism is currently considered
+** to be experimental.  The interface might change in incompatible ways.
+** If this is a problem for you, do not use the interface at this time.
+**
+** When the virtual-table mechanism stabilizes, we will declare the
+** interface fixed, support it indefinitely, and remove this comment.
+*/
+
+/*
+** Structures used by the virtual table interface
+*/
+typedef struct sqlite3_vtab sqlite3_vtab;
+typedef struct sqlite3_index_info sqlite3_index_info;
+typedef struct sqlite3_vtab_cursor sqlite3_vtab_cursor;
+typedef struct sqlite3_module sqlite3_module;
+
+/*
+** CAPI3REF: Virtual Table Object
+** KEYWORDS: sqlite3_module {virtual table module}
+**
+** This structure, sometimes called a "virtual table module", 
+** defines the implementation of a [virtual tables].  
+** This structure consists mostly of methods for the module.
+**
+** ^A virtual table module is created by filling in a persistent
+** instance of this structure and passing a pointer to that instance
+** to [sqlite3_create_module()] or [sqlite3_create_module_v2()].
+** ^The registration remains valid until it is replaced by a different
+** module or until the [database connection] closes.  The content
+** of this structure must not change while it is registered with
+** any database connection.
+*/
+struct sqlite3_module {
+  int iVersion;
+  int (*xCreate)(sqlite3*, void *pAux,
+               int argc, const char *const*argv,
+               sqlite3_vtab **ppVTab, char**);
+  int (*xConnect)(sqlite3*, void *pAux,
+               int argc, const char *const*argv,
+               sqlite3_vtab **ppVTab, char**);
+  int (*xBestIndex)(sqlite3_vtab *pVTab, sqlite3_index_info*);
+  int (*xDisconnect)(sqlite3_vtab *pVTab);
+  int (*xDestroy)(sqlite3_vtab *pVTab);
+  int (*xOpen)(sqlite3_vtab *pVTab, sqlite3_vtab_cursor **ppCursor);
+  int (*xClose)(sqlite3_vtab_cursor*);
+  int (*xFilter)(sqlite3_vtab_cursor*, int idxNum, const char *idxStr,
+                int argc, sqlite3_value **argv);
+  int (*xNext)(sqlite3_vtab_cursor*);
+  int (*xEof)(sqlite3_vtab_cursor*);
+  int (*xColumn)(sqlite3_vtab_cursor*, sqlite3_context*, int);
+  int (*xRowid)(sqlite3_vtab_cursor*, sqlite3_int64 *pRowid);
+  int (*xUpdate)(sqlite3_vtab *, int, sqlite3_value **, sqlite3_int64 *);
+  int (*xBegin)(sqlite3_vtab *pVTab);
+  int (*xSync)(sqlite3_vtab *pVTab);
+  int (*xCommit)(sqlite3_vtab *pVTab);
+  int (*xRollback)(sqlite3_vtab *pVTab);
+  int (*xFindFunction)(sqlite3_vtab *pVtab, int nArg, const char *zName,
+                       void (**pxFunc)(sqlite3_context*,int,sqlite3_value**),
+                       void **ppArg);
+  int (*xRename)(sqlite3_vtab *pVtab, const char *zNew);
+  /* The methods above are in version 1 of the sqlite_module object. Those 
+  ** below are for version 2 and greater. */
+  int (*xSavepoint)(sqlite3_vtab *pVTab, int);
+  int (*xRelease)(sqlite3_vtab *pVTab, int);
+  int (*xRollbackTo)(sqlite3_vtab *pVTab, int);
+};
+
+/*
+** CAPI3REF: Virtual Table Indexing Information
+** KEYWORDS: sqlite3_index_info
+**
+** The sqlite3_index_info structure and its substructures is used as part
+** of the [virtual table] interface to
+** pass information into and receive the reply from the [xBestIndex]
+** method of a [virtual table module].  The fields under **Inputs** are the
+** inputs to xBestIndex and are read-only.  xBestIndex inserts its
+** results into the **Outputs** fields.
+**
+** ^(The aConstraint[] array records WHERE clause constraints of the form:
+**
+** <blockquote>column OP expr</blockquote>
+**
+** where OP is =, &lt;, &lt;=, &gt;, or &gt;=.)^  ^(The particular operator is
+** stored in aConstraint[].op using one of the
+** [SQLITE_INDEX_CONSTRAINT_EQ | SQLITE_INDEX_CONSTRAINT_ values].)^
+** ^(The index of the column is stored in
+** aConstraint[].iColumn.)^  ^(aConstraint[].usable is TRUE if the
+** expr on the right-hand side can be evaluated (and thus the constraint
+** is usable) and false if it cannot.)^
+**
