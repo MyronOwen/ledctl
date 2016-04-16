@@ -6159,3 +6159,242 @@ SQLITE_API int sqlite3_mutex_notheld(sqlite3_mutex*);
 #define SQLITE_MUTEX_RECURSIVE        1
 #define SQLITE_MUTEX_STATIC_MASTER    2
 #define SQLITE_MUTEX_STATIC_MEM       3  /* sqlite3_malloc() */
+#define SQLITE_MUTEX_STATIC_MEM2      4  /* NOT USED */
+#define SQLITE_MUTEX_STATIC_OPEN      4  /* sqlite3BtreeOpen() */
+#define SQLITE_MUTEX_STATIC_PRNG      5  /* sqlite3_random() */
+#define SQLITE_MUTEX_STATIC_LRU       6  /* lru page list */
+#define SQLITE_MUTEX_STATIC_LRU2      7  /* NOT USED */
+#define SQLITE_MUTEX_STATIC_PMEM      7  /* sqlite3PageMalloc() */
+#define SQLITE_MUTEX_STATIC_APP1      8  /* For use by application */
+#define SQLITE_MUTEX_STATIC_APP2      9  /* For use by application */
+#define SQLITE_MUTEX_STATIC_APP3     10  /* For use by application */
+
+/*
+** CAPI3REF: Retrieve the mutex for a database connection
+**
+** ^This interface returns a pointer the [sqlite3_mutex] object that 
+** serializes access to the [database connection] given in the argument
+** when the [threading mode] is Serialized.
+** ^If the [threading mode] is Single-thread or Multi-thread then this
+** routine returns a NULL pointer.
+*/
+SQLITE_API sqlite3_mutex *sqlite3_db_mutex(sqlite3*);
+
+/*
+** CAPI3REF: Low-Level Control Of Database Files
+**
+** ^The [sqlite3_file_control()] interface makes a direct call to the
+** xFileControl method for the [sqlite3_io_methods] object associated
+** with a particular database identified by the second argument. ^The
+** name of the database is "main" for the main database or "temp" for the
+** TEMP database, or the name that appears after the AS keyword for
+** databases that are added using the [ATTACH] SQL command.
+** ^A NULL pointer can be used in place of "main" to refer to the
+** main database file.
+** ^The third and fourth parameters to this routine
+** are passed directly through to the second and third parameters of
+** the xFileControl method.  ^The return value of the xFileControl
+** method becomes the return value of this routine.
+**
+** ^The SQLITE_FCNTL_FILE_POINTER value for the op parameter causes
+** a pointer to the underlying [sqlite3_file] object to be written into
+** the space pointed to by the 4th parameter.  ^The SQLITE_FCNTL_FILE_POINTER
+** case is a short-circuit path which does not actually invoke the
+** underlying sqlite3_io_methods.xFileControl method.
+**
+** ^If the second parameter (zDbName) does not match the name of any
+** open database file, then SQLITE_ERROR is returned.  ^This error
+** code is not remembered and will not be recalled by [sqlite3_errcode()]
+** or [sqlite3_errmsg()].  The underlying xFileControl method might
+** also return SQLITE_ERROR.  There is no way to distinguish between
+** an incorrect zDbName and an SQLITE_ERROR return from the underlying
+** xFileControl method.
+**
+** See also: [SQLITE_FCNTL_LOCKSTATE]
+*/
+SQLITE_API int sqlite3_file_control(sqlite3*, const char *zDbName, int op, void*);
+
+/*
+** CAPI3REF: Testing Interface
+**
+** ^The sqlite3_test_control() interface is used to read out internal
+** state of SQLite and to inject faults into SQLite for testing
+** purposes.  ^The first parameter is an operation code that determines
+** the number, meaning, and operation of all subsequent parameters.
+**
+** This interface is not for use by applications.  It exists solely
+** for verifying the correct operation of the SQLite library.  Depending
+** on how the SQLite library is compiled, this interface might not exist.
+**
+** The details of the operation codes, their meanings, the parameters
+** they take, and what they do are all subject to change without notice.
+** Unlike most of the SQLite API, this function is not guaranteed to
+** operate consistently from one release to the next.
+*/
+SQLITE_API int sqlite3_test_control(int op, ...);
+
+/*
+** CAPI3REF: Testing Interface Operation Codes
+**
+** These constants are the valid operation code parameters used
+** as the first argument to [sqlite3_test_control()].
+**
+** These parameters and their meanings are subject to change
+** without notice.  These values are for testing purposes only.
+** Applications should not use any of these parameters or the
+** [sqlite3_test_control()] interface.
+*/
+#define SQLITE_TESTCTRL_FIRST                    5
+#define SQLITE_TESTCTRL_PRNG_SAVE                5
+#define SQLITE_TESTCTRL_PRNG_RESTORE             6
+#define SQLITE_TESTCTRL_PRNG_RESET               7
+#define SQLITE_TESTCTRL_BITVEC_TEST              8
+#define SQLITE_TESTCTRL_FAULT_INSTALL            9
+#define SQLITE_TESTCTRL_BENIGN_MALLOC_HOOKS     10
+#define SQLITE_TESTCTRL_PENDING_BYTE            11
+#define SQLITE_TESTCTRL_ASSERT                  12
+#define SQLITE_TESTCTRL_ALWAYS                  13
+#define SQLITE_TESTCTRL_RESERVE                 14
+#define SQLITE_TESTCTRL_OPTIMIZATIONS           15
+#define SQLITE_TESTCTRL_ISKEYWORD               16
+#define SQLITE_TESTCTRL_SCRATCHMALLOC           17
+#define SQLITE_TESTCTRL_LOCALTIME_FAULT         18
+#define SQLITE_TESTCTRL_EXPLAIN_STMT            19  /* NOT USED */
+#define SQLITE_TESTCTRL_NEVER_CORRUPT           20
+#define SQLITE_TESTCTRL_VDBE_COVERAGE           21
+#define SQLITE_TESTCTRL_BYTEORDER               22
+#define SQLITE_TESTCTRL_ISINIT                  23
+#define SQLITE_TESTCTRL_SORTER_MMAP             24
+#define SQLITE_TESTCTRL_LAST                    24
+
+/*
+** CAPI3REF: SQLite Runtime Status
+**
+** ^This interface is used to retrieve runtime status information
+** about the performance of SQLite, and optionally to reset various
+** highwater marks.  ^The first argument is an integer code for
+** the specific parameter to measure.  ^(Recognized integer codes
+** are of the form [status parameters | SQLITE_STATUS_...].)^
+** ^The current value of the parameter is returned into *pCurrent.
+** ^The highest recorded value is returned in *pHighwater.  ^If the
+** resetFlag is true, then the highest record value is reset after
+** *pHighwater is written.  ^(Some parameters do not record the highest
+** value.  For those parameters
+** nothing is written into *pHighwater and the resetFlag is ignored.)^
+** ^(Other parameters record only the highwater mark and not the current
+** value.  For these latter parameters nothing is written into *pCurrent.)^
+**
+** ^The sqlite3_status() routine returns SQLITE_OK on success and a
+** non-zero [error code] on failure.
+**
+** This routine is threadsafe but is not atomic.  This routine can be
+** called while other threads are running the same or different SQLite
+** interfaces.  However the values returned in *pCurrent and
+** *pHighwater reflect the status of SQLite at different points in time
+** and it is possible that another thread might change the parameter
+** in between the times when *pCurrent and *pHighwater are written.
+**
+** See also: [sqlite3_db_status()]
+*/
+SQLITE_API int sqlite3_status(int op, int *pCurrent, int *pHighwater, int resetFlag);
+
+
+/*
+** CAPI3REF: Status Parameters
+** KEYWORDS: {status parameters}
+**
+** These integer constants designate various run-time status parameters
+** that can be returned by [sqlite3_status()].
+**
+** <dl>
+** [[SQLITE_STATUS_MEMORY_USED]] ^(<dt>SQLITE_STATUS_MEMORY_USED</dt>
+** <dd>This parameter is the current amount of memory checked out
+** using [sqlite3_malloc()], either directly or indirectly.  The
+** figure includes calls made to [sqlite3_malloc()] by the application
+** and internal memory usage by the SQLite library.  Scratch memory
+** controlled by [SQLITE_CONFIG_SCRATCH] and auxiliary page-cache
+** memory controlled by [SQLITE_CONFIG_PAGECACHE] is not included in
+** this parameter.  The amount returned is the sum of the allocation
+** sizes as reported by the xSize method in [sqlite3_mem_methods].</dd>)^
+**
+** [[SQLITE_STATUS_MALLOC_SIZE]] ^(<dt>SQLITE_STATUS_MALLOC_SIZE</dt>
+** <dd>This parameter records the largest memory allocation request
+** handed to [sqlite3_malloc()] or [sqlite3_realloc()] (or their
+** internal equivalents).  Only the value returned in the
+** *pHighwater parameter to [sqlite3_status()] is of interest.  
+** The value written into the *pCurrent parameter is undefined.</dd>)^
+**
+** [[SQLITE_STATUS_MALLOC_COUNT]] ^(<dt>SQLITE_STATUS_MALLOC_COUNT</dt>
+** <dd>This parameter records the number of separate memory allocations
+** currently checked out.</dd>)^
+**
+** [[SQLITE_STATUS_PAGECACHE_USED]] ^(<dt>SQLITE_STATUS_PAGECACHE_USED</dt>
+** <dd>This parameter returns the number of pages used out of the
+** [pagecache memory allocator] that was configured using 
+** [SQLITE_CONFIG_PAGECACHE].  The
+** value returned is in pages, not in bytes.</dd>)^
+**
+** [[SQLITE_STATUS_PAGECACHE_OVERFLOW]] 
+** ^(<dt>SQLITE_STATUS_PAGECACHE_OVERFLOW</dt>
+** <dd>This parameter returns the number of bytes of page cache
+** allocation which could not be satisfied by the [SQLITE_CONFIG_PAGECACHE]
+** buffer and where forced to overflow to [sqlite3_malloc()].  The
+** returned value includes allocations that overflowed because they
+** where too large (they were larger than the "sz" parameter to
+** [SQLITE_CONFIG_PAGECACHE]) and allocations that overflowed because
+** no space was left in the page cache.</dd>)^
+**
+** [[SQLITE_STATUS_PAGECACHE_SIZE]] ^(<dt>SQLITE_STATUS_PAGECACHE_SIZE</dt>
+** <dd>This parameter records the largest memory allocation request
+** handed to [pagecache memory allocator].  Only the value returned in the
+** *pHighwater parameter to [sqlite3_status()] is of interest.  
+** The value written into the *pCurrent parameter is undefined.</dd>)^
+**
+** [[SQLITE_STATUS_SCRATCH_USED]] ^(<dt>SQLITE_STATUS_SCRATCH_USED</dt>
+** <dd>This parameter returns the number of allocations used out of the
+** [scratch memory allocator] configured using
+** [SQLITE_CONFIG_SCRATCH].  The value returned is in allocations, not
+** in bytes.  Since a single thread may only have one scratch allocation
+** outstanding at time, this parameter also reports the number of threads
+** using scratch memory at the same time.</dd>)^
+**
+** [[SQLITE_STATUS_SCRATCH_OVERFLOW]] ^(<dt>SQLITE_STATUS_SCRATCH_OVERFLOW</dt>
+** <dd>This parameter returns the number of bytes of scratch memory
+** allocation which could not be satisfied by the [SQLITE_CONFIG_SCRATCH]
+** buffer and where forced to overflow to [sqlite3_malloc()].  The values
+** returned include overflows because the requested allocation was too
+** larger (that is, because the requested allocation was larger than the
+** "sz" parameter to [SQLITE_CONFIG_SCRATCH]) and because no scratch buffer
+** slots were available.
+** </dd>)^
+**
+** [[SQLITE_STATUS_SCRATCH_SIZE]] ^(<dt>SQLITE_STATUS_SCRATCH_SIZE</dt>
+** <dd>This parameter records the largest memory allocation request
+** handed to [scratch memory allocator].  Only the value returned in the
+** *pHighwater parameter to [sqlite3_status()] is of interest.  
+** The value written into the *pCurrent parameter is undefined.</dd>)^
+**
+** [[SQLITE_STATUS_PARSER_STACK]] ^(<dt>SQLITE_STATUS_PARSER_STACK</dt>
+** <dd>This parameter records the deepest parser stack.  It is only
+** meaningful if SQLite is compiled with [YYTRACKMAXSTACKDEPTH].</dd>)^
+** </dl>
+**
+** New status parameters may be added from time to time.
+*/
+#define SQLITE_STATUS_MEMORY_USED          0
+#define SQLITE_STATUS_PAGECACHE_USED       1
+#define SQLITE_STATUS_PAGECACHE_OVERFLOW   2
+#define SQLITE_STATUS_SCRATCH_USED         3
+#define SQLITE_STATUS_SCRATCH_OVERFLOW     4
+#define SQLITE_STATUS_MALLOC_SIZE          5
+#define SQLITE_STATUS_PARSER_STACK         6
+#define SQLITE_STATUS_PAGECACHE_SIZE       7
+#define SQLITE_STATUS_SCRATCH_SIZE         8
+#define SQLITE_STATUS_MALLOC_COUNT         9
+
+/*
+** CAPI3REF: Database Connection Status
+**
+** ^This interface is used to retrieve runtime status information 
+** about a single [database connection].  ^The first argument is the
+** database connection object to be interrogated.  ^The second argument
