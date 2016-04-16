@@ -5687,3 +5687,238 @@ typedef struct sqlite3_blob sqlite3_blob;
 ** rather the symbolic name of the database. For attached databases, this is
 ** the name that appears after the AS keyword in the [ATTACH] statement.
 ** For the main database file, the database name is "main". For TEMP
+** tables, the database name is "temp".)^
+**
+** ^If the flags parameter is non-zero, then the BLOB is opened for read
+** and write access. ^If the flags parameter is zero, the BLOB is opened for
+** read-only access.
+**
+** ^(On success, [SQLITE_OK] is returned and the new [BLOB handle] is stored
+** in *ppBlob. Otherwise an [error code] is returned and, unless the error
+** code is SQLITE_MISUSE, *ppBlob is set to NULL.)^ ^This means that, provided
+** the API is not misused, it is always safe to call [sqlite3_blob_close()] 
+** on *ppBlob after this function it returns.
+**
+** This function fails with SQLITE_ERROR if any of the following are true:
+** <ul>
+**   <li> ^(Database zDb does not exist)^, 
+**   <li> ^(Table zTable does not exist within database zDb)^, 
+**   <li> ^(Table zTable is a WITHOUT ROWID table)^, 
+**   <li> ^(Column zColumn does not exist)^,
+**   <li> ^(Row iRow is not present in the table)^,
+**   <li> ^(The specified column of row iRow contains a value that is not
+**         a TEXT or BLOB value)^,
+**   <li> ^(Column zColumn is part of an index, PRIMARY KEY or UNIQUE 
+**         constraint and the blob is being opened for read/write access)^,
+**   <li> ^([foreign key constraints | Foreign key constraints] are enabled, 
+**         column zColumn is part of a [child key] definition and the blob is
+**         being opened for read/write access)^.
+** </ul>
+**
+** ^Unless it returns SQLITE_MISUSE, this function sets the 
+** [database connection] error code and message accessible via 
+** [sqlite3_errcode()] and [sqlite3_errmsg()] and related functions. 
+**
+**
+** ^(If the row that a BLOB handle points to is modified by an
+** [UPDATE], [DELETE], or by [ON CONFLICT] side-effects
+** then the BLOB handle is marked as "expired".
+** This is true if any column of the row is changed, even a column
+** other than the one the BLOB handle is open on.)^
+** ^Calls to [sqlite3_blob_read()] and [sqlite3_blob_write()] for
+** an expired BLOB handle fail with a return code of [SQLITE_ABORT].
+** ^(Changes written into a BLOB prior to the BLOB expiring are not
+** rolled back by the expiration of the BLOB.  Such changes will eventually
+** commit if the transaction continues to completion.)^
+**
+** ^Use the [sqlite3_blob_bytes()] interface to determine the size of
+** the opened blob.  ^The size of a blob may not be changed by this
+** interface.  Use the [UPDATE] SQL command to change the size of a
+** blob.
+**
+** ^The [sqlite3_bind_zeroblob()] and [sqlite3_result_zeroblob()] interfaces
+** and the built-in [zeroblob] SQL function may be used to create a 
+** zero-filled blob to read or write using the incremental-blob interface.
+**
+** To avoid a resource leak, every open [BLOB handle] should eventually
+** be released by a call to [sqlite3_blob_close()].
+*/
+SQLITE_API int sqlite3_blob_open(
+  sqlite3*,
+  const char *zDb,
+  const char *zTable,
+  const char *zColumn,
+  sqlite3_int64 iRow,
+  int flags,
+  sqlite3_blob **ppBlob
+);
+
+/*
+** CAPI3REF: Move a BLOB Handle to a New Row
+**
+** ^This function is used to move an existing blob handle so that it points
+** to a different row of the same database table. ^The new row is identified
+** by the rowid value passed as the second argument. Only the row can be
+** changed. ^The database, table and column on which the blob handle is open
+** remain the same. Moving an existing blob handle to a new row can be
+** faster than closing the existing handle and opening a new one.
+**
+** ^(The new row must meet the same criteria as for [sqlite3_blob_open()] -
+** it must exist and there must be either a blob or text value stored in
+** the nominated column.)^ ^If the new row is not present in the table, or if
+** it does not contain a blob or text value, or if another error occurs, an
+** SQLite error code is returned and the blob handle is considered aborted.
+** ^All subsequent calls to [sqlite3_blob_read()], [sqlite3_blob_write()] or
+** [sqlite3_blob_reopen()] on an aborted blob handle immediately return
+** SQLITE_ABORT. ^Calling [sqlite3_blob_bytes()] on an aborted blob handle
+** always returns zero.
+**
+** ^This function sets the database handle error code and message.
+*/
+SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_blob_reopen(sqlite3_blob *, sqlite3_int64);
+
+/*
+** CAPI3REF: Close A BLOB Handle
+**
+** ^This function closes an open [BLOB handle]. ^(The BLOB handle is closed
+** unconditionally.  Even if this routine returns an error code, the 
+** handle is still closed.)^
+**
+** ^If the blob handle being closed was opened for read-write access, and if
+** the database is in auto-commit mode and there are no other open read-write
+** blob handles or active write statements, the current transaction is
+** committed. ^If an error occurs while committing the transaction, an error
+** code is returned and the transaction rolled back.
+**
+** Calling this function with an argument that is not a NULL pointer or an
+** open blob handle results in undefined behaviour. ^Calling this routine 
+** with a null pointer (such as would be returned by a failed call to 
+** [sqlite3_blob_open()]) is a harmless no-op. ^Otherwise, if this function
+** is passed a valid open blob handle, the values returned by the 
+** sqlite3_errcode() and sqlite3_errmsg() functions are set before returning.
+*/
+SQLITE_API int sqlite3_blob_close(sqlite3_blob *);
+
+/*
+** CAPI3REF: Return The Size Of An Open BLOB
+**
+** ^Returns the size in bytes of the BLOB accessible via the 
+** successfully opened [BLOB handle] in its only argument.  ^The
+** incremental blob I/O routines can only read or overwriting existing
+** blob content; they cannot change the size of a blob.
+**
+** This routine only works on a [BLOB handle] which has been created
+** by a prior successful call to [sqlite3_blob_open()] and which has not
+** been closed by [sqlite3_blob_close()].  Passing any other pointer in
+** to this routine results in undefined and probably undesirable behavior.
+*/
+SQLITE_API int sqlite3_blob_bytes(sqlite3_blob *);
+
+/*
+** CAPI3REF: Read Data From A BLOB Incrementally
+**
+** ^(This function is used to read data from an open [BLOB handle] into a
+** caller-supplied buffer. N bytes of data are copied into buffer Z
+** from the open BLOB, starting at offset iOffset.)^
+**
+** ^If offset iOffset is less than N bytes from the end of the BLOB,
+** [SQLITE_ERROR] is returned and no data is read.  ^If N or iOffset is
+** less than zero, [SQLITE_ERROR] is returned and no data is read.
+** ^The size of the blob (and hence the maximum value of N+iOffset)
+** can be determined using the [sqlite3_blob_bytes()] interface.
+**
+** ^An attempt to read from an expired [BLOB handle] fails with an
+** error code of [SQLITE_ABORT].
+**
+** ^(On success, sqlite3_blob_read() returns SQLITE_OK.
+** Otherwise, an [error code] or an [extended error code] is returned.)^
+**
+** This routine only works on a [BLOB handle] which has been created
+** by a prior successful call to [sqlite3_blob_open()] and which has not
+** been closed by [sqlite3_blob_close()].  Passing any other pointer in
+** to this routine results in undefined and probably undesirable behavior.
+**
+** See also: [sqlite3_blob_write()].
+*/
+SQLITE_API int sqlite3_blob_read(sqlite3_blob *, void *Z, int N, int iOffset);
+
+/*
+** CAPI3REF: Write Data Into A BLOB Incrementally
+**
+** ^(This function is used to write data into an open [BLOB handle] from a
+** caller-supplied buffer. N bytes of data are copied from the buffer Z
+** into the open BLOB, starting at offset iOffset.)^
+**
+** ^(On success, sqlite3_blob_write() returns SQLITE_OK.
+** Otherwise, an  [error code] or an [extended error code] is returned.)^
+** ^Unless SQLITE_MISUSE is returned, this function sets the 
+** [database connection] error code and message accessible via 
+** [sqlite3_errcode()] and [sqlite3_errmsg()] and related functions. 
+**
+** ^If the [BLOB handle] passed as the first argument was not opened for
+** writing (the flags parameter to [sqlite3_blob_open()] was zero),
+** this function returns [SQLITE_READONLY].
+**
+** This function may only modify the contents of the BLOB; it is
+** not possible to increase the size of a BLOB using this API.
+** ^If offset iOffset is less than N bytes from the end of the BLOB,
+** [SQLITE_ERROR] is returned and no data is written. The size of the 
+** BLOB (and hence the maximum value of N+iOffset) can be determined 
+** using the [sqlite3_blob_bytes()] interface. ^If N or iOffset are less 
+** than zero [SQLITE_ERROR] is returned and no data is written.
+**
+** ^An attempt to write to an expired [BLOB handle] fails with an
+** error code of [SQLITE_ABORT].  ^Writes to the BLOB that occurred
+** before the [BLOB handle] expired are not rolled back by the
+** expiration of the handle, though of course those changes might
+** have been overwritten by the statement that expired the BLOB handle
+** or by other independent statements.
+**
+** This routine only works on a [BLOB handle] which has been created
+** by a prior successful call to [sqlite3_blob_open()] and which has not
+** been closed by [sqlite3_blob_close()].  Passing any other pointer in
+** to this routine results in undefined and probably undesirable behavior.
+**
+** See also: [sqlite3_blob_read()].
+*/
+SQLITE_API int sqlite3_blob_write(sqlite3_blob *, const void *z, int n, int iOffset);
+
+/*
+** CAPI3REF: Virtual File System Objects
+**
+** A virtual filesystem (VFS) is an [sqlite3_vfs] object
+** that SQLite uses to interact
+** with the underlying operating system.  Most SQLite builds come with a
+** single default VFS that is appropriate for the host computer.
+** New VFSes can be registered and existing VFSes can be unregistered.
+** The following interfaces are provided.
+**
+** ^The sqlite3_vfs_find() interface returns a pointer to a VFS given its name.
+** ^Names are case sensitive.
+** ^Names are zero-terminated UTF-8 strings.
+** ^If there is no match, a NULL pointer is returned.
+** ^If zVfsName is NULL then the default VFS is returned.
+**
+** ^New VFSes are registered with sqlite3_vfs_register().
+** ^Each new VFS becomes the default VFS if the makeDflt flag is set.
+** ^The same VFS can be registered multiple times without injury.
+** ^To make an existing VFS into the default VFS, register it again
+** with the makeDflt flag set.  If two different VFSes with the
+** same name are registered, the behavior is undefined.  If a
+** VFS is registered with a name that is NULL or an empty string,
+** then the behavior is undefined.
+**
+** ^Unregister a VFS with the sqlite3_vfs_unregister() interface.
+** ^(If the default VFS is unregistered, another VFS is chosen as
+** the default.  The choice for the new VFS is arbitrary.)^
+*/
+SQLITE_API sqlite3_vfs *sqlite3_vfs_find(const char *zVfsName);
+SQLITE_API int sqlite3_vfs_register(sqlite3_vfs*, int makeDflt);
+SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs*);
+
+/*
+** CAPI3REF: Mutexes
+**
+** The SQLite core uses these routines for thread
+** synchronization. Though they are intended for internal
+** use by SQLite, code that links against SQLite is
