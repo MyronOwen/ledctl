@@ -729,3 +729,236 @@ SQLITE_API int sqlite3_exec(
 ** elevated privileges.
 */
 #define SQLITE_IOCAP_ATOMIC                 0x00000001
+#define SQLITE_IOCAP_ATOMIC512              0x00000002
+#define SQLITE_IOCAP_ATOMIC1K               0x00000004
+#define SQLITE_IOCAP_ATOMIC2K               0x00000008
+#define SQLITE_IOCAP_ATOMIC4K               0x00000010
+#define SQLITE_IOCAP_ATOMIC8K               0x00000020
+#define SQLITE_IOCAP_ATOMIC16K              0x00000040
+#define SQLITE_IOCAP_ATOMIC32K              0x00000080
+#define SQLITE_IOCAP_ATOMIC64K              0x00000100
+#define SQLITE_IOCAP_SAFE_APPEND            0x00000200
+#define SQLITE_IOCAP_SEQUENTIAL             0x00000400
+#define SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN  0x00000800
+#define SQLITE_IOCAP_POWERSAFE_OVERWRITE    0x00001000
+#define SQLITE_IOCAP_IMMUTABLE              0x00002000
+
+/*
+** CAPI3REF: File Locking Levels
+**
+** SQLite uses one of these integer values as the second
+** argument to calls it makes to the xLock() and xUnlock() methods
+** of an [sqlite3_io_methods] object.
+*/
+#define SQLITE_LOCK_NONE          0
+#define SQLITE_LOCK_SHARED        1
+#define SQLITE_LOCK_RESERVED      2
+#define SQLITE_LOCK_PENDING       3
+#define SQLITE_LOCK_EXCLUSIVE     4
+
+/*
+** CAPI3REF: Synchronization Type Flags
+**
+** When SQLite invokes the xSync() method of an
+** [sqlite3_io_methods] object it uses a combination of
+** these integer values as the second argument.
+**
+** When the SQLITE_SYNC_DATAONLY flag is used, it means that the
+** sync operation only needs to flush data to mass storage.  Inode
+** information need not be flushed. If the lower four bits of the flag
+** equal SQLITE_SYNC_NORMAL, that means to use normal fsync() semantics.
+** If the lower four bits equal SQLITE_SYNC_FULL, that means
+** to use Mac OS X style fullsync instead of fsync().
+**
+** Do not confuse the SQLITE_SYNC_NORMAL and SQLITE_SYNC_FULL flags
+** with the [PRAGMA synchronous]=NORMAL and [PRAGMA synchronous]=FULL
+** settings.  The [synchronous pragma] determines when calls to the
+** xSync VFS method occur and applies uniformly across all platforms.
+** The SQLITE_SYNC_NORMAL and SQLITE_SYNC_FULL flags determine how
+** energetic or rigorous or forceful the sync operations are and
+** only make a difference on Mac OSX for the default SQLite code.
+** (Third-party VFS implementations might also make the distinction
+** between SQLITE_SYNC_NORMAL and SQLITE_SYNC_FULL, but among the
+** operating systems natively supported by SQLite, only Mac OSX
+** cares about the difference.)
+*/
+#define SQLITE_SYNC_NORMAL        0x00002
+#define SQLITE_SYNC_FULL          0x00003
+#define SQLITE_SYNC_DATAONLY      0x00010
+
+/*
+** CAPI3REF: OS Interface Open File Handle
+**
+** An [sqlite3_file] object represents an open file in the 
+** [sqlite3_vfs | OS interface layer].  Individual OS interface
+** implementations will
+** want to subclass this object by appending additional fields
+** for their own use.  The pMethods entry is a pointer to an
+** [sqlite3_io_methods] object that defines methods for performing
+** I/O operations on the open file.
+*/
+typedef struct sqlite3_file sqlite3_file;
+struct sqlite3_file {
+  const struct sqlite3_io_methods *pMethods;  /* Methods for an open file */
+};
+
+/*
+** CAPI3REF: OS Interface File Virtual Methods Object
+**
+** Every file opened by the [sqlite3_vfs.xOpen] method populates an
+** [sqlite3_file] object (or, more commonly, a subclass of the
+** [sqlite3_file] object) with a pointer to an instance of this object.
+** This object defines the methods used to perform various operations
+** against the open file represented by the [sqlite3_file] object.
+**
+** If the [sqlite3_vfs.xOpen] method sets the sqlite3_file.pMethods element 
+** to a non-NULL pointer, then the sqlite3_io_methods.xClose method
+** may be invoked even if the [sqlite3_vfs.xOpen] reported that it failed.  The
+** only way to prevent a call to xClose following a failed [sqlite3_vfs.xOpen]
+** is for the [sqlite3_vfs.xOpen] to set the sqlite3_file.pMethods element
+** to NULL.
+**
+** The flags argument to xSync may be one of [SQLITE_SYNC_NORMAL] or
+** [SQLITE_SYNC_FULL].  The first choice is the normal fsync().
+** The second choice is a Mac OS X style fullsync.  The [SQLITE_SYNC_DATAONLY]
+** flag may be ORed in to indicate that only the data of the file
+** and not its inode needs to be synced.
+**
+** The integer values to xLock() and xUnlock() are one of
+** <ul>
+** <li> [SQLITE_LOCK_NONE],
+** <li> [SQLITE_LOCK_SHARED],
+** <li> [SQLITE_LOCK_RESERVED],
+** <li> [SQLITE_LOCK_PENDING], or
+** <li> [SQLITE_LOCK_EXCLUSIVE].
+** </ul>
+** xLock() increases the lock. xUnlock() decreases the lock.
+** The xCheckReservedLock() method checks whether any database connection,
+** either in this process or in some other process, is holding a RESERVED,
+** PENDING, or EXCLUSIVE lock on the file.  It returns true
+** if such a lock exists and false otherwise.
+**
+** The xFileControl() method is a generic interface that allows custom
+** VFS implementations to directly control an open file using the
+** [sqlite3_file_control()] interface.  The second "op" argument is an
+** integer opcode.  The third argument is a generic pointer intended to
+** point to a structure that may contain arguments or space in which to
+** write return values.  Potential uses for xFileControl() might be
+** functions to enable blocking locks with timeouts, to change the
+** locking strategy (for example to use dot-file locks), to inquire
+** about the status of a lock, or to break stale locks.  The SQLite
+** core reserves all opcodes less than 100 for its own use.
+** A [file control opcodes | list of opcodes] less than 100 is available.
+** Applications that define a custom xFileControl method should use opcodes
+** greater than 100 to avoid conflicts.  VFS implementations should
+** return [SQLITE_NOTFOUND] for file control opcodes that they do not
+** recognize.
+**
+** The xSectorSize() method returns the sector size of the
+** device that underlies the file.  The sector size is the
+** minimum write that can be performed without disturbing
+** other bytes in the file.  The xDeviceCharacteristics()
+** method returns a bit vector describing behaviors of the
+** underlying device:
+**
+** <ul>
+** <li> [SQLITE_IOCAP_ATOMIC]
+** <li> [SQLITE_IOCAP_ATOMIC512]
+** <li> [SQLITE_IOCAP_ATOMIC1K]
+** <li> [SQLITE_IOCAP_ATOMIC2K]
+** <li> [SQLITE_IOCAP_ATOMIC4K]
+** <li> [SQLITE_IOCAP_ATOMIC8K]
+** <li> [SQLITE_IOCAP_ATOMIC16K]
+** <li> [SQLITE_IOCAP_ATOMIC32K]
+** <li> [SQLITE_IOCAP_ATOMIC64K]
+** <li> [SQLITE_IOCAP_SAFE_APPEND]
+** <li> [SQLITE_IOCAP_SEQUENTIAL]
+** </ul>
+**
+** The SQLITE_IOCAP_ATOMIC property means that all writes of
+** any size are atomic.  The SQLITE_IOCAP_ATOMICnnn values
+** mean that writes of blocks that are nnn bytes in size and
+** are aligned to an address which is an integer multiple of
+** nnn are atomic.  The SQLITE_IOCAP_SAFE_APPEND value means
+** that when data is appended to a file, the data is appended
+** first then the size of the file is extended, never the other
+** way around.  The SQLITE_IOCAP_SEQUENTIAL property means that
+** information is written to disk in the same order as calls
+** to xWrite().
+**
+** If xRead() returns SQLITE_IOERR_SHORT_READ it must also fill
+** in the unread portions of the buffer with zeros.  A VFS that
+** fails to zero-fill short reads might seem to work.  However,
+** failure to zero-fill short reads will eventually lead to
+** database corruption.
+*/
+typedef struct sqlite3_io_methods sqlite3_io_methods;
+struct sqlite3_io_methods {
+  int iVersion;
+  int (*xClose)(sqlite3_file*);
+  int (*xRead)(sqlite3_file*, void*, int iAmt, sqlite3_int64 iOfst);
+  int (*xWrite)(sqlite3_file*, const void*, int iAmt, sqlite3_int64 iOfst);
+  int (*xTruncate)(sqlite3_file*, sqlite3_int64 size);
+  int (*xSync)(sqlite3_file*, int flags);
+  int (*xFileSize)(sqlite3_file*, sqlite3_int64 *pSize);
+  int (*xLock)(sqlite3_file*, int);
+  int (*xUnlock)(sqlite3_file*, int);
+  int (*xCheckReservedLock)(sqlite3_file*, int *pResOut);
+  int (*xFileControl)(sqlite3_file*, int op, void *pArg);
+  int (*xSectorSize)(sqlite3_file*);
+  int (*xDeviceCharacteristics)(sqlite3_file*);
+  /* Methods above are valid for version 1 */
+  int (*xShmMap)(sqlite3_file*, int iPg, int pgsz, int, void volatile**);
+  int (*xShmLock)(sqlite3_file*, int offset, int n, int flags);
+  void (*xShmBarrier)(sqlite3_file*);
+  int (*xShmUnmap)(sqlite3_file*, int deleteFlag);
+  /* Methods above are valid for version 2 */
+  int (*xFetch)(sqlite3_file*, sqlite3_int64 iOfst, int iAmt, void **pp);
+  int (*xUnfetch)(sqlite3_file*, sqlite3_int64 iOfst, void *p);
+  /* Methods above are valid for version 3 */
+  /* Additional methods may be added in future releases */
+};
+
+/*
+** CAPI3REF: Standard File Control Opcodes
+** KEYWORDS: {file control opcodes} {file control opcode}
+**
+** These integer constants are opcodes for the xFileControl method
+** of the [sqlite3_io_methods] object and for the [sqlite3_file_control()]
+** interface.
+**
+** The [SQLITE_FCNTL_LOCKSTATE] opcode is used for debugging.  This
+** opcode causes the xFileControl method to write the current state of
+** the lock (one of [SQLITE_LOCK_NONE], [SQLITE_LOCK_SHARED],
+** [SQLITE_LOCK_RESERVED], [SQLITE_LOCK_PENDING], or [SQLITE_LOCK_EXCLUSIVE])
+** into an integer that the pArg argument points to. This capability
+** is used during testing and only needs to be supported when SQLITE_TEST
+** is defined.
+** <ul>
+** <li>[[SQLITE_FCNTL_SIZE_HINT]]
+** The [SQLITE_FCNTL_SIZE_HINT] opcode is used by SQLite to give the VFS
+** layer a hint of how large the database file will grow to be during the
+** current transaction.  This hint is not guaranteed to be accurate but it
+** is often close.  The underlying VFS might choose to preallocate database
+** file space based on this hint in order to help writes to the database
+** file run faster.
+**
+** <li>[[SQLITE_FCNTL_CHUNK_SIZE]]
+** The [SQLITE_FCNTL_CHUNK_SIZE] opcode is used to request that the VFS
+** extends and truncates the database file in chunks of a size specified
+** by the user. The fourth argument to [sqlite3_file_control()] should 
+** point to an integer (type int) containing the new chunk-size to use
+** for the nominated database. Allocating database file space in large
+** chunks (say 1MB at a time), may reduce file-system fragmentation and
+** improve performance on some systems.
+**
+** <li>[[SQLITE_FCNTL_FILE_POINTER]]
+** The [SQLITE_FCNTL_FILE_POINTER] opcode is used to obtain a pointer
+** to the [sqlite3_file] object associated with a particular database
+** connection.  See the [sqlite3_file_control()] documentation for
+** additional information.
+**
+** <li>[[SQLITE_FCNTL_SYNC_OMITTED]]
+** No longer in use.
+**
+** <li>[[SQLITE_FCNTL_SYNC]]
