@@ -1842,3 +1842,213 @@ struct sqlite3_mem_methods {
 ** In a multi-threaded application, the application-defined logger
 ** function must be threadsafe. </dd>
 **
+** [[SQLITE_CONFIG_URI]] <dt>SQLITE_CONFIG_URI
+** <dd>^(The SQLITE_CONFIG_URI option takes a single argument of type int.
+** If non-zero, then URI handling is globally enabled. If the parameter is zero,
+** then URI handling is globally disabled.)^ ^If URI handling is globally
+** enabled, all filenames passed to [sqlite3_open()], [sqlite3_open_v2()],
+** [sqlite3_open16()] or
+** specified as part of [ATTACH] commands are interpreted as URIs, regardless
+** of whether or not the [SQLITE_OPEN_URI] flag is set when the database
+** connection is opened. ^If it is globally disabled, filenames are
+** only interpreted as URIs if the SQLITE_OPEN_URI flag is set when the
+** database connection is opened. ^(By default, URI handling is globally
+** disabled. The default value may be changed by compiling with the
+** [SQLITE_USE_URI] symbol defined.)^
+**
+** [[SQLITE_CONFIG_COVERING_INDEX_SCAN]] <dt>SQLITE_CONFIG_COVERING_INDEX_SCAN
+** <dd>^The SQLITE_CONFIG_COVERING_INDEX_SCAN option takes a single integer
+** argument which is interpreted as a boolean in order to enable or disable
+** the use of covering indices for full table scans in the query optimizer.
+** ^The default setting is determined
+** by the [SQLITE_ALLOW_COVERING_INDEX_SCAN] compile-time option, or is "on"
+** if that compile-time option is omitted.
+** The ability to disable the use of covering indices for full table scans
+** is because some incorrectly coded legacy applications might malfunction
+** when the optimization is enabled.  Providing the ability to
+** disable the optimization allows the older, buggy application code to work
+** without change even with newer versions of SQLite.
+**
+** [[SQLITE_CONFIG_PCACHE]] [[SQLITE_CONFIG_GETPCACHE]]
+** <dt>SQLITE_CONFIG_PCACHE and SQLITE_CONFIG_GETPCACHE
+** <dd> These options are obsolete and should not be used by new code.
+** They are retained for backwards compatibility but are now no-ops.
+** </dd>
+**
+** [[SQLITE_CONFIG_SQLLOG]]
+** <dt>SQLITE_CONFIG_SQLLOG
+** <dd>This option is only available if sqlite is compiled with the
+** [SQLITE_ENABLE_SQLLOG] pre-processor macro defined. The first argument should
+** be a pointer to a function of type void(*)(void*,sqlite3*,const char*, int).
+** The second should be of type (void*). The callback is invoked by the library
+** in three separate circumstances, identified by the value passed as the
+** fourth parameter. If the fourth parameter is 0, then the database connection
+** passed as the second argument has just been opened. The third argument
+** points to a buffer containing the name of the main database file. If the
+** fourth parameter is 1, then the SQL statement that the third parameter
+** points to has just been executed. Or, if the fourth parameter is 2, then
+** the connection being passed as the second parameter is being closed. The
+** third parameter is passed NULL In this case.  An example of using this
+** configuration option can be seen in the "test_sqllog.c" source file in
+** the canonical SQLite source tree.</dd>
+**
+** [[SQLITE_CONFIG_MMAP_SIZE]]
+** <dt>SQLITE_CONFIG_MMAP_SIZE
+** <dd>^SQLITE_CONFIG_MMAP_SIZE takes two 64-bit integer (sqlite3_int64) values
+** that are the default mmap size limit (the default setting for
+** [PRAGMA mmap_size]) and the maximum allowed mmap size limit.
+** ^The default setting can be overridden by each database connection using
+** either the [PRAGMA mmap_size] command, or by using the
+** [SQLITE_FCNTL_MMAP_SIZE] file control.  ^(The maximum allowed mmap size
+** will be silently truncated if necessary so that it does not exceed the
+** compile-time maximum mmap size set by the
+** [SQLITE_MAX_MMAP_SIZE] compile-time option.)^
+** ^If either argument to this option is negative, then that argument is
+** changed to its compile-time default.
+**
+** [[SQLITE_CONFIG_WIN32_HEAPSIZE]]
+** <dt>SQLITE_CONFIG_WIN32_HEAPSIZE
+** <dd>^The SQLITE_CONFIG_WIN32_HEAPSIZE option is only available if SQLite is
+** compiled for Windows with the [SQLITE_WIN32_MALLOC] pre-processor macro
+** defined. ^SQLITE_CONFIG_WIN32_HEAPSIZE takes a 32-bit unsigned integer value
+** that specifies the maximum size of the created heap.
+** </dl>
+**
+** [[SQLITE_CONFIG_PCACHE_HDRSZ]]
+** <dt>SQLITE_CONFIG_PCACHE_HDRSZ
+** <dd>^The SQLITE_CONFIG_PCACHE_HDRSZ option takes a single parameter which
+** is a pointer to an integer and writes into that integer the number of extra
+** bytes per page required for each page in [SQLITE_CONFIG_PAGECACHE].
+** The amount of extra space required can change depending on the compiler,
+** target platform, and SQLite version.
+**
+** [[SQLITE_CONFIG_PMASZ]]
+** <dt>SQLITE_CONFIG_PMASZ
+** <dd>^The SQLITE_CONFIG_PMASZ option takes a single parameter which
+** is an unsigned integer and sets the "Minimum PMA Size" for the multithreaded
+** sorter to that integer.  The default minimum PMA Size is set by the
+** [SQLITE_SORTER_PMASZ] compile-time option.  New threads are launched
+** to help with sort operations when multithreaded sorting
+** is enabled (using the [PRAGMA threads] command) and the amount of content
+** to be sorted exceeds the page size times the minimum of the
+** [PRAGMA cache_size] setting and this value.
+** </dl>
+*/
+#define SQLITE_CONFIG_SINGLETHREAD  1  /* nil */
+#define SQLITE_CONFIG_MULTITHREAD   2  /* nil */
+#define SQLITE_CONFIG_SERIALIZED    3  /* nil */
+#define SQLITE_CONFIG_MALLOC        4  /* sqlite3_mem_methods* */
+#define SQLITE_CONFIG_GETMALLOC     5  /* sqlite3_mem_methods* */
+#define SQLITE_CONFIG_SCRATCH       6  /* void*, int sz, int N */
+#define SQLITE_CONFIG_PAGECACHE     7  /* void*, int sz, int N */
+#define SQLITE_CONFIG_HEAP          8  /* void*, int nByte, int min */
+#define SQLITE_CONFIG_MEMSTATUS     9  /* boolean */
+#define SQLITE_CONFIG_MUTEX        10  /* sqlite3_mutex_methods* */
+#define SQLITE_CONFIG_GETMUTEX     11  /* sqlite3_mutex_methods* */
+/* previously SQLITE_CONFIG_CHUNKALLOC 12 which is now unused. */ 
+#define SQLITE_CONFIG_LOOKASIDE    13  /* int int */
+#define SQLITE_CONFIG_PCACHE       14  /* no-op */
+#define SQLITE_CONFIG_GETPCACHE    15  /* no-op */
+#define SQLITE_CONFIG_LOG          16  /* xFunc, void* */
+#define SQLITE_CONFIG_URI          17  /* int */
+#define SQLITE_CONFIG_PCACHE2      18  /* sqlite3_pcache_methods2* */
+#define SQLITE_CONFIG_GETPCACHE2   19  /* sqlite3_pcache_methods2* */
+#define SQLITE_CONFIG_COVERING_INDEX_SCAN 20  /* int */
+#define SQLITE_CONFIG_SQLLOG       21  /* xSqllog, void* */
+#define SQLITE_CONFIG_MMAP_SIZE    22  /* sqlite3_int64, sqlite3_int64 */
+#define SQLITE_CONFIG_WIN32_HEAPSIZE      23  /* int nByte */
+#define SQLITE_CONFIG_PCACHE_HDRSZ        24  /* int *psz */
+#define SQLITE_CONFIG_PMASZ               25  /* unsigned int szPma */
+
+/*
+** CAPI3REF: Database Connection Configuration Options
+**
+** These constants are the available integer configuration options that
+** can be passed as the second argument to the [sqlite3_db_config()] interface.
+**
+** New configuration options may be added in future releases of SQLite.
+** Existing configuration options might be discontinued.  Applications
+** should check the return code from [sqlite3_db_config()] to make sure that
+** the call worked.  ^The [sqlite3_db_config()] interface will return a
+** non-zero [error code] if a discontinued or unsupported configuration option
+** is invoked.
+**
+** <dl>
+** <dt>SQLITE_DBCONFIG_LOOKASIDE</dt>
+** <dd> ^This option takes three additional arguments that determine the 
+** [lookaside memory allocator] configuration for the [database connection].
+** ^The first argument (the third parameter to [sqlite3_db_config()] is a
+** pointer to a memory buffer to use for lookaside memory.
+** ^The first argument after the SQLITE_DBCONFIG_LOOKASIDE verb
+** may be NULL in which case SQLite will allocate the
+** lookaside buffer itself using [sqlite3_malloc()]. ^The second argument is the
+** size of each lookaside buffer slot.  ^The third argument is the number of
+** slots.  The size of the buffer in the first argument must be greater than
+** or equal to the product of the second and third arguments.  The buffer
+** must be aligned to an 8-byte boundary.  ^If the second argument to
+** SQLITE_DBCONFIG_LOOKASIDE is not a multiple of 8, it is internally
+** rounded down to the next smaller multiple of 8.  ^(The lookaside memory
+** configuration for a database connection can only be changed when that
+** connection is not currently using lookaside memory, or in other words
+** when the "current value" returned by
+** [sqlite3_db_status](D,[SQLITE_CONFIG_LOOKASIDE],...) is zero.
+** Any attempt to change the lookaside memory configuration when lookaside
+** memory is in use leaves the configuration unchanged and returns 
+** [SQLITE_BUSY].)^</dd>
+**
+** <dt>SQLITE_DBCONFIG_ENABLE_FKEY</dt>
+** <dd> ^This option is used to enable or disable the enforcement of
+** [foreign key constraints].  There should be two additional arguments.
+** The first argument is an integer which is 0 to disable FK enforcement,
+** positive to enable FK enforcement or negative to leave FK enforcement
+** unchanged.  The second parameter is a pointer to an integer into which
+** is written 0 or 1 to indicate whether FK enforcement is off or on
+** following this call.  The second parameter may be a NULL pointer, in
+** which case the FK enforcement setting is not reported back. </dd>
+**
+** <dt>SQLITE_DBCONFIG_ENABLE_TRIGGER</dt>
+** <dd> ^This option is used to enable or disable [CREATE TRIGGER | triggers].
+** There should be two additional arguments.
+** The first argument is an integer which is 0 to disable triggers,
+** positive to enable triggers or negative to leave the setting unchanged.
+** The second parameter is a pointer to an integer into which
+** is written 0 or 1 to indicate whether triggers are disabled or enabled
+** following this call.  The second parameter may be a NULL pointer, in
+** which case the trigger setting is not reported back. </dd>
+**
+** </dl>
+*/
+#define SQLITE_DBCONFIG_LOOKASIDE       1001  /* void* int int */
+#define SQLITE_DBCONFIG_ENABLE_FKEY     1002  /* int int* */
+#define SQLITE_DBCONFIG_ENABLE_TRIGGER  1003  /* int int* */
+
+
+/*
+** CAPI3REF: Enable Or Disable Extended Result Codes
+**
+** ^The sqlite3_extended_result_codes() routine enables or disables the
+** [extended result codes] feature of SQLite. ^The extended result
+** codes are disabled by default for historical compatibility.
+*/
+SQLITE_API int sqlite3_extended_result_codes(sqlite3*, int onoff);
+
+/*
+** CAPI3REF: Last Insert Rowid
+**
+** ^Each entry in most SQLite tables (except for [WITHOUT ROWID] tables)
+** has a unique 64-bit signed
+** integer key called the [ROWID | "rowid"]. ^The rowid is always available
+** as an undeclared column named ROWID, OID, or _ROWID_ as long as those
+** names are not also used by explicitly declared columns. ^If
+** the table has a column of type [INTEGER PRIMARY KEY] then that column
+** is another alias for the rowid.
+**
+** ^The sqlite3_last_insert_rowid(D) interface returns the [rowid] of the 
+** most recent successful [INSERT] into a rowid table or [virtual table]
+** on database connection D.
+** ^Inserts into [WITHOUT ROWID] tables are not recorded.
+** ^If no successful [INSERT]s into rowid tables
+** have ever occurred on the database connection D, 
+** then sqlite3_last_insert_rowid(D) returns zero.
+**
+** ^(If an [INSERT] occurs within a trigger or within a [virtual table]
