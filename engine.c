@@ -2781,3 +2781,234 @@ SQLITE_API int sqlite3_set_authorizer(
 #define SQLITE_INSERT               18   /* Table Name      NULL            */
 #define SQLITE_PRAGMA               19   /* Pragma Name     1st arg or NULL */
 #define SQLITE_READ                 20   /* Table Name      Column Name     */
+#define SQLITE_SELECT               21   /* NULL            NULL            */
+#define SQLITE_TRANSACTION          22   /* Operation       NULL            */
+#define SQLITE_UPDATE               23   /* Table Name      Column Name     */
+#define SQLITE_ATTACH               24   /* Filename        NULL            */
+#define SQLITE_DETACH               25   /* Database Name   NULL            */
+#define SQLITE_ALTER_TABLE          26   /* Database Name   Table Name      */
+#define SQLITE_REINDEX              27   /* Index Name      NULL            */
+#define SQLITE_ANALYZE              28   /* Table Name      NULL            */
+#define SQLITE_CREATE_VTABLE        29   /* Table Name      Module Name     */
+#define SQLITE_DROP_VTABLE          30   /* Table Name      Module Name     */
+#define SQLITE_FUNCTION             31   /* NULL            Function Name   */
+#define SQLITE_SAVEPOINT            32   /* Operation       Savepoint Name  */
+#define SQLITE_COPY                  0   /* No longer used */
+#define SQLITE_RECURSIVE            33   /* NULL            NULL            */
+
+/*
+** CAPI3REF: Tracing And Profiling Functions
+**
+** These routines register callback functions that can be used for
+** tracing and profiling the execution of SQL statements.
+**
+** ^The callback function registered by sqlite3_trace() is invoked at
+** various times when an SQL statement is being run by [sqlite3_step()].
+** ^The sqlite3_trace() callback is invoked with a UTF-8 rendering of the
+** SQL statement text as the statement first begins executing.
+** ^(Additional sqlite3_trace() callbacks might occur
+** as each triggered subprogram is entered.  The callbacks for triggers
+** contain a UTF-8 SQL comment that identifies the trigger.)^
+**
+** The [SQLITE_TRACE_SIZE_LIMIT] compile-time option can be used to limit
+** the length of [bound parameter] expansion in the output of sqlite3_trace().
+**
+** ^The callback function registered by sqlite3_profile() is invoked
+** as each SQL statement finishes.  ^The profile callback contains
+** the original statement text and an estimate of wall-clock time
+** of how long that statement took to run.  ^The profile callback
+** time is in units of nanoseconds, however the current implementation
+** is only capable of millisecond resolution so the six least significant
+** digits in the time are meaningless.  Future versions of SQLite
+** might provide greater resolution on the profiler callback.  The
+** sqlite3_profile() function is considered experimental and is
+** subject to change in future versions of SQLite.
+*/
+SQLITE_API void *sqlite3_trace(sqlite3*, void(*xTrace)(void*,const char*), void*);
+SQLITE_API SQLITE_EXPERIMENTAL void *sqlite3_profile(sqlite3*,
+   void(*xProfile)(void*,const char*,sqlite3_uint64), void*);
+
+/*
+** CAPI3REF: Query Progress Callbacks
+**
+** ^The sqlite3_progress_handler(D,N,X,P) interface causes the callback
+** function X to be invoked periodically during long running calls to
+** [sqlite3_exec()], [sqlite3_step()] and [sqlite3_get_table()] for
+** database connection D.  An example use for this
+** interface is to keep a GUI updated during a large query.
+**
+** ^The parameter P is passed through as the only parameter to the 
+** callback function X.  ^The parameter N is the approximate number of 
+** [virtual machine instructions] that are evaluated between successive
+** invocations of the callback X.  ^If N is less than one then the progress
+** handler is disabled.
+**
+** ^Only a single progress handler may be defined at one time per
+** [database connection]; setting a new progress handler cancels the
+** old one.  ^Setting parameter X to NULL disables the progress handler.
+** ^The progress handler is also disabled by setting N to a value less
+** than 1.
+**
+** ^If the progress callback returns non-zero, the operation is
+** interrupted.  This feature can be used to implement a
+** "Cancel" button on a GUI progress dialog box.
+**
+** The progress handler callback must not do anything that will modify
+** the database connection that invoked the progress handler.
+** Note that [sqlite3_prepare_v2()] and [sqlite3_step()] both modify their
+** database connections for the meaning of "modify" in this paragraph.
+**
+*/
+SQLITE_API void sqlite3_progress_handler(sqlite3*, int, int(*)(void*), void*);
+
+/*
+** CAPI3REF: Opening A New Database Connection
+**
+** ^These routines open an SQLite database file as specified by the 
+** filename argument. ^The filename argument is interpreted as UTF-8 for
+** sqlite3_open() and sqlite3_open_v2() and as UTF-16 in the native byte
+** order for sqlite3_open16(). ^(A [database connection] handle is usually
+** returned in *ppDb, even if an error occurs.  The only exception is that
+** if SQLite is unable to allocate memory to hold the [sqlite3] object,
+** a NULL will be written into *ppDb instead of a pointer to the [sqlite3]
+** object.)^ ^(If the database is opened (and/or created) successfully, then
+** [SQLITE_OK] is returned.  Otherwise an [error code] is returned.)^ ^The
+** [sqlite3_errmsg()] or [sqlite3_errmsg16()] routines can be used to obtain
+** an English language description of the error following a failure of any
+** of the sqlite3_open() routines.
+**
+** ^The default encoding will be UTF-8 for databases created using
+** sqlite3_open() or sqlite3_open_v2().  ^The default encoding for databases
+** created using sqlite3_open16() will be UTF-16 in the native byte order.
+**
+** Whether or not an error occurs when it is opened, resources
+** associated with the [database connection] handle should be released by
+** passing it to [sqlite3_close()] when it is no longer required.
+**
+** The sqlite3_open_v2() interface works like sqlite3_open()
+** except that it accepts two additional parameters for additional control
+** over the new database connection.  ^(The flags parameter to
+** sqlite3_open_v2() can take one of
+** the following three values, optionally combined with the 
+** [SQLITE_OPEN_NOMUTEX], [SQLITE_OPEN_FULLMUTEX], [SQLITE_OPEN_SHAREDCACHE],
+** [SQLITE_OPEN_PRIVATECACHE], and/or [SQLITE_OPEN_URI] flags:)^
+**
+** <dl>
+** ^(<dt>[SQLITE_OPEN_READONLY]</dt>
+** <dd>The database is opened in read-only mode.  If the database does not
+** already exist, an error is returned.</dd>)^
+**
+** ^(<dt>[SQLITE_OPEN_READWRITE]</dt>
+** <dd>The database is opened for reading and writing if possible, or reading
+** only if the file is write protected by the operating system.  In either
+** case the database must already exist, otherwise an error is returned.</dd>)^
+**
+** ^(<dt>[SQLITE_OPEN_READWRITE] | [SQLITE_OPEN_CREATE]</dt>
+** <dd>The database is opened for reading and writing, and is created if
+** it does not already exist. This is the behavior that is always used for
+** sqlite3_open() and sqlite3_open16().</dd>)^
+** </dl>
+**
+** If the 3rd parameter to sqlite3_open_v2() is not one of the
+** combinations shown above optionally combined with other
+** [SQLITE_OPEN_READONLY | SQLITE_OPEN_* bits]
+** then the behavior is undefined.
+**
+** ^If the [SQLITE_OPEN_NOMUTEX] flag is set, then the database connection
+** opens in the multi-thread [threading mode] as long as the single-thread
+** mode has not been set at compile-time or start-time.  ^If the
+** [SQLITE_OPEN_FULLMUTEX] flag is set then the database connection opens
+** in the serialized [threading mode] unless single-thread was
+** previously selected at compile-time or start-time.
+** ^The [SQLITE_OPEN_SHAREDCACHE] flag causes the database connection to be
+** eligible to use [shared cache mode], regardless of whether or not shared
+** cache is enabled using [sqlite3_enable_shared_cache()].  ^The
+** [SQLITE_OPEN_PRIVATECACHE] flag causes the database connection to not
+** participate in [shared cache mode] even if it is enabled.
+**
+** ^The fourth parameter to sqlite3_open_v2() is the name of the
+** [sqlite3_vfs] object that defines the operating system interface that
+** the new database connection should use.  ^If the fourth parameter is
+** a NULL pointer then the default [sqlite3_vfs] object is used.
+**
+** ^If the filename is ":memory:", then a private, temporary in-memory database
+** is created for the connection.  ^This in-memory database will vanish when
+** the database connection is closed.  Future versions of SQLite might
+** make use of additional special filenames that begin with the ":" character.
+** It is recommended that when a database filename actually does begin with
+** a ":" character you should prefix the filename with a pathname such as
+** "./" to avoid ambiguity.
+**
+** ^If the filename is an empty string, then a private, temporary
+** on-disk database will be created.  ^This private database will be
+** automatically deleted as soon as the database connection is closed.
+**
+** [[URI filenames in sqlite3_open()]] <h3>URI Filenames</h3>
+**
+** ^If [URI filename] interpretation is enabled, and the filename argument
+** begins with "file:", then the filename is interpreted as a URI. ^URI
+** filename interpretation is enabled if the [SQLITE_OPEN_URI] flag is
+** set in the fourth argument to sqlite3_open_v2(), or if it has
+** been enabled globally using the [SQLITE_CONFIG_URI] option with the
+** [sqlite3_config()] method or by the [SQLITE_USE_URI] compile-time option.
+** As of SQLite version 3.7.7, URI filename interpretation is turned off
+** by default, but future releases of SQLite might enable URI filename
+** interpretation by default.  See "[URI filenames]" for additional
+** information.
+**
+** URI filenames are parsed according to RFC 3986. ^If the URI contains an
+** authority, then it must be either an empty string or the string 
+** "localhost". ^If the authority is not an empty string or "localhost", an 
+** error is returned to the caller. ^The fragment component of a URI, if 
+** present, is ignored.
+**
+** ^SQLite uses the path component of the URI as the name of the disk file
+** which contains the database. ^If the path begins with a '/' character, 
+** then it is interpreted as an absolute path. ^If the path does not begin 
+** with a '/' (meaning that the authority section is omitted from the URI)
+** then the path is interpreted as a relative path. 
+** ^(On windows, the first component of an absolute path 
+** is a drive specification (e.g. "C:").)^
+**
+** [[core URI query parameters]]
+** The query component of a URI may contain parameters that are interpreted
+** either by SQLite itself, or by a [VFS | custom VFS implementation].
+** SQLite and its built-in [VFSes] interpret the
+** following query parameters:
+**
+** <ul>
+**   <li> <b>vfs</b>: ^The "vfs" parameter may be used to specify the name of
+**     a VFS object that provides the operating system interface that should
+**     be used to access the database file on disk. ^If this option is set to
+**     an empty string the default VFS object is used. ^Specifying an unknown
+**     VFS is an error. ^If sqlite3_open_v2() is used and the vfs option is
+**     present, then the VFS specified by the option takes precedence over
+**     the value passed as the fourth parameter to sqlite3_open_v2().
+**
+**   <li> <b>mode</b>: ^(The mode parameter may be set to either "ro", "rw",
+**     "rwc", or "memory". Attempting to set it to any other value is
+**     an error)^. 
+**     ^If "ro" is specified, then the database is opened for read-only 
+**     access, just as if the [SQLITE_OPEN_READONLY] flag had been set in the 
+**     third argument to sqlite3_open_v2(). ^If the mode option is set to 
+**     "rw", then the database is opened for read-write (but not create) 
+**     access, as if SQLITE_OPEN_READWRITE (but not SQLITE_OPEN_CREATE) had 
+**     been set. ^Value "rwc" is equivalent to setting both 
+**     SQLITE_OPEN_READWRITE and SQLITE_OPEN_CREATE.  ^If the mode option is
+**     set to "memory" then a pure [in-memory database] that never reads
+**     or writes from disk is used. ^It is an error to specify a value for
+**     the mode parameter that is less restrictive than that specified by
+**     the flags passed in the third parameter to sqlite3_open_v2().
+**
+**   <li> <b>cache</b>: ^The cache parameter may be set to either "shared" or
+**     "private". ^Setting it to "shared" is equivalent to setting the
+**     SQLITE_OPEN_SHAREDCACHE bit in the flags argument passed to
+**     sqlite3_open_v2(). ^Setting the cache parameter to "private" is 
+**     equivalent to setting the SQLITE_OPEN_PRIVATECACHE bit.
+**     ^If sqlite3_open_v2() is used and the "cache" parameter is present in
+**     a URI filename, its value overrides any behavior requested by setting
+**     SQLITE_OPEN_PRIVATECACHE or SQLITE_OPEN_SHAREDCACHE flag.
+**
+**  <li> <b>psow</b>: ^The psow parameter indicates whether or not the
+**     [powersafe overwrite] property does or does not apply to the
+**     storage media on which the database file resides.
