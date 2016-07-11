@@ -3910,3 +3910,235 @@ SQLITE_API const void *sqlite3_column_decltype16(sqlite3_stmt*,int);
 ** [prepared statement].  ^In the "v2" interface,
 ** the more specific error code is returned directly by sqlite3_step().
 **
+** [SQLITE_MISUSE] means that the this routine was called inappropriately.
+** Perhaps it was called on a [prepared statement] that has
+** already been [sqlite3_finalize | finalized] or on one that had
+** previously returned [SQLITE_ERROR] or [SQLITE_DONE].  Or it could
+** be the case that the same database connection is being used by two or
+** more threads at the same moment in time.
+**
+** For all versions of SQLite up to and including 3.6.23.1, a call to
+** [sqlite3_reset()] was required after sqlite3_step() returned anything
+** other than [SQLITE_ROW] before any subsequent invocation of
+** sqlite3_step().  Failure to reset the prepared statement using 
+** [sqlite3_reset()] would result in an [SQLITE_MISUSE] return from
+** sqlite3_step().  But after version 3.6.23.1, sqlite3_step() began
+** calling [sqlite3_reset()] automatically in this circumstance rather
+** than returning [SQLITE_MISUSE].  This is not considered a compatibility
+** break because any application that ever receives an SQLITE_MISUSE error
+** is broken by definition.  The [SQLITE_OMIT_AUTORESET] compile-time option
+** can be used to restore the legacy behavior.
+**
+** <b>Goofy Interface Alert:</b> In the legacy interface, the sqlite3_step()
+** API always returns a generic error code, [SQLITE_ERROR], following any
+** error other than [SQLITE_BUSY] and [SQLITE_MISUSE].  You must call
+** [sqlite3_reset()] or [sqlite3_finalize()] in order to find one of the
+** specific [error codes] that better describes the error.
+** We admit that this is a goofy design.  The problem has been fixed
+** with the "v2" interface.  If you prepare all of your SQL statements
+** using either [sqlite3_prepare_v2()] or [sqlite3_prepare16_v2()] instead
+** of the legacy [sqlite3_prepare()] and [sqlite3_prepare16()] interfaces,
+** then the more specific [error codes] are returned directly
+** by sqlite3_step().  The use of the "v2" interface is recommended.
+*/
+SQLITE_API int sqlite3_step(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Number of columns in a result set
+**
+** ^The sqlite3_data_count(P) interface returns the number of columns in the
+** current row of the result set of [prepared statement] P.
+** ^If prepared statement P does not have results ready to return
+** (via calls to the [sqlite3_column_int | sqlite3_column_*()] of
+** interfaces) then sqlite3_data_count(P) returns 0.
+** ^The sqlite3_data_count(P) routine also returns 0 if P is a NULL pointer.
+** ^The sqlite3_data_count(P) routine returns 0 if the previous call to
+** [sqlite3_step](P) returned [SQLITE_DONE].  ^The sqlite3_data_count(P)
+** will return non-zero if previous call to [sqlite3_step](P) returned
+** [SQLITE_ROW], except in the case of the [PRAGMA incremental_vacuum]
+** where it always returns zero since each step of that multi-step
+** pragma returns 0 columns of data.
+**
+** See also: [sqlite3_column_count()]
+*/
+SQLITE_API int sqlite3_data_count(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Fundamental Datatypes
+** KEYWORDS: SQLITE_TEXT
+**
+** ^(Every value in SQLite has one of five fundamental datatypes:
+**
+** <ul>
+** <li> 64-bit signed integer
+** <li> 64-bit IEEE floating point number
+** <li> string
+** <li> BLOB
+** <li> NULL
+** </ul>)^
+**
+** These constants are codes for each of those types.
+**
+** Note that the SQLITE_TEXT constant was also used in SQLite version 2
+** for a completely different meaning.  Software that links against both
+** SQLite version 2 and SQLite version 3 should use SQLITE3_TEXT, not
+** SQLITE_TEXT.
+*/
+#define SQLITE_INTEGER  1
+#define SQLITE_FLOAT    2
+#define SQLITE_BLOB     4
+#define SQLITE_NULL     5
+#ifdef SQLITE_TEXT
+# undef SQLITE_TEXT
+#else
+# define SQLITE_TEXT     3
+#endif
+#define SQLITE3_TEXT     3
+
+/*
+** CAPI3REF: Result Values From A Query
+** KEYWORDS: {column access functions}
+**
+** These routines form the "result set" interface.
+**
+** ^These routines return information about a single column of the current
+** result row of a query.  ^In every case the first argument is a pointer
+** to the [prepared statement] that is being evaluated (the [sqlite3_stmt*]
+** that was returned from [sqlite3_prepare_v2()] or one of its variants)
+** and the second argument is the index of the column for which information
+** should be returned. ^The leftmost column of the result set has the index 0.
+** ^The number of columns in the result can be determined using
+** [sqlite3_column_count()].
+**
+** If the SQL statement does not currently point to a valid row, or if the
+** column index is out of range, the result is undefined.
+** These routines may only be called when the most recent call to
+** [sqlite3_step()] has returned [SQLITE_ROW] and neither
+** [sqlite3_reset()] nor [sqlite3_finalize()] have been called subsequently.
+** If any of these routines are called after [sqlite3_reset()] or
+** [sqlite3_finalize()] or after [sqlite3_step()] has returned
+** something other than [SQLITE_ROW], the results are undefined.
+** If [sqlite3_step()] or [sqlite3_reset()] or [sqlite3_finalize()]
+** are called from a different thread while any of these routines
+** are pending, then the results are undefined.
+**
+** ^The sqlite3_column_type() routine returns the
+** [SQLITE_INTEGER | datatype code] for the initial data type
+** of the result column.  ^The returned value is one of [SQLITE_INTEGER],
+** [SQLITE_FLOAT], [SQLITE_TEXT], [SQLITE_BLOB], or [SQLITE_NULL].  The value
+** returned by sqlite3_column_type() is only meaningful if no type
+** conversions have occurred as described below.  After a type conversion,
+** the value returned by sqlite3_column_type() is undefined.  Future
+** versions of SQLite may change the behavior of sqlite3_column_type()
+** following a type conversion.
+**
+** ^If the result is a BLOB or UTF-8 string then the sqlite3_column_bytes()
+** routine returns the number of bytes in that BLOB or string.
+** ^If the result is a UTF-16 string, then sqlite3_column_bytes() converts
+** the string to UTF-8 and then returns the number of bytes.
+** ^If the result is a numeric value then sqlite3_column_bytes() uses
+** [sqlite3_snprintf()] to convert that value to a UTF-8 string and returns
+** the number of bytes in that string.
+** ^If the result is NULL, then sqlite3_column_bytes() returns zero.
+**
+** ^If the result is a BLOB or UTF-16 string then the sqlite3_column_bytes16()
+** routine returns the number of bytes in that BLOB or string.
+** ^If the result is a UTF-8 string, then sqlite3_column_bytes16() converts
+** the string to UTF-16 and then returns the number of bytes.
+** ^If the result is a numeric value then sqlite3_column_bytes16() uses
+** [sqlite3_snprintf()] to convert that value to a UTF-16 string and returns
+** the number of bytes in that string.
+** ^If the result is NULL, then sqlite3_column_bytes16() returns zero.
+**
+** ^The values returned by [sqlite3_column_bytes()] and 
+** [sqlite3_column_bytes16()] do not include the zero terminators at the end
+** of the string.  ^For clarity: the values returned by
+** [sqlite3_column_bytes()] and [sqlite3_column_bytes16()] are the number of
+** bytes in the string, not the number of characters.
+**
+** ^Strings returned by sqlite3_column_text() and sqlite3_column_text16(),
+** even empty strings, are always zero-terminated.  ^The return
+** value from sqlite3_column_blob() for a zero-length BLOB is a NULL pointer.
+**
+** ^The object returned by [sqlite3_column_value()] is an
+** [unprotected sqlite3_value] object.  An unprotected sqlite3_value object
+** may only be used with [sqlite3_bind_value()] and [sqlite3_result_value()].
+** If the [unprotected sqlite3_value] object returned by
+** [sqlite3_column_value()] is used in any other way, including calls
+** to routines like [sqlite3_value_int()], [sqlite3_value_text()],
+** or [sqlite3_value_bytes()], then the behavior is undefined.
+**
+** These routines attempt to convert the value where appropriate.  ^For
+** example, if the internal representation is FLOAT and a text result
+** is requested, [sqlite3_snprintf()] is used internally to perform the
+** conversion automatically.  ^(The following table details the conversions
+** that are applied:
+**
+** <blockquote>
+** <table border="1">
+** <tr><th> Internal<br>Type <th> Requested<br>Type <th>  Conversion
+**
+** <tr><td>  NULL    <td> INTEGER   <td> Result is 0
+** <tr><td>  NULL    <td>  FLOAT    <td> Result is 0.0
+** <tr><td>  NULL    <td>   TEXT    <td> Result is a NULL pointer
+** <tr><td>  NULL    <td>   BLOB    <td> Result is a NULL pointer
+** <tr><td> INTEGER  <td>  FLOAT    <td> Convert from integer to float
+** <tr><td> INTEGER  <td>   TEXT    <td> ASCII rendering of the integer
+** <tr><td> INTEGER  <td>   BLOB    <td> Same as INTEGER->TEXT
+** <tr><td>  FLOAT   <td> INTEGER   <td> [CAST] to INTEGER
+** <tr><td>  FLOAT   <td>   TEXT    <td> ASCII rendering of the float
+** <tr><td>  FLOAT   <td>   BLOB    <td> [CAST] to BLOB
+** <tr><td>  TEXT    <td> INTEGER   <td> [CAST] to INTEGER
+** <tr><td>  TEXT    <td>  FLOAT    <td> [CAST] to REAL
+** <tr><td>  TEXT    <td>   BLOB    <td> No change
+** <tr><td>  BLOB    <td> INTEGER   <td> [CAST] to INTEGER
+** <tr><td>  BLOB    <td>  FLOAT    <td> [CAST] to REAL
+** <tr><td>  BLOB    <td>   TEXT    <td> Add a zero terminator if needed
+** </table>
+** </blockquote>)^
+**
+** The table above makes reference to standard C library functions atoi()
+** and atof().  SQLite does not really use these functions.  It has its
+** own equivalent internal routines.  The atoi() and atof() names are
+** used in the table for brevity and because they are familiar to most
+** C programmers.
+**
+** Note that when type conversions occur, pointers returned by prior
+** calls to sqlite3_column_blob(), sqlite3_column_text(), and/or
+** sqlite3_column_text16() may be invalidated.
+** Type conversions and pointer invalidations might occur
+** in the following cases:
+**
+** <ul>
+** <li> The initial content is a BLOB and sqlite3_column_text() or
+**      sqlite3_column_text16() is called.  A zero-terminator might
+**      need to be added to the string.</li>
+** <li> The initial content is UTF-8 text and sqlite3_column_bytes16() or
+**      sqlite3_column_text16() is called.  The content must be converted
+**      to UTF-16.</li>
+** <li> The initial content is UTF-16 text and sqlite3_column_bytes() or
+**      sqlite3_column_text() is called.  The content must be converted
+**      to UTF-8.</li>
+** </ul>
+**
+** ^Conversions between UTF-16be and UTF-16le are always done in place and do
+** not invalidate a prior pointer, though of course the content of the buffer
+** that the prior pointer references will have been modified.  Other kinds
+** of conversion are done in place when it is possible, but sometimes they
+** are not possible and in those cases prior pointers are invalidated.
+**
+** The safest and easiest to remember policy is to invoke these routines
+** in one of the following ways:
+**
+** <ul>
+**  <li>sqlite3_column_text() followed by sqlite3_column_bytes()</li>
+**  <li>sqlite3_column_blob() followed by sqlite3_column_bytes()</li>
+**  <li>sqlite3_column_text16() followed by sqlite3_column_bytes16()</li>
+** </ul>
+**
+** In other words, you should call sqlite3_column_text(),
+** sqlite3_column_blob(), or sqlite3_column_text16() first to force the result
+** into the desired format, then invoke sqlite3_column_bytes() or
+** sqlite3_column_bytes16() to find the size of the result.  Do not mix calls
+** to sqlite3_column_text() or sqlite3_column_blob() with calls to
+** sqlite3_column_bytes16(), and do not mix calls to sqlite3_column_text16()
