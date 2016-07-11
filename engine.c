@@ -3673,3 +3673,240 @@ SQLITE_API int sqlite3_bind_zeroblob(sqlite3_stmt*, int, int n);
 **
 ** ^This routine can be used to find the number of [SQL parameters]
 ** in a [prepared statement].  SQL parameters are tokens of the
+** form "?", "?NNN", ":AAA", "$AAA", or "@AAA" that serve as
+** placeholders for values that are [sqlite3_bind_blob | bound]
+** to the parameters at a later time.
+**
+** ^(This routine actually returns the index of the largest (rightmost)
+** parameter. For all forms except ?NNN, this will correspond to the
+** number of unique parameters.  If parameters of the ?NNN form are used,
+** there may be gaps in the list.)^
+**
+** See also: [sqlite3_bind_blob|sqlite3_bind()],
+** [sqlite3_bind_parameter_name()], and
+** [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API int sqlite3_bind_parameter_count(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Name Of A Host Parameter
+**
+** ^The sqlite3_bind_parameter_name(P,N) interface returns
+** the name of the N-th [SQL parameter] in the [prepared statement] P.
+** ^(SQL parameters of the form "?NNN" or ":AAA" or "@AAA" or "$AAA"
+** have a name which is the string "?NNN" or ":AAA" or "@AAA" or "$AAA"
+** respectively.
+** In other words, the initial ":" or "$" or "@" or "?"
+** is included as part of the name.)^
+** ^Parameters of the form "?" without a following integer have no name
+** and are referred to as "nameless" or "anonymous parameters".
+**
+** ^The first host parameter has an index of 1, not 0.
+**
+** ^If the value N is out of range or if the N-th parameter is
+** nameless, then NULL is returned.  ^The returned string is
+** always in UTF-8 encoding even if the named parameter was
+** originally specified as UTF-16 in [sqlite3_prepare16()] or
+** [sqlite3_prepare16_v2()].
+**
+** See also: [sqlite3_bind_blob|sqlite3_bind()],
+** [sqlite3_bind_parameter_count()], and
+** [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API const char *sqlite3_bind_parameter_name(sqlite3_stmt*, int);
+
+/*
+** CAPI3REF: Index Of A Parameter With A Given Name
+**
+** ^Return the index of an SQL parameter given its name.  ^The
+** index value returned is suitable for use as the second
+** parameter to [sqlite3_bind_blob|sqlite3_bind()].  ^A zero
+** is returned if no matching parameter is found.  ^The parameter
+** name must be given in UTF-8 even if the original statement
+** was prepared from UTF-16 text using [sqlite3_prepare16_v2()].
+**
+** See also: [sqlite3_bind_blob|sqlite3_bind()],
+** [sqlite3_bind_parameter_count()], and
+** [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API int sqlite3_bind_parameter_index(sqlite3_stmt*, const char *zName);
+
+/*
+** CAPI3REF: Reset All Bindings On A Prepared Statement
+**
+** ^Contrary to the intuition of many, [sqlite3_reset()] does not reset
+** the [sqlite3_bind_blob | bindings] on a [prepared statement].
+** ^Use this routine to reset all host parameters to NULL.
+*/
+SQLITE_API int sqlite3_clear_bindings(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Number Of Columns In A Result Set
+**
+** ^Return the number of columns in the result set returned by the
+** [prepared statement]. ^This routine returns 0 if pStmt is an SQL
+** statement that does not return data (for example an [UPDATE]).
+**
+** See also: [sqlite3_data_count()]
+*/
+SQLITE_API int sqlite3_column_count(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Column Names In A Result Set
+**
+** ^These routines return the name assigned to a particular column
+** in the result set of a [SELECT] statement.  ^The sqlite3_column_name()
+** interface returns a pointer to a zero-terminated UTF-8 string
+** and sqlite3_column_name16() returns a pointer to a zero-terminated
+** UTF-16 string.  ^The first parameter is the [prepared statement]
+** that implements the [SELECT] statement. ^The second parameter is the
+** column number.  ^The leftmost column is number 0.
+**
+** ^The returned string pointer is valid until either the [prepared statement]
+** is destroyed by [sqlite3_finalize()] or until the statement is automatically
+** reprepared by the first call to [sqlite3_step()] for a particular run
+** or until the next call to
+** sqlite3_column_name() or sqlite3_column_name16() on the same column.
+**
+** ^If sqlite3_malloc() fails during the processing of either routine
+** (for example during a conversion from UTF-8 to UTF-16) then a
+** NULL pointer is returned.
+**
+** ^The name of a result column is the value of the "AS" clause for
+** that column, if there is an AS clause.  If there is no AS clause
+** then the name of the column is unspecified and may change from
+** one release of SQLite to the next.
+*/
+SQLITE_API const char *sqlite3_column_name(sqlite3_stmt*, int N);
+SQLITE_API const void *sqlite3_column_name16(sqlite3_stmt*, int N);
+
+/*
+** CAPI3REF: Source Of Data In A Query Result
+**
+** ^These routines provide a means to determine the database, table, and
+** table column that is the origin of a particular result column in
+** [SELECT] statement.
+** ^The name of the database or table or column can be returned as
+** either a UTF-8 or UTF-16 string.  ^The _database_ routines return
+** the database name, the _table_ routines return the table name, and
+** the origin_ routines return the column name.
+** ^The returned string is valid until the [prepared statement] is destroyed
+** using [sqlite3_finalize()] or until the statement is automatically
+** reprepared by the first call to [sqlite3_step()] for a particular run
+** or until the same information is requested
+** again in a different encoding.
+**
+** ^The names returned are the original un-aliased names of the
+** database, table, and column.
+**
+** ^The first argument to these interfaces is a [prepared statement].
+** ^These functions return information about the Nth result column returned by
+** the statement, where N is the second function argument.
+** ^The left-most column is column 0 for these routines.
+**
+** ^If the Nth column returned by the statement is an expression or
+** subquery and is not a column value, then all of these functions return
+** NULL.  ^These routine might also return NULL if a memory allocation error
+** occurs.  ^Otherwise, they return the name of the attached database, table,
+** or column that query result column was extracted from.
+**
+** ^As with all other SQLite APIs, those whose names end with "16" return
+** UTF-16 encoded strings and the other functions return UTF-8.
+**
+** ^These APIs are only available if the library was compiled with the
+** [SQLITE_ENABLE_COLUMN_METADATA] C-preprocessor symbol.
+**
+** If two or more threads call one or more of these routines against the same
+** prepared statement and column at the same time then the results are
+** undefined.
+**
+** If two or more threads call one or more
+** [sqlite3_column_database_name | column metadata interfaces]
+** for the same [prepared statement] and result column
+** at the same time then the results are undefined.
+*/
+SQLITE_API const char *sqlite3_column_database_name(sqlite3_stmt*,int);
+SQLITE_API const void *sqlite3_column_database_name16(sqlite3_stmt*,int);
+SQLITE_API const char *sqlite3_column_table_name(sqlite3_stmt*,int);
+SQLITE_API const void *sqlite3_column_table_name16(sqlite3_stmt*,int);
+SQLITE_API const char *sqlite3_column_origin_name(sqlite3_stmt*,int);
+SQLITE_API const void *sqlite3_column_origin_name16(sqlite3_stmt*,int);
+
+/*
+** CAPI3REF: Declared Datatype Of A Query Result
+**
+** ^(The first parameter is a [prepared statement].
+** If this statement is a [SELECT] statement and the Nth column of the
+** returned result set of that [SELECT] is a table column (not an
+** expression or subquery) then the declared type of the table
+** column is returned.)^  ^If the Nth column of the result set is an
+** expression or subquery, then a NULL pointer is returned.
+** ^The returned string is always UTF-8 encoded.
+**
+** ^(For example, given the database schema:
+**
+** CREATE TABLE t1(c1 VARIANT);
+**
+** and the following statement to be compiled:
+**
+** SELECT c1 + 1, c1 FROM t1;
+**
+** this routine would return the string "VARIANT" for the second result
+** column (i==1), and a NULL pointer for the first result column (i==0).)^
+**
+** ^SQLite uses dynamic run-time typing.  ^So just because a column
+** is declared to contain a particular type does not mean that the
+** data stored in that column is of the declared type.  SQLite is
+** strongly typed, but the typing is dynamic not static.  ^Type
+** is associated with individual values, not with the containers
+** used to hold those values.
+*/
+SQLITE_API const char *sqlite3_column_decltype(sqlite3_stmt*,int);
+SQLITE_API const void *sqlite3_column_decltype16(sqlite3_stmt*,int);
+
+/*
+** CAPI3REF: Evaluate An SQL Statement
+**
+** After a [prepared statement] has been prepared using either
+** [sqlite3_prepare_v2()] or [sqlite3_prepare16_v2()] or one of the legacy
+** interfaces [sqlite3_prepare()] or [sqlite3_prepare16()], this function
+** must be called one or more times to evaluate the statement.
+**
+** The details of the behavior of the sqlite3_step() interface depend
+** on whether the statement was prepared using the newer "v2" interface
+** [sqlite3_prepare_v2()] and [sqlite3_prepare16_v2()] or the older legacy
+** interface [sqlite3_prepare()] and [sqlite3_prepare16()].  The use of the
+** new "v2" interface is recommended for new applications but the legacy
+** interface will continue to be supported.
+**
+** ^In the legacy interface, the return value will be either [SQLITE_BUSY],
+** [SQLITE_DONE], [SQLITE_ROW], [SQLITE_ERROR], or [SQLITE_MISUSE].
+** ^With the "v2" interface, any of the other [result codes] or
+** [extended result codes] might be returned as well.
+**
+** ^[SQLITE_BUSY] means that the database engine was unable to acquire the
+** database locks it needs to do its job.  ^If the statement is a [COMMIT]
+** or occurs outside of an explicit transaction, then you can retry the
+** statement.  If the statement is not a [COMMIT] and occurs within an
+** explicit transaction then you should rollback the transaction before
+** continuing.
+**
+** ^[SQLITE_DONE] means that the statement has finished executing
+** successfully.  sqlite3_step() should not be called again on this virtual
+** machine without first calling [sqlite3_reset()] to reset the virtual
+** machine back to its initial state.
+**
+** ^If the SQL statement being executed returns any data, then [SQLITE_ROW]
+** is returned each time a new row of data is ready for processing by the
+** caller. The values may be accessed using the [column access functions].
+** sqlite3_step() is called again to retrieve the next row of data.
+**
+** ^[SQLITE_ERROR] means that a run-time error (such as a constraint
+** violation) has occurred.  sqlite3_step() should not be called again on
+** the VM. More information may be found by calling [sqlite3_errmsg()].
+** ^With the legacy interface, a more specific error code (for example,
+** [SQLITE_INTERRUPT], [SQLITE_SCHEMA], [SQLITE_CORRUPT], and so forth)
+** can be obtained by calling [sqlite3_reset()] on the
+** [prepared statement].  ^In the "v2" interface,
+** the more specific error code is returned directly by sqlite3_step().
+**
