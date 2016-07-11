@@ -4142,3 +4142,236 @@ SQLITE_API int sqlite3_data_count(sqlite3_stmt *pStmt);
 ** sqlite3_column_bytes16() to find the size of the result.  Do not mix calls
 ** to sqlite3_column_text() or sqlite3_column_blob() with calls to
 ** sqlite3_column_bytes16(), and do not mix calls to sqlite3_column_text16()
+** with calls to sqlite3_column_bytes().
+**
+** ^The pointers returned are valid until a type conversion occurs as
+** described above, or until [sqlite3_step()] or [sqlite3_reset()] or
+** [sqlite3_finalize()] is called.  ^The memory space used to hold strings
+** and BLOBs is freed automatically.  Do <b>not</b> pass the pointers returned
+** from [sqlite3_column_blob()], [sqlite3_column_text()], etc. into
+** [sqlite3_free()].
+**
+** ^(If a memory allocation error occurs during the evaluation of any
+** of these routines, a default value is returned.  The default value
+** is either the integer 0, the floating point number 0.0, or a NULL
+** pointer.  Subsequent calls to [sqlite3_errcode()] will return
+** [SQLITE_NOMEM].)^
+*/
+SQLITE_API const void *sqlite3_column_blob(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_bytes(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_bytes16(sqlite3_stmt*, int iCol);
+SQLITE_API double sqlite3_column_double(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_int(sqlite3_stmt*, int iCol);
+SQLITE_API sqlite3_int64 sqlite3_column_int64(sqlite3_stmt*, int iCol);
+SQLITE_API const unsigned char *sqlite3_column_text(sqlite3_stmt*, int iCol);
+SQLITE_API const void *sqlite3_column_text16(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_type(sqlite3_stmt*, int iCol);
+SQLITE_API sqlite3_value *sqlite3_column_value(sqlite3_stmt*, int iCol);
+
+/*
+** CAPI3REF: Destroy A Prepared Statement Object
+**
+** ^The sqlite3_finalize() function is called to delete a [prepared statement].
+** ^If the most recent evaluation of the statement encountered no errors
+** or if the statement is never been evaluated, then sqlite3_finalize() returns
+** SQLITE_OK.  ^If the most recent evaluation of statement S failed, then
+** sqlite3_finalize(S) returns the appropriate [error code] or
+** [extended error code].
+**
+** ^The sqlite3_finalize(S) routine can be called at any point during
+** the life cycle of [prepared statement] S:
+** before statement S is ever evaluated, after
+** one or more calls to [sqlite3_reset()], or after any call
+** to [sqlite3_step()] regardless of whether or not the statement has
+** completed execution.
+**
+** ^Invoking sqlite3_finalize() on a NULL pointer is a harmless no-op.
+**
+** The application must finalize every [prepared statement] in order to avoid
+** resource leaks.  It is a grievous error for the application to try to use
+** a prepared statement after it has been finalized.  Any use of a prepared
+** statement after it has been finalized can result in undefined and
+** undesirable behavior such as segfaults and heap corruption.
+*/
+SQLITE_API int sqlite3_finalize(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Reset A Prepared Statement Object
+**
+** The sqlite3_reset() function is called to reset a [prepared statement]
+** object back to its initial state, ready to be re-executed.
+** ^Any SQL statement variables that had values bound to them using
+** the [sqlite3_bind_blob | sqlite3_bind_*() API] retain their values.
+** Use [sqlite3_clear_bindings()] to reset the bindings.
+**
+** ^The [sqlite3_reset(S)] interface resets the [prepared statement] S
+** back to the beginning of its program.
+**
+** ^If the most recent call to [sqlite3_step(S)] for the
+** [prepared statement] S returned [SQLITE_ROW] or [SQLITE_DONE],
+** or if [sqlite3_step(S)] has never before been called on S,
+** then [sqlite3_reset(S)] returns [SQLITE_OK].
+**
+** ^If the most recent call to [sqlite3_step(S)] for the
+** [prepared statement] S indicated an error, then
+** [sqlite3_reset(S)] returns an appropriate [error code].
+**
+** ^The [sqlite3_reset(S)] interface does not change the values
+** of any [sqlite3_bind_blob|bindings] on the [prepared statement] S.
+*/
+SQLITE_API int sqlite3_reset(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Create Or Redefine SQL Functions
+** KEYWORDS: {function creation routines}
+** KEYWORDS: {application-defined SQL function}
+** KEYWORDS: {application-defined SQL functions}
+**
+** ^These functions (collectively known as "function creation routines")
+** are used to add SQL functions or aggregates or to redefine the behavior
+** of existing SQL functions or aggregates.  The only differences between
+** these routines are the text encoding expected for
+** the second parameter (the name of the function being created)
+** and the presence or absence of a destructor callback for
+** the application data pointer.
+**
+** ^The first parameter is the [database connection] to which the SQL
+** function is to be added.  ^If an application uses more than one database
+** connection then application-defined SQL functions must be added
+** to each database connection separately.
+**
+** ^The second parameter is the name of the SQL function to be created or
+** redefined.  ^The length of the name is limited to 255 bytes in a UTF-8
+** representation, exclusive of the zero-terminator.  ^Note that the name
+** length limit is in UTF-8 bytes, not characters nor UTF-16 bytes.  
+** ^Any attempt to create a function with a longer name
+** will result in [SQLITE_MISUSE] being returned.
+**
+** ^The third parameter (nArg)
+** is the number of arguments that the SQL function or
+** aggregate takes. ^If this parameter is -1, then the SQL function or
+** aggregate may take any number of arguments between 0 and the limit
+** set by [sqlite3_limit]([SQLITE_LIMIT_FUNCTION_ARG]).  If the third
+** parameter is less than -1 or greater than 127 then the behavior is
+** undefined.
+**
+** ^The fourth parameter, eTextRep, specifies what
+** [SQLITE_UTF8 | text encoding] this SQL function prefers for
+** its parameters.  The application should set this parameter to
+** [SQLITE_UTF16LE] if the function implementation invokes 
+** [sqlite3_value_text16le()] on an input, or [SQLITE_UTF16BE] if the
+** implementation invokes [sqlite3_value_text16be()] on an input, or
+** [SQLITE_UTF16] if [sqlite3_value_text16()] is used, or [SQLITE_UTF8]
+** otherwise.  ^The same SQL function may be registered multiple times using
+** different preferred text encodings, with different implementations for
+** each encoding.
+** ^When multiple implementations of the same function are available, SQLite
+** will pick the one that involves the least amount of data conversion.
+**
+** ^The fourth parameter may optionally be ORed with [SQLITE_DETERMINISTIC]
+** to signal that the function will always return the same result given
+** the same inputs within a single SQL statement.  Most SQL functions are
+** deterministic.  The built-in [random()] SQL function is an example of a
+** function that is not deterministic.  The SQLite query planner is able to
+** perform additional optimizations on deterministic functions, so use
+** of the [SQLITE_DETERMINISTIC] flag is recommended where possible.
+**
+** ^(The fifth parameter is an arbitrary pointer.  The implementation of the
+** function can gain access to this pointer using [sqlite3_user_data()].)^
+**
+** ^The sixth, seventh and eighth parameters, xFunc, xStep and xFinal, are
+** pointers to C-language functions that implement the SQL function or
+** aggregate. ^A scalar SQL function requires an implementation of the xFunc
+** callback only; NULL pointers must be passed as the xStep and xFinal
+** parameters. ^An aggregate SQL function requires an implementation of xStep
+** and xFinal and NULL pointer must be passed for xFunc. ^To delete an existing
+** SQL function or aggregate, pass NULL pointers for all three function
+** callbacks.
+**
+** ^(If the ninth parameter to sqlite3_create_function_v2() is not NULL,
+** then it is destructor for the application data pointer. 
+** The destructor is invoked when the function is deleted, either by being
+** overloaded or when the database connection closes.)^
+** ^The destructor is also invoked if the call to
+** sqlite3_create_function_v2() fails.
+** ^When the destructor callback of the tenth parameter is invoked, it
+** is passed a single argument which is a copy of the application data 
+** pointer which was the fifth parameter to sqlite3_create_function_v2().
+**
+** ^It is permitted to register multiple implementations of the same
+** functions with the same name but with either differing numbers of
+** arguments or differing preferred text encodings.  ^SQLite will use
+** the implementation that most closely matches the way in which the
+** SQL function is used.  ^A function implementation with a non-negative
+** nArg parameter is a better match than a function implementation with
+** a negative nArg.  ^A function where the preferred text encoding
+** matches the database encoding is a better
+** match than a function where the encoding is different.  
+** ^A function where the encoding difference is between UTF16le and UTF16be
+** is a closer match than a function where the encoding difference is
+** between UTF8 and UTF16.
+**
+** ^Built-in functions may be overloaded by new application-defined functions.
+**
+** ^An application-defined function is permitted to call other
+** SQLite interfaces.  However, such calls must not
+** close the database connection nor finalize or reset the prepared
+** statement in which the function is running.
+*/
+SQLITE_API int sqlite3_create_function(
+  sqlite3 *db,
+  const char *zFunctionName,
+  int nArg,
+  int eTextRep,
+  void *pApp,
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
+  void (*xStep)(sqlite3_context*,int,sqlite3_value**),
+  void (*xFinal)(sqlite3_context*)
+);
+SQLITE_API int sqlite3_create_function16(
+  sqlite3 *db,
+  const void *zFunctionName,
+  int nArg,
+  int eTextRep,
+  void *pApp,
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
+  void (*xStep)(sqlite3_context*,int,sqlite3_value**),
+  void (*xFinal)(sqlite3_context*)
+);
+SQLITE_API int sqlite3_create_function_v2(
+  sqlite3 *db,
+  const char *zFunctionName,
+  int nArg,
+  int eTextRep,
+  void *pApp,
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
+  void (*xStep)(sqlite3_context*,int,sqlite3_value**),
+  void (*xFinal)(sqlite3_context*),
+  void(*xDestroy)(void*)
+);
+
+/*
+** CAPI3REF: Text Encodings
+**
+** These constant define integer codes that represent the various
+** text encodings supported by SQLite.
+*/
+#define SQLITE_UTF8           1    /* IMP: R-37514-35566 */
+#define SQLITE_UTF16LE        2    /* IMP: R-03371-37637 */
+#define SQLITE_UTF16BE        3    /* IMP: R-51971-34154 */
+#define SQLITE_UTF16          4    /* Use native byte order */
+#define SQLITE_ANY            5    /* Deprecated */
+#define SQLITE_UTF16_ALIGNED  8    /* sqlite3_create_collation only */
+
+/*
+** CAPI3REF: Function Flags
+**
+** These constants may be ORed together with the 
+** [SQLITE_UTF8 | preferred text encoding] as the fourth argument
+** to [sqlite3_create_function()], [sqlite3_create_function16()], or
+** [sqlite3_create_function_v2()].
+*/
+#define SQLITE_DETERMINISTIC    0x800
+
+/*
+** CAPI3REF: Deprecated Functions
