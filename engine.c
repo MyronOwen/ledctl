@@ -3471,3 +3471,205 @@ SQLITE_API const char *sqlite3_sql(sqlite3_stmt *pStmt);
 ** rather they control the timing of when other statements modify the 
 ** database.  ^The [ATTACH] and [DETACH] statements also cause
 ** sqlite3_stmt_readonly() to return true since, while those statements
+** change the configuration of a database connection, they do not make 
+** changes to the content of the database files on disk.
+*/
+SQLITE_API int sqlite3_stmt_readonly(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Determine If A Prepared Statement Has Been Reset
+**
+** ^The sqlite3_stmt_busy(S) interface returns true (non-zero) if the
+** [prepared statement] S has been stepped at least once using 
+** [sqlite3_step(S)] but has not run to completion and/or has not 
+** been reset using [sqlite3_reset(S)].  ^The sqlite3_stmt_busy(S)
+** interface returns false if S is a NULL pointer.  If S is not a 
+** NULL pointer and is not a pointer to a valid [prepared statement]
+** object, then the behavior is undefined and probably undesirable.
+**
+** This interface can be used in combination [sqlite3_next_stmt()]
+** to locate all prepared statements associated with a database 
+** connection that are in need of being reset.  This can be used,
+** for example, in diagnostic routines to search for prepared 
+** statements that are holding a transaction open.
+*/
+SQLITE_API int sqlite3_stmt_busy(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Dynamically Typed Value Object
+** KEYWORDS: {protected sqlite3_value} {unprotected sqlite3_value}
+**
+** SQLite uses the sqlite3_value object to represent all values
+** that can be stored in a database table. SQLite uses dynamic typing
+** for the values it stores.  ^Values stored in sqlite3_value objects
+** can be integers, floating point values, strings, BLOBs, or NULL.
+**
+** An sqlite3_value object may be either "protected" or "unprotected".
+** Some interfaces require a protected sqlite3_value.  Other interfaces
+** will accept either a protected or an unprotected sqlite3_value.
+** Every interface that accepts sqlite3_value arguments specifies
+** whether or not it requires a protected sqlite3_value.
+**
+** The terms "protected" and "unprotected" refer to whether or not
+** a mutex is held.  An internal mutex is held for a protected
+** sqlite3_value object but no mutex is held for an unprotected
+** sqlite3_value object.  If SQLite is compiled to be single-threaded
+** (with [SQLITE_THREADSAFE=0] and with [sqlite3_threadsafe()] returning 0)
+** or if SQLite is run in one of reduced mutex modes 
+** [SQLITE_CONFIG_SINGLETHREAD] or [SQLITE_CONFIG_MULTITHREAD]
+** then there is no distinction between protected and unprotected
+** sqlite3_value objects and they can be used interchangeably.  However,
+** for maximum code portability it is recommended that applications
+** still make the distinction between protected and unprotected
+** sqlite3_value objects even when not strictly required.
+**
+** ^The sqlite3_value objects that are passed as parameters into the
+** implementation of [application-defined SQL functions] are protected.
+** ^The sqlite3_value object returned by
+** [sqlite3_column_value()] is unprotected.
+** Unprotected sqlite3_value objects may only be used with
+** [sqlite3_result_value()] and [sqlite3_bind_value()].
+** The [sqlite3_value_blob | sqlite3_value_type()] family of
+** interfaces require protected sqlite3_value objects.
+*/
+typedef struct Mem sqlite3_value;
+
+/*
+** CAPI3REF: SQL Function Context Object
+**
+** The context in which an SQL function executes is stored in an
+** sqlite3_context object.  ^A pointer to an sqlite3_context object
+** is always first parameter to [application-defined SQL functions].
+** The application-defined SQL function implementation will pass this
+** pointer through into calls to [sqlite3_result_int | sqlite3_result()],
+** [sqlite3_aggregate_context()], [sqlite3_user_data()],
+** [sqlite3_context_db_handle()], [sqlite3_get_auxdata()],
+** and/or [sqlite3_set_auxdata()].
+*/
+typedef struct sqlite3_context sqlite3_context;
+
+/*
+** CAPI3REF: Binding Values To Prepared Statements
+** KEYWORDS: {host parameter} {host parameters} {host parameter name}
+** KEYWORDS: {SQL parameter} {SQL parameters} {parameter binding}
+**
+** ^(In the SQL statement text input to [sqlite3_prepare_v2()] and its variants,
+** literals may be replaced by a [parameter] that matches one of following
+** templates:
+**
+** <ul>
+** <li>  ?
+** <li>  ?NNN
+** <li>  :VVV
+** <li>  @VVV
+** <li>  $VVV
+** </ul>
+**
+** In the templates above, NNN represents an integer literal,
+** and VVV represents an alphanumeric identifier.)^  ^The values of these
+** parameters (also called "host parameter names" or "SQL parameters")
+** can be set using the sqlite3_bind_*() routines defined here.
+**
+** ^The first argument to the sqlite3_bind_*() routines is always
+** a pointer to the [sqlite3_stmt] object returned from
+** [sqlite3_prepare_v2()] or its variants.
+**
+** ^The second argument is the index of the SQL parameter to be set.
+** ^The leftmost SQL parameter has an index of 1.  ^When the same named
+** SQL parameter is used more than once, second and subsequent
+** occurrences have the same index as the first occurrence.
+** ^The index for named parameters can be looked up using the
+** [sqlite3_bind_parameter_index()] API if desired.  ^The index
+** for "?NNN" parameters is the value of NNN.
+** ^The NNN value must be between 1 and the [sqlite3_limit()]
+** parameter [SQLITE_LIMIT_VARIABLE_NUMBER] (default value: 999).
+**
+** ^The third argument is the value to bind to the parameter.
+** ^If the third parameter to sqlite3_bind_text() or sqlite3_bind_text16()
+** or sqlite3_bind_blob() is a NULL pointer then the fourth parameter
+** is ignored and the end result is the same as sqlite3_bind_null().
+**
+** ^(In those routines that have a fourth argument, its value is the
+** number of bytes in the parameter.  To be clear: the value is the
+** number of <u>bytes</u> in the value, not the number of characters.)^
+** ^If the fourth parameter to sqlite3_bind_text() or sqlite3_bind_text16()
+** is negative, then the length of the string is
+** the number of bytes up to the first zero terminator.
+** If the fourth parameter to sqlite3_bind_blob() is negative, then
+** the behavior is undefined.
+** If a non-negative fourth parameter is provided to sqlite3_bind_text()
+** or sqlite3_bind_text16() or sqlite3_bind_text64() then
+** that parameter must be the byte offset
+** where the NUL terminator would occur assuming the string were NUL
+** terminated.  If any NUL characters occur at byte offsets less than 
+** the value of the fourth parameter then the resulting string value will
+** contain embedded NULs.  The result of expressions involving strings
+** with embedded NULs is undefined.
+**
+** ^The fifth argument to the BLOB and string binding interfaces
+** is a destructor used to dispose of the BLOB or
+** string after SQLite has finished with it.  ^The destructor is called
+** to dispose of the BLOB or string even if the call to bind API fails.
+** ^If the fifth argument is
+** the special value [SQLITE_STATIC], then SQLite assumes that the
+** information is in static, unmanaged space and does not need to be freed.
+** ^If the fifth argument has the value [SQLITE_TRANSIENT], then
+** SQLite makes its own private copy of the data immediately, before
+** the sqlite3_bind_*() routine returns.
+**
+** ^The sixth argument to sqlite3_bind_text64() must be one of
+** [SQLITE_UTF8], [SQLITE_UTF16], [SQLITE_UTF16BE], or [SQLITE_UTF16LE]
+** to specify the encoding of the text in the third parameter.  If
+** the sixth argument to sqlite3_bind_text64() is not one of the
+** allowed values shown above, or if the text encoding is different
+** from the encoding specified by the sixth parameter, then the behavior
+** is undefined.
+**
+** ^The sqlite3_bind_zeroblob() routine binds a BLOB of length N that
+** is filled with zeroes.  ^A zeroblob uses a fixed amount of memory
+** (just an integer to hold its size) while it is being processed.
+** Zeroblobs are intended to serve as placeholders for BLOBs whose
+** content is later written using
+** [sqlite3_blob_open | incremental BLOB I/O] routines.
+** ^A negative value for the zeroblob results in a zero-length BLOB.
+**
+** ^If any of the sqlite3_bind_*() routines are called with a NULL pointer
+** for the [prepared statement] or with a prepared statement for which
+** [sqlite3_step()] has been called more recently than [sqlite3_reset()],
+** then the call will return [SQLITE_MISUSE].  If any sqlite3_bind_()
+** routine is passed a [prepared statement] that has been finalized, the
+** result is undefined and probably harmful.
+**
+** ^Bindings are not cleared by the [sqlite3_reset()] routine.
+** ^Unbound parameters are interpreted as NULL.
+**
+** ^The sqlite3_bind_* routines return [SQLITE_OK] on success or an
+** [error code] if anything goes wrong.
+** ^[SQLITE_TOOBIG] might be returned if the size of a string or BLOB
+** exceeds limits imposed by [sqlite3_limit]([SQLITE_LIMIT_LENGTH]) or
+** [SQLITE_MAX_LENGTH].
+** ^[SQLITE_RANGE] is returned if the parameter
+** index is out of range.  ^[SQLITE_NOMEM] is returned if malloc() fails.
+**
+** See also: [sqlite3_bind_parameter_count()],
+** [sqlite3_bind_parameter_name()], and [sqlite3_bind_parameter_index()].
+*/
+SQLITE_API int sqlite3_bind_blob(sqlite3_stmt*, int, const void*, int n, void(*)(void*));
+SQLITE_API int sqlite3_bind_blob64(sqlite3_stmt*, int, const void*, sqlite3_uint64,
+                        void(*)(void*));
+SQLITE_API int sqlite3_bind_double(sqlite3_stmt*, int, double);
+SQLITE_API int sqlite3_bind_int(sqlite3_stmt*, int, int);
+SQLITE_API int sqlite3_bind_int64(sqlite3_stmt*, int, sqlite3_int64);
+SQLITE_API int sqlite3_bind_null(sqlite3_stmt*, int);
+SQLITE_API int sqlite3_bind_text(sqlite3_stmt*,int,const char*,int,void(*)(void*));
+SQLITE_API int sqlite3_bind_text16(sqlite3_stmt*, int, const void*, int, void(*)(void*));
+SQLITE_API int sqlite3_bind_text64(sqlite3_stmt*, int, const char*, sqlite3_uint64,
+                         void(*)(void*), unsigned char encoding);
+SQLITE_API int sqlite3_bind_value(sqlite3_stmt*, int, const sqlite3_value*);
+SQLITE_API int sqlite3_bind_zeroblob(sqlite3_stmt*, int, int n);
+
+/*
+** CAPI3REF: Number Of SQL Parameters
+**
+** ^This routine can be used to find the number of [SQL parameters]
+** in a [prepared statement].  SQL parameters are tokens of the
