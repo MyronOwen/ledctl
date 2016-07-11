@@ -3248,3 +3248,226 @@ typedef struct sqlite3_stmt sqlite3_stmt;
 ** off the Internet.  The internal databases can be given the
 ** large, default limits.  Databases managed by external sources can
 ** be given much smaller limits designed to prevent a denial of service
+** attack.  Developers might also want to use the [sqlite3_set_authorizer()]
+** interface to further control untrusted SQL.  The size of the database
+** created by an untrusted script can be contained using the
+** [max_page_count] [PRAGMA].
+**
+** New run-time limit categories may be added in future releases.
+*/
+SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
+
+/*
+** CAPI3REF: Run-Time Limit Categories
+** KEYWORDS: {limit category} {*limit categories}
+**
+** These constants define various performance limits
+** that can be lowered at run-time using [sqlite3_limit()].
+** The synopsis of the meanings of the various limits is shown below.
+** Additional information is available at [limits | Limits in SQLite].
+**
+** <dl>
+** [[SQLITE_LIMIT_LENGTH]] ^(<dt>SQLITE_LIMIT_LENGTH</dt>
+** <dd>The maximum size of any string or BLOB or table row, in bytes.<dd>)^
+**
+** [[SQLITE_LIMIT_SQL_LENGTH]] ^(<dt>SQLITE_LIMIT_SQL_LENGTH</dt>
+** <dd>The maximum length of an SQL statement, in bytes.</dd>)^
+**
+** [[SQLITE_LIMIT_COLUMN]] ^(<dt>SQLITE_LIMIT_COLUMN</dt>
+** <dd>The maximum number of columns in a table definition or in the
+** result set of a [SELECT] or the maximum number of columns in an index
+** or in an ORDER BY or GROUP BY clause.</dd>)^
+**
+** [[SQLITE_LIMIT_EXPR_DEPTH]] ^(<dt>SQLITE_LIMIT_EXPR_DEPTH</dt>
+** <dd>The maximum depth of the parse tree on any expression.</dd>)^
+**
+** [[SQLITE_LIMIT_COMPOUND_SELECT]] ^(<dt>SQLITE_LIMIT_COMPOUND_SELECT</dt>
+** <dd>The maximum number of terms in a compound SELECT statement.</dd>)^
+**
+** [[SQLITE_LIMIT_VDBE_OP]] ^(<dt>SQLITE_LIMIT_VDBE_OP</dt>
+** <dd>The maximum number of instructions in a virtual machine program
+** used to implement an SQL statement.  This limit is not currently
+** enforced, though that might be added in some future release of
+** SQLite.</dd>)^
+**
+** [[SQLITE_LIMIT_FUNCTION_ARG]] ^(<dt>SQLITE_LIMIT_FUNCTION_ARG</dt>
+** <dd>The maximum number of arguments on a function.</dd>)^
+**
+** [[SQLITE_LIMIT_ATTACHED]] ^(<dt>SQLITE_LIMIT_ATTACHED</dt>
+** <dd>The maximum number of [ATTACH | attached databases].)^</dd>
+**
+** [[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]]
+** ^(<dt>SQLITE_LIMIT_LIKE_PATTERN_LENGTH</dt>
+** <dd>The maximum length of the pattern argument to the [LIKE] or
+** [GLOB] operators.</dd>)^
+**
+** [[SQLITE_LIMIT_VARIABLE_NUMBER]]
+** ^(<dt>SQLITE_LIMIT_VARIABLE_NUMBER</dt>
+** <dd>The maximum index number of any [parameter] in an SQL statement.)^
+**
+** [[SQLITE_LIMIT_TRIGGER_DEPTH]] ^(<dt>SQLITE_LIMIT_TRIGGER_DEPTH</dt>
+** <dd>The maximum depth of recursion for triggers.</dd>)^
+**
+** [[SQLITE_LIMIT_WORKER_THREADS]] ^(<dt>SQLITE_LIMIT_WORKER_THREADS</dt>
+** <dd>The maximum number of auxiliary worker threads that a single
+** [prepared statement] may start.</dd>)^
+** </dl>
+*/
+#define SQLITE_LIMIT_LENGTH                    0
+#define SQLITE_LIMIT_SQL_LENGTH                1
+#define SQLITE_LIMIT_COLUMN                    2
+#define SQLITE_LIMIT_EXPR_DEPTH                3
+#define SQLITE_LIMIT_COMPOUND_SELECT           4
+#define SQLITE_LIMIT_VDBE_OP                   5
+#define SQLITE_LIMIT_FUNCTION_ARG              6
+#define SQLITE_LIMIT_ATTACHED                  7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH       8
+#define SQLITE_LIMIT_VARIABLE_NUMBER           9
+#define SQLITE_LIMIT_TRIGGER_DEPTH            10
+#define SQLITE_LIMIT_WORKER_THREADS           11
+
+/*
+** CAPI3REF: Compiling An SQL Statement
+** KEYWORDS: {SQL statement compiler}
+**
+** To execute an SQL query, it must first be compiled into a byte-code
+** program using one of these routines.
+**
+** The first argument, "db", is a [database connection] obtained from a
+** prior successful call to [sqlite3_open()], [sqlite3_open_v2()] or
+** [sqlite3_open16()].  The database connection must not have been closed.
+**
+** The second argument, "zSql", is the statement to be compiled, encoded
+** as either UTF-8 or UTF-16.  The sqlite3_prepare() and sqlite3_prepare_v2()
+** interfaces use UTF-8, and sqlite3_prepare16() and sqlite3_prepare16_v2()
+** use UTF-16.
+**
+** ^If the nByte argument is less than zero, then zSql is read up to the
+** first zero terminator. ^If nByte is non-negative, then it is the maximum
+** number of  bytes read from zSql.  ^When nByte is non-negative, the
+** zSql string ends at either the first '\000' or '\u0000' character or
+** the nByte-th byte, whichever comes first. If the caller knows
+** that the supplied string is nul-terminated, then there is a small
+** performance advantage to be gained by passing an nByte parameter that
+** is equal to the number of bytes in the input string <i>including</i>
+** the nul-terminator bytes as this saves SQLite from having to
+** make a copy of the input string.
+**
+** ^If pzTail is not NULL then *pzTail is made to point to the first byte
+** past the end of the first SQL statement in zSql.  These routines only
+** compile the first statement in zSql, so *pzTail is left pointing to
+** what remains uncompiled.
+**
+** ^*ppStmt is left pointing to a compiled [prepared statement] that can be
+** executed using [sqlite3_step()].  ^If there is an error, *ppStmt is set
+** to NULL.  ^If the input text contains no SQL (if the input is an empty
+** string or a comment) then *ppStmt is set to NULL.
+** The calling procedure is responsible for deleting the compiled
+** SQL statement using [sqlite3_finalize()] after it has finished with it.
+** ppStmt may not be NULL.
+**
+** ^On success, the sqlite3_prepare() family of routines return [SQLITE_OK];
+** otherwise an [error code] is returned.
+**
+** The sqlite3_prepare_v2() and sqlite3_prepare16_v2() interfaces are
+** recommended for all new programs. The two older interfaces are retained
+** for backwards compatibility, but their use is discouraged.
+** ^In the "v2" interfaces, the prepared statement
+** that is returned (the [sqlite3_stmt] object) contains a copy of the
+** original SQL text. This causes the [sqlite3_step()] interface to
+** behave differently in three ways:
+**
+** <ol>
+** <li>
+** ^If the database schema changes, instead of returning [SQLITE_SCHEMA] as it
+** always used to do, [sqlite3_step()] will automatically recompile the SQL
+** statement and try to run it again. As many as [SQLITE_MAX_SCHEMA_RETRY]
+** retries will occur before sqlite3_step() gives up and returns an error.
+** </li>
+**
+** <li>
+** ^When an error occurs, [sqlite3_step()] will return one of the detailed
+** [error codes] or [extended error codes].  ^The legacy behavior was that
+** [sqlite3_step()] would only return a generic [SQLITE_ERROR] result code
+** and the application would have to make a second call to [sqlite3_reset()]
+** in order to find the underlying cause of the problem. With the "v2" prepare
+** interfaces, the underlying reason for the error is returned immediately.
+** </li>
+**
+** <li>
+** ^If the specific value bound to [parameter | host parameter] in the 
+** WHERE clause might influence the choice of query plan for a statement,
+** then the statement will be automatically recompiled, as if there had been 
+** a schema change, on the first  [sqlite3_step()] call following any change
+** to the [sqlite3_bind_text | bindings] of that [parameter]. 
+** ^The specific value of WHERE-clause [parameter] might influence the 
+** choice of query plan if the parameter is the left-hand side of a [LIKE]
+** or [GLOB] operator or if the parameter is compared to an indexed column
+** and the [SQLITE_ENABLE_STAT3] compile-time option is enabled.
+** </li>
+** </ol>
+*/
+SQLITE_API int sqlite3_prepare(
+  sqlite3 *db,            /* Database handle */
+  const char *zSql,       /* SQL statement, UTF-8 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+SQLITE_API int sqlite3_prepare_v2(
+  sqlite3 *db,            /* Database handle */
+  const char *zSql,       /* SQL statement, UTF-8 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+SQLITE_API int sqlite3_prepare16(
+  sqlite3 *db,            /* Database handle */
+  const void *zSql,       /* SQL statement, UTF-16 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const void **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+SQLITE_API int sqlite3_prepare16_v2(
+  sqlite3 *db,            /* Database handle */
+  const void *zSql,       /* SQL statement, UTF-16 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const void **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
+
+/*
+** CAPI3REF: Retrieving Statement SQL
+**
+** ^This interface can be used to retrieve a saved copy of the original
+** SQL text used to create a [prepared statement] if that statement was
+** compiled using either [sqlite3_prepare_v2()] or [sqlite3_prepare16_v2()].
+*/
+SQLITE_API const char *sqlite3_sql(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Determine If An SQL Statement Writes The Database
+**
+** ^The sqlite3_stmt_readonly(X) interface returns true (non-zero) if
+** and only if the [prepared statement] X makes no direct changes to
+** the content of the database file.
+**
+** Note that [application-defined SQL functions] or
+** [virtual tables] might change the database indirectly as a side effect.  
+** ^(For example, if an application defines a function "eval()" that 
+** calls [sqlite3_exec()], then the following SQL statement would
+** change the database file through side-effects:
+**
+** <blockquote><pre>
+**    SELECT eval('DELETE FROM t1') FROM t2;
+** </pre></blockquote>
+**
+** But because the [SELECT] statement does not change the database file
+** directly, sqlite3_stmt_readonly() would still return true.)^
+**
+** ^Transaction control statements such as [BEGIN], [COMMIT], [ROLLBACK],
+** [SAVEPOINT], and [RELEASE] cause sqlite3_stmt_readonly() to return true,
+** since the statements themselves do not actually modify the database but
+** rather they control the timing of when other statements modify the 
+** database.  ^The [ATTACH] and [DETACH] statements also cause
+** sqlite3_stmt_readonly() to return true since, while those statements
