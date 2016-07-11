@@ -4375,3 +4375,228 @@ SQLITE_API int sqlite3_create_function_v2(
 
 /*
 ** CAPI3REF: Deprecated Functions
+** DEPRECATED
+**
+** These functions are [deprecated].  In order to maintain
+** backwards compatibility with older code, these functions continue 
+** to be supported.  However, new applications should avoid
+** the use of these functions.  To help encourage people to avoid
+** using these functions, we are not going to tell you what they do.
+*/
+#ifndef SQLITE_OMIT_DEPRECATED
+SQLITE_API SQLITE_DEPRECATED int sqlite3_aggregate_count(sqlite3_context*);
+SQLITE_API SQLITE_DEPRECATED int sqlite3_expired(sqlite3_stmt*);
+SQLITE_API SQLITE_DEPRECATED int sqlite3_transfer_bindings(sqlite3_stmt*, sqlite3_stmt*);
+SQLITE_API SQLITE_DEPRECATED int sqlite3_global_recover(void);
+SQLITE_API SQLITE_DEPRECATED void sqlite3_thread_cleanup(void);
+SQLITE_API SQLITE_DEPRECATED int sqlite3_memory_alarm(void(*)(void*,sqlite3_int64,int),
+                      void*,sqlite3_int64);
+#endif
+
+/*
+** CAPI3REF: Obtaining SQL Function Parameter Values
+**
+** The C-language implementation of SQL functions and aggregates uses
+** this set of interface routines to access the parameter values on
+** the function or aggregate.
+**
+** The xFunc (for scalar functions) or xStep (for aggregates) parameters
+** to [sqlite3_create_function()] and [sqlite3_create_function16()]
+** define callbacks that implement the SQL functions and aggregates.
+** The 3rd parameter to these callbacks is an array of pointers to
+** [protected sqlite3_value] objects.  There is one [sqlite3_value] object for
+** each parameter to the SQL function.  These routines are used to
+** extract values from the [sqlite3_value] objects.
+**
+** These routines work only with [protected sqlite3_value] objects.
+** Any attempt to use these routines on an [unprotected sqlite3_value]
+** object results in undefined behavior.
+**
+** ^These routines work just like the corresponding [column access functions]
+** except that these routines take a single [protected sqlite3_value] object
+** pointer instead of a [sqlite3_stmt*] pointer and an integer column number.
+**
+** ^The sqlite3_value_text16() interface extracts a UTF-16 string
+** in the native byte-order of the host machine.  ^The
+** sqlite3_value_text16be() and sqlite3_value_text16le() interfaces
+** extract UTF-16 strings as big-endian and little-endian respectively.
+**
+** ^(The sqlite3_value_numeric_type() interface attempts to apply
+** numeric affinity to the value.  This means that an attempt is
+** made to convert the value to an integer or floating point.  If
+** such a conversion is possible without loss of information (in other
+** words, if the value is a string that looks like a number)
+** then the conversion is performed.  Otherwise no conversion occurs.
+** The [SQLITE_INTEGER | datatype] after conversion is returned.)^
+**
+** Please pay particular attention to the fact that the pointer returned
+** from [sqlite3_value_blob()], [sqlite3_value_text()], or
+** [sqlite3_value_text16()] can be invalidated by a subsequent call to
+** [sqlite3_value_bytes()], [sqlite3_value_bytes16()], [sqlite3_value_text()],
+** or [sqlite3_value_text16()].
+**
+** These routines must be called from the same thread as
+** the SQL function that supplied the [sqlite3_value*] parameters.
+*/
+SQLITE_API const void *sqlite3_value_blob(sqlite3_value*);
+SQLITE_API int sqlite3_value_bytes(sqlite3_value*);
+SQLITE_API int sqlite3_value_bytes16(sqlite3_value*);
+SQLITE_API double sqlite3_value_double(sqlite3_value*);
+SQLITE_API int sqlite3_value_int(sqlite3_value*);
+SQLITE_API sqlite3_int64 sqlite3_value_int64(sqlite3_value*);
+SQLITE_API const unsigned char *sqlite3_value_text(sqlite3_value*);
+SQLITE_API const void *sqlite3_value_text16(sqlite3_value*);
+SQLITE_API const void *sqlite3_value_text16le(sqlite3_value*);
+SQLITE_API const void *sqlite3_value_text16be(sqlite3_value*);
+SQLITE_API int sqlite3_value_type(sqlite3_value*);
+SQLITE_API int sqlite3_value_numeric_type(sqlite3_value*);
+
+/*
+** CAPI3REF: Obtain Aggregate Function Context
+**
+** Implementations of aggregate SQL functions use this
+** routine to allocate memory for storing their state.
+**
+** ^The first time the sqlite3_aggregate_context(C,N) routine is called 
+** for a particular aggregate function, SQLite
+** allocates N of memory, zeroes out that memory, and returns a pointer
+** to the new memory. ^On second and subsequent calls to
+** sqlite3_aggregate_context() for the same aggregate function instance,
+** the same buffer is returned.  Sqlite3_aggregate_context() is normally
+** called once for each invocation of the xStep callback and then one
+** last time when the xFinal callback is invoked.  ^(When no rows match
+** an aggregate query, the xStep() callback of the aggregate function
+** implementation is never called and xFinal() is called exactly once.
+** In those cases, sqlite3_aggregate_context() might be called for the
+** first time from within xFinal().)^
+**
+** ^The sqlite3_aggregate_context(C,N) routine returns a NULL pointer 
+** when first called if N is less than or equal to zero or if a memory
+** allocate error occurs.
+**
+** ^(The amount of space allocated by sqlite3_aggregate_context(C,N) is
+** determined by the N parameter on first successful call.  Changing the
+** value of N in subsequent call to sqlite3_aggregate_context() within
+** the same aggregate function instance will not resize the memory
+** allocation.)^  Within the xFinal callback, it is customary to set
+** N=0 in calls to sqlite3_aggregate_context(C,N) so that no 
+** pointless memory allocations occur.
+**
+** ^SQLite automatically frees the memory allocated by 
+** sqlite3_aggregate_context() when the aggregate query concludes.
+**
+** The first parameter must be a copy of the
+** [sqlite3_context | SQL function context] that is the first parameter
+** to the xStep or xFinal callback routine that implements the aggregate
+** function.
+**
+** This routine must be called from the same thread in which
+** the aggregate SQL function is running.
+*/
+SQLITE_API void *sqlite3_aggregate_context(sqlite3_context*, int nBytes);
+
+/*
+** CAPI3REF: User Data For Functions
+**
+** ^The sqlite3_user_data() interface returns a copy of
+** the pointer that was the pUserData parameter (the 5th parameter)
+** of the [sqlite3_create_function()]
+** and [sqlite3_create_function16()] routines that originally
+** registered the application defined function.
+**
+** This routine must be called from the same thread in which
+** the application-defined function is running.
+*/
+SQLITE_API void *sqlite3_user_data(sqlite3_context*);
+
+/*
+** CAPI3REF: Database Connection For Functions
+**
+** ^The sqlite3_context_db_handle() interface returns a copy of
+** the pointer to the [database connection] (the 1st parameter)
+** of the [sqlite3_create_function()]
+** and [sqlite3_create_function16()] routines that originally
+** registered the application defined function.
+*/
+SQLITE_API sqlite3 *sqlite3_context_db_handle(sqlite3_context*);
+
+/*
+** CAPI3REF: Function Auxiliary Data
+**
+** These functions may be used by (non-aggregate) SQL functions to
+** associate metadata with argument values. If the same value is passed to
+** multiple invocations of the same SQL function during query execution, under
+** some circumstances the associated metadata may be preserved.  An example
+** of where this might be useful is in a regular-expression matching
+** function. The compiled version of the regular expression can be stored as
+** metadata associated with the pattern string.  
+** Then as long as the pattern string remains the same,
+** the compiled regular expression can be reused on multiple
+** invocations of the same function.
+**
+** ^The sqlite3_get_auxdata() interface returns a pointer to the metadata
+** associated by the sqlite3_set_auxdata() function with the Nth argument
+** value to the application-defined function. ^If there is no metadata
+** associated with the function argument, this sqlite3_get_auxdata() interface
+** returns a NULL pointer.
+**
+** ^The sqlite3_set_auxdata(C,N,P,X) interface saves P as metadata for the N-th
+** argument of the application-defined function.  ^Subsequent
+** calls to sqlite3_get_auxdata(C,N) return P from the most recent
+** sqlite3_set_auxdata(C,N,P,X) call if the metadata is still valid or
+** NULL if the metadata has been discarded.
+** ^After each call to sqlite3_set_auxdata(C,N,P,X) where X is not NULL,
+** SQLite will invoke the destructor function X with parameter P exactly
+** once, when the metadata is discarded.
+** SQLite is free to discard the metadata at any time, including: <ul>
+** <li> when the corresponding function parameter changes, or
+** <li> when [sqlite3_reset()] or [sqlite3_finalize()] is called for the
+**      SQL statement, or
+** <li> when sqlite3_set_auxdata() is invoked again on the same parameter, or
+** <li> during the original sqlite3_set_auxdata() call when a memory 
+**      allocation error occurs. </ul>)^
+**
+** Note the last bullet in particular.  The destructor X in 
+** sqlite3_set_auxdata(C,N,P,X) might be called immediately, before the
+** sqlite3_set_auxdata() interface even returns.  Hence sqlite3_set_auxdata()
+** should be called near the end of the function implementation and the
+** function implementation should not make any use of P after
+** sqlite3_set_auxdata() has been called.
+**
+** ^(In practice, metadata is preserved between function calls for
+** function parameters that are compile-time constants, including literal
+** values and [parameters] and expressions composed from the same.)^
+**
+** These routines must be called from the same thread in which
+** the SQL function is running.
+*/
+SQLITE_API void *sqlite3_get_auxdata(sqlite3_context*, int N);
+SQLITE_API void sqlite3_set_auxdata(sqlite3_context*, int N, void*, void (*)(void*));
+
+
+/*
+** CAPI3REF: Constants Defining Special Destructor Behavior
+**
+** These are special values for the destructor that is passed in as the
+** final argument to routines like [sqlite3_result_blob()].  ^If the destructor
+** argument is SQLITE_STATIC, it means that the content pointer is constant
+** and will never change.  It does not need to be destroyed.  ^The
+** SQLITE_TRANSIENT value means that the content will likely change in
+** the near future and that SQLite should make its own private copy of
+** the content before returning.
+**
+** The typedef is necessary to work around problems in certain
+** C++ compilers.
+*/
+typedef void (*sqlite3_destructor_type)(void*);
+#define SQLITE_STATIC      ((sqlite3_destructor_type)0)
+#define SQLITE_TRANSIENT   ((sqlite3_destructor_type)-1)
+
+/*
+** CAPI3REF: Setting The Result Of An SQL Function
+**
+** These routines are used by the xFunc or xFinal callbacks that
+** implement SQL functions and aggregates.  See
+** [sqlite3_create_function()] and [sqlite3_create_function16()]
+** for additional information.
+**
