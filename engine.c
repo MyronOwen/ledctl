@@ -4827,3 +4827,226 @@ SQLITE_API int sqlite3_create_collation16(
   int eTextRep, 
   void *pArg,
   int(*xCompare)(void*,int,const void*,int,const void*)
+);
+
+/*
+** CAPI3REF: Collation Needed Callbacks
+**
+** ^To avoid having to register all collation sequences before a database
+** can be used, a single callback function may be registered with the
+** [database connection] to be invoked whenever an undefined collation
+** sequence is required.
+**
+** ^If the function is registered using the sqlite3_collation_needed() API,
+** then it is passed the names of undefined collation sequences as strings
+** encoded in UTF-8. ^If sqlite3_collation_needed16() is used,
+** the names are passed as UTF-16 in machine native byte order.
+** ^A call to either function replaces the existing collation-needed callback.
+**
+** ^(When the callback is invoked, the first argument passed is a copy
+** of the second argument to sqlite3_collation_needed() or
+** sqlite3_collation_needed16().  The second argument is the database
+** connection.  The third argument is one of [SQLITE_UTF8], [SQLITE_UTF16BE],
+** or [SQLITE_UTF16LE], indicating the most desirable form of the collation
+** sequence function required.  The fourth parameter is the name of the
+** required collation sequence.)^
+**
+** The callback function should register the desired collation using
+** [sqlite3_create_collation()], [sqlite3_create_collation16()], or
+** [sqlite3_create_collation_v2()].
+*/
+SQLITE_API int sqlite3_collation_needed(
+  sqlite3*, 
+  void*, 
+  void(*)(void*,sqlite3*,int eTextRep,const char*)
+);
+SQLITE_API int sqlite3_collation_needed16(
+  sqlite3*, 
+  void*,
+  void(*)(void*,sqlite3*,int eTextRep,const void*)
+);
+
+#ifdef SQLITE_HAS_CODEC
+/*
+** Specify the key for an encrypted database.  This routine should be
+** called right after sqlite3_open().
+**
+** The code to implement this API is not available in the public release
+** of SQLite.
+*/
+SQLITE_API int sqlite3_key(
+  sqlite3 *db,                   /* Database to be rekeyed */
+  const void *pKey, int nKey     /* The key */
+);
+SQLITE_API int sqlite3_key_v2(
+  sqlite3 *db,                   /* Database to be rekeyed */
+  const char *zDbName,           /* Name of the database */
+  const void *pKey, int nKey     /* The key */
+);
+
+/*
+** Change the key on an open database.  If the current database is not
+** encrypted, this routine will encrypt it.  If pNew==0 or nNew==0, the
+** database is decrypted.
+**
+** The code to implement this API is not available in the public release
+** of SQLite.
+*/
+SQLITE_API int sqlite3_rekey(
+  sqlite3 *db,                   /* Database to be rekeyed */
+  const void *pKey, int nKey     /* The new key */
+);
+SQLITE_API int sqlite3_rekey_v2(
+  sqlite3 *db,                   /* Database to be rekeyed */
+  const char *zDbName,           /* Name of the database */
+  const void *pKey, int nKey     /* The new key */
+);
+
+/*
+** Specify the activation key for a SEE database.  Unless 
+** activated, none of the SEE routines will work.
+*/
+SQLITE_API void sqlite3_activate_see(
+  const char *zPassPhrase        /* Activation phrase */
+);
+#endif
+
+#ifdef SQLITE_ENABLE_CEROD
+/*
+** Specify the activation key for a CEROD database.  Unless 
+** activated, none of the CEROD routines will work.
+*/
+SQLITE_API void sqlite3_activate_cerod(
+  const char *zPassPhrase        /* Activation phrase */
+);
+#endif
+
+/*
+** CAPI3REF: Suspend Execution For A Short Time
+**
+** The sqlite3_sleep() function causes the current thread to suspend execution
+** for at least a number of milliseconds specified in its parameter.
+**
+** If the operating system does not support sleep requests with
+** millisecond time resolution, then the time will be rounded up to
+** the nearest second. The number of milliseconds of sleep actually
+** requested from the operating system is returned.
+**
+** ^SQLite implements this interface by calling the xSleep()
+** method of the default [sqlite3_vfs] object.  If the xSleep() method
+** of the default VFS is not implemented correctly, or not implemented at
+** all, then the behavior of sqlite3_sleep() may deviate from the description
+** in the previous paragraphs.
+*/
+SQLITE_API int sqlite3_sleep(int);
+
+/*
+** CAPI3REF: Name Of The Folder Holding Temporary Files
+**
+** ^(If this global variable is made to point to a string which is
+** the name of a folder (a.k.a. directory), then all temporary files
+** created by SQLite when using a built-in [sqlite3_vfs | VFS]
+** will be placed in that directory.)^  ^If this variable
+** is a NULL pointer, then SQLite performs a search for an appropriate
+** temporary file directory.
+**
+** Applications are strongly discouraged from using this global variable.
+** It is required to set a temporary folder on Windows Runtime (WinRT).
+** But for all other platforms, it is highly recommended that applications
+** neither read nor write this variable.  This global variable is a relic
+** that exists for backwards compatibility of legacy applications and should
+** be avoided in new projects.
+**
+** It is not safe to read or modify this variable in more than one
+** thread at a time.  It is not safe to read or modify this variable
+** if a [database connection] is being used at the same time in a separate
+** thread.
+** It is intended that this variable be set once
+** as part of process initialization and before any SQLite interface
+** routines have been called and that this variable remain unchanged
+** thereafter.
+**
+** ^The [temp_store_directory pragma] may modify this variable and cause
+** it to point to memory obtained from [sqlite3_malloc].  ^Furthermore,
+** the [temp_store_directory pragma] always assumes that any string
+** that this variable points to is held in memory obtained from 
+** [sqlite3_malloc] and the pragma may attempt to free that memory
+** using [sqlite3_free].
+** Hence, if this variable is modified directly, either it should be
+** made NULL or made to point to memory obtained from [sqlite3_malloc]
+** or else the use of the [temp_store_directory pragma] should be avoided.
+** Except when requested by the [temp_store_directory pragma], SQLite
+** does not free the memory that sqlite3_temp_directory points to.  If
+** the application wants that memory to be freed, it must do
+** so itself, taking care to only do so after all [database connection]
+** objects have been destroyed.
+**
+** <b>Note to Windows Runtime users:</b>  The temporary directory must be set
+** prior to calling [sqlite3_open] or [sqlite3_open_v2].  Otherwise, various
+** features that require the use of temporary files may fail.  Here is an
+** example of how to do this using C++ with the Windows Runtime:
+**
+** <blockquote><pre>
+** LPCWSTR zPath = Windows::Storage::ApplicationData::Current->
+** &nbsp;     TemporaryFolder->Path->Data();
+** char zPathBuf&#91;MAX_PATH + 1&#93;;
+** memset(zPathBuf, 0, sizeof(zPathBuf));
+** WideCharToMultiByte(CP_UTF8, 0, zPath, -1, zPathBuf, sizeof(zPathBuf),
+** &nbsp;     NULL, NULL);
+** sqlite3_temp_directory = sqlite3_mprintf("%s", zPathBuf);
+** </pre></blockquote>
+*/
+SQLITE_API char *sqlite3_temp_directory;
+
+/*
+** CAPI3REF: Name Of The Folder Holding Database Files
+**
+** ^(If this global variable is made to point to a string which is
+** the name of a folder (a.k.a. directory), then all database files
+** specified with a relative pathname and created or accessed by
+** SQLite when using a built-in windows [sqlite3_vfs | VFS] will be assumed
+** to be relative to that directory.)^ ^If this variable is a NULL
+** pointer, then SQLite assumes that all database files specified
+** with a relative pathname are relative to the current directory
+** for the process.  Only the windows VFS makes use of this global
+** variable; it is ignored by the unix VFS.
+**
+** Changing the value of this variable while a database connection is
+** open can result in a corrupt database.
+**
+** It is not safe to read or modify this variable in more than one
+** thread at a time.  It is not safe to read or modify this variable
+** if a [database connection] is being used at the same time in a separate
+** thread.
+** It is intended that this variable be set once
+** as part of process initialization and before any SQLite interface
+** routines have been called and that this variable remain unchanged
+** thereafter.
+**
+** ^The [data_store_directory pragma] may modify this variable and cause
+** it to point to memory obtained from [sqlite3_malloc].  ^Furthermore,
+** the [data_store_directory pragma] always assumes that any string
+** that this variable points to is held in memory obtained from 
+** [sqlite3_malloc] and the pragma may attempt to free that memory
+** using [sqlite3_free].
+** Hence, if this variable is modified directly, either it should be
+** made NULL or made to point to memory obtained from [sqlite3_malloc]
+** or else the use of the [data_store_directory pragma] should be avoided.
+*/
+SQLITE_API char *sqlite3_data_directory;
+
+/*
+** CAPI3REF: Test For Auto-Commit Mode
+** KEYWORDS: {autocommit mode}
+**
+** ^The sqlite3_get_autocommit() interface returns non-zero or
+** zero if the given database connection is or is not in autocommit mode,
+** respectively.  ^Autocommit mode is on by default.
+** ^Autocommit mode is disabled by a [BEGIN] statement.
+** ^Autocommit mode is re-enabled by a [COMMIT] or [ROLLBACK].
+**
+** If certain kinds of errors occur on a statement within a multi-statement
+** transaction (errors including [SQLITE_FULL], [SQLITE_IOERR],
+** [SQLITE_NOMEM], [SQLITE_BUSY], and [SQLITE_INTERRUPT]) then the
+** transaction might be rolled back automatically.  The only way to
+** find out whether SQLite automatically rolled back the transaction after
