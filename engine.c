@@ -5050,3 +5050,227 @@ SQLITE_API char *sqlite3_data_directory;
 ** [SQLITE_NOMEM], [SQLITE_BUSY], and [SQLITE_INTERRUPT]) then the
 ** transaction might be rolled back automatically.  The only way to
 ** find out whether SQLite automatically rolled back the transaction after
+** an error is to use this function.
+**
+** If another thread changes the autocommit status of the database
+** connection while this routine is running, then the return value
+** is undefined.
+*/
+SQLITE_API int sqlite3_get_autocommit(sqlite3*);
+
+/*
+** CAPI3REF: Find The Database Handle Of A Prepared Statement
+**
+** ^The sqlite3_db_handle interface returns the [database connection] handle
+** to which a [prepared statement] belongs.  ^The [database connection]
+** returned by sqlite3_db_handle is the same [database connection]
+** that was the first argument
+** to the [sqlite3_prepare_v2()] call (or its variants) that was used to
+** create the statement in the first place.
+*/
+SQLITE_API sqlite3 *sqlite3_db_handle(sqlite3_stmt*);
+
+/*
+** CAPI3REF: Return The Filename For A Database Connection
+**
+** ^The sqlite3_db_filename(D,N) interface returns a pointer to a filename
+** associated with database N of connection D.  ^The main database file
+** has the name "main".  If there is no attached database N on the database
+** connection D, or if database N is a temporary or in-memory database, then
+** a NULL pointer is returned.
+**
+** ^The filename returned by this function is the output of the
+** xFullPathname method of the [VFS].  ^In other words, the filename
+** will be an absolute pathname, even if the filename used
+** to open the database originally was a URI or relative pathname.
+*/
+SQLITE_API const char *sqlite3_db_filename(sqlite3 *db, const char *zDbName);
+
+/*
+** CAPI3REF: Determine if a database is read-only
+**
+** ^The sqlite3_db_readonly(D,N) interface returns 1 if the database N
+** of connection D is read-only, 0 if it is read/write, or -1 if N is not
+** the name of a database on connection D.
+*/
+SQLITE_API int sqlite3_db_readonly(sqlite3 *db, const char *zDbName);
+
+/*
+** CAPI3REF: Find the next prepared statement
+**
+** ^This interface returns a pointer to the next [prepared statement] after
+** pStmt associated with the [database connection] pDb.  ^If pStmt is NULL
+** then this interface returns a pointer to the first prepared statement
+** associated with the database connection pDb.  ^If no prepared statement
+** satisfies the conditions of this routine, it returns NULL.
+**
+** The [database connection] pointer D in a call to
+** [sqlite3_next_stmt(D,S)] must refer to an open database
+** connection and in particular must not be a NULL pointer.
+*/
+SQLITE_API sqlite3_stmt *sqlite3_next_stmt(sqlite3 *pDb, sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Commit And Rollback Notification Callbacks
+**
+** ^The sqlite3_commit_hook() interface registers a callback
+** function to be invoked whenever a transaction is [COMMIT | committed].
+** ^Any callback set by a previous call to sqlite3_commit_hook()
+** for the same database connection is overridden.
+** ^The sqlite3_rollback_hook() interface registers a callback
+** function to be invoked whenever a transaction is [ROLLBACK | rolled back].
+** ^Any callback set by a previous call to sqlite3_rollback_hook()
+** for the same database connection is overridden.
+** ^The pArg argument is passed through to the callback.
+** ^If the callback on a commit hook function returns non-zero,
+** then the commit is converted into a rollback.
+**
+** ^The sqlite3_commit_hook(D,C,P) and sqlite3_rollback_hook(D,C,P) functions
+** return the P argument from the previous call of the same function
+** on the same [database connection] D, or NULL for
+** the first call for each function on D.
+**
+** The commit and rollback hook callbacks are not reentrant.
+** The callback implementation must not do anything that will modify
+** the database connection that invoked the callback.  Any actions
+** to modify the database connection must be deferred until after the
+** completion of the [sqlite3_step()] call that triggered the commit
+** or rollback hook in the first place.
+** Note that running any other SQL statements, including SELECT statements,
+** or merely calling [sqlite3_prepare_v2()] and [sqlite3_step()] will modify
+** the database connections for the meaning of "modify" in this paragraph.
+**
+** ^Registering a NULL function disables the callback.
+**
+** ^When the commit hook callback routine returns zero, the [COMMIT]
+** operation is allowed to continue normally.  ^If the commit hook
+** returns non-zero, then the [COMMIT] is converted into a [ROLLBACK].
+** ^The rollback hook is invoked on a rollback that results from a commit
+** hook returning non-zero, just as it would be with any other rollback.
+**
+** ^For the purposes of this API, a transaction is said to have been
+** rolled back if an explicit "ROLLBACK" statement is executed, or
+** an error or constraint causes an implicit rollback to occur.
+** ^The rollback callback is not invoked if a transaction is
+** automatically rolled back because the database connection is closed.
+**
+** See also the [sqlite3_update_hook()] interface.
+*/
+SQLITE_API void *sqlite3_commit_hook(sqlite3*, int(*)(void*), void*);
+SQLITE_API void *sqlite3_rollback_hook(sqlite3*, void(*)(void *), void*);
+
+/*
+** CAPI3REF: Data Change Notification Callbacks
+**
+** ^The sqlite3_update_hook() interface registers a callback function
+** with the [database connection] identified by the first argument
+** to be invoked whenever a row is updated, inserted or deleted in
+** a rowid table.
+** ^Any callback set by a previous call to this function
+** for the same database connection is overridden.
+**
+** ^The second argument is a pointer to the function to invoke when a
+** row is updated, inserted or deleted in a rowid table.
+** ^The first argument to the callback is a copy of the third argument
+** to sqlite3_update_hook().
+** ^The second callback argument is one of [SQLITE_INSERT], [SQLITE_DELETE],
+** or [SQLITE_UPDATE], depending on the operation that caused the callback
+** to be invoked.
+** ^The third and fourth arguments to the callback contain pointers to the
+** database and table name containing the affected row.
+** ^The final callback parameter is the [rowid] of the row.
+** ^In the case of an update, this is the [rowid] after the update takes place.
+**
+** ^(The update hook is not invoked when internal system tables are
+** modified (i.e. sqlite_master and sqlite_sequence).)^
+** ^The update hook is not invoked when [WITHOUT ROWID] tables are modified.
+**
+** ^In the current implementation, the update hook
+** is not invoked when duplication rows are deleted because of an
+** [ON CONFLICT | ON CONFLICT REPLACE] clause.  ^Nor is the update hook
+** invoked when rows are deleted using the [truncate optimization].
+** The exceptions defined in this paragraph might change in a future
+** release of SQLite.
+**
+** The update hook implementation must not do anything that will modify
+** the database connection that invoked the update hook.  Any actions
+** to modify the database connection must be deferred until after the
+** completion of the [sqlite3_step()] call that triggered the update hook.
+** Note that [sqlite3_prepare_v2()] and [sqlite3_step()] both modify their
+** database connections for the meaning of "modify" in this paragraph.
+**
+** ^The sqlite3_update_hook(D,C,P) function
+** returns the P argument from the previous call
+** on the same [database connection] D, or NULL for
+** the first call on D.
+**
+** See also the [sqlite3_commit_hook()] and [sqlite3_rollback_hook()]
+** interfaces.
+*/
+SQLITE_API void *sqlite3_update_hook(
+  sqlite3*, 
+  void(*)(void *,int ,char const *,char const *,sqlite3_int64),
+  void*
+);
+
+/*
+** CAPI3REF: Enable Or Disable Shared Pager Cache
+**
+** ^(This routine enables or disables the sharing of the database cache
+** and schema data structures between [database connection | connections]
+** to the same database. Sharing is enabled if the argument is true
+** and disabled if the argument is false.)^
+**
+** ^Cache sharing is enabled and disabled for an entire process.
+** This is a change as of SQLite version 3.5.0. In prior versions of SQLite,
+** sharing was enabled or disabled for each thread separately.
+**
+** ^(The cache sharing mode set by this interface effects all subsequent
+** calls to [sqlite3_open()], [sqlite3_open_v2()], and [sqlite3_open16()].
+** Existing database connections continue use the sharing mode
+** that was in effect at the time they were opened.)^
+**
+** ^(This routine returns [SQLITE_OK] if shared cache was enabled or disabled
+** successfully.  An [error code] is returned otherwise.)^
+**
+** ^Shared cache is disabled by default. But this might change in
+** future releases of SQLite.  Applications that care about shared
+** cache setting should set it explicitly.
+**
+** This interface is threadsafe on processors where writing a
+** 32-bit integer is atomic.
+**
+** See Also:  [SQLite Shared-Cache Mode]
+*/
+SQLITE_API int sqlite3_enable_shared_cache(int);
+
+/*
+** CAPI3REF: Attempt To Free Heap Memory
+**
+** ^The sqlite3_release_memory() interface attempts to free N bytes
+** of heap memory by deallocating non-essential memory allocations
+** held by the database library.   Memory used to cache database
+** pages to improve performance is an example of non-essential memory.
+** ^sqlite3_release_memory() returns the number of bytes actually freed,
+** which might be more or less than the amount requested.
+** ^The sqlite3_release_memory() routine is a no-op returning zero
+** if SQLite is not compiled with [SQLITE_ENABLE_MEMORY_MANAGEMENT].
+**
+** See also: [sqlite3_db_release_memory()]
+*/
+SQLITE_API int sqlite3_release_memory(int);
+
+/*
+** CAPI3REF: Free Memory Used By A Database Connection
+**
+** ^The sqlite3_db_release_memory(D) interface attempts to free as much heap
+** memory as possible from database connection D. Unlike the
+** [sqlite3_release_memory()] interface, this interface is in effect even
+** when the [SQLITE_ENABLE_MEMORY_MANAGEMENT] compile-time option is
+** omitted.
+**
+** See also: [sqlite3_release_memory()]
+*/
+SQLITE_API int sqlite3_db_release_memory(sqlite3*);
+
+/*
