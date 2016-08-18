@@ -6601,3 +6601,231 @@ SQLITE_API int sqlite3_db_status(sqlite3*, int op, int *pCur, int *pHiwtr, int r
 ** if a discontinued or unsupported verb is invoked.
 **
 ** <dl>
+** [[SQLITE_DBSTATUS_LOOKASIDE_USED]] ^(<dt>SQLITE_DBSTATUS_LOOKASIDE_USED</dt>
+** <dd>This parameter returns the number of lookaside memory slots currently
+** checked out.</dd>)^
+**
+** [[SQLITE_DBSTATUS_LOOKASIDE_HIT]] ^(<dt>SQLITE_DBSTATUS_LOOKASIDE_HIT</dt>
+** <dd>This parameter returns the number malloc attempts that were 
+** satisfied using lookaside memory. Only the high-water value is meaningful;
+** the current value is always zero.)^
+**
+** [[SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE]]
+** ^(<dt>SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE</dt>
+** <dd>This parameter returns the number malloc attempts that might have
+** been satisfied using lookaside memory but failed due to the amount of
+** memory requested being larger than the lookaside slot size.
+** Only the high-water value is meaningful;
+** the current value is always zero.)^
+**
+** [[SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL]]
+** ^(<dt>SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL</dt>
+** <dd>This parameter returns the number malloc attempts that might have
+** been satisfied using lookaside memory but failed due to all lookaside
+** memory already being in use.
+** Only the high-water value is meaningful;
+** the current value is always zero.)^
+**
+** [[SQLITE_DBSTATUS_CACHE_USED]] ^(<dt>SQLITE_DBSTATUS_CACHE_USED</dt>
+** <dd>This parameter returns the approximate number of bytes of heap
+** memory used by all pager caches associated with the database connection.)^
+** ^The highwater mark associated with SQLITE_DBSTATUS_CACHE_USED is always 0.
+**
+** [[SQLITE_DBSTATUS_SCHEMA_USED]] ^(<dt>SQLITE_DBSTATUS_SCHEMA_USED</dt>
+** <dd>This parameter returns the approximate number of bytes of heap
+** memory used to store the schema for all databases associated
+** with the connection - main, temp, and any [ATTACH]-ed databases.)^ 
+** ^The full amount of memory used by the schemas is reported, even if the
+** schema memory is shared with other database connections due to
+** [shared cache mode] being enabled.
+** ^The highwater mark associated with SQLITE_DBSTATUS_SCHEMA_USED is always 0.
+**
+** [[SQLITE_DBSTATUS_STMT_USED]] ^(<dt>SQLITE_DBSTATUS_STMT_USED</dt>
+** <dd>This parameter returns the approximate number of bytes of heap
+** and lookaside memory used by all prepared statements associated with
+** the database connection.)^
+** ^The highwater mark associated with SQLITE_DBSTATUS_STMT_USED is always 0.
+** </dd>
+**
+** [[SQLITE_DBSTATUS_CACHE_HIT]] ^(<dt>SQLITE_DBSTATUS_CACHE_HIT</dt>
+** <dd>This parameter returns the number of pager cache hits that have
+** occurred.)^ ^The highwater mark associated with SQLITE_DBSTATUS_CACHE_HIT 
+** is always 0.
+** </dd>
+**
+** [[SQLITE_DBSTATUS_CACHE_MISS]] ^(<dt>SQLITE_DBSTATUS_CACHE_MISS</dt>
+** <dd>This parameter returns the number of pager cache misses that have
+** occurred.)^ ^The highwater mark associated with SQLITE_DBSTATUS_CACHE_MISS 
+** is always 0.
+** </dd>
+**
+** [[SQLITE_DBSTATUS_CACHE_WRITE]] ^(<dt>SQLITE_DBSTATUS_CACHE_WRITE</dt>
+** <dd>This parameter returns the number of dirty cache entries that have
+** been written to disk. Specifically, the number of pages written to the
+** wal file in wal mode databases, or the number of pages written to the
+** database file in rollback mode databases. Any pages written as part of
+** transaction rollback or database recovery operations are not included.
+** If an IO or other error occurs while writing a page to disk, the effect
+** on subsequent SQLITE_DBSTATUS_CACHE_WRITE requests is undefined.)^ ^The
+** highwater mark associated with SQLITE_DBSTATUS_CACHE_WRITE is always 0.
+** </dd>
+**
+** [[SQLITE_DBSTATUS_DEFERRED_FKS]] ^(<dt>SQLITE_DBSTATUS_DEFERRED_FKS</dt>
+** <dd>This parameter returns zero for the current value if and only if
+** all foreign key constraints (deferred or immediate) have been
+** resolved.)^  ^The highwater mark is always 0.
+** </dd>
+** </dl>
+*/
+#define SQLITE_DBSTATUS_LOOKASIDE_USED       0
+#define SQLITE_DBSTATUS_CACHE_USED           1
+#define SQLITE_DBSTATUS_SCHEMA_USED          2
+#define SQLITE_DBSTATUS_STMT_USED            3
+#define SQLITE_DBSTATUS_LOOKASIDE_HIT        4
+#define SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE  5
+#define SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL  6
+#define SQLITE_DBSTATUS_CACHE_HIT            7
+#define SQLITE_DBSTATUS_CACHE_MISS           8
+#define SQLITE_DBSTATUS_CACHE_WRITE          9
+#define SQLITE_DBSTATUS_DEFERRED_FKS        10
+#define SQLITE_DBSTATUS_MAX                 10   /* Largest defined DBSTATUS */
+
+
+/*
+** CAPI3REF: Prepared Statement Status
+**
+** ^(Each prepared statement maintains various
+** [SQLITE_STMTSTATUS counters] that measure the number
+** of times it has performed specific operations.)^  These counters can
+** be used to monitor the performance characteristics of the prepared
+** statements.  For example, if the number of table steps greatly exceeds
+** the number of table searches or result rows, that would tend to indicate
+** that the prepared statement is using a full table scan rather than
+** an index.  
+**
+** ^(This interface is used to retrieve and reset counter values from
+** a [prepared statement].  The first argument is the prepared statement
+** object to be interrogated.  The second argument
+** is an integer code for a specific [SQLITE_STMTSTATUS counter]
+** to be interrogated.)^
+** ^The current value of the requested counter is returned.
+** ^If the resetFlg is true, then the counter is reset to zero after this
+** interface call returns.
+**
+** See also: [sqlite3_status()] and [sqlite3_db_status()].
+*/
+SQLITE_API int sqlite3_stmt_status(sqlite3_stmt*, int op,int resetFlg);
+
+/*
+** CAPI3REF: Status Parameters for prepared statements
+** KEYWORDS: {SQLITE_STMTSTATUS counter} {SQLITE_STMTSTATUS counters}
+**
+** These preprocessor macros define integer codes that name counter
+** values associated with the [sqlite3_stmt_status()] interface.
+** The meanings of the various counters are as follows:
+**
+** <dl>
+** [[SQLITE_STMTSTATUS_FULLSCAN_STEP]] <dt>SQLITE_STMTSTATUS_FULLSCAN_STEP</dt>
+** <dd>^This is the number of times that SQLite has stepped forward in
+** a table as part of a full table scan.  Large numbers for this counter
+** may indicate opportunities for performance improvement through 
+** careful use of indices.</dd>
+**
+** [[SQLITE_STMTSTATUS_SORT]] <dt>SQLITE_STMTSTATUS_SORT</dt>
+** <dd>^This is the number of sort operations that have occurred.
+** A non-zero value in this counter may indicate an opportunity to
+** improvement performance through careful use of indices.</dd>
+**
+** [[SQLITE_STMTSTATUS_AUTOINDEX]] <dt>SQLITE_STMTSTATUS_AUTOINDEX</dt>
+** <dd>^This is the number of rows inserted into transient indices that
+** were created automatically in order to help joins run faster.
+** A non-zero value in this counter may indicate an opportunity to
+** improvement performance by adding permanent indices that do not
+** need to be reinitialized each time the statement is run.</dd>
+**
+** [[SQLITE_STMTSTATUS_VM_STEP]] <dt>SQLITE_STMTSTATUS_VM_STEP</dt>
+** <dd>^This is the number of virtual machine operations executed
+** by the prepared statement if that number is less than or equal
+** to 2147483647.  The number of virtual machine operations can be 
+** used as a proxy for the total work done by the prepared statement.
+** If the number of virtual machine operations exceeds 2147483647
+** then the value returned by this statement status code is undefined.
+** </dd>
+** </dl>
+*/
+#define SQLITE_STMTSTATUS_FULLSCAN_STEP     1
+#define SQLITE_STMTSTATUS_SORT              2
+#define SQLITE_STMTSTATUS_AUTOINDEX         3
+#define SQLITE_STMTSTATUS_VM_STEP           4
+
+/*
+** CAPI3REF: Custom Page Cache Object
+**
+** The sqlite3_pcache type is opaque.  It is implemented by
+** the pluggable module.  The SQLite core has no knowledge of
+** its size or internal structure and never deals with the
+** sqlite3_pcache object except by holding and passing pointers
+** to the object.
+**
+** See [sqlite3_pcache_methods2] for additional information.
+*/
+typedef struct sqlite3_pcache sqlite3_pcache;
+
+/*
+** CAPI3REF: Custom Page Cache Object
+**
+** The sqlite3_pcache_page object represents a single page in the
+** page cache.  The page cache will allocate instances of this
+** object.  Various methods of the page cache use pointers to instances
+** of this object as parameters or as their return value.
+**
+** See [sqlite3_pcache_methods2] for additional information.
+*/
+typedef struct sqlite3_pcache_page sqlite3_pcache_page;
+struct sqlite3_pcache_page {
+  void *pBuf;        /* The content of the page */
+  void *pExtra;      /* Extra information associated with the page */
+};
+
+/*
+** CAPI3REF: Application Defined Page Cache.
+** KEYWORDS: {page cache}
+**
+** ^(The [sqlite3_config]([SQLITE_CONFIG_PCACHE2], ...) interface can
+** register an alternative page cache implementation by passing in an 
+** instance of the sqlite3_pcache_methods2 structure.)^
+** In many applications, most of the heap memory allocated by 
+** SQLite is used for the page cache.
+** By implementing a 
+** custom page cache using this API, an application can better control
+** the amount of memory consumed by SQLite, the way in which 
+** that memory is allocated and released, and the policies used to 
+** determine exactly which parts of a database file are cached and for 
+** how long.
+**
+** The alternative page cache mechanism is an
+** extreme measure that is only needed by the most demanding applications.
+** The built-in page cache is recommended for most uses.
+**
+** ^(The contents of the sqlite3_pcache_methods2 structure are copied to an
+** internal buffer by SQLite within the call to [sqlite3_config].  Hence
+** the application may discard the parameter after the call to
+** [sqlite3_config()] returns.)^
+**
+** [[the xInit() page cache method]]
+** ^(The xInit() method is called once for each effective 
+** call to [sqlite3_initialize()])^
+** (usually only once during the lifetime of the process). ^(The xInit()
+** method is passed a copy of the sqlite3_pcache_methods2.pArg value.)^
+** The intent of the xInit() method is to set up global data structures 
+** required by the custom page cache implementation. 
+** ^(If the xInit() method is NULL, then the 
+** built-in default page cache is used instead of the application defined
+** page cache.)^
+**
+** [[the xShutdown() page cache method]]
+** ^The xShutdown() method is called by [sqlite3_shutdown()].
+** It can be used to clean up 
+** any outstanding resources before process shutdown, if required.
+** ^The xShutdown() method may be NULL.
+**
