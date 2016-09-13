@@ -7975,3 +7975,234 @@ struct sqlite3_rtree_query_info {
 ** The code generator for compound SELECT statements does one
 ** level of recursion for each term.  A stack overflow can result
 ** if the number of terms is too large.  In practice, most SQL
+** never has more than 3 or 4 terms.  Use a value of 0 to disable
+** any limit on the number of terms in a compount SELECT.
+*/
+#ifndef SQLITE_MAX_COMPOUND_SELECT
+# define SQLITE_MAX_COMPOUND_SELECT 500
+#endif
+
+/*
+** The maximum number of opcodes in a VDBE program.
+** Not currently enforced.
+*/
+#ifndef SQLITE_MAX_VDBE_OP
+# define SQLITE_MAX_VDBE_OP 25000
+#endif
+
+/*
+** The maximum number of arguments to an SQL function.
+*/
+#ifndef SQLITE_MAX_FUNCTION_ARG
+# define SQLITE_MAX_FUNCTION_ARG 127
+#endif
+
+/*
+** The maximum number of in-memory pages to use for the main database
+** table and for temporary tables.  The SQLITE_DEFAULT_CACHE_SIZE
+*/
+#ifndef SQLITE_DEFAULT_CACHE_SIZE
+# define SQLITE_DEFAULT_CACHE_SIZE  2000
+#endif
+#ifndef SQLITE_DEFAULT_TEMP_CACHE_SIZE
+# define SQLITE_DEFAULT_TEMP_CACHE_SIZE  500
+#endif
+
+/*
+** The default number of frames to accumulate in the log file before
+** checkpointing the database in WAL mode.
+*/
+#ifndef SQLITE_DEFAULT_WAL_AUTOCHECKPOINT
+# define SQLITE_DEFAULT_WAL_AUTOCHECKPOINT  1000
+#endif
+
+/*
+** The maximum number of attached databases.  This must be between 0
+** and 62.  The upper bound on 62 is because a 64-bit integer bitmap
+** is used internally to track attached databases.
+*/
+#ifndef SQLITE_MAX_ATTACHED
+# define SQLITE_MAX_ATTACHED 10
+#endif
+
+
+/*
+** The maximum value of a ?nnn wildcard that the parser will accept.
+*/
+#ifndef SQLITE_MAX_VARIABLE_NUMBER
+# define SQLITE_MAX_VARIABLE_NUMBER 999
+#endif
+
+/* Maximum page size.  The upper bound on this value is 65536.  This a limit
+** imposed by the use of 16-bit offsets within each page.
+**
+** Earlier versions of SQLite allowed the user to change this value at
+** compile time. This is no longer permitted, on the grounds that it creates
+** a library that is technically incompatible with an SQLite library 
+** compiled with a different limit. If a process operating on a database 
+** with a page-size of 65536 bytes crashes, then an instance of SQLite 
+** compiled with the default page-size limit will not be able to rollback 
+** the aborted transaction. This could lead to database corruption.
+*/
+#ifdef SQLITE_MAX_PAGE_SIZE
+# undef SQLITE_MAX_PAGE_SIZE
+#endif
+#define SQLITE_MAX_PAGE_SIZE 65536
+
+
+/*
+** The default size of a database page.
+*/
+#ifndef SQLITE_DEFAULT_PAGE_SIZE
+# define SQLITE_DEFAULT_PAGE_SIZE 1024
+#endif
+#if SQLITE_DEFAULT_PAGE_SIZE>SQLITE_MAX_PAGE_SIZE
+# undef SQLITE_DEFAULT_PAGE_SIZE
+# define SQLITE_DEFAULT_PAGE_SIZE SQLITE_MAX_PAGE_SIZE
+#endif
+
+/*
+** Ordinarily, if no value is explicitly provided, SQLite creates databases
+** with page size SQLITE_DEFAULT_PAGE_SIZE. However, based on certain
+** device characteristics (sector-size and atomic write() support),
+** SQLite may choose a larger value. This constant is the maximum value
+** SQLite will choose on its own.
+*/
+#ifndef SQLITE_MAX_DEFAULT_PAGE_SIZE
+# define SQLITE_MAX_DEFAULT_PAGE_SIZE 8192
+#endif
+#if SQLITE_MAX_DEFAULT_PAGE_SIZE>SQLITE_MAX_PAGE_SIZE
+# undef SQLITE_MAX_DEFAULT_PAGE_SIZE
+# define SQLITE_MAX_DEFAULT_PAGE_SIZE SQLITE_MAX_PAGE_SIZE
+#endif
+
+
+/*
+** Maximum number of pages in one database file.
+**
+** This is really just the default value for the max_page_count pragma.
+** This value can be lowered (or raised) at run-time using that the
+** max_page_count macro.
+*/
+#ifndef SQLITE_MAX_PAGE_COUNT
+# define SQLITE_MAX_PAGE_COUNT 1073741823
+#endif
+
+/*
+** Maximum length (in bytes) of the pattern in a LIKE or GLOB
+** operator.
+*/
+#ifndef SQLITE_MAX_LIKE_PATTERN_LENGTH
+# define SQLITE_MAX_LIKE_PATTERN_LENGTH 50000
+#endif
+
+/*
+** Maximum depth of recursion for triggers.
+**
+** A value of 1 means that a trigger program will not be able to itself
+** fire any triggers. A value of 0 means that no trigger programs at all 
+** may be executed.
+*/
+#ifndef SQLITE_MAX_TRIGGER_DEPTH
+# define SQLITE_MAX_TRIGGER_DEPTH 1000
+#endif
+
+/************** End of sqliteLimit.h *****************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+
+/* Disable nuisance warnings on Borland compilers */
+#if defined(__BORLANDC__)
+#pragma warn -rch /* unreachable code */
+#pragma warn -ccc /* Condition is always true or false */
+#pragma warn -aus /* Assigned value is never used */
+#pragma warn -csu /* Comparing signed and unsigned */
+#pragma warn -spa /* Suspicious pointer arithmetic */
+#endif
+
+/*
+** Include standard header files as necessary
+*/
+#ifdef HAVE_STDINT_H
+#include <stdint.h>
+#endif
+#ifdef HAVE_INTTYPES_H
+#include <inttypes.h>
+#endif
+
+/*
+** The following macros are used to cast pointers to integers and
+** integers to pointers.  The way you do this varies from one compiler
+** to the next, so we have developed the following set of #if statements
+** to generate appropriate macros for a wide range of compilers.
+**
+** The correct "ANSI" way to do this is to use the intptr_t type. 
+** Unfortunately, that typedef is not available on all compilers, or
+** if it is available, it requires an #include of specific headers
+** that vary from one machine to the next.
+**
+** Ticket #3860:  The llvm-gcc-4.2 compiler from Apple chokes on
+** the ((void*)&((char*)0)[X]) construct.  But MSVC chokes on ((void*)(X)).
+** So we have to define the macros in different ways depending on the
+** compiler.
+*/
+#if defined(__PTRDIFF_TYPE__)  /* This case should work for GCC */
+# define SQLITE_INT_TO_PTR(X)  ((void*)(__PTRDIFF_TYPE__)(X))
+# define SQLITE_PTR_TO_INT(X)  ((int)(__PTRDIFF_TYPE__)(X))
+#elif !defined(__GNUC__)       /* Works for compilers other than LLVM */
+# define SQLITE_INT_TO_PTR(X)  ((void*)&((char*)0)[X])
+# define SQLITE_PTR_TO_INT(X)  ((int)(((char*)X)-(char*)0))
+#elif defined(HAVE_STDINT_H)   /* Use this case if we have ANSI headers */
+# define SQLITE_INT_TO_PTR(X)  ((void*)(intptr_t)(X))
+# define SQLITE_PTR_TO_INT(X)  ((int)(intptr_t)(X))
+#else                          /* Generates a warning - but it always works */
+# define SQLITE_INT_TO_PTR(X)  ((void*)(X))
+# define SQLITE_PTR_TO_INT(X)  ((int)(X))
+#endif
+
+/*
+** A macro to hint to the compiler that a function should not be
+** inlined.
+*/
+#if defined(__GNUC__)
+#  define SQLITE_NOINLINE  __attribute__((noinline))
+#elif defined(_MSC_VER) && _MSC_VER>=1310
+#  define SQLITE_NOINLINE  __declspec(noinline)
+#else
+#  define SQLITE_NOINLINE
+#endif
+
+/*
+** The SQLITE_THREADSAFE macro must be defined as 0, 1, or 2.
+** 0 means mutexes are permanently disable and the library is never
+** threadsafe.  1 means the library is serialized which is the highest
+** level of threadsafety.  2 means the library is multithreaded - multiple
+** threads can use SQLite as long as no two threads try to use the same
+** database connection at the same time.
+**
+** Older versions of SQLite used an optional THREADSAFE macro.
+** We support that for legacy.
+*/
+#if !defined(SQLITE_THREADSAFE)
+# if defined(THREADSAFE)
+#   define SQLITE_THREADSAFE THREADSAFE
+# else
+#   define SQLITE_THREADSAFE 1 /* IMP: R-07272-22309 */
+# endif
+#endif
+
+/*
+** Powersafe overwrite is on by default.  But can be turned off using
+** the -DSQLITE_POWERSAFE_OVERWRITE=0 command-line option.
+*/
+#ifndef SQLITE_POWERSAFE_OVERWRITE
+# define SQLITE_POWERSAFE_OVERWRITE 1
+#endif
+
+/*
+** EVIDENCE-OF: R-25715-37072 Memory allocation statistics are enabled by
+** default unless SQLite is compiled with SQLITE_DEFAULT_MEMSTATUS=0 in
+** which case memory allocation statistics are disabled by default.
+*/
+#if !defined(SQLITE_DEFAULT_MEMSTATUS)
+# define SQLITE_DEFAULT_MEMSTATUS 1
+#endif
