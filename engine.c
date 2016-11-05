@@ -8645,3 +8645,241 @@ SQLITE_PRIVATE void sqlite3HashClear(Hash*);
 
 /*
 ** If compiling for a processor that lacks floating point support,
+** substitute integer for floating-point
+*/
+#ifdef SQLITE_OMIT_FLOATING_POINT
+# define double sqlite_int64
+# define float sqlite_int64
+# define LONGDOUBLE_TYPE sqlite_int64
+# ifndef SQLITE_BIG_DBL
+#   define SQLITE_BIG_DBL (((sqlite3_int64)1)<<50)
+# endif
+# define SQLITE_OMIT_DATETIME_FUNCS 1
+# define SQLITE_OMIT_TRACE 1
+# undef SQLITE_MIXED_ENDIAN_64BIT_FLOAT
+# undef SQLITE_HAVE_ISNAN
+#endif
+#ifndef SQLITE_BIG_DBL
+# define SQLITE_BIG_DBL (1e99)
+#endif
+
+/*
+** OMIT_TEMPDB is set to 1 if SQLITE_OMIT_TEMPDB is defined, or 0
+** afterward. Having this macro allows us to cause the C compiler 
+** to omit code used by TEMP tables without messy #ifndef statements.
+*/
+#ifdef SQLITE_OMIT_TEMPDB
+#define OMIT_TEMPDB 1
+#else
+#define OMIT_TEMPDB 0
+#endif
+
+/*
+** The "file format" number is an integer that is incremented whenever
+** the VDBE-level file format changes.  The following macros define the
+** the default file format for new databases and the maximum file format
+** that the library can read.
+*/
+#define SQLITE_MAX_FILE_FORMAT 4
+#ifndef SQLITE_DEFAULT_FILE_FORMAT
+# define SQLITE_DEFAULT_FILE_FORMAT 4
+#endif
+
+/*
+** Determine whether triggers are recursive by default.  This can be
+** changed at run-time using a pragma.
+*/
+#ifndef SQLITE_DEFAULT_RECURSIVE_TRIGGERS
+# define SQLITE_DEFAULT_RECURSIVE_TRIGGERS 0
+#endif
+
+/*
+** Provide a default value for SQLITE_TEMP_STORE in case it is not specified
+** on the command-line
+*/
+#ifndef SQLITE_TEMP_STORE
+# define SQLITE_TEMP_STORE 1
+# define SQLITE_TEMP_STORE_xc 1  /* Exclude from ctime.c */
+#endif
+
+/*
+** If no value has been provided for SQLITE_MAX_WORKER_THREADS, or if
+** SQLITE_TEMP_STORE is set to 3 (never use temporary files), set it 
+** to zero.
+*/
+#if SQLITE_TEMP_STORE==3 || SQLITE_THREADSAFE==0
+# undef SQLITE_MAX_WORKER_THREADS
+# define SQLITE_MAX_WORKER_THREADS 0
+#endif
+#ifndef SQLITE_MAX_WORKER_THREADS
+# define SQLITE_MAX_WORKER_THREADS 8
+#endif
+#ifndef SQLITE_DEFAULT_WORKER_THREADS
+# define SQLITE_DEFAULT_WORKER_THREADS 0
+#endif
+#if SQLITE_DEFAULT_WORKER_THREADS>SQLITE_MAX_WORKER_THREADS
+# undef SQLITE_MAX_WORKER_THREADS
+# define SQLITE_MAX_WORKER_THREADS SQLITE_DEFAULT_WORKER_THREADS
+#endif
+
+
+/*
+** GCC does not define the offsetof() macro so we'll have to do it
+** ourselves.
+*/
+#ifndef offsetof
+#define offsetof(STRUCTURE,FIELD) ((int)((char*)&((STRUCTURE*)0)->FIELD))
+#endif
+
+/*
+** Macros to compute minimum and maximum of two numbers.
+*/
+#define MIN(A,B) ((A)<(B)?(A):(B))
+#define MAX(A,B) ((A)>(B)?(A):(B))
+
+/*
+** Swap two objects of type TYPE.
+*/
+#define SWAP(TYPE,A,B) {TYPE t=A; A=B; B=t;}
+
+/*
+** Check to see if this machine uses EBCDIC.  (Yes, believe it or
+** not, there are still machines out there that use EBCDIC.)
+*/
+#if 'A' == '\301'
+# define SQLITE_EBCDIC 1
+#else
+# define SQLITE_ASCII 1
+#endif
+
+/*
+** Integers of known sizes.  These typedefs might change for architectures
+** where the sizes very.  Preprocessor macros are available so that the
+** types can be conveniently redefined at compile-type.  Like this:
+**
+**         cc '-DUINTPTR_TYPE=long long int' ...
+*/
+#ifndef UINT32_TYPE
+# ifdef HAVE_UINT32_T
+#  define UINT32_TYPE uint32_t
+# else
+#  define UINT32_TYPE unsigned int
+# endif
+#endif
+#ifndef UINT16_TYPE
+# ifdef HAVE_UINT16_T
+#  define UINT16_TYPE uint16_t
+# else
+#  define UINT16_TYPE unsigned short int
+# endif
+#endif
+#ifndef INT16_TYPE
+# ifdef HAVE_INT16_T
+#  define INT16_TYPE int16_t
+# else
+#  define INT16_TYPE short int
+# endif
+#endif
+#ifndef UINT8_TYPE
+# ifdef HAVE_UINT8_T
+#  define UINT8_TYPE uint8_t
+# else
+#  define UINT8_TYPE unsigned char
+# endif
+#endif
+#ifndef INT8_TYPE
+# ifdef HAVE_INT8_T
+#  define INT8_TYPE int8_t
+# else
+#  define INT8_TYPE signed char
+# endif
+#endif
+#ifndef LONGDOUBLE_TYPE
+# define LONGDOUBLE_TYPE long double
+#endif
+typedef sqlite_int64 i64;          /* 8-byte signed integer */
+typedef sqlite_uint64 u64;         /* 8-byte unsigned integer */
+typedef UINT32_TYPE u32;           /* 4-byte unsigned integer */
+typedef UINT16_TYPE u16;           /* 2-byte unsigned integer */
+typedef INT16_TYPE i16;            /* 2-byte signed integer */
+typedef UINT8_TYPE u8;             /* 1-byte unsigned integer */
+typedef INT8_TYPE i8;              /* 1-byte signed integer */
+
+/*
+** SQLITE_MAX_U32 is a u64 constant that is the maximum u64 value
+** that can be stored in a u32 without loss of data.  The value
+** is 0x00000000ffffffff.  But because of quirks of some compilers, we
+** have to specify the value in the less intuitive manner shown:
+*/
+#define SQLITE_MAX_U32  ((((u64)1)<<32)-1)
+
+/*
+** The datatype used to store estimates of the number of rows in a
+** table or index.  This is an unsigned integer type.  For 99.9% of
+** the world, a 32-bit integer is sufficient.  But a 64-bit integer
+** can be used at compile-time if desired.
+*/
+#ifdef SQLITE_64BIT_STATS
+ typedef u64 tRowcnt;    /* 64-bit only if requested at compile-time */
+#else
+ typedef u32 tRowcnt;    /* 32-bit is the default */
+#endif
+
+/*
+** Estimated quantities used for query planning are stored as 16-bit
+** logarithms.  For quantity X, the value stored is 10*log2(X).  This
+** gives a possible range of values of approximately 1.0e986 to 1e-986.
+** But the allowed values are "grainy".  Not every value is representable.
+** For example, quantities 16 and 17 are both represented by a LogEst
+** of 40.  However, since LogEst quantities are suppose to be estimates,
+** not exact values, this imprecision is not a problem.
+**
+** "LogEst" is short for "Logarithmic Estimate".
+**
+** Examples:
+**      1 -> 0              20 -> 43          10000 -> 132
+**      2 -> 10             25 -> 46          25000 -> 146
+**      3 -> 16            100 -> 66        1000000 -> 199
+**      4 -> 20           1000 -> 99        1048576 -> 200
+**     10 -> 33           1024 -> 100    4294967296 -> 320
+**
+** The LogEst can be negative to indicate fractional values. 
+** Examples:
+**
+**    0.5 -> -10           0.1 -> -33        0.0625 -> -40
+*/
+typedef INT16_TYPE LogEst;
+
+/*
+** Macros to determine whether the machine is big or little endian,
+** and whether or not that determination is run-time or compile-time.
+**
+** For best performance, an attempt is made to guess at the byte-order
+** using C-preprocessor macros.  If that is unsuccessful, or if
+** -DSQLITE_RUNTIME_BYTEORDER=1 is set, then byte-order is determined
+** at run-time.
+*/
+#ifdef SQLITE_AMALGAMATION
+SQLITE_PRIVATE const int sqlite3one = 1;
+#else
+SQLITE_PRIVATE const int sqlite3one;
+#endif
+#if (defined(i386)     || defined(__i386__)   || defined(_M_IX86) ||    \
+     defined(__x86_64) || defined(__x86_64__) || defined(_M_X64)  ||    \
+     defined(_M_AMD64) || defined(_M_ARM)     || defined(__x86)   ||    \
+     defined(__arm__)) && !defined(SQLITE_RUNTIME_BYTEORDER)
+# define SQLITE_BYTEORDER    1234
+# define SQLITE_BIGENDIAN    0
+# define SQLITE_LITTLEENDIAN 1
+# define SQLITE_UTF16NATIVE  SQLITE_UTF16LE
+#endif
+#if (defined(sparc)    || defined(__ppc__))  \
+    && !defined(SQLITE_RUNTIME_BYTEORDER)
+# define SQLITE_BYTEORDER    4321
+# define SQLITE_BIGENDIAN    1
+# define SQLITE_LITTLEENDIAN 0
+# define SQLITE_UTF16NATIVE  SQLITE_UTF16BE
+#endif
+#if !defined(SQLITE_BYTEORDER)
+# define SQLITE_BYTEORDER    0     /* 0 means "unknown at compile-time" */
+# define SQLITE_BIGENDIAN    (*(char *)(&sqlite3one)==0)
