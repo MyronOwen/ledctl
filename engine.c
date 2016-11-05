@@ -9086,3 +9086,227 @@ SQLITE_API   void *sqlite3_wsd_find(void *K, int L);
 ** For example those parameters only used in assert() statements. In these
 ** cases the parameters are named as per the usual conventions.
 */
+#define UNUSED_PARAMETER(x) (void)(x)
+#define UNUSED_PARAMETER2(x,y) UNUSED_PARAMETER(x),UNUSED_PARAMETER(y)
+
+/*
+** Forward references to structures
+*/
+typedef struct AggInfo AggInfo;
+typedef struct AuthContext AuthContext;
+typedef struct AutoincInfo AutoincInfo;
+typedef struct Bitvec Bitvec;
+typedef struct CollSeq CollSeq;
+typedef struct Column Column;
+typedef struct Db Db;
+typedef struct Schema Schema;
+typedef struct Expr Expr;
+typedef struct ExprList ExprList;
+typedef struct ExprSpan ExprSpan;
+typedef struct FKey FKey;
+typedef struct FuncDestructor FuncDestructor;
+typedef struct FuncDef FuncDef;
+typedef struct FuncDefHash FuncDefHash;
+typedef struct IdList IdList;
+typedef struct Index Index;
+typedef struct IndexSample IndexSample;
+typedef struct KeyClass KeyClass;
+typedef struct KeyInfo KeyInfo;
+typedef struct Lookaside Lookaside;
+typedef struct LookasideSlot LookasideSlot;
+typedef struct Module Module;
+typedef struct NameContext NameContext;
+typedef struct Parse Parse;
+typedef struct PrintfArguments PrintfArguments;
+typedef struct RowSet RowSet;
+typedef struct Savepoint Savepoint;
+typedef struct Select Select;
+typedef struct SQLiteThread SQLiteThread;
+typedef struct SelectDest SelectDest;
+typedef struct SrcList SrcList;
+typedef struct StrAccum StrAccum;
+typedef struct Table Table;
+typedef struct TableLock TableLock;
+typedef struct Token Token;
+typedef struct TreeView TreeView;
+typedef struct Trigger Trigger;
+typedef struct TriggerPrg TriggerPrg;
+typedef struct TriggerStep TriggerStep;
+typedef struct UnpackedRecord UnpackedRecord;
+typedef struct VTable VTable;
+typedef struct VtabCtx VtabCtx;
+typedef struct Walker Walker;
+typedef struct WhereInfo WhereInfo;
+typedef struct With With;
+
+/*
+** Defer sourcing vdbe.h and btree.h until after the "u8" and 
+** "BusyHandler" typedefs. vdbe.h also requires a few of the opaque
+** pointer types (i.e. FuncDef) defined above.
+*/
+/************** Include btree.h in the middle of sqliteInt.h *****************/
+/************** Begin file btree.h *******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This header file defines the interface that the sqlite B-Tree file
+** subsystem.  See comments in the source code for a detailed description
+** of what each interface routine does.
+*/
+#ifndef _BTREE_H_
+#define _BTREE_H_
+
+/* TODO: This definition is just included so other modules compile. It
+** needs to be revisited.
+*/
+#define SQLITE_N_BTREE_META 16
+
+/*
+** If defined as non-zero, auto-vacuum is enabled by default. Otherwise
+** it must be turned on for each database using "PRAGMA auto_vacuum = 1".
+*/
+#ifndef SQLITE_DEFAULT_AUTOVACUUM
+  #define SQLITE_DEFAULT_AUTOVACUUM 0
+#endif
+
+#define BTREE_AUTOVACUUM_NONE 0        /* Do not do auto-vacuum */
+#define BTREE_AUTOVACUUM_FULL 1        /* Do full auto-vacuum */
+#define BTREE_AUTOVACUUM_INCR 2        /* Incremental vacuum */
+
+/*
+** Forward declarations of structure
+*/
+typedef struct Btree Btree;
+typedef struct BtCursor BtCursor;
+typedef struct BtShared BtShared;
+
+
+SQLITE_PRIVATE int sqlite3BtreeOpen(
+  sqlite3_vfs *pVfs,       /* VFS to use with this b-tree */
+  const char *zFilename,   /* Name of database file to open */
+  sqlite3 *db,             /* Associated database connection */
+  Btree **ppBtree,         /* Return open Btree* here */
+  int flags,               /* Flags */
+  int vfsFlags             /* Flags passed through to VFS open */
+);
+
+/* The flags parameter to sqlite3BtreeOpen can be the bitwise or of the
+** following values.
+**
+** NOTE:  These values must match the corresponding PAGER_ values in
+** pager.h.
+*/
+#define BTREE_OMIT_JOURNAL  1  /* Do not create or use a rollback journal */
+#define BTREE_MEMORY        2  /* This is an in-memory DB */
+#define BTREE_SINGLE        4  /* The file contains at most 1 b-tree */
+#define BTREE_UNORDERED     8  /* Use of a hash implementation is OK */
+
+SQLITE_PRIVATE int sqlite3BtreeClose(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeSetCacheSize(Btree*,int);
+#if SQLITE_MAX_MMAP_SIZE>0
+SQLITE_PRIVATE   int sqlite3BtreeSetMmapLimit(Btree*,sqlite3_int64);
+#endif
+SQLITE_PRIVATE int sqlite3BtreeSetPagerFlags(Btree*,unsigned);
+SQLITE_PRIVATE int sqlite3BtreeSyncDisabled(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeSetPageSize(Btree *p, int nPagesize, int nReserve, int eFix);
+SQLITE_PRIVATE int sqlite3BtreeGetPageSize(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeMaxPageCount(Btree*,int);
+SQLITE_PRIVATE u32 sqlite3BtreeLastPage(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeSecureDelete(Btree*,int);
+SQLITE_PRIVATE int sqlite3BtreeGetReserve(Btree*);
+#if defined(SQLITE_HAS_CODEC) || defined(SQLITE_DEBUG)
+SQLITE_PRIVATE int sqlite3BtreeGetReserveNoMutex(Btree *p);
+#endif
+SQLITE_PRIVATE int sqlite3BtreeSetAutoVacuum(Btree *, int);
+SQLITE_PRIVATE int sqlite3BtreeGetAutoVacuum(Btree *);
+SQLITE_PRIVATE int sqlite3BtreeBeginTrans(Btree*,int);
+SQLITE_PRIVATE int sqlite3BtreeCommitPhaseOne(Btree*, const char *zMaster);
+SQLITE_PRIVATE int sqlite3BtreeCommitPhaseTwo(Btree*, int);
+SQLITE_PRIVATE int sqlite3BtreeCommit(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeRollback(Btree*,int,int);
+SQLITE_PRIVATE int sqlite3BtreeBeginStmt(Btree*,int);
+SQLITE_PRIVATE int sqlite3BtreeCreateTable(Btree*, int*, int flags);
+SQLITE_PRIVATE int sqlite3BtreeIsInTrans(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeIsInReadTrans(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeIsInBackup(Btree*);
+SQLITE_PRIVATE void *sqlite3BtreeSchema(Btree *, int, void(*)(void *));
+SQLITE_PRIVATE int sqlite3BtreeSchemaLocked(Btree *pBtree);
+SQLITE_PRIVATE int sqlite3BtreeLockTable(Btree *pBtree, int iTab, u8 isWriteLock);
+SQLITE_PRIVATE int sqlite3BtreeSavepoint(Btree *, int, int);
+
+SQLITE_PRIVATE const char *sqlite3BtreeGetFilename(Btree *);
+SQLITE_PRIVATE const char *sqlite3BtreeGetJournalname(Btree *);
+SQLITE_PRIVATE int sqlite3BtreeCopyFile(Btree *, Btree *);
+
+SQLITE_PRIVATE int sqlite3BtreeIncrVacuum(Btree *);
+
+/* The flags parameter to sqlite3BtreeCreateTable can be the bitwise OR
+** of the flags shown below.
+**
+** Every SQLite table must have either BTREE_INTKEY or BTREE_BLOBKEY set.
+** With BTREE_INTKEY, the table key is a 64-bit integer and arbitrary data
+** is stored in the leaves.  (BTREE_INTKEY is used for SQL tables.)  With
+** BTREE_BLOBKEY, the key is an arbitrary BLOB and no content is stored
+** anywhere - the key is the content.  (BTREE_BLOBKEY is used for SQL
+** indices.)
+*/
+#define BTREE_INTKEY     1    /* Table has only 64-bit signed integer keys */
+#define BTREE_BLOBKEY    2    /* Table has keys only - no data */
+
+SQLITE_PRIVATE int sqlite3BtreeDropTable(Btree*, int, int*);
+SQLITE_PRIVATE int sqlite3BtreeClearTable(Btree*, int, int*);
+SQLITE_PRIVATE int sqlite3BtreeClearTableOfCursor(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeTripAllCursors(Btree*, int, int);
+
+SQLITE_PRIVATE void sqlite3BtreeGetMeta(Btree *pBtree, int idx, u32 *pValue);
+SQLITE_PRIVATE int sqlite3BtreeUpdateMeta(Btree*, int idx, u32 value);
+
+SQLITE_PRIVATE int sqlite3BtreeNewDb(Btree *p);
+
+/*
+** The second parameter to sqlite3BtreeGetMeta or sqlite3BtreeUpdateMeta
+** should be one of the following values. The integer values are assigned 
+** to constants so that the offset of the corresponding field in an
+** SQLite database header may be found using the following formula:
+**
+**   offset = 36 + (idx * 4)
+**
+** For example, the free-page-count field is located at byte offset 36 of
+** the database file header. The incr-vacuum-flag field is located at
+** byte offset 64 (== 36+4*7).
+**
+** The BTREE_DATA_VERSION value is not really a value stored in the header.
+** It is a read-only number computed by the pager.  But we merge it with
+** the header value access routines since its access pattern is the same.
+** Call it a "virtual meta value".
+*/
+#define BTREE_FREE_PAGE_COUNT     0
+#define BTREE_SCHEMA_VERSION      1
+#define BTREE_FILE_FORMAT         2
+#define BTREE_DEFAULT_CACHE_SIZE  3
+#define BTREE_LARGEST_ROOT_PAGE   4
+#define BTREE_TEXT_ENCODING       5
+#define BTREE_USER_VERSION        6
+#define BTREE_INCR_VACUUM         7
+#define BTREE_APPLICATION_ID      8
+#define BTREE_DATA_VERSION        15  /* A virtual meta-value */
+
+/*
+** Values that may be OR'd together to form the second argument of an
+** sqlite3BtreeCursorHints() call.
+*/
+#define BTREE_BULKLOAD 0x00000001
+
+SQLITE_PRIVATE int sqlite3BtreeCursor(
+  Btree*,                              /* BTree containing table to open */
+  int iTable,                          /* Index of root page */
+  int wrFlag,                          /* 1 for writing.  0 for read-only */
+  struct KeyInfo*,                     /* First argument to compare function */
