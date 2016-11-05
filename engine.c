@@ -8410,3 +8410,238 @@ typedef struct HashElem HashElem;
 ** the global doubly-linked list.  The contents of the bucket are the
 ** element pointed to plus the next _ht.count-1 elements in the list.
 **
+** Hash.htsize and Hash.ht may be zero.  In that case lookup is done
+** by a linear search of the global list.  For small tables, the 
+** Hash.ht table is never allocated because if there are few elements
+** in the table, it is faster to do a linear search than to manage
+** the hash table.
+*/
+struct Hash {
+  unsigned int htsize;      /* Number of buckets in the hash table */
+  unsigned int count;       /* Number of entries in this table */
+  HashElem *first;          /* The first element of the array */
+  struct _ht {              /* the hash table */
+    int count;                 /* Number of entries with this hash */
+    HashElem *chain;           /* Pointer to first entry with this hash */
+  } *ht;
+};
+
+/* Each element in the hash table is an instance of the following 
+** structure.  All elements are stored on a single doubly-linked list.
+**
+** Again, this structure is intended to be opaque, but it can't really
+** be opaque because it is used by macros.
+*/
+struct HashElem {
+  HashElem *next, *prev;       /* Next and previous elements in the table */
+  void *data;                  /* Data associated with this element */
+  const char *pKey;            /* Key associated with this element */
+};
+
+/*
+** Access routines.  To delete, insert a NULL pointer.
+*/
+SQLITE_PRIVATE void sqlite3HashInit(Hash*);
+SQLITE_PRIVATE void *sqlite3HashInsert(Hash*, const char *pKey, void *pData);
+SQLITE_PRIVATE void *sqlite3HashFind(const Hash*, const char *pKey);
+SQLITE_PRIVATE void sqlite3HashClear(Hash*);
+
+/*
+** Macros for looping over all elements of a hash table.  The idiom is
+** like this:
+**
+**   Hash h;
+**   HashElem *p;
+**   ...
+**   for(p=sqliteHashFirst(&h); p; p=sqliteHashNext(p)){
+**     SomeStructure *pData = sqliteHashData(p);
+**     // do something with pData
+**   }
+*/
+#define sqliteHashFirst(H)  ((H)->first)
+#define sqliteHashNext(E)   ((E)->next)
+#define sqliteHashData(E)   ((E)->data)
+/* #define sqliteHashKey(E)    ((E)->pKey) // NOT USED */
+/* #define sqliteHashKeysize(E) ((E)->nKey)  // NOT USED */
+
+/*
+** Number of entries in a hash table
+*/
+/* #define sqliteHashCount(H)  ((H)->count) // NOT USED */
+
+#endif /* _SQLITE_HASH_H_ */
+
+/************** End of hash.h ************************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include parse.h in the middle of sqliteInt.h *****************/
+/************** Begin file parse.h *******************************************/
+#define TK_SEMI                             1
+#define TK_EXPLAIN                          2
+#define TK_QUERY                            3
+#define TK_PLAN                             4
+#define TK_BEGIN                            5
+#define TK_TRANSACTION                      6
+#define TK_DEFERRED                         7
+#define TK_IMMEDIATE                        8
+#define TK_EXCLUSIVE                        9
+#define TK_COMMIT                          10
+#define TK_END                             11
+#define TK_ROLLBACK                        12
+#define TK_SAVEPOINT                       13
+#define TK_RELEASE                         14
+#define TK_TO                              15
+#define TK_TABLE                           16
+#define TK_CREATE                          17
+#define TK_IF                              18
+#define TK_NOT                             19
+#define TK_EXISTS                          20
+#define TK_TEMP                            21
+#define TK_LP                              22
+#define TK_RP                              23
+#define TK_AS                              24
+#define TK_WITHOUT                         25
+#define TK_COMMA                           26
+#define TK_ID                              27
+#define TK_INDEXED                         28
+#define TK_ABORT                           29
+#define TK_ACTION                          30
+#define TK_AFTER                           31
+#define TK_ANALYZE                         32
+#define TK_ASC                             33
+#define TK_ATTACH                          34
+#define TK_BEFORE                          35
+#define TK_BY                              36
+#define TK_CASCADE                         37
+#define TK_CAST                            38
+#define TK_COLUMNKW                        39
+#define TK_CONFLICT                        40
+#define TK_DATABASE                        41
+#define TK_DESC                            42
+#define TK_DETACH                          43
+#define TK_EACH                            44
+#define TK_FAIL                            45
+#define TK_FOR                             46
+#define TK_IGNORE                          47
+#define TK_INITIALLY                       48
+#define TK_INSTEAD                         49
+#define TK_LIKE_KW                         50
+#define TK_MATCH                           51
+#define TK_NO                              52
+#define TK_KEY                             53
+#define TK_OF                              54
+#define TK_OFFSET                          55
+#define TK_PRAGMA                          56
+#define TK_RAISE                           57
+#define TK_RECURSIVE                       58
+#define TK_REPLACE                         59
+#define TK_RESTRICT                        60
+#define TK_ROW                             61
+#define TK_TRIGGER                         62
+#define TK_VACUUM                          63
+#define TK_VIEW                            64
+#define TK_VIRTUAL                         65
+#define TK_WITH                            66
+#define TK_REINDEX                         67
+#define TK_RENAME                          68
+#define TK_CTIME_KW                        69
+#define TK_ANY                             70
+#define TK_OR                              71
+#define TK_AND                             72
+#define TK_IS                              73
+#define TK_BETWEEN                         74
+#define TK_IN                              75
+#define TK_ISNULL                          76
+#define TK_NOTNULL                         77
+#define TK_NE                              78
+#define TK_EQ                              79
+#define TK_GT                              80
+#define TK_LE                              81
+#define TK_LT                              82
+#define TK_GE                              83
+#define TK_ESCAPE                          84
+#define TK_BITAND                          85
+#define TK_BITOR                           86
+#define TK_LSHIFT                          87
+#define TK_RSHIFT                          88
+#define TK_PLUS                            89
+#define TK_MINUS                           90
+#define TK_STAR                            91
+#define TK_SLASH                           92
+#define TK_REM                             93
+#define TK_CONCAT                          94
+#define TK_COLLATE                         95
+#define TK_BITNOT                          96
+#define TK_STRING                          97
+#define TK_JOIN_KW                         98
+#define TK_CONSTRAINT                      99
+#define TK_DEFAULT                        100
+#define TK_NULL                           101
+#define TK_PRIMARY                        102
+#define TK_UNIQUE                         103
+#define TK_CHECK                          104
+#define TK_REFERENCES                     105
+#define TK_AUTOINCR                       106
+#define TK_ON                             107
+#define TK_INSERT                         108
+#define TK_DELETE                         109
+#define TK_UPDATE                         110
+#define TK_SET                            111
+#define TK_DEFERRABLE                     112
+#define TK_FOREIGN                        113
+#define TK_DROP                           114
+#define TK_UNION                          115
+#define TK_ALL                            116
+#define TK_EXCEPT                         117
+#define TK_INTERSECT                      118
+#define TK_SELECT                         119
+#define TK_VALUES                         120
+#define TK_DISTINCT                       121
+#define TK_DOT                            122
+#define TK_FROM                           123
+#define TK_JOIN                           124
+#define TK_USING                          125
+#define TK_ORDER                          126
+#define TK_GROUP                          127
+#define TK_HAVING                         128
+#define TK_LIMIT                          129
+#define TK_WHERE                          130
+#define TK_INTO                           131
+#define TK_INTEGER                        132
+#define TK_FLOAT                          133
+#define TK_BLOB                           134
+#define TK_VARIABLE                       135
+#define TK_CASE                           136
+#define TK_WHEN                           137
+#define TK_THEN                           138
+#define TK_ELSE                           139
+#define TK_INDEX                          140
+#define TK_ALTER                          141
+#define TK_ADD                            142
+#define TK_TO_TEXT                        143
+#define TK_TO_BLOB                        144
+#define TK_TO_NUMERIC                     145
+#define TK_TO_INT                         146
+#define TK_TO_REAL                        147
+#define TK_ISNOT                          148
+#define TK_END_OF_FILE                    149
+#define TK_ILLEGAL                        150
+#define TK_SPACE                          151
+#define TK_UNCLOSED_STRING                152
+#define TK_FUNCTION                       153
+#define TK_COLUMN                         154
+#define TK_AGG_FUNCTION                   155
+#define TK_AGG_COLUMN                     156
+#define TK_UMINUS                         157
+#define TK_UPLUS                          158
+#define TK_REGISTER                       159
+
+/************** End of parse.h ***********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <stddef.h>
+
+/*
+** If compiling for a processor that lacks floating point support,
