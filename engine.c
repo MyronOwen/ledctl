@@ -9796,3 +9796,236 @@ SQLITE_PRIVATE void sqlite3VdbeUsesBtree(Vdbe*, int);
 SQLITE_PRIVATE VdbeOp *sqlite3VdbeGetOp(Vdbe*, int);
 SQLITE_PRIVATE int sqlite3VdbeMakeLabel(Vdbe*);
 SQLITE_PRIVATE void sqlite3VdbeRunOnlyOnce(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeDelete(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeClearObject(sqlite3*,Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeMakeReady(Vdbe*,Parse*);
+SQLITE_PRIVATE int sqlite3VdbeFinalize(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeResolveLabel(Vdbe*, int);
+SQLITE_PRIVATE int sqlite3VdbeCurrentAddr(Vdbe*);
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   int sqlite3VdbeAssertMayAbort(Vdbe *, int);
+#endif
+SQLITE_PRIVATE void sqlite3VdbeResetStepResult(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeRewind(Vdbe*);
+SQLITE_PRIVATE int sqlite3VdbeReset(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeSetNumCols(Vdbe*,int);
+SQLITE_PRIVATE int sqlite3VdbeSetColName(Vdbe*, int, int, const char *, void(*)(void*));
+SQLITE_PRIVATE void sqlite3VdbeCountChanges(Vdbe*);
+SQLITE_PRIVATE sqlite3 *sqlite3VdbeDb(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeSetSql(Vdbe*, const char *z, int n, int);
+SQLITE_PRIVATE void sqlite3VdbeSwap(Vdbe*,Vdbe*);
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeTakeOpArray(Vdbe*, int*, int*);
+SQLITE_PRIVATE sqlite3_value *sqlite3VdbeGetBoundValue(Vdbe*, int, u8);
+SQLITE_PRIVATE void sqlite3VdbeSetVarmask(Vdbe*, int);
+#ifndef SQLITE_OMIT_TRACE
+SQLITE_PRIVATE   char *sqlite3VdbeExpandSql(Vdbe*, const char*);
+#endif
+SQLITE_PRIVATE int sqlite3MemCompare(const Mem*, const Mem*, const CollSeq*);
+
+SQLITE_PRIVATE void sqlite3VdbeRecordUnpack(KeyInfo*,int,const void*,UnpackedRecord*);
+SQLITE_PRIVATE int sqlite3VdbeRecordCompare(int,const void*,UnpackedRecord*);
+SQLITE_PRIVATE UnpackedRecord *sqlite3VdbeAllocUnpackedRecord(KeyInfo *, char *, int, char **);
+
+typedef int (*RecordCompare)(int,const void*,UnpackedRecord*);
+SQLITE_PRIVATE RecordCompare sqlite3VdbeFindCompare(UnpackedRecord*);
+
+#ifndef SQLITE_OMIT_TRIGGER
+SQLITE_PRIVATE void sqlite3VdbeLinkSubProgram(Vdbe *, SubProgram *);
+#endif
+
+/* Use SQLITE_ENABLE_COMMENTS to enable generation of extra comments on
+** each VDBE opcode.
+**
+** Use the SQLITE_ENABLE_MODULE_COMMENTS macro to see some extra no-op
+** comments in VDBE programs that show key decision points in the code
+** generator.
+*/
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+SQLITE_PRIVATE   void sqlite3VdbeComment(Vdbe*, const char*, ...);
+# define VdbeComment(X)  sqlite3VdbeComment X
+SQLITE_PRIVATE   void sqlite3VdbeNoopComment(Vdbe*, const char*, ...);
+# define VdbeNoopComment(X)  sqlite3VdbeNoopComment X
+# ifdef SQLITE_ENABLE_MODULE_COMMENTS
+#   define VdbeModuleComment(X)  sqlite3VdbeNoopComment X
+# else
+#   define VdbeModuleComment(X)
+# endif
+#else
+# define VdbeComment(X)
+# define VdbeNoopComment(X)
+# define VdbeModuleComment(X)
+#endif
+
+/*
+** The VdbeCoverage macros are used to set a coverage testing point
+** for VDBE branch instructions.  The coverage testing points are line
+** numbers in the sqlite3.c source file.  VDBE branch coverage testing
+** only works with an amalagmation build.  That's ok since a VDBE branch
+** coverage build designed for testing the test suite only.  No application
+** should ever ship with VDBE branch coverage measuring turned on.
+**
+**    VdbeCoverage(v)                  // Mark the previously coded instruction
+**                                     // as a branch
+**
+**    VdbeCoverageIf(v, conditional)   // Mark previous if conditional true
+**
+**    VdbeCoverageAlwaysTaken(v)       // Previous branch is always taken
+**
+**    VdbeCoverageNeverTaken(v)        // Previous branch is never taken
+**
+** Every VDBE branch operation must be tagged with one of the macros above.
+** If not, then when "make test" is run with -DSQLITE_VDBE_COVERAGE and
+** -DSQLITE_DEBUG then an ALWAYS() will fail in the vdbeTakeBranch()
+** routine in vdbe.c, alerting the developer to the missed tag.
+*/
+#ifdef SQLITE_VDBE_COVERAGE
+SQLITE_PRIVATE   void sqlite3VdbeSetLineNumber(Vdbe*,int);
+# define VdbeCoverage(v) sqlite3VdbeSetLineNumber(v,__LINE__)
+# define VdbeCoverageIf(v,x) if(x)sqlite3VdbeSetLineNumber(v,__LINE__)
+# define VdbeCoverageAlwaysTaken(v) sqlite3VdbeSetLineNumber(v,2);
+# define VdbeCoverageNeverTaken(v) sqlite3VdbeSetLineNumber(v,1);
+# define VDBE_OFFSET_LINENO(x) (__LINE__+x)
+#else
+# define VdbeCoverage(v)
+# define VdbeCoverageIf(v,x)
+# define VdbeCoverageAlwaysTaken(v)
+# define VdbeCoverageNeverTaken(v)
+# define VDBE_OFFSET_LINENO(x) 0
+#endif
+
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+SQLITE_PRIVATE void sqlite3VdbeScanStatus(Vdbe*, int, int, int, LogEst, const char*);
+#else
+# define sqlite3VdbeScanStatus(a,b,c,d,e)
+#endif
+
+#endif
+
+/************** End of vdbe.h ************************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include pager.h in the middle of sqliteInt.h *****************/
+/************** Begin file pager.h *******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This header file defines the interface that the sqlite page cache
+** subsystem.  The page cache subsystem reads and writes a file a page
+** at a time and provides a journal for rollback.
+*/
+
+#ifndef _PAGER_H_
+#define _PAGER_H_
+
+/*
+** Default maximum size for persistent journal files. A negative 
+** value means no limit. This value may be overridden using the 
+** sqlite3PagerJournalSizeLimit() API. See also "PRAGMA journal_size_limit".
+*/
+#ifndef SQLITE_DEFAULT_JOURNAL_SIZE_LIMIT
+  #define SQLITE_DEFAULT_JOURNAL_SIZE_LIMIT -1
+#endif
+
+/*
+** The type used to represent a page number.  The first page in a file
+** is called page 1.  0 is used to represent "not a page".
+*/
+typedef u32 Pgno;
+
+/*
+** Each open file is managed by a separate instance of the "Pager" structure.
+*/
+typedef struct Pager Pager;
+
+/*
+** Handle type for pages.
+*/
+typedef struct PgHdr DbPage;
+
+/*
+** Page number PAGER_MJ_PGNO is never used in an SQLite database (it is
+** reserved for working around a windows/posix incompatibility). It is
+** used in the journal to signify that the remainder of the journal file 
+** is devoted to storing a master journal name - there are no more pages to
+** roll back. See comments for function writeMasterJournal() in pager.c 
+** for details.
+*/
+#define PAGER_MJ_PGNO(x) ((Pgno)((PENDING_BYTE/((x)->pageSize))+1))
+
+/*
+** Allowed values for the flags parameter to sqlite3PagerOpen().
+**
+** NOTE: These values must match the corresponding BTREE_ values in btree.h.
+*/
+#define PAGER_OMIT_JOURNAL  0x0001    /* Do not use a rollback journal */
+#define PAGER_MEMORY        0x0002    /* In-memory database */
+
+/*
+** Valid values for the second argument to sqlite3PagerLockingMode().
+*/
+#define PAGER_LOCKINGMODE_QUERY      -1
+#define PAGER_LOCKINGMODE_NORMAL      0
+#define PAGER_LOCKINGMODE_EXCLUSIVE   1
+
+/*
+** Numeric constants that encode the journalmode.  
+*/
+#define PAGER_JOURNALMODE_QUERY     (-1)  /* Query the value of journalmode */
+#define PAGER_JOURNALMODE_DELETE      0   /* Commit by deleting journal file */
+#define PAGER_JOURNALMODE_PERSIST     1   /* Commit by zeroing journal header */
+#define PAGER_JOURNALMODE_OFF         2   /* Journal omitted.  */
+#define PAGER_JOURNALMODE_TRUNCATE    3   /* Commit by truncating journal */
+#define PAGER_JOURNALMODE_MEMORY      4   /* In-memory journal file */
+#define PAGER_JOURNALMODE_WAL         5   /* Use write-ahead logging */
+
+/*
+** Flags that make up the mask passed to sqlite3PagerAcquire().
+*/
+#define PAGER_GET_NOCONTENT     0x01  /* Do not load data from disk */
+#define PAGER_GET_READONLY      0x02  /* Read-only page is acceptable */
+
+/*
+** Flags for sqlite3PagerSetFlags()
+*/
+#define PAGER_SYNCHRONOUS_OFF       0x01  /* PRAGMA synchronous=OFF */
+#define PAGER_SYNCHRONOUS_NORMAL    0x02  /* PRAGMA synchronous=NORMAL */
+#define PAGER_SYNCHRONOUS_FULL      0x03  /* PRAGMA synchronous=FULL */
+#define PAGER_SYNCHRONOUS_MASK      0x03  /* Mask for three values above */
+#define PAGER_FULLFSYNC             0x04  /* PRAGMA fullfsync=ON */
+#define PAGER_CKPT_FULLFSYNC        0x08  /* PRAGMA checkpoint_fullfsync=ON */
+#define PAGER_CACHESPILL            0x10  /* PRAGMA cache_spill=ON */
+#define PAGER_FLAGS_MASK            0x1c  /* All above except SYNCHRONOUS */
+
+/*
+** The remainder of this file contains the declarations of the functions
+** that make up the Pager sub-system API. See source code comments for 
+** a detailed description of each routine.
+*/
+
+/* Open and close a Pager connection. */ 
+SQLITE_PRIVATE int sqlite3PagerOpen(
+  sqlite3_vfs*,
+  Pager **ppPager,
+  const char*,
+  int,
+  int,
+  int,
+  void(*)(DbPage*)
+);
+SQLITE_PRIVATE int sqlite3PagerClose(Pager *pPager);
+SQLITE_PRIVATE int sqlite3PagerReadFileheader(Pager*, int, unsigned char*);
+
+/* Functions used to configure a Pager object. */
+SQLITE_PRIVATE void sqlite3PagerSetBusyhandler(Pager*, int(*)(void *), void *);
+SQLITE_PRIVATE int sqlite3PagerSetPagesize(Pager*, u32*, int);
+SQLITE_PRIVATE int sqlite3PagerMaxPageCount(Pager*, int);
+SQLITE_PRIVATE void sqlite3PagerSetCachesize(Pager*, int);
+SQLITE_PRIVATE void sqlite3PagerSetMmapLimit(Pager *, sqlite3_int64);
+SQLITE_PRIVATE void sqlite3PagerShrink(Pager*);
