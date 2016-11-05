@@ -10029,3 +10029,218 @@ SQLITE_PRIVATE int sqlite3PagerMaxPageCount(Pager*, int);
 SQLITE_PRIVATE void sqlite3PagerSetCachesize(Pager*, int);
 SQLITE_PRIVATE void sqlite3PagerSetMmapLimit(Pager *, sqlite3_int64);
 SQLITE_PRIVATE void sqlite3PagerShrink(Pager*);
+SQLITE_PRIVATE void sqlite3PagerSetFlags(Pager*,unsigned);
+SQLITE_PRIVATE int sqlite3PagerLockingMode(Pager *, int);
+SQLITE_PRIVATE int sqlite3PagerSetJournalMode(Pager *, int);
+SQLITE_PRIVATE int sqlite3PagerGetJournalMode(Pager*);
+SQLITE_PRIVATE int sqlite3PagerOkToChangeJournalMode(Pager*);
+SQLITE_PRIVATE i64 sqlite3PagerJournalSizeLimit(Pager *, i64);
+SQLITE_PRIVATE sqlite3_backup **sqlite3PagerBackupPtr(Pager*);
+
+/* Functions used to obtain and release page references. */ 
+SQLITE_PRIVATE int sqlite3PagerAcquire(Pager *pPager, Pgno pgno, DbPage **ppPage, int clrFlag);
+#define sqlite3PagerGet(A,B,C) sqlite3PagerAcquire(A,B,C,0)
+SQLITE_PRIVATE DbPage *sqlite3PagerLookup(Pager *pPager, Pgno pgno);
+SQLITE_PRIVATE void sqlite3PagerRef(DbPage*);
+SQLITE_PRIVATE void sqlite3PagerUnref(DbPage*);
+SQLITE_PRIVATE void sqlite3PagerUnrefNotNull(DbPage*);
+
+/* Operations on page references. */
+SQLITE_PRIVATE int sqlite3PagerWrite(DbPage*);
+SQLITE_PRIVATE void sqlite3PagerDontWrite(DbPage*);
+SQLITE_PRIVATE int sqlite3PagerMovepage(Pager*,DbPage*,Pgno,int);
+SQLITE_PRIVATE int sqlite3PagerPageRefcount(DbPage*);
+SQLITE_PRIVATE void *sqlite3PagerGetData(DbPage *); 
+SQLITE_PRIVATE void *sqlite3PagerGetExtra(DbPage *); 
+
+/* Functions used to manage pager transactions and savepoints. */
+SQLITE_PRIVATE void sqlite3PagerPagecount(Pager*, int*);
+SQLITE_PRIVATE int sqlite3PagerBegin(Pager*, int exFlag, int);
+SQLITE_PRIVATE int sqlite3PagerCommitPhaseOne(Pager*,const char *zMaster, int);
+SQLITE_PRIVATE int sqlite3PagerExclusiveLock(Pager*);
+SQLITE_PRIVATE int sqlite3PagerSync(Pager *pPager, const char *zMaster);
+SQLITE_PRIVATE int sqlite3PagerCommitPhaseTwo(Pager*);
+SQLITE_PRIVATE int sqlite3PagerRollback(Pager*);
+SQLITE_PRIVATE int sqlite3PagerOpenSavepoint(Pager *pPager, int n);
+SQLITE_PRIVATE int sqlite3PagerSavepoint(Pager *pPager, int op, int iSavepoint);
+SQLITE_PRIVATE int sqlite3PagerSharedLock(Pager *pPager);
+
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE   int sqlite3PagerCheckpoint(Pager *pPager, int, int*, int*);
+SQLITE_PRIVATE   int sqlite3PagerWalSupported(Pager *pPager);
+SQLITE_PRIVATE   int sqlite3PagerWalCallback(Pager *pPager);
+SQLITE_PRIVATE   int sqlite3PagerOpenWal(Pager *pPager, int *pisOpen);
+SQLITE_PRIVATE   int sqlite3PagerCloseWal(Pager *pPager);
+#endif
+
+#ifdef SQLITE_ENABLE_ZIPVFS
+SQLITE_PRIVATE   int sqlite3PagerWalFramesize(Pager *pPager);
+#endif
+
+/* Functions used to query pager state and configuration. */
+SQLITE_PRIVATE u8 sqlite3PagerIsreadonly(Pager*);
+SQLITE_PRIVATE u32 sqlite3PagerDataVersion(Pager*);
+SQLITE_PRIVATE int sqlite3PagerRefcount(Pager*);
+SQLITE_PRIVATE int sqlite3PagerMemUsed(Pager*);
+SQLITE_PRIVATE const char *sqlite3PagerFilename(Pager*, int);
+SQLITE_PRIVATE const sqlite3_vfs *sqlite3PagerVfs(Pager*);
+SQLITE_PRIVATE sqlite3_file *sqlite3PagerFile(Pager*);
+SQLITE_PRIVATE const char *sqlite3PagerJournalname(Pager*);
+SQLITE_PRIVATE int sqlite3PagerNosync(Pager*);
+SQLITE_PRIVATE void *sqlite3PagerTempSpace(Pager*);
+SQLITE_PRIVATE int sqlite3PagerIsMemdb(Pager*);
+SQLITE_PRIVATE void sqlite3PagerCacheStat(Pager *, int, int, int *);
+SQLITE_PRIVATE void sqlite3PagerClearCache(Pager *);
+SQLITE_PRIVATE int sqlite3SectorSize(sqlite3_file *);
+
+/* Functions used to truncate the database file. */
+SQLITE_PRIVATE void sqlite3PagerTruncateImage(Pager*,Pgno);
+
+SQLITE_PRIVATE void sqlite3PagerRekey(DbPage*, Pgno, u16);
+
+#if defined(SQLITE_HAS_CODEC) && !defined(SQLITE_OMIT_WAL)
+SQLITE_PRIVATE void *sqlite3PagerCodec(DbPage *);
+#endif
+
+/* Functions to support testing and debugging. */
+#if !defined(NDEBUG) || defined(SQLITE_TEST)
+SQLITE_PRIVATE   Pgno sqlite3PagerPagenumber(DbPage*);
+SQLITE_PRIVATE   int sqlite3PagerIswriteable(DbPage*);
+#endif
+#ifdef SQLITE_TEST
+SQLITE_PRIVATE   int *sqlite3PagerStats(Pager*);
+SQLITE_PRIVATE   void sqlite3PagerRefdump(Pager*);
+  void disable_simulated_io_errors(void);
+  void enable_simulated_io_errors(void);
+#else
+# define disable_simulated_io_errors()
+# define enable_simulated_io_errors()
+#endif
+
+#endif /* _PAGER_H_ */
+
+/************** End of pager.h ***********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include pcache.h in the middle of sqliteInt.h ****************/
+/************** Begin file pcache.h ******************************************/
+/*
+** 2008 August 05
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This header file defines the interface that the sqlite page cache
+** subsystem. 
+*/
+
+#ifndef _PCACHE_H_
+
+typedef struct PgHdr PgHdr;
+typedef struct PCache PCache;
+
+/*
+** Every page in the cache is controlled by an instance of the following
+** structure.
+*/
+struct PgHdr {
+  sqlite3_pcache_page *pPage;    /* Pcache object page handle */
+  void *pData;                   /* Page data */
+  void *pExtra;                  /* Extra content */
+  PgHdr *pDirty;                 /* Transient list of dirty pages */
+  Pager *pPager;                 /* The pager this page is part of */
+  Pgno pgno;                     /* Page number for this page */
+#ifdef SQLITE_CHECK_PAGES
+  u32 pageHash;                  /* Hash of page content */
+#endif
+  u16 flags;                     /* PGHDR flags defined below */
+
+  /**********************************************************************
+  ** Elements above are public.  All that follows is private to pcache.c
+  ** and should not be accessed by other modules.
+  */
+  i16 nRef;                      /* Number of users of this page */
+  PCache *pCache;                /* Cache that owns this page */
+
+  PgHdr *pDirtyNext;             /* Next element in list of dirty pages */
+  PgHdr *pDirtyPrev;             /* Previous element in list of dirty pages */
+};
+
+/* Bit values for PgHdr.flags */
+#define PGHDR_DIRTY             0x002  /* Page has changed */
+#define PGHDR_NEED_SYNC         0x004  /* Fsync the rollback journal before
+                                       ** writing this page to the database */
+#define PGHDR_NEED_READ         0x008  /* Content is unread */
+#define PGHDR_REUSE_UNLIKELY    0x010  /* A hint that reuse is unlikely */
+#define PGHDR_DONT_WRITE        0x020  /* Do not write content to disk */
+
+#define PGHDR_MMAP              0x040  /* This is an mmap page object */
+
+/* Initialize and shutdown the page cache subsystem */
+SQLITE_PRIVATE int sqlite3PcacheInitialize(void);
+SQLITE_PRIVATE void sqlite3PcacheShutdown(void);
+
+/* Page cache buffer management:
+** These routines implement SQLITE_CONFIG_PAGECACHE.
+*/
+SQLITE_PRIVATE void sqlite3PCacheBufferSetup(void *, int sz, int n);
+
+/* Create a new pager cache.
+** Under memory stress, invoke xStress to try to make pages clean.
+** Only clean and unpinned pages can be reclaimed.
+*/
+SQLITE_PRIVATE int sqlite3PcacheOpen(
+  int szPage,                    /* Size of every page */
+  int szExtra,                   /* Extra space associated with each page */
+  int bPurgeable,                /* True if pages are on backing store */
+  int (*xStress)(void*, PgHdr*), /* Call to try to make pages clean */
+  void *pStress,                 /* Argument to xStress */
+  PCache *pToInit                /* Preallocated space for the PCache */
+);
+
+/* Modify the page-size after the cache has been created. */
+SQLITE_PRIVATE int sqlite3PcacheSetPageSize(PCache *, int);
+
+/* Return the size in bytes of a PCache object.  Used to preallocate
+** storage space.
+*/
+SQLITE_PRIVATE int sqlite3PcacheSize(void);
+
+/* One release per successful fetch.  Page is pinned until released.
+** Reference counted. 
+*/
+SQLITE_PRIVATE sqlite3_pcache_page *sqlite3PcacheFetch(PCache*, Pgno, int createFlag);
+SQLITE_PRIVATE int sqlite3PcacheFetchStress(PCache*, Pgno, sqlite3_pcache_page**);
+SQLITE_PRIVATE PgHdr *sqlite3PcacheFetchFinish(PCache*, Pgno, sqlite3_pcache_page *pPage);
+SQLITE_PRIVATE void sqlite3PcacheRelease(PgHdr*);
+
+SQLITE_PRIVATE void sqlite3PcacheDrop(PgHdr*);         /* Remove page from cache */
+SQLITE_PRIVATE void sqlite3PcacheMakeDirty(PgHdr*);    /* Make sure page is marked dirty */
+SQLITE_PRIVATE void sqlite3PcacheMakeClean(PgHdr*);    /* Mark a single page as clean */
+SQLITE_PRIVATE void sqlite3PcacheCleanAll(PCache*);    /* Mark all dirty list pages as clean */
+
+/* Change a page number.  Used by incr-vacuum. */
+SQLITE_PRIVATE void sqlite3PcacheMove(PgHdr*, Pgno);
+
+/* Remove all pages with pgno>x.  Reset the cache if x==0 */
+SQLITE_PRIVATE void sqlite3PcacheTruncate(PCache*, Pgno x);
+
+/* Get a list of all dirty pages in the cache, sorted by page number */
+SQLITE_PRIVATE PgHdr *sqlite3PcacheDirtyList(PCache*);
+
+/* Reset and close the cache object */
+SQLITE_PRIVATE void sqlite3PcacheClose(PCache*);
+
+/* Clear flags from pages of the page cache */
+SQLITE_PRIVATE void sqlite3PcacheClearSyncFlags(PCache *);
+
+/* Discard the contents of the cache */
+SQLITE_PRIVATE void sqlite3PcacheClear(PCache*);
+
+/* Return the total number of outstanding page references */
+SQLITE_PRIVATE int sqlite3PcacheRefCount(PCache*);
+
