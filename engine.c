@@ -9310,3 +9310,239 @@ SQLITE_PRIVATE int sqlite3BtreeCursor(
   int iTable,                          /* Index of root page */
   int wrFlag,                          /* 1 for writing.  0 for read-only */
   struct KeyInfo*,                     /* First argument to compare function */
+  BtCursor *pCursor                    /* Space to write cursor structure */
+);
+SQLITE_PRIVATE int sqlite3BtreeCursorSize(void);
+SQLITE_PRIVATE void sqlite3BtreeCursorZero(BtCursor*);
+
+SQLITE_PRIVATE int sqlite3BtreeCloseCursor(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeMovetoUnpacked(
+  BtCursor*,
+  UnpackedRecord *pUnKey,
+  i64 intKey,
+  int bias,
+  int *pRes
+);
+SQLITE_PRIVATE int sqlite3BtreeCursorHasMoved(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeCursorRestore(BtCursor*, int*);
+SQLITE_PRIVATE int sqlite3BtreeDelete(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeInsert(BtCursor*, const void *pKey, i64 nKey,
+                                  const void *pData, int nData,
+                                  int nZero, int bias, int seekResult);
+SQLITE_PRIVATE int sqlite3BtreeFirst(BtCursor*, int *pRes);
+SQLITE_PRIVATE int sqlite3BtreeLast(BtCursor*, int *pRes);
+SQLITE_PRIVATE int sqlite3BtreeNext(BtCursor*, int *pRes);
+SQLITE_PRIVATE int sqlite3BtreeEof(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreePrevious(BtCursor*, int *pRes);
+SQLITE_PRIVATE int sqlite3BtreeKeySize(BtCursor*, i64 *pSize);
+SQLITE_PRIVATE int sqlite3BtreeKey(BtCursor*, u32 offset, u32 amt, void*);
+SQLITE_PRIVATE const void *sqlite3BtreeKeyFetch(BtCursor*, u32 *pAmt);
+SQLITE_PRIVATE const void *sqlite3BtreeDataFetch(BtCursor*, u32 *pAmt);
+SQLITE_PRIVATE int sqlite3BtreeDataSize(BtCursor*, u32 *pSize);
+SQLITE_PRIVATE int sqlite3BtreeData(BtCursor*, u32 offset, u32 amt, void*);
+
+SQLITE_PRIVATE char *sqlite3BtreeIntegrityCheck(Btree*, int *aRoot, int nRoot, int, int*);
+SQLITE_PRIVATE struct Pager *sqlite3BtreePager(Btree*);
+
+SQLITE_PRIVATE int sqlite3BtreePutData(BtCursor*, u32 offset, u32 amt, void*);
+SQLITE_PRIVATE void sqlite3BtreeIncrblobCursor(BtCursor *);
+SQLITE_PRIVATE void sqlite3BtreeClearCursor(BtCursor *);
+SQLITE_PRIVATE int sqlite3BtreeSetVersion(Btree *pBt, int iVersion);
+SQLITE_PRIVATE void sqlite3BtreeCursorHints(BtCursor *, unsigned int mask);
+SQLITE_PRIVATE int sqlite3BtreeIsReadonly(Btree *pBt);
+SQLITE_PRIVATE int sqlite3HeaderSizeBtree(void);
+
+#ifndef NDEBUG
+SQLITE_PRIVATE int sqlite3BtreeCursorIsValid(BtCursor*);
+#endif
+
+#ifndef SQLITE_OMIT_BTREECOUNT
+SQLITE_PRIVATE int sqlite3BtreeCount(BtCursor *, i64 *);
+#endif
+
+#ifdef SQLITE_TEST
+SQLITE_PRIVATE int sqlite3BtreeCursorInfo(BtCursor*, int*, int);
+SQLITE_PRIVATE void sqlite3BtreeCursorList(Btree*);
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE   int sqlite3BtreeCheckpoint(Btree*, int, int *, int *);
+#endif
+
+/*
+** If we are not using shared cache, then there is no need to
+** use mutexes to access the BtShared structures.  So make the
+** Enter and Leave procedures no-ops.
+*/
+#ifndef SQLITE_OMIT_SHARED_CACHE
+SQLITE_PRIVATE   void sqlite3BtreeEnter(Btree*);
+SQLITE_PRIVATE   void sqlite3BtreeEnterAll(sqlite3*);
+#else
+# define sqlite3BtreeEnter(X) 
+# define sqlite3BtreeEnterAll(X)
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE
+SQLITE_PRIVATE   int sqlite3BtreeSharable(Btree*);
+SQLITE_PRIVATE   void sqlite3BtreeLeave(Btree*);
+SQLITE_PRIVATE   void sqlite3BtreeEnterCursor(BtCursor*);
+SQLITE_PRIVATE   void sqlite3BtreeLeaveCursor(BtCursor*);
+SQLITE_PRIVATE   void sqlite3BtreeLeaveAll(sqlite3*);
+#ifndef NDEBUG
+  /* These routines are used inside assert() statements only. */
+SQLITE_PRIVATE   int sqlite3BtreeHoldsMutex(Btree*);
+SQLITE_PRIVATE   int sqlite3BtreeHoldsAllMutexes(sqlite3*);
+SQLITE_PRIVATE   int sqlite3SchemaMutexHeld(sqlite3*,int,Schema*);
+#endif
+#else
+
+# define sqlite3BtreeSharable(X) 0
+# define sqlite3BtreeLeave(X)
+# define sqlite3BtreeEnterCursor(X)
+# define sqlite3BtreeLeaveCursor(X)
+# define sqlite3BtreeLeaveAll(X)
+
+# define sqlite3BtreeHoldsMutex(X) 1
+# define sqlite3BtreeHoldsAllMutexes(X) 1
+# define sqlite3SchemaMutexHeld(X,Y,Z) 1
+#endif
+
+
+#endif /* _BTREE_H_ */
+
+/************** End of btree.h ***********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include vdbe.h in the middle of sqliteInt.h ******************/
+/************** Begin file vdbe.h ********************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** Header file for the Virtual DataBase Engine (VDBE)
+**
+** This header defines the interface to the virtual database engine
+** or VDBE.  The VDBE implements an abstract machine that runs a
+** simple program to access and modify the underlying database.
+*/
+#ifndef _SQLITE_VDBE_H_
+#define _SQLITE_VDBE_H_
+/* #include <stdio.h> */
+
+/*
+** A single VDBE is an opaque structure named "Vdbe".  Only routines
+** in the source file sqliteVdbe.c are allowed to see the insides
+** of this structure.
+*/
+typedef struct Vdbe Vdbe;
+
+/*
+** The names of the following types declared in vdbeInt.h are required
+** for the VdbeOp definition.
+*/
+typedef struct Mem Mem;
+typedef struct SubProgram SubProgram;
+
+/*
+** A single instruction of the virtual machine has an opcode
+** and as many as three operands.  The instruction is recorded
+** as an instance of the following structure:
+*/
+struct VdbeOp {
+  u8 opcode;          /* What operation to perform */
+  signed char p4type; /* One of the P4_xxx constants for p4 */
+  u8 opflags;         /* Mask of the OPFLG_* flags in opcodes.h */
+  u8 p5;              /* Fifth parameter is an unsigned character */
+  int p1;             /* First operand */
+  int p2;             /* Second parameter (often the jump destination) */
+  int p3;             /* The third parameter */
+  union {             /* fourth parameter */
+    int i;                 /* Integer value if p4type==P4_INT32 */
+    void *p;               /* Generic pointer */
+    char *z;               /* Pointer to data for string (char array) types */
+    i64 *pI64;             /* Used when p4type is P4_INT64 */
+    double *pReal;         /* Used when p4type is P4_REAL */
+    FuncDef *pFunc;        /* Used when p4type is P4_FUNCDEF */
+    CollSeq *pColl;        /* Used when p4type is P4_COLLSEQ */
+    Mem *pMem;             /* Used when p4type is P4_MEM */
+    VTable *pVtab;         /* Used when p4type is P4_VTAB */
+    KeyInfo *pKeyInfo;     /* Used when p4type is P4_KEYINFO */
+    int *ai;               /* Used when p4type is P4_INTARRAY */
+    SubProgram *pProgram;  /* Used when p4type is P4_SUBPROGRAM */
+    int (*xAdvance)(BtCursor *, int *);
+  } p4;
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+  char *zComment;          /* Comment to improve readability */
+#endif
+#ifdef VDBE_PROFILE
+  u32 cnt;                 /* Number of times this instruction was executed */
+  u64 cycles;              /* Total time spent executing this instruction */
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+  int iSrcLine;            /* Source-code line that generated this opcode */
+#endif
+};
+typedef struct VdbeOp VdbeOp;
+
+
+/*
+** A sub-routine used to implement a trigger program.
+*/
+struct SubProgram {
+  VdbeOp *aOp;                  /* Array of opcodes for sub-program */
+  int nOp;                      /* Elements in aOp[] */
+  int nMem;                     /* Number of memory cells required */
+  int nCsr;                     /* Number of cursors required */
+  int nOnce;                    /* Number of OP_Once instructions */
+  void *token;                  /* id that may be used to recursive triggers */
+  SubProgram *pNext;            /* Next sub-program already visited */
+};
+
+/*
+** A smaller version of VdbeOp used for the VdbeAddOpList() function because
+** it takes up less space.
+*/
+struct VdbeOpList {
+  u8 opcode;          /* What operation to perform */
+  signed char p1;     /* First operand */
+  signed char p2;     /* Second parameter (often the jump destination) */
+  signed char p3;     /* Third parameter */
+};
+typedef struct VdbeOpList VdbeOpList;
+
+/*
+** Allowed values of VdbeOp.p4type
+*/
+#define P4_NOTUSED    0   /* The P4 parameter is not used */
+#define P4_DYNAMIC  (-1)  /* Pointer to a string obtained from sqliteMalloc() */
+#define P4_STATIC   (-2)  /* Pointer to a static string */
+#define P4_COLLSEQ  (-4)  /* P4 is a pointer to a CollSeq structure */
+#define P4_FUNCDEF  (-5)  /* P4 is a pointer to a FuncDef structure */
+#define P4_KEYINFO  (-6)  /* P4 is a pointer to a KeyInfo structure */
+#define P4_MEM      (-8)  /* P4 is a pointer to a Mem*    structure */
+#define P4_TRANSIENT  0   /* P4 is a pointer to a transient string */
+#define P4_VTAB     (-10) /* P4 is a pointer to an sqlite3_vtab structure */
+#define P4_MPRINTF  (-11) /* P4 is a string obtained from sqlite3_mprintf() */
+#define P4_REAL     (-12) /* P4 is a 64-bit floating point value */
+#define P4_INT64    (-13) /* P4 is a 64-bit signed integer */
+#define P4_INT32    (-14) /* P4 is a 32-bit signed integer */
+#define P4_INTARRAY (-15) /* P4 is a vector of 32-bit integers */
+#define P4_SUBPROGRAM  (-18) /* P4 is a pointer to a SubProgram structure */
+#define P4_ADVANCE  (-19) /* P4 is a pointer to BtreeNext() or BtreePrev() */
+
+/* Error message codes for OP_Halt */
+#define P5_ConstraintNotNull 1
+#define P5_ConstraintUnique  2
+#define P5_ConstraintCheck   3
+#define P5_ConstraintFK      4
+
+/*
+** The Vdbe.aColName array contains 5n Mem structures, where n is the 
+** number of columns of data returned by the statement.
+*/
