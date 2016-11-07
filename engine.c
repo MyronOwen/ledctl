@@ -10708,3 +10708,211 @@ struct Schema {
 **
 ** DB_UnresetViews means that one or more views have column names that
 ** have been filled out.  If the schema changes, these column names might
+** changes and so the view will need to be reset.
+*/
+#define DB_SchemaLoaded    0x0001  /* The schema has been loaded */
+#define DB_UnresetViews    0x0002  /* Some views have defined column names */
+#define DB_Empty           0x0004  /* The file is empty (length 0 bytes) */
+
+/*
+** The number of different kinds of things that can be limited
+** using the sqlite3_limit() interface.
+*/
+#define SQLITE_N_LIMIT (SQLITE_LIMIT_WORKER_THREADS+1)
+
+/*
+** Lookaside malloc is a set of fixed-size buffers that can be used
+** to satisfy small transient memory allocation requests for objects
+** associated with a particular database connection.  The use of
+** lookaside malloc provides a significant performance enhancement
+** (approx 10%) by avoiding numerous malloc/free requests while parsing
+** SQL statements.
+**
+** The Lookaside structure holds configuration information about the
+** lookaside malloc subsystem.  Each available memory allocation in
+** the lookaside subsystem is stored on a linked list of LookasideSlot
+** objects.
+**
+** Lookaside allocations are only allowed for objects that are associated
+** with a particular database connection.  Hence, schema information cannot
+** be stored in lookaside because in shared cache mode the schema information
+** is shared by multiple database connections.  Therefore, while parsing
+** schema information, the Lookaside.bEnabled flag is cleared so that
+** lookaside allocations are not used to construct the schema objects.
+*/
+struct Lookaside {
+  u16 sz;                 /* Size of each buffer in bytes */
+  u8 bEnabled;            /* False to disable new lookaside allocations */
+  u8 bMalloced;           /* True if pStart obtained from sqlite3_malloc() */
+  int nOut;               /* Number of buffers currently checked out */
+  int mxOut;              /* Highwater mark for nOut */
+  int anStat[3];          /* 0: hits.  1: size misses.  2: full misses */
+  LookasideSlot *pFree;   /* List of available buffers */
+  void *pStart;           /* First byte of available memory space */
+  void *pEnd;             /* First byte past end of available space */
+};
+struct LookasideSlot {
+  LookasideSlot *pNext;    /* Next buffer in the list of free buffers */
+};
+
+/*
+** A hash table for function definitions.
+**
+** Hash each FuncDef structure into one of the FuncDefHash.a[] slots.
+** Collisions are on the FuncDef.pHash chain.
+*/
+struct FuncDefHash {
+  FuncDef *a[23];       /* Hash table for functions */
+};
+
+#ifdef SQLITE_USER_AUTHENTICATION
+/*
+** Information held in the "sqlite3" database connection object and used
+** to manage user authentication.
+*/
+typedef struct sqlite3_userauth sqlite3_userauth;
+struct sqlite3_userauth {
+  u8 authLevel;                 /* Current authentication level */
+  int nAuthPW;                  /* Size of the zAuthPW in bytes */
+  char *zAuthPW;                /* Password used to authenticate */
+  char *zAuthUser;              /* User name used to authenticate */
+};
+
+/* Allowed values for sqlite3_userauth.authLevel */
+#define UAUTH_Unknown     0     /* Authentication not yet checked */
+#define UAUTH_Fail        1     /* User authentication failed */
+#define UAUTH_User        2     /* Authenticated as a normal user */
+#define UAUTH_Admin       3     /* Authenticated as an administrator */
+
+/* Functions used only by user authorization logic */
+SQLITE_PRIVATE int sqlite3UserAuthTable(const char*);
+SQLITE_PRIVATE int sqlite3UserAuthCheckLogin(sqlite3*,const char*,u8*);
+SQLITE_PRIVATE void sqlite3UserAuthInit(sqlite3*);
+SQLITE_PRIVATE void sqlite3CryptFunc(sqlite3_context*,int,sqlite3_value**);
+
+#endif /* SQLITE_USER_AUTHENTICATION */
+
+/*
+** typedef for the authorization callback function.
+*/
+#ifdef SQLITE_USER_AUTHENTICATION
+  typedef int (*sqlite3_xauth)(void*,int,const char*,const char*,const char*,
+                               const char*, const char*);
+#else
+  typedef int (*sqlite3_xauth)(void*,int,const char*,const char*,const char*,
+                               const char*);
+#endif
+
+
+/*
+** Each database connection is an instance of the following structure.
+*/
+struct sqlite3 {
+  sqlite3_vfs *pVfs;            /* OS Interface */
+  struct Vdbe *pVdbe;           /* List of active virtual machines */
+  CollSeq *pDfltColl;           /* The default collating sequence (BINARY) */
+  sqlite3_mutex *mutex;         /* Connection mutex */
+  Db *aDb;                      /* All backends */
+  int nDb;                      /* Number of backends currently in use */
+  int flags;                    /* Miscellaneous flags. See below */
+  i64 lastRowid;                /* ROWID of most recent insert (see above) */
+  i64 szMmap;                   /* Default mmap_size setting */
+  unsigned int openFlags;       /* Flags passed to sqlite3_vfs.xOpen() */
+  int errCode;                  /* Most recent error code (SQLITE_*) */
+  int errMask;                  /* & result codes with this before returning */
+  u16 dbOptFlags;               /* Flags to enable/disable optimizations */
+  u8 enc;                       /* Text encoding */
+  u8 autoCommit;                /* The auto-commit flag. */
+  u8 temp_store;                /* 1: file 2: memory 0: default */
+  u8 mallocFailed;              /* True if we have seen a malloc failure */
+  u8 dfltLockMode;              /* Default locking-mode for attached dbs */
+  signed char nextAutovac;      /* Autovac setting after VACUUM if >=0 */
+  u8 suppressErr;               /* Do not issue error messages if true */
+  u8 vtabOnConflict;            /* Value to return for s3_vtab_on_conflict() */
+  u8 isTransactionSavepoint;    /* True if the outermost savepoint is a TS */
+  int nextPagesize;             /* Pagesize after VACUUM if >0 */
+  u32 magic;                    /* Magic number for detect library misuse */
+  int nChange;                  /* Value returned by sqlite3_changes() */
+  int nTotalChange;             /* Value returned by sqlite3_total_changes() */
+  int aLimit[SQLITE_N_LIMIT];   /* Limits */
+  int nMaxSorterMmap;           /* Maximum size of regions mapped by sorter */
+  struct sqlite3InitInfo {      /* Information used during initialization */
+    int newTnum;                /* Rootpage of table being initialized */
+    u8 iDb;                     /* Which db file is being initialized */
+    u8 busy;                    /* TRUE if currently initializing */
+    u8 orphanTrigger;           /* Last statement is orphaned TEMP trigger */
+  } init;
+  int nVdbeActive;              /* Number of VDBEs currently running */
+  int nVdbeRead;                /* Number of active VDBEs that read or write */
+  int nVdbeWrite;               /* Number of active VDBEs that read and write */
+  int nVdbeExec;                /* Number of nested calls to VdbeExec() */
+  int nExtension;               /* Number of loaded extensions */
+  void **aExtension;            /* Array of shared library handles */
+  void (*xTrace)(void*,const char*);        /* Trace function */
+  void *pTraceArg;                          /* Argument to the trace function */
+  void (*xProfile)(void*,const char*,u64);  /* Profiling function */
+  void *pProfileArg;                        /* Argument to profile function */
+  void *pCommitArg;                 /* Argument to xCommitCallback() */   
+  int (*xCommitCallback)(void*);    /* Invoked at every commit. */
+  void *pRollbackArg;               /* Argument to xRollbackCallback() */   
+  void (*xRollbackCallback)(void*); /* Invoked at every commit. */
+  void *pUpdateArg;
+  void (*xUpdateCallback)(void*,int, const char*,const char*,sqlite_int64);
+#ifndef SQLITE_OMIT_WAL
+  int (*xWalCallback)(void *, sqlite3 *, const char *, int);
+  void *pWalArg;
+#endif
+  void(*xCollNeeded)(void*,sqlite3*,int eTextRep,const char*);
+  void(*xCollNeeded16)(void*,sqlite3*,int eTextRep,const void*);
+  void *pCollNeededArg;
+  sqlite3_value *pErr;          /* Most recent error message */
+  union {
+    volatile int isInterrupted; /* True if sqlite3_interrupt has been called */
+    double notUsed1;            /* Spacer */
+  } u1;
+  Lookaside lookaside;          /* Lookaside malloc configuration */
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  sqlite3_xauth xAuth;          /* Access authorization function */
+  void *pAuthArg;               /* 1st argument to the access auth function */
+#endif
+#ifndef SQLITE_OMIT_PROGRESS_CALLBACK
+  int (*xProgress)(void *);     /* The progress callback */
+  void *pProgressArg;           /* Argument to the progress callback */
+  unsigned nProgressOps;        /* Number of opcodes for progress callback */
+#endif
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  int nVTrans;                  /* Allocated size of aVTrans */
+  Hash aModule;                 /* populated by sqlite3_create_module() */
+  VtabCtx *pVtabCtx;            /* Context for active vtab connect/create */
+  VTable **aVTrans;             /* Virtual tables with open transactions */
+  VTable *pDisconnect;    /* Disconnect these in next sqlite3_prepare() */
+#endif
+  FuncDefHash aFunc;            /* Hash table of connection functions */
+  Hash aCollSeq;                /* All collating sequences */
+  BusyHandler busyHandler;      /* Busy callback */
+  Db aDbStatic[2];              /* Static space for the 2 default backends */
+  Savepoint *pSavepoint;        /* List of active savepoints */
+  int busyTimeout;              /* Busy handler timeout, in msec */
+  int nSavepoint;               /* Number of non-transaction savepoints */
+  int nStatement;               /* Number of nested statement-transactions  */
+  i64 nDeferredCons;            /* Net deferred constraints this transaction. */
+  i64 nDeferredImmCons;         /* Net deferred immediate constraints */
+  int *pnBytesFreed;            /* If not NULL, increment this in DbFree() */
+#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY
+  /* The following variables are all protected by the STATIC_MASTER 
+  ** mutex, not by sqlite3.mutex. They are used by code in notify.c. 
+  **
+  ** When X.pUnlockConnection==Y, that means that X is waiting for Y to
+  ** unlock so that it can proceed.
+  **
+  ** When X.pBlockingConnection==Y, that means that something that X tried
+  ** tried to do recently failed with an SQLITE_LOCKED error due to locks
+  ** held by Y.
+  */
+  sqlite3 *pBlockingConnection; /* Connection that caused SQLITE_LOCKED */
+  sqlite3 *pUnlockConnection;           /* Connection to watch for unlock */
+  void *pUnlockArg;                     /* Argument to xUnlockNotify */
+  void (*xUnlockNotify)(void **, int);  /* Unlock notify callback */
+  sqlite3 *pNextBlocked;        /* Next in list of all blocked connections */
+#endif
+#ifdef SQLITE_USER_AUTHENTICATION
