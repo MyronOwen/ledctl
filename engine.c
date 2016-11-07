@@ -10483,3 +10483,228 @@ SQLITE_PRIVATE int sqlite3HeaderSizePcache1(void);
 ** clients on win95, winNT, and unix all talking to the same shared file
 ** and all locking correctly.  To do so would require that samba (or whatever
 ** tool is being used for file sharing) implements locks correctly between
+** windows and unix.  I'm guessing that isn't likely to happen, but by
+** using the same locking range we are at least open to the possibility.
+**
+** Locking in windows is manditory.  For this reason, we cannot store
+** actual data in the bytes used for locking.  The pager never allocates
+** the pages involved in locking therefore.  SHARED_SIZE is selected so
+** that all locks will fit on a single page even at the minimum page size.
+** PENDING_BYTE defines the beginning of the locks.  By default PENDING_BYTE
+** is set high so that we don't have to allocate an unused page except
+** for very large databases.  But one should test the page skipping logic 
+** by setting PENDING_BYTE low and running the entire regression suite.
+**
+** Changing the value of PENDING_BYTE results in a subtly incompatible
+** file format.  Depending on how it is changed, you might not notice
+** the incompatibility right away, even running a full regression test.
+** The default location of PENDING_BYTE is the first byte past the
+** 1GB boundary.
+**
+*/
+#ifdef SQLITE_OMIT_WSD
+# define PENDING_BYTE     (0x40000000)
+#else
+# define PENDING_BYTE      sqlite3PendingByte
+#endif
+#define RESERVED_BYTE     (PENDING_BYTE+1)
+#define SHARED_FIRST      (PENDING_BYTE+2)
+#define SHARED_SIZE       510
+
+/*
+** Wrapper around OS specific sqlite3_os_init() function.
+*/
+SQLITE_PRIVATE int sqlite3OsInit(void);
+
+/* 
+** Functions for accessing sqlite3_file methods 
+*/
+SQLITE_PRIVATE int sqlite3OsClose(sqlite3_file*);
+SQLITE_PRIVATE int sqlite3OsRead(sqlite3_file*, void*, int amt, i64 offset);
+SQLITE_PRIVATE int sqlite3OsWrite(sqlite3_file*, const void*, int amt, i64 offset);
+SQLITE_PRIVATE int sqlite3OsTruncate(sqlite3_file*, i64 size);
+SQLITE_PRIVATE int sqlite3OsSync(sqlite3_file*, int);
+SQLITE_PRIVATE int sqlite3OsFileSize(sqlite3_file*, i64 *pSize);
+SQLITE_PRIVATE int sqlite3OsLock(sqlite3_file*, int);
+SQLITE_PRIVATE int sqlite3OsUnlock(sqlite3_file*, int);
+SQLITE_PRIVATE int sqlite3OsCheckReservedLock(sqlite3_file *id, int *pResOut);
+SQLITE_PRIVATE int sqlite3OsFileControl(sqlite3_file*,int,void*);
+SQLITE_PRIVATE void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
+#define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
+SQLITE_PRIVATE int sqlite3OsSectorSize(sqlite3_file *id);
+SQLITE_PRIVATE int sqlite3OsDeviceCharacteristics(sqlite3_file *id);
+SQLITE_PRIVATE int sqlite3OsShmMap(sqlite3_file *,int,int,int,void volatile **);
+SQLITE_PRIVATE int sqlite3OsShmLock(sqlite3_file *id, int, int, int);
+SQLITE_PRIVATE void sqlite3OsShmBarrier(sqlite3_file *id);
+SQLITE_PRIVATE int sqlite3OsShmUnmap(sqlite3_file *id, int);
+SQLITE_PRIVATE int sqlite3OsFetch(sqlite3_file *id, i64, int, void **);
+SQLITE_PRIVATE int sqlite3OsUnfetch(sqlite3_file *, i64, void *);
+
+
+/* 
+** Functions for accessing sqlite3_vfs methods 
+*/
+SQLITE_PRIVATE int sqlite3OsOpen(sqlite3_vfs *, const char *, sqlite3_file*, int, int *);
+SQLITE_PRIVATE int sqlite3OsDelete(sqlite3_vfs *, const char *, int);
+SQLITE_PRIVATE int sqlite3OsAccess(sqlite3_vfs *, const char *, int, int *pResOut);
+SQLITE_PRIVATE int sqlite3OsFullPathname(sqlite3_vfs *, const char *, int, char *);
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_PRIVATE void *sqlite3OsDlOpen(sqlite3_vfs *, const char *);
+SQLITE_PRIVATE void sqlite3OsDlError(sqlite3_vfs *, int, char *);
+SQLITE_PRIVATE void (*sqlite3OsDlSym(sqlite3_vfs *, void *, const char *))(void);
+SQLITE_PRIVATE void sqlite3OsDlClose(sqlite3_vfs *, void *);
+#endif /* SQLITE_OMIT_LOAD_EXTENSION */
+SQLITE_PRIVATE int sqlite3OsRandomness(sqlite3_vfs *, int, char *);
+SQLITE_PRIVATE int sqlite3OsSleep(sqlite3_vfs *, int);
+SQLITE_PRIVATE int sqlite3OsCurrentTimeInt64(sqlite3_vfs *, sqlite3_int64*);
+
+/*
+** Convenience functions for opening and closing files using 
+** sqlite3_malloc() to obtain space for the file-handle structure.
+*/
+SQLITE_PRIVATE int sqlite3OsOpenMalloc(sqlite3_vfs *, const char *, sqlite3_file **, int,int*);
+SQLITE_PRIVATE int sqlite3OsCloseFree(sqlite3_file *);
+
+#endif /* _SQLITE_OS_H_ */
+
+/************** End of os.h **************************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include mutex.h in the middle of sqliteInt.h *****************/
+/************** Begin file mutex.h *******************************************/
+/*
+** 2007 August 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains the common header for all mutex implementations.
+** The sqliteInt.h header #includes this file so that it is available
+** to all source files.  We break it out in an effort to keep the code
+** better organized.
+**
+** NOTE:  source files should *not* #include this header file directly.
+** Source files should #include the sqliteInt.h file and let that file
+** include this one indirectly.
+*/
+
+
+/*
+** Figure out what version of the code to use.  The choices are
+**
+**   SQLITE_MUTEX_OMIT         No mutex logic.  Not even stubs.  The
+**                             mutexes implementation cannot be overridden
+**                             at start-time.
+**
+**   SQLITE_MUTEX_NOOP         For single-threaded applications.  No
+**                             mutual exclusion is provided.  But this
+**                             implementation can be overridden at
+**                             start-time.
+**
+**   SQLITE_MUTEX_PTHREADS     For multi-threaded applications on Unix.
+**
+**   SQLITE_MUTEX_W32          For multi-threaded applications on Win32.
+*/
+#if !SQLITE_THREADSAFE
+# define SQLITE_MUTEX_OMIT
+#endif
+#if SQLITE_THREADSAFE && !defined(SQLITE_MUTEX_NOOP)
+#  if SQLITE_OS_UNIX
+#    define SQLITE_MUTEX_PTHREADS
+#  elif SQLITE_OS_WIN
+#    define SQLITE_MUTEX_W32
+#  else
+#    define SQLITE_MUTEX_NOOP
+#  endif
+#endif
+
+#ifdef SQLITE_MUTEX_OMIT
+/*
+** If this is a no-op implementation, implement everything as macros.
+*/
+#define sqlite3_mutex_alloc(X)    ((sqlite3_mutex*)8)
+#define sqlite3_mutex_free(X)
+#define sqlite3_mutex_enter(X)    
+#define sqlite3_mutex_try(X)      SQLITE_OK
+#define sqlite3_mutex_leave(X)    
+#define sqlite3_mutex_held(X)     ((void)(X),1)
+#define sqlite3_mutex_notheld(X)  ((void)(X),1)
+#define sqlite3MutexAlloc(X)      ((sqlite3_mutex*)8)
+#define sqlite3MutexInit()        SQLITE_OK
+#define sqlite3MutexEnd()
+#define MUTEX_LOGIC(X)
+#else
+#define MUTEX_LOGIC(X)            X
+#endif /* defined(SQLITE_MUTEX_OMIT) */
+
+/************** End of mutex.h ***********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+
+
+/*
+** Each database file to be accessed by the system is an instance
+** of the following structure.  There are normally two of these structures
+** in the sqlite.aDb[] array.  aDb[0] is the main database file and
+** aDb[1] is the database file used to hold temporary tables.  Additional
+** databases may be attached.
+*/
+struct Db {
+  char *zName;         /* Name of this database */
+  Btree *pBt;          /* The B*Tree structure for this database file */
+  u8 safety_level;     /* How aggressive at syncing data to disk */
+  Schema *pSchema;     /* Pointer to database schema (possibly shared) */
+};
+
+/*
+** An instance of the following structure stores a database schema.
+**
+** Most Schema objects are associated with a Btree.  The exception is
+** the Schema for the TEMP databaes (sqlite3.aDb[1]) which is free-standing.
+** In shared cache mode, a single Schema object can be shared by multiple
+** Btrees that refer to the same underlying BtShared object.
+** 
+** Schema objects are automatically deallocated when the last Btree that
+** references them is destroyed.   The TEMP Schema is manually freed by
+** sqlite3_close().
+*
+** A thread must be holding a mutex on the corresponding Btree in order
+** to access Schema content.  This implies that the thread must also be
+** holding a mutex on the sqlite3 connection pointer that owns the Btree.
+** For a TEMP Schema, only the connection mutex is required.
+*/
+struct Schema {
+  int schema_cookie;   /* Database schema version number for this file */
+  int iGeneration;     /* Generation counter.  Incremented with each change */
+  Hash tblHash;        /* All tables indexed by name */
+  Hash idxHash;        /* All (named) indices indexed by name */
+  Hash trigHash;       /* All triggers indexed by name */
+  Hash fkeyHash;       /* All foreign keys by referenced table name */
+  Table *pSeqTab;      /* The sqlite_sequence table used by AUTOINCREMENT */
+  u8 file_format;      /* Schema format version for this file */
+  u8 enc;              /* Text encoding used by this database */
+  u16 schemaFlags;     /* Flags associated with this schema */
+  int cache_size;      /* Number of pages to use in the cache */
+};
+
+/*
+** These macros can be used to test, set, or clear bits in the 
+** Db.pSchema->flags field.
+*/
+#define DbHasProperty(D,I,P)     (((D)->aDb[I].pSchema->schemaFlags&(P))==(P))
+#define DbHasAnyProperty(D,I,P)  (((D)->aDb[I].pSchema->schemaFlags&(P))!=0)
+#define DbSetProperty(D,I,P)     (D)->aDb[I].pSchema->schemaFlags|=(P)
+#define DbClearProperty(D,I,P)   (D)->aDb[I].pSchema->schemaFlags&=~(P)
+
+/*
+** Allowed values for the DB.pSchema->flags field.
+**
+** The DB_SchemaLoaded flag is set after the database schema has been
+** read into internal hash tables.
+**
+** DB_UnresetViews means that one or more views have column names that
+** have been filled out.  If the schema changes, these column names might
