@@ -10916,3 +10916,213 @@ struct sqlite3 {
   sqlite3 *pNextBlocked;        /* Next in list of all blocked connections */
 #endif
 #ifdef SQLITE_USER_AUTHENTICATION
+  sqlite3_userauth auth;        /* User authentication information */
+#endif
+};
+
+/*
+** A macro to discover the encoding of a database.
+*/
+#define SCHEMA_ENC(db) ((db)->aDb[0].pSchema->enc)
+#define ENC(db)        ((db)->enc)
+
+/*
+** Possible values for the sqlite3.flags.
+*/
+#define SQLITE_VdbeTrace      0x00000001  /* True to trace VDBE execution */
+#define SQLITE_InternChanges  0x00000002  /* Uncommitted Hash table changes */
+#define SQLITE_FullFSync      0x00000004  /* Use full fsync on the backend */
+#define SQLITE_CkptFullFSync  0x00000008  /* Use full fsync for checkpoint */
+#define SQLITE_CacheSpill     0x00000010  /* OK to spill pager cache */
+#define SQLITE_FullColNames   0x00000020  /* Show full column names on SELECT */
+#define SQLITE_ShortColNames  0x00000040  /* Show short columns names */
+#define SQLITE_CountRows      0x00000080  /* Count rows changed by INSERT, */
+                                          /*   DELETE, or UPDATE and return */
+                                          /*   the count using a callback. */
+#define SQLITE_NullCallback   0x00000100  /* Invoke the callback once if the */
+                                          /*   result set is empty */
+#define SQLITE_SqlTrace       0x00000200  /* Debug print SQL as it executes */
+#define SQLITE_VdbeListing    0x00000400  /* Debug listings of VDBE programs */
+#define SQLITE_WriteSchema    0x00000800  /* OK to update SQLITE_MASTER */
+#define SQLITE_VdbeAddopTrace 0x00001000  /* Trace sqlite3VdbeAddOp() calls */
+#define SQLITE_IgnoreChecks   0x00002000  /* Do not enforce check constraints */
+#define SQLITE_ReadUncommitted 0x0004000  /* For shared-cache mode */
+#define SQLITE_LegacyFileFmt  0x00008000  /* Create new databases in format 1 */
+#define SQLITE_RecoveryMode   0x00010000  /* Ignore schema errors */
+#define SQLITE_ReverseOrder   0x00020000  /* Reverse unordered SELECTs */
+#define SQLITE_RecTriggers    0x00040000  /* Enable recursive triggers */
+#define SQLITE_ForeignKeys    0x00080000  /* Enforce foreign key constraints  */
+#define SQLITE_AutoIndex      0x00100000  /* Enable automatic indexes */
+#define SQLITE_PreferBuiltin  0x00200000  /* Preference to built-in funcs */
+#define SQLITE_LoadExtension  0x00400000  /* Enable load_extension */
+#define SQLITE_EnableTrigger  0x00800000  /* True to enable triggers */
+#define SQLITE_DeferFKs       0x01000000  /* Defer all FK constraints */
+#define SQLITE_QueryOnly      0x02000000  /* Disable database changes */
+#define SQLITE_VdbeEQP        0x04000000  /* Debug EXPLAIN QUERY PLAN */
+
+
+/*
+** Bits of the sqlite3.dbOptFlags field that are used by the
+** sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS,...) interface to
+** selectively disable various optimizations.
+*/
+#define SQLITE_QueryFlattener 0x0001   /* Query flattening */
+#define SQLITE_ColumnCache    0x0002   /* Column cache */
+#define SQLITE_GroupByOrder   0x0004   /* GROUPBY cover of ORDERBY */
+#define SQLITE_FactorOutConst 0x0008   /* Constant factoring */
+/*                not used    0x0010   // Was: SQLITE_IdxRealAsInt */
+#define SQLITE_DistinctOpt    0x0020   /* DISTINCT using indexes */
+#define SQLITE_CoverIdxScan   0x0040   /* Covering index scans */
+#define SQLITE_OrderByIdxJoin 0x0080   /* ORDER BY of joins via index */
+#define SQLITE_SubqCoroutine  0x0100   /* Evaluate subqueries as coroutines */
+#define SQLITE_Transitive     0x0200   /* Transitive constraints */
+#define SQLITE_OmitNoopJoin   0x0400   /* Omit unused tables in joins */
+#define SQLITE_Stat34         0x0800   /* Use STAT3 or STAT4 data */
+#define SQLITE_AllOpts        0xffff   /* All optimizations */
+
+/*
+** Macros for testing whether or not optimizations are enabled or disabled.
+*/
+#ifndef SQLITE_OMIT_BUILTIN_TEST
+#define OptimizationDisabled(db, mask)  (((db)->dbOptFlags&(mask))!=0)
+#define OptimizationEnabled(db, mask)   (((db)->dbOptFlags&(mask))==0)
+#else
+#define OptimizationDisabled(db, mask)  0
+#define OptimizationEnabled(db, mask)   1
+#endif
+
+/*
+** Return true if it OK to factor constant expressions into the initialization
+** code. The argument is a Parse object for the code generator.
+*/
+#define ConstFactorOk(P) ((P)->okConstFactor)
+
+/*
+** Possible values for the sqlite.magic field.
+** The numbers are obtained at random and have no special meaning, other
+** than being distinct from one another.
+*/
+#define SQLITE_MAGIC_OPEN     0xa029a697  /* Database is open */
+#define SQLITE_MAGIC_CLOSED   0x9f3c2d33  /* Database is closed */
+#define SQLITE_MAGIC_SICK     0x4b771290  /* Error and awaiting close */
+#define SQLITE_MAGIC_BUSY     0xf03b7906  /* Database currently in use */
+#define SQLITE_MAGIC_ERROR    0xb5357930  /* An SQLITE_MISUSE error occurred */
+#define SQLITE_MAGIC_ZOMBIE   0x64cffc7f  /* Close with last statement close */
+
+/*
+** Each SQL function is defined by an instance of the following
+** structure.  A pointer to this structure is stored in the sqlite.aFunc
+** hash table.  When multiple functions have the same name, the hash table
+** points to a linked list of these structures.
+*/
+struct FuncDef {
+  i16 nArg;            /* Number of arguments.  -1 means unlimited */
+  u16 funcFlags;       /* Some combination of SQLITE_FUNC_* */
+  void *pUserData;     /* User data parameter */
+  FuncDef *pNext;      /* Next function with same name */
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**); /* Regular function */
+  void (*xStep)(sqlite3_context*,int,sqlite3_value**); /* Aggregate step */
+  void (*xFinalize)(sqlite3_context*);                /* Aggregate finalizer */
+  char *zName;         /* SQL name of the function. */
+  FuncDef *pHash;      /* Next with a different name but the same hash */
+  FuncDestructor *pDestructor;   /* Reference counted destructor function */
+};
+
+/*
+** This structure encapsulates a user-function destructor callback (as
+** configured using create_function_v2()) and a reference counter. When
+** create_function_v2() is called to create a function with a destructor,
+** a single object of this type is allocated. FuncDestructor.nRef is set to 
+** the number of FuncDef objects created (either 1 or 3, depending on whether
+** or not the specified encoding is SQLITE_ANY). The FuncDef.pDestructor
+** member of each of the new FuncDef objects is set to point to the allocated
+** FuncDestructor.
+**
+** Thereafter, when one of the FuncDef objects is deleted, the reference
+** count on this object is decremented. When it reaches 0, the destructor
+** is invoked and the FuncDestructor structure freed.
+*/
+struct FuncDestructor {
+  int nRef;
+  void (*xDestroy)(void *);
+  void *pUserData;
+};
+
+/*
+** Possible values for FuncDef.flags.  Note that the _LENGTH and _TYPEOF
+** values must correspond to OPFLAG_LENGTHARG and OPFLAG_TYPEOFARG.  There
+** are assert() statements in the code to verify this.
+*/
+#define SQLITE_FUNC_ENCMASK  0x003 /* SQLITE_UTF8, SQLITE_UTF16BE or UTF16LE */
+#define SQLITE_FUNC_LIKE     0x004 /* Candidate for the LIKE optimization */
+#define SQLITE_FUNC_CASE     0x008 /* Case-sensitive LIKE-type function */
+#define SQLITE_FUNC_EPHEM    0x010 /* Ephemeral.  Delete with VDBE */
+#define SQLITE_FUNC_NEEDCOLL 0x020 /* sqlite3GetFuncCollSeq() might be called */
+#define SQLITE_FUNC_LENGTH   0x040 /* Built-in length() function */
+#define SQLITE_FUNC_TYPEOF   0x080 /* Built-in typeof() function */
+#define SQLITE_FUNC_COUNT    0x100 /* Built-in count(*) aggregate */
+#define SQLITE_FUNC_COALESCE 0x200 /* Built-in coalesce() or ifnull() */
+#define SQLITE_FUNC_UNLIKELY 0x400 /* Built-in unlikely() function */
+#define SQLITE_FUNC_CONSTANT 0x800 /* Constant inputs give a constant output */
+#define SQLITE_FUNC_MINMAX  0x1000 /* True for min() and max() aggregates */
+
+/*
+** The following three macros, FUNCTION(), LIKEFUNC() and AGGREGATE() are
+** used to create the initializers for the FuncDef structures.
+**
+**   FUNCTION(zName, nArg, iArg, bNC, xFunc)
+**     Used to create a scalar function definition of a function zName 
+**     implemented by C function xFunc that accepts nArg arguments. The
+**     value passed as iArg is cast to a (void*) and made available
+**     as the user-data (sqlite3_user_data()) for the function. If 
+**     argument bNC is true, then the SQLITE_FUNC_NEEDCOLL flag is set.
+**
+**   VFUNCTION(zName, nArg, iArg, bNC, xFunc)
+**     Like FUNCTION except it omits the SQLITE_FUNC_CONSTANT flag.
+**
+**   AGGREGATE(zName, nArg, iArg, bNC, xStep, xFinal)
+**     Used to create an aggregate function definition implemented by
+**     the C functions xStep and xFinal. The first four parameters
+**     are interpreted in the same way as the first 4 parameters to
+**     FUNCTION().
+**
+**   LIKEFUNC(zName, nArg, pArg, flags)
+**     Used to create a scalar function definition of a function zName 
+**     that accepts nArg arguments and is implemented by a call to C 
+**     function likeFunc. Argument pArg is cast to a (void *) and made
+**     available as the function user-data (sqlite3_user_data()). The
+**     FuncDef.flags variable is set to the value passed as the flags
+**     parameter.
+*/
+#define FUNCTION(zName, nArg, iArg, bNC, xFunc) \
+  {nArg, SQLITE_FUNC_CONSTANT|SQLITE_UTF8|(bNC*SQLITE_FUNC_NEEDCOLL), \
+   SQLITE_INT_TO_PTR(iArg), 0, xFunc, 0, 0, #zName, 0, 0}
+#define VFUNCTION(zName, nArg, iArg, bNC, xFunc) \
+  {nArg, SQLITE_UTF8|(bNC*SQLITE_FUNC_NEEDCOLL), \
+   SQLITE_INT_TO_PTR(iArg), 0, xFunc, 0, 0, #zName, 0, 0}
+#define FUNCTION2(zName, nArg, iArg, bNC, xFunc, extraFlags) \
+  {nArg,SQLITE_FUNC_CONSTANT|SQLITE_UTF8|(bNC*SQLITE_FUNC_NEEDCOLL)|extraFlags,\
+   SQLITE_INT_TO_PTR(iArg), 0, xFunc, 0, 0, #zName, 0, 0}
+#define STR_FUNCTION(zName, nArg, pArg, bNC, xFunc) \
+  {nArg, SQLITE_FUNC_CONSTANT|SQLITE_UTF8|(bNC*SQLITE_FUNC_NEEDCOLL), \
+   pArg, 0, xFunc, 0, 0, #zName, 0, 0}
+#define LIKEFUNC(zName, nArg, arg, flags) \
+  {nArg, SQLITE_FUNC_CONSTANT|SQLITE_UTF8|flags, \
+   (void *)arg, 0, likeFunc, 0, 0, #zName, 0, 0}
+#define AGGREGATE(zName, nArg, arg, nc, xStep, xFinal) \
+  {nArg, SQLITE_UTF8|(nc*SQLITE_FUNC_NEEDCOLL), \
+   SQLITE_INT_TO_PTR(arg), 0, 0, xStep,xFinal,#zName,0,0}
+#define AGGREGATE2(zName, nArg, arg, nc, xStep, xFinal, extraFlags) \
+  {nArg, SQLITE_UTF8|(nc*SQLITE_FUNC_NEEDCOLL)|extraFlags, \
+   SQLITE_INT_TO_PTR(arg), 0, 0, xStep,xFinal,#zName,0,0}
+
+/*
+** All current savepoints are stored in a linked list starting at
+** sqlite3.pSavepoint. The first element in the list is the most recently
+** opened savepoint. Savepoints are added to the list by the vdbe
+** OP_Savepoint instruction.
+*/
+struct Savepoint {
+  char *zName;                        /* Savepoint name (nul-terminated) */
+  i64 nDeferredCons;                  /* Number of deferred fk violations */
+  i64 nDeferredImmCons;               /* Number of deferred imm fk. */
