@@ -12307,3 +12307,236 @@ struct Parse {
   u8 checkSchema;      /* Causes schema cookie check after an error */
   u8 nested;           /* Number of nested calls to the parser/code generator */
   u8 nTempReg;         /* Number of temporary registers in aTempReg[] */
+  u8 isMultiWrite;     /* True if statement may modify/insert multiple rows */
+  u8 mayAbort;         /* True if statement may throw an ABORT exception */
+  u8 hasCompound;      /* Need to invoke convertCompoundSelectToSubquery() */
+  u8 okConstFactor;    /* OK to factor out constants */
+  int aTempReg[8];     /* Holding area for temporary registers */
+  int nRangeReg;       /* Size of the temporary register block */
+  int iRangeReg;       /* First register in temporary register block */
+  int nErr;            /* Number of errors seen */
+  int nTab;            /* Number of previously allocated VDBE cursors */
+  int nMem;            /* Number of memory cells used so far */
+  int nSet;            /* Number of sets used so far */
+  int nOnce;           /* Number of OP_Once instructions so far */
+  int nOpAlloc;        /* Number of slots allocated for Vdbe.aOp[] */
+  int iFixedOp;        /* Never back out opcodes iFixedOp-1 or earlier */
+  int ckBase;          /* Base register of data during check constraints */
+  int iPartIdxTab;     /* Table corresponding to a partial index */
+  int iCacheLevel;     /* ColCache valid when aColCache[].iLevel<=iCacheLevel */
+  int iCacheCnt;       /* Counter used to generate aColCache[].lru values */
+  int nLabel;          /* Number of labels used */
+  int *aLabel;         /* Space to hold the labels */
+  struct yColCache {
+    int iTable;           /* Table cursor number */
+    i16 iColumn;          /* Table column number */
+    u8 tempReg;           /* iReg is a temp register that needs to be freed */
+    int iLevel;           /* Nesting level */
+    int iReg;             /* Reg with value of this column. 0 means none. */
+    int lru;              /* Least recently used entry has the smallest value */
+  } aColCache[SQLITE_N_COLCACHE];  /* One for each column cache entry */
+  ExprList *pConstExpr;/* Constant expressions */
+  Token constraintName;/* Name of the constraint currently being parsed */
+  yDbMask writeMask;   /* Start a write transaction on these databases */
+  yDbMask cookieMask;  /* Bitmask of schema verified databases */
+  int cookieValue[SQLITE_MAX_ATTACHED+2];  /* Values of cookies to verify */
+  int regRowid;        /* Register holding rowid of CREATE TABLE entry */
+  int regRoot;         /* Register holding root page number for new objects */
+  int nMaxArg;         /* Max args passed to user function by sub-program */
+#if SELECTTRACE_ENABLED
+  int nSelect;         /* Number of SELECT statements seen */
+  int nSelectIndent;   /* How far to indent SELECTTRACE() output */
+#endif
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  int nTableLock;        /* Number of locks in aTableLock */
+  TableLock *aTableLock; /* Required table locks for shared-cache mode */
+#endif
+  AutoincInfo *pAinc;  /* Information about AUTOINCREMENT counters */
+
+  /* Information used while coding trigger programs. */
+  Parse *pToplevel;    /* Parse structure for main program (or NULL) */
+  Table *pTriggerTab;  /* Table triggers are being coded for */
+  int addrCrTab;       /* Address of OP_CreateTable opcode on CREATE TABLE */
+  int addrSkipPK;      /* Address of instruction to skip PRIMARY KEY index */
+  u32 nQueryLoop;      /* Est number of iterations of a query (10*log2(N)) */
+  u32 oldmask;         /* Mask of old.* columns referenced */
+  u32 newmask;         /* Mask of new.* columns referenced */
+  u8 eTriggerOp;       /* TK_UPDATE, TK_INSERT or TK_DELETE */
+  u8 eOrconf;          /* Default ON CONFLICT policy for trigger steps */
+  u8 disableTriggers;  /* True to disable triggers */
+
+  /************************************************************************
+  ** Above is constant between recursions.  Below is reset before and after
+  ** each recursion.  The boundary between these two regions is determined
+  ** using offsetof(Parse,nVar) so the nVar field must be the first field
+  ** in the recursive region.
+  ************************************************************************/
+
+  int nVar;                 /* Number of '?' variables seen in the SQL so far */
+  int nzVar;                /* Number of available slots in azVar[] */
+  u8 iPkSortOrder;          /* ASC or DESC for INTEGER PRIMARY KEY */
+  u8 bFreeWith;             /* True if pWith should be freed with parser */
+  u8 explain;               /* True if the EXPLAIN flag is found on the query */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  u8 declareVtab;           /* True if inside sqlite3_declare_vtab() */
+  int nVtabLock;            /* Number of virtual tables to lock */
+#endif
+  int nAlias;               /* Number of aliased result set columns */
+  int nHeight;              /* Expression tree height of current sub-select */
+#ifndef SQLITE_OMIT_EXPLAIN
+  int iSelectId;            /* ID of current select for EXPLAIN output */
+  int iNextSelectId;        /* Next available select ID for EXPLAIN output */
+#endif
+  char **azVar;             /* Pointers to names of parameters */
+  Vdbe *pReprepare;         /* VM being reprepared (sqlite3Reprepare()) */
+  const char *zTail;        /* All SQL text past the last semicolon parsed */
+  Table *pNewTable;         /* A table being constructed by CREATE TABLE */
+  Trigger *pNewTrigger;     /* Trigger under construct by a CREATE TRIGGER */
+  const char *zAuthContext; /* The 6th parameter to db->xAuth callbacks */
+  Token sNameToken;         /* Token with unqualified schema object name */
+  Token sLastToken;         /* The last token parsed */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  Token sArg;               /* Complete text of a module argument */
+  Table **apVtabLock;       /* Pointer to virtual tables needing locking */
+#endif
+  Table *pZombieTab;        /* List of Table objects to delete after code gen */
+  TriggerPrg *pTriggerPrg;  /* Linked list of coded triggers */
+  With *pWith;              /* Current WITH clause, or NULL */
+};
+
+/*
+** Return true if currently inside an sqlite3_declare_vtab() call.
+*/
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+  #define IN_DECLARE_VTAB 0
+#else
+  #define IN_DECLARE_VTAB (pParse->declareVtab)
+#endif
+
+/*
+** An instance of the following structure can be declared on a stack and used
+** to save the Parse.zAuthContext value so that it can be restored later.
+*/
+struct AuthContext {
+  const char *zAuthContext;   /* Put saved Parse.zAuthContext here */
+  Parse *pParse;              /* The Parse structure */
+};
+
+/*
+** Bitfield flags for P5 value in various opcodes.
+*/
+#define OPFLAG_NCHANGE       0x01    /* Set to update db->nChange */
+#define OPFLAG_EPHEM         0x01    /* OP_Column: Ephemeral output is ok */
+#define OPFLAG_LASTROWID     0x02    /* Set to update db->lastRowid */
+#define OPFLAG_ISUPDATE      0x04    /* This OP_Insert is an sql UPDATE */
+#define OPFLAG_APPEND        0x08    /* This is likely to be an append */
+#define OPFLAG_USESEEKRESULT 0x10    /* Try to avoid a seek in BtreeInsert() */
+#define OPFLAG_LENGTHARG     0x40    /* OP_Column only used for length() */
+#define OPFLAG_TYPEOFARG     0x80    /* OP_Column only used for typeof() */
+#define OPFLAG_BULKCSR       0x01    /* OP_Open** used to open bulk cursor */
+#define OPFLAG_P2ISREG       0x02    /* P2 to OP_Open** is a register number */
+#define OPFLAG_PERMUTE       0x01    /* OP_Compare: use the permutation */
+
+/*
+ * Each trigger present in the database schema is stored as an instance of
+ * struct Trigger. 
+ *
+ * Pointers to instances of struct Trigger are stored in two ways.
+ * 1. In the "trigHash" hash table (part of the sqlite3* that represents the 
+ *    database). This allows Trigger structures to be retrieved by name.
+ * 2. All triggers associated with a single table form a linked list, using the
+ *    pNext member of struct Trigger. A pointer to the first element of the
+ *    linked list is stored as the "pTrigger" member of the associated
+ *    struct Table.
+ *
+ * The "step_list" member points to the first element of a linked list
+ * containing the SQL statements specified as the trigger program.
+ */
+struct Trigger {
+  char *zName;            /* The name of the trigger                        */
+  char *table;            /* The table or view to which the trigger applies */
+  u8 op;                  /* One of TK_DELETE, TK_UPDATE, TK_INSERT         */
+  u8 tr_tm;               /* One of TRIGGER_BEFORE, TRIGGER_AFTER */
+  Expr *pWhen;            /* The WHEN clause of the expression (may be NULL) */
+  IdList *pColumns;       /* If this is an UPDATE OF <column-list> trigger,
+                             the <column-list> is stored here */
+  Schema *pSchema;        /* Schema containing the trigger */
+  Schema *pTabSchema;     /* Schema containing the table */
+  TriggerStep *step_list; /* Link list of trigger program steps             */
+  Trigger *pNext;         /* Next trigger associated with the table */
+};
+
+/*
+** A trigger is either a BEFORE or an AFTER trigger.  The following constants
+** determine which. 
+**
+** If there are multiple triggers, you might of some BEFORE and some AFTER.
+** In that cases, the constants below can be ORed together.
+*/
+#define TRIGGER_BEFORE  1
+#define TRIGGER_AFTER   2
+
+/*
+ * An instance of struct TriggerStep is used to store a single SQL statement
+ * that is a part of a trigger-program. 
+ *
+ * Instances of struct TriggerStep are stored in a singly linked list (linked
+ * using the "pNext" member) referenced by the "step_list" member of the 
+ * associated struct Trigger instance. The first element of the linked list is
+ * the first step of the trigger-program.
+ * 
+ * The "op" member indicates whether this is a "DELETE", "INSERT", "UPDATE" or
+ * "SELECT" statement. The meanings of the other members is determined by the 
+ * value of "op" as follows:
+ *
+ * (op == TK_INSERT)
+ * orconf    -> stores the ON CONFLICT algorithm
+ * pSelect   -> If this is an INSERT INTO ... SELECT ... statement, then
+ *              this stores a pointer to the SELECT statement. Otherwise NULL.
+ * target    -> A token holding the quoted name of the table to insert into.
+ * pExprList -> If this is an INSERT INTO ... VALUES ... statement, then
+ *              this stores values to be inserted. Otherwise NULL.
+ * pIdList   -> If this is an INSERT INTO ... (<column-names>) VALUES ... 
+ *              statement, then this stores the column-names to be
+ *              inserted into.
+ *
+ * (op == TK_DELETE)
+ * target    -> A token holding the quoted name of the table to delete from.
+ * pWhere    -> The WHERE clause of the DELETE statement if one is specified.
+ *              Otherwise NULL.
+ * 
+ * (op == TK_UPDATE)
+ * target    -> A token holding the quoted name of the table to update rows of.
+ * pWhere    -> The WHERE clause of the UPDATE statement if one is specified.
+ *              Otherwise NULL.
+ * pExprList -> A list of the columns to update and the expressions to update
+ *              them to. See sqlite3Update() documentation of "pChanges"
+ *              argument.
+ * 
+ */
+struct TriggerStep {
+  u8 op;               /* One of TK_DELETE, TK_UPDATE, TK_INSERT, TK_SELECT */
+  u8 orconf;           /* OE_Rollback etc. */
+  Trigger *pTrig;      /* The trigger that this step is a part of */
+  Select *pSelect;     /* SELECT statment or RHS of INSERT INTO .. SELECT ... */
+  Token target;        /* Target table for DELETE, UPDATE, INSERT */
+  Expr *pWhere;        /* The WHERE clause for DELETE or UPDATE steps */
+  ExprList *pExprList; /* SET clause for UPDATE. */
+  IdList *pIdList;     /* Column names for INSERT */
+  TriggerStep *pNext;  /* Next in the link-list */
+  TriggerStep *pLast;  /* Last element in link-list. Valid for 1st elem only */
+};
+
+/*
+** The following structure contains information used by the sqliteFix...
+** routines as they walk the parse tree to make database references
+** explicit.  
+*/
+typedef struct DbFixer DbFixer;
+struct DbFixer {
+  Parse *pParse;      /* The parsing context.  Error messages written here */
+  Schema *pSchema;    /* Fix items to this schema */
+  int bVarOnly;       /* Check for variable references only */
+  const char *zDb;    /* Make sure all objects are contained in this database */
+  const char *zType;  /* Type of the container - used for error messages */
+  const Token *pName; /* Name of the container - used for error messages */
