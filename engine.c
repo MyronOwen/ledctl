@@ -12540,3 +12540,239 @@ struct DbFixer {
   const char *zDb;    /* Make sure all objects are contained in this database */
   const char *zType;  /* Type of the container - used for error messages */
   const Token *pName; /* Name of the container - used for error messages */
+};
+
+/*
+** An objected used to accumulate the text of a string where we
+** do not necessarily know how big the string will be in the end.
+*/
+struct StrAccum {
+  sqlite3 *db;         /* Optional database for lookaside.  Can be NULL */
+  char *zBase;         /* A base allocation.  Not from malloc. */
+  char *zText;         /* The string collected so far */
+  int  nChar;          /* Length of the string so far */
+  int  nAlloc;         /* Amount of space allocated in zText */
+  int  mxAlloc;        /* Maximum allowed string length */
+  u8   useMalloc;      /* 0: none,  1: sqlite3DbMalloc,  2: sqlite3_malloc */
+  u8   accError;       /* STRACCUM_NOMEM or STRACCUM_TOOBIG */
+};
+#define STRACCUM_NOMEM   1
+#define STRACCUM_TOOBIG  2
+
+/*
+** A pointer to this structure is used to communicate information
+** from sqlite3Init and OP_ParseSchema into the sqlite3InitCallback.
+*/
+typedef struct {
+  sqlite3 *db;        /* The database being initialized */
+  char **pzErrMsg;    /* Error message stored here */
+  int iDb;            /* 0 for main database.  1 for TEMP, 2.. for ATTACHed */
+  int rc;             /* Result code stored here */
+} InitData;
+
+/*
+** Structure containing global configuration data for the SQLite library.
+**
+** This structure also contains some state information.
+*/
+struct Sqlite3Config {
+  int bMemstat;                     /* True to enable memory status */
+  int bCoreMutex;                   /* True to enable core mutexing */
+  int bFullMutex;                   /* True to enable full mutexing */
+  int bOpenUri;                     /* True to interpret filenames as URIs */
+  int bUseCis;                      /* Use covering indices for full-scans */
+  int mxStrlen;                     /* Maximum string length */
+  int neverCorrupt;                 /* Database is always well-formed */
+  int szLookaside;                  /* Default lookaside buffer size */
+  int nLookaside;                   /* Default lookaside buffer count */
+  sqlite3_mem_methods m;            /* Low-level memory allocation interface */
+  sqlite3_mutex_methods mutex;      /* Low-level mutex interface */
+  sqlite3_pcache_methods2 pcache2;  /* Low-level page-cache interface */
+  void *pHeap;                      /* Heap storage space */
+  int nHeap;                        /* Size of pHeap[] */
+  int mnReq, mxReq;                 /* Min and max heap requests sizes */
+  sqlite3_int64 szMmap;             /* mmap() space per open file */
+  sqlite3_int64 mxMmap;             /* Maximum value for szMmap */
+  void *pScratch;                   /* Scratch memory */
+  int szScratch;                    /* Size of each scratch buffer */
+  int nScratch;                     /* Number of scratch buffers */
+  void *pPage;                      /* Page cache memory */
+  int szPage;                       /* Size of each page in pPage[] */
+  int nPage;                        /* Number of pages in pPage[] */
+  int mxParserStack;                /* maximum depth of the parser stack */
+  int sharedCacheEnabled;           /* true if shared-cache mode enabled */
+  u32 szPma;                        /* Maximum Sorter PMA size */
+  /* The above might be initialized to non-zero.  The following need to always
+  ** initially be zero, however. */
+  int isInit;                       /* True after initialization has finished */
+  int inProgress;                   /* True while initialization in progress */
+  int isMutexInit;                  /* True after mutexes are initialized */
+  int isMallocInit;                 /* True after malloc is initialized */
+  int isPCacheInit;                 /* True after malloc is initialized */
+  int nRefInitMutex;                /* Number of users of pInitMutex */
+  sqlite3_mutex *pInitMutex;        /* Mutex used by sqlite3_initialize() */
+  void (*xLog)(void*,int,const char*); /* Function for logging */
+  void *pLogArg;                       /* First argument to xLog() */
+#ifdef SQLITE_ENABLE_SQLLOG
+  void(*xSqllog)(void*,sqlite3*,const char*, int);
+  void *pSqllogArg;
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+  /* The following callback (if not NULL) is invoked on every VDBE branch
+  ** operation.  Set the callback using SQLITE_TESTCTRL_VDBE_COVERAGE.
+  */
+  void (*xVdbeBranch)(void*,int iSrcLine,u8 eThis,u8 eMx);  /* Callback */
+  void *pVdbeBranchArg;                                     /* 1st argument */
+#endif
+#ifndef SQLITE_OMIT_BUILTIN_TEST
+  int (*xTestCallback)(int);        /* Invoked by sqlite3FaultSim() */
+#endif
+  int bLocaltimeFault;              /* True to fail localtime() calls */
+};
+
+/*
+** This macro is used inside of assert() statements to indicate that
+** the assert is only valid on a well-formed database.  Instead of:
+**
+**     assert( X );
+**
+** One writes:
+**
+**     assert( X || CORRUPT_DB );
+**
+** CORRUPT_DB is true during normal operation.  CORRUPT_DB does not indicate
+** that the database is definitely corrupt, only that it might be corrupt.
+** For most test cases, CORRUPT_DB is set to false using a special
+** sqlite3_test_control().  This enables assert() statements to prove
+** things that are always true for well-formed databases.
+*/
+#define CORRUPT_DB  (sqlite3Config.neverCorrupt==0)
+
+/*
+** Context pointer passed down through the tree-walk.
+*/
+struct Walker {
+  int (*xExprCallback)(Walker*, Expr*);     /* Callback for expressions */
+  int (*xSelectCallback)(Walker*,Select*);  /* Callback for SELECTs */
+  void (*xSelectCallback2)(Walker*,Select*);/* Second callback for SELECTs */
+  Parse *pParse;                            /* Parser context.  */
+  int walkerDepth;                          /* Number of subqueries */
+  u8 eCode;                                 /* A small processing code */
+  union {                                   /* Extra data for callback */
+    NameContext *pNC;                          /* Naming context */
+    int n;                                     /* A counter */
+    int iCur;                                  /* A cursor number */
+    SrcList *pSrcList;                         /* FROM clause */
+    struct SrcCount *pSrcCount;                /* Counting column references */
+  } u;
+};
+
+/* Forward declarations */
+SQLITE_PRIVATE int sqlite3WalkExpr(Walker*, Expr*);
+SQLITE_PRIVATE int sqlite3WalkExprList(Walker*, ExprList*);
+SQLITE_PRIVATE int sqlite3WalkSelect(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3WalkSelectExpr(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3WalkSelectFrom(Walker*, Select*);
+
+/*
+** Return code from the parse-tree walking primitives and their
+** callbacks.
+*/
+#define WRC_Continue    0   /* Continue down into children */
+#define WRC_Prune       1   /* Omit children but continue walking siblings */
+#define WRC_Abort       2   /* Abandon the tree walk */
+
+/*
+** An instance of this structure represents a set of one or more CTEs
+** (common table expressions) created by a single WITH clause.
+*/
+struct With {
+  int nCte;                       /* Number of CTEs in the WITH clause */
+  With *pOuter;                   /* Containing WITH clause, or NULL */
+  struct Cte {                    /* For each CTE in the WITH clause.... */
+    char *zName;                    /* Name of this CTE */
+    ExprList *pCols;                /* List of explicit column names, or NULL */
+    Select *pSelect;                /* The definition of this CTE */
+    const char *zErr;               /* Error message for circular references */
+  } a[1];
+};
+
+#ifdef SQLITE_DEBUG
+/*
+** An instance of the TreeView object is used for printing the content of
+** data structures on sqlite3DebugPrintf() using a tree-like view.
+*/
+struct TreeView {
+  int iLevel;             /* Which level of the tree we are on */
+  u8  bLine[100];         /* Draw vertical in column i if bLine[i] is true */
+};
+#endif /* SQLITE_DEBUG */
+
+/*
+** Assuming zIn points to the first byte of a UTF-8 character,
+** advance zIn to point to the first byte of the next UTF-8 character.
+*/
+#define SQLITE_SKIP_UTF8(zIn) {                        \
+  if( (*(zIn++))>=0xc0 ){                              \
+    while( (*zIn & 0xc0)==0x80 ){ zIn++; }             \
+  }                                                    \
+}
+
+/*
+** The SQLITE_*_BKPT macros are substitutes for the error codes with
+** the same name but without the _BKPT suffix.  These macros invoke
+** routines that report the line-number on which the error originated
+** using sqlite3_log().  The routines also provide a convenient place
+** to set a debugger breakpoint.
+*/
+SQLITE_PRIVATE int sqlite3CorruptError(int);
+SQLITE_PRIVATE int sqlite3MisuseError(int);
+SQLITE_PRIVATE int sqlite3CantopenError(int);
+#define SQLITE_CORRUPT_BKPT sqlite3CorruptError(__LINE__)
+#define SQLITE_MISUSE_BKPT sqlite3MisuseError(__LINE__)
+#define SQLITE_CANTOPEN_BKPT sqlite3CantopenError(__LINE__)
+
+
+/*
+** FTS4 is really an extension for FTS3.  It is enabled using the
+** SQLITE_ENABLE_FTS3 macro.  But to avoid confusion we also call
+** the SQLITE_ENABLE_FTS4 macro to serve as an alias for SQLITE_ENABLE_FTS3.
+*/
+#if defined(SQLITE_ENABLE_FTS4) && !defined(SQLITE_ENABLE_FTS3)
+# define SQLITE_ENABLE_FTS3 1
+#endif
+
+/*
+** The ctype.h header is needed for non-ASCII systems.  It is also
+** needed by FTS3 when FTS3 is included in the amalgamation.
+*/
+#if !defined(SQLITE_ASCII) || \
+    (defined(SQLITE_ENABLE_FTS3) && defined(SQLITE_AMALGAMATION))
+# include <ctype.h>
+#endif
+
+/*
+** The following macros mimic the standard library functions toupper(),
+** isspace(), isalnum(), isdigit() and isxdigit(), respectively. The
+** sqlite versions only work for ASCII characters, regardless of locale.
+*/
+#ifdef SQLITE_ASCII
+# define sqlite3Toupper(x)  ((x)&~(sqlite3CtypeMap[(unsigned char)(x)]&0x20))
+# define sqlite3Isspace(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x01)
+# define sqlite3Isalnum(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x06)
+# define sqlite3Isalpha(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x02)
+# define sqlite3Isdigit(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x04)
+# define sqlite3Isxdigit(x)  (sqlite3CtypeMap[(unsigned char)(x)]&0x08)
+# define sqlite3Tolower(x)   (sqlite3UpperToLower[(unsigned char)(x)])
+#else
+# define sqlite3Toupper(x)   toupper((unsigned char)(x))
+# define sqlite3Isspace(x)   isspace((unsigned char)(x))
+# define sqlite3Isalnum(x)   isalnum((unsigned char)(x))
+# define sqlite3Isalpha(x)   isalpha((unsigned char)(x))
+# define sqlite3Isdigit(x)   isdigit((unsigned char)(x))
+# define sqlite3Isxdigit(x)  isxdigit((unsigned char)(x))
+# define sqlite3Tolower(x)   tolower((unsigned char)(x))
+#endif
+SQLITE_PRIVATE int sqlite3IsIdChar(u8);
+
+/*
