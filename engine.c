@@ -11860,3 +11860,224 @@ struct ExprList {
     unsigned done :1;       /* A flag to indicate when processing is finished */
     unsigned bSpanIsTab :1; /* zSpan holds DB.TABLE.COLUMN */
     unsigned reusable :1;   /* Constant expression is reusable */
+    union {
+      struct {
+        u16 iOrderByCol;      /* For ORDER BY, column number in result set */
+        u16 iAlias;           /* Index into Parse.aAlias[] for zName */
+      } x;
+      int iConstExprReg;      /* Register in which Expr value is cached */
+    } u;
+  } *a;                  /* Alloc a power of two greater or equal to nExpr */
+};
+
+/*
+** An instance of this structure is used by the parser to record both
+** the parse tree for an expression and the span of input text for an
+** expression.
+*/
+struct ExprSpan {
+  Expr *pExpr;          /* The expression parse tree */
+  const char *zStart;   /* First character of input text */
+  const char *zEnd;     /* One character past the end of input text */
+};
+
+/*
+** An instance of this structure can hold a simple list of identifiers,
+** such as the list "a,b,c" in the following statements:
+**
+**      INSERT INTO t(a,b,c) VALUES ...;
+**      CREATE INDEX idx ON t(a,b,c);
+**      CREATE TRIGGER trig BEFORE UPDATE ON t(a,b,c) ...;
+**
+** The IdList.a.idx field is used when the IdList represents the list of
+** column names after a table name in an INSERT statement.  In the statement
+**
+**     INSERT INTO t(a,b,c) ...
+**
+** If "a" is the k-th column of table "t", then IdList.a[0].idx==k.
+*/
+struct IdList {
+  struct IdList_item {
+    char *zName;      /* Name of the identifier */
+    int idx;          /* Index in some Table.aCol[] of a column named zName */
+  } *a;
+  int nId;         /* Number of identifiers on the list */
+};
+
+/*
+** The bitmask datatype defined below is used for various optimizations.
+**
+** Changing this from a 64-bit to a 32-bit type limits the number of
+** tables in a join to 32 instead of 64.  But it also reduces the size
+** of the library by 738 bytes on ix86.
+*/
+typedef u64 Bitmask;
+
+/*
+** The number of bits in a Bitmask.  "BMS" means "BitMask Size".
+*/
+#define BMS  ((int)(sizeof(Bitmask)*8))
+
+/*
+** A bit in a Bitmask
+*/
+#define MASKBIT(n)   (((Bitmask)1)<<(n))
+#define MASKBIT32(n) (((unsigned int)1)<<(n))
+
+/*
+** The following structure describes the FROM clause of a SELECT statement.
+** Each table or subquery in the FROM clause is a separate element of
+** the SrcList.a[] array.
+**
+** With the addition of multiple database support, the following structure
+** can also be used to describe a particular table such as the table that
+** is modified by an INSERT, DELETE, or UPDATE statement.  In standard SQL,
+** such a table must be a simple name: ID.  But in SQLite, the table can
+** now be identified by a database name, a dot, then the table name: ID.ID.
+**
+** The jointype starts out showing the join type between the current table
+** and the next table on the list.  The parser builds the list this way.
+** But sqlite3SrcListShiftJoinType() later shifts the jointypes so that each
+** jointype expresses the join between the table and the previous table.
+**
+** In the colUsed field, the high-order bit (bit 63) is set if the table
+** contains more than 63 columns and the 64-th or later column is used.
+*/
+struct SrcList {
+  int nSrc;        /* Number of tables or subqueries in the FROM clause */
+  u32 nAlloc;      /* Number of entries allocated in a[] below */
+  struct SrcList_item {
+    Schema *pSchema;  /* Schema to which this item is fixed */
+    char *zDatabase;  /* Name of database holding this table */
+    char *zName;      /* Name of the table */
+    char *zAlias;     /* The "B" part of a "A AS B" phrase.  zName is the "A" */
+    Table *pTab;      /* An SQL table corresponding to zName */
+    Select *pSelect;  /* A SELECT statement used in place of a table name */
+    int addrFillSub;  /* Address of subroutine to manifest a subquery */
+    int regReturn;    /* Register holding return address of addrFillSub */
+    int regResult;    /* Registers holding results of a co-routine */
+    u8 jointype;      /* Type of join between this able and the previous */
+    unsigned notIndexed :1;    /* True if there is a NOT INDEXED clause */
+    unsigned isCorrelated :1;  /* True if sub-query is correlated */
+    unsigned viaCoroutine :1;  /* Implemented as a co-routine */
+    unsigned isRecursive :1;   /* True for recursive reference in WITH */
+#ifndef SQLITE_OMIT_EXPLAIN
+    u8 iSelectId;     /* If pSelect!=0, the id of the sub-select in EQP */
+#endif
+    int iCursor;      /* The VDBE cursor number used to access this table */
+    Expr *pOn;        /* The ON clause of a join */
+    IdList *pUsing;   /* The USING clause of a join */
+    Bitmask colUsed;  /* Bit N (1<<N) set if column N of pTab is used */
+    char *zIndex;     /* Identifier from "INDEXED BY <zIndex>" clause */
+    Index *pIndex;    /* Index structure corresponding to zIndex, if any */
+  } a[1];             /* One entry for each identifier on the list */
+};
+
+/*
+** Permitted values of the SrcList.a.jointype field
+*/
+#define JT_INNER     0x0001    /* Any kind of inner or cross join */
+#define JT_CROSS     0x0002    /* Explicit use of the CROSS keyword */
+#define JT_NATURAL   0x0004    /* True for a "natural" join */
+#define JT_LEFT      0x0008    /* Left outer join */
+#define JT_RIGHT     0x0010    /* Right outer join */
+#define JT_OUTER     0x0020    /* The "OUTER" keyword is present */
+#define JT_ERROR     0x0040    /* unknown or unsupported join type */
+
+
+/*
+** Flags appropriate for the wctrlFlags parameter of sqlite3WhereBegin()
+** and the WhereInfo.wctrlFlags member.
+*/
+#define WHERE_ORDERBY_NORMAL   0x0000 /* No-op */
+#define WHERE_ORDERBY_MIN      0x0001 /* ORDER BY processing for min() func */
+#define WHERE_ORDERBY_MAX      0x0002 /* ORDER BY processing for max() func */
+#define WHERE_ONEPASS_DESIRED  0x0004 /* Want to do one-pass UPDATE/DELETE */
+#define WHERE_DUPLICATES_OK    0x0008 /* Ok to return a row more than once */
+#define WHERE_OMIT_OPEN_CLOSE  0x0010 /* Table cursors are already open */
+#define WHERE_FORCE_TABLE      0x0020 /* Do not use an index-only search */
+#define WHERE_ONETABLE_ONLY    0x0040 /* Only code the 1st table in pTabList */
+                          /*   0x0080 // not currently used */
+#define WHERE_GROUPBY          0x0100 /* pOrderBy is really a GROUP BY */
+#define WHERE_DISTINCTBY       0x0200 /* pOrderby is really a DISTINCT clause */
+#define WHERE_WANT_DISTINCT    0x0400 /* All output needs to be distinct */
+#define WHERE_SORTBYGROUP      0x0800 /* Support sqlite3WhereIsSorted() */
+#define WHERE_REOPEN_IDX       0x1000 /* Try to use OP_ReopenIdx */
+
+/* Allowed return values from sqlite3WhereIsDistinct()
+*/
+#define WHERE_DISTINCT_NOOP      0  /* DISTINCT keyword not used */
+#define WHERE_DISTINCT_UNIQUE    1  /* No duplicates */
+#define WHERE_DISTINCT_ORDERED   2  /* All duplicates are adjacent */
+#define WHERE_DISTINCT_UNORDERED 3  /* Duplicates are scattered */
+
+/*
+** A NameContext defines a context in which to resolve table and column
+** names.  The context consists of a list of tables (the pSrcList) field and
+** a list of named expression (pEList).  The named expression list may
+** be NULL.  The pSrc corresponds to the FROM clause of a SELECT or
+** to the table being operated on by INSERT, UPDATE, or DELETE.  The
+** pEList corresponds to the result set of a SELECT and is NULL for
+** other statements.
+**
+** NameContexts can be nested.  When resolving names, the inner-most 
+** context is searched first.  If no match is found, the next outer
+** context is checked.  If there is still no match, the next context
+** is checked.  This process continues until either a match is found
+** or all contexts are check.  When a match is found, the nRef member of
+** the context containing the match is incremented. 
+**
+** Each subquery gets a new NameContext.  The pNext field points to the
+** NameContext in the parent query.  Thus the process of scanning the
+** NameContext list corresponds to searching through successively outer
+** subqueries looking for a match.
+*/
+struct NameContext {
+  Parse *pParse;       /* The parser */
+  SrcList *pSrcList;   /* One or more tables used to resolve names */
+  ExprList *pEList;    /* Optional list of result-set columns */
+  AggInfo *pAggInfo;   /* Information about aggregates at this level */
+  NameContext *pNext;  /* Next outer name context.  NULL for outermost */
+  int nRef;            /* Number of names resolved by this context */
+  int nErr;            /* Number of errors encountered while resolving names */
+  u16 ncFlags;         /* Zero or more NC_* flags defined below */
+};
+
+/*
+** Allowed values for the NameContext, ncFlags field.
+**
+** Note:  NC_MinMaxAgg must have the same value as SF_MinMaxAgg and
+** SQLITE_FUNC_MINMAX.
+** 
+*/
+#define NC_AllowAgg  0x0001  /* Aggregate functions are allowed here */
+#define NC_HasAgg    0x0002  /* One or more aggregate functions seen */
+#define NC_IsCheck   0x0004  /* True if resolving names in a CHECK constraint */
+#define NC_InAggFunc 0x0008  /* True if analyzing arguments to an agg func */
+#define NC_PartIdx   0x0010  /* True if resolving a partial index WHERE */
+#define NC_MinMaxAgg 0x1000  /* min/max aggregates seen.  See note above */
+
+/*
+** An instance of the following structure contains all information
+** needed to generate code for a single SELECT statement.
+**
+** nLimit is set to -1 if there is no LIMIT clause.  nOffset is set to 0.
+** If there is a LIMIT clause, the parser sets nLimit to the value of the
+** limit and nOffset to the value of the offset (or 0 if there is not
+** offset).  But later on, nLimit and nOffset become the memory locations
+** in the VDBE that record the limit and offset counters.
+**
+** addrOpenEphm[] entries contain the address of OP_OpenEphemeral opcodes.
+** These addresses must be stored so that we can go back and fill in
+** the P4_KEYINFO and P2 parameters later.  Neither the KeyInfo nor
+** the number of columns in P2 can be computed at the same time
+** as the OP_OpenEphm instruction is coded because not
+** enough information about the compound query is known at that point.
+** The KeyInfo for addrOpenTran[0] and [1] contains collating sequences
+** for the result set.  The KeyInfo for addrOpenEphm[2] contains collating
+** sequences for the ORDER BY clause.
+*/
+struct Select {
+  ExprList *pEList;      /* The fields of the result */
+  u8 op;                 /* One of: TK_UNION TK_ALL TK_INTERSECT TK_EXCEPT */
+  u16 selFlags;          /* Various SF_* values */
