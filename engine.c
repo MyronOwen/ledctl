@@ -11370,3 +11370,241 @@ struct Table {
 */
 #ifndef SQLITE_OMIT_VIRTUALTABLE
 #  define IsVirtual(X)      (((X)->tabFlags & TF_Virtual)!=0)
+#  define IsHiddenColumn(X) (((X)->colFlags & COLFLAG_HIDDEN)!=0)
+#else
+#  define IsVirtual(X)      0
+#  define IsHiddenColumn(X) 0
+#endif
+
+/* Does the table have a rowid */
+#define HasRowid(X)     (((X)->tabFlags & TF_WithoutRowid)==0)
+
+/*
+** Each foreign key constraint is an instance of the following structure.
+**
+** A foreign key is associated with two tables.  The "from" table is
+** the table that contains the REFERENCES clause that creates the foreign
+** key.  The "to" table is the table that is named in the REFERENCES clause.
+** Consider this example:
+**
+**     CREATE TABLE ex1(
+**       a INTEGER PRIMARY KEY,
+**       b INTEGER CONSTRAINT fk1 REFERENCES ex2(x)
+**     );
+**
+** For foreign key "fk1", the from-table is "ex1" and the to-table is "ex2".
+** Equivalent names:
+**
+**     from-table == child-table
+**       to-table == parent-table
+**
+** Each REFERENCES clause generates an instance of the following structure
+** which is attached to the from-table.  The to-table need not exist when
+** the from-table is created.  The existence of the to-table is not checked.
+**
+** The list of all parents for child Table X is held at X.pFKey.
+**
+** A list of all children for a table named Z (which might not even exist)
+** is held in Schema.fkeyHash with a hash key of Z.
+*/
+struct FKey {
+  Table *pFrom;     /* Table containing the REFERENCES clause (aka: Child) */
+  FKey *pNextFrom;  /* Next FKey with the same in pFrom. Next parent of pFrom */
+  char *zTo;        /* Name of table that the key points to (aka: Parent) */
+  FKey *pNextTo;    /* Next with the same zTo. Next child of zTo. */
+  FKey *pPrevTo;    /* Previous with the same zTo */
+  int nCol;         /* Number of columns in this key */
+  /* EV: R-30323-21917 */
+  u8 isDeferred;       /* True if constraint checking is deferred till COMMIT */
+  u8 aAction[2];        /* ON DELETE and ON UPDATE actions, respectively */
+  Trigger *apTrigger[2];/* Triggers for aAction[] actions */
+  struct sColMap {      /* Mapping of columns in pFrom to columns in zTo */
+    int iFrom;            /* Index of column in pFrom */
+    char *zCol;           /* Name of column in zTo.  If NULL use PRIMARY KEY */
+  } aCol[1];            /* One entry for each of nCol columns */
+};
+
+/*
+** SQLite supports many different ways to resolve a constraint
+** error.  ROLLBACK processing means that a constraint violation
+** causes the operation in process to fail and for the current transaction
+** to be rolled back.  ABORT processing means the operation in process
+** fails and any prior changes from that one operation are backed out,
+** but the transaction is not rolled back.  FAIL processing means that
+** the operation in progress stops and returns an error code.  But prior
+** changes due to the same operation are not backed out and no rollback
+** occurs.  IGNORE means that the particular row that caused the constraint
+** error is not inserted or updated.  Processing continues and no error
+** is returned.  REPLACE means that preexisting database rows that caused
+** a UNIQUE constraint violation are removed so that the new insert or
+** update can proceed.  Processing continues and no error is reported.
+**
+** RESTRICT, SETNULL, and CASCADE actions apply only to foreign keys.
+** RESTRICT is the same as ABORT for IMMEDIATE foreign keys and the
+** same as ROLLBACK for DEFERRED keys.  SETNULL means that the foreign
+** key is set to NULL.  CASCADE means that a DELETE or UPDATE of the
+** referenced table row is propagated into the row that holds the
+** foreign key.
+** 
+** The following symbolic values are used to record which type
+** of action to take.
+*/
+#define OE_None     0   /* There is no constraint to check */
+#define OE_Rollback 1   /* Fail the operation and rollback the transaction */
+#define OE_Abort    2   /* Back out changes but do no rollback transaction */
+#define OE_Fail     3   /* Stop the operation but leave all prior changes */
+#define OE_Ignore   4   /* Ignore the error. Do not do the INSERT or UPDATE */
+#define OE_Replace  5   /* Delete existing record, then do INSERT or UPDATE */
+
+#define OE_Restrict 6   /* OE_Abort for IMMEDIATE, OE_Rollback for DEFERRED */
+#define OE_SetNull  7   /* Set the foreign key value to NULL */
+#define OE_SetDflt  8   /* Set the foreign key value to its default */
+#define OE_Cascade  9   /* Cascade the changes */
+
+#define OE_Default  10  /* Do whatever the default action is */
+
+
+/*
+** An instance of the following structure is passed as the first
+** argument to sqlite3VdbeKeyCompare and is used to control the 
+** comparison of the two index keys.
+**
+** Note that aSortOrder[] and aColl[] have nField+1 slots.  There
+** are nField slots for the columns of an index then one extra slot
+** for the rowid at the end.
+*/
+struct KeyInfo {
+  u32 nRef;           /* Number of references to this KeyInfo object */
+  u8 enc;             /* Text encoding - one of the SQLITE_UTF* values */
+  u16 nField;         /* Number of key columns in the index */
+  u16 nXField;        /* Number of columns beyond the key columns */
+  sqlite3 *db;        /* The database connection */
+  u8 *aSortOrder;     /* Sort order for each column. */
+  CollSeq *aColl[1];  /* Collating sequence for each term of the key */
+};
+
+/*
+** An instance of the following structure holds information about a
+** single index record that has already been parsed out into individual
+** values.
+**
+** A record is an object that contains one or more fields of data.
+** Records are used to store the content of a table row and to store
+** the key of an index.  A blob encoding of a record is created by
+** the OP_MakeRecord opcode of the VDBE and is disassembled by the
+** OP_Column opcode.
+**
+** This structure holds a record that has already been disassembled
+** into its constituent fields.
+**
+** The r1 and r2 member variables are only used by the optimized comparison
+** functions vdbeRecordCompareInt() and vdbeRecordCompareString().
+*/
+struct UnpackedRecord {
+  KeyInfo *pKeyInfo;  /* Collation and sort-order information */
+  u16 nField;         /* Number of entries in apMem[] */
+  i8 default_rc;      /* Comparison result if keys are equal */
+  u8 errCode;         /* Error detected by xRecordCompare (CORRUPT or NOMEM) */
+  Mem *aMem;          /* Values */
+  int r1;             /* Value to return if (lhs > rhs) */
+  int r2;             /* Value to return if (rhs < lhs) */
+};
+
+
+/*
+** Each SQL index is represented in memory by an
+** instance of the following structure.
+**
+** The columns of the table that are to be indexed are described
+** by the aiColumn[] field of this structure.  For example, suppose
+** we have the following table and index:
+**
+**     CREATE TABLE Ex1(c1 int, c2 int, c3 text);
+**     CREATE INDEX Ex2 ON Ex1(c3,c1);
+**
+** In the Table structure describing Ex1, nCol==3 because there are
+** three columns in the table.  In the Index structure describing
+** Ex2, nColumn==2 since 2 of the 3 columns of Ex1 are indexed.
+** The value of aiColumn is {2, 0}.  aiColumn[0]==2 because the 
+** first column to be indexed (c3) has an index of 2 in Ex1.aCol[].
+** The second column to be indexed (c1) has an index of 0 in
+** Ex1.aCol[], hence Ex2.aiColumn[1]==0.
+**
+** The Index.onError field determines whether or not the indexed columns
+** must be unique and what to do if they are not.  When Index.onError=OE_None,
+** it means this is not a unique index.  Otherwise it is a unique index
+** and the value of Index.onError indicate the which conflict resolution 
+** algorithm to employ whenever an attempt is made to insert a non-unique
+** element.
+*/
+struct Index {
+  char *zName;             /* Name of this index */
+  i16 *aiColumn;           /* Which columns are used by this index.  1st is 0 */
+  LogEst *aiRowLogEst;     /* From ANALYZE: Est. rows selected by each column */
+  Table *pTable;           /* The SQL table being indexed */
+  char *zColAff;           /* String defining the affinity of each column */
+  Index *pNext;            /* The next index associated with the same table */
+  Schema *pSchema;         /* Schema containing this index */
+  u8 *aSortOrder;          /* for each column: True==DESC, False==ASC */
+  char **azColl;           /* Array of collation sequence names for index */
+  Expr *pPartIdxWhere;     /* WHERE clause for partial indices */
+  int tnum;                /* DB Page containing root of this index */
+  LogEst szIdxRow;         /* Estimated average row size in bytes */
+  u16 nKeyCol;             /* Number of columns forming the key */
+  u16 nColumn;             /* Number of columns stored in the index */
+  u8 onError;              /* OE_Abort, OE_Ignore, OE_Replace, or OE_None */
+  unsigned idxType:2;      /* 1==UNIQUE, 2==PRIMARY KEY, 0==CREATE INDEX */
+  unsigned bUnordered:1;   /* Use this index for == or IN queries only */
+  unsigned uniqNotNull:1;  /* True if UNIQUE and NOT NULL for all columns */
+  unsigned isResized:1;    /* True if resizeIndexObject() has been called */
+  unsigned isCovering:1;   /* True if this is a covering index */
+  unsigned noSkipScan:1;   /* Do not try to use skip-scan if true */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  int nSample;             /* Number of elements in aSample[] */
+  int nSampleCol;          /* Size of IndexSample.anEq[] and so on */
+  tRowcnt *aAvgEq;         /* Average nEq values for keys not in aSample */
+  IndexSample *aSample;    /* Samples of the left-most key */
+  tRowcnt *aiRowEst;       /* Non-logarithmic stat1 data for this index */
+  tRowcnt nRowEst0;        /* Non-logarithmic number of rows in the index */
+#endif
+};
+
+/*
+** Allowed values for Index.idxType
+*/
+#define SQLITE_IDXTYPE_APPDEF      0   /* Created using CREATE INDEX */
+#define SQLITE_IDXTYPE_UNIQUE      1   /* Implements a UNIQUE constraint */
+#define SQLITE_IDXTYPE_PRIMARYKEY  2   /* Is the PRIMARY KEY for the table */
+
+/* Return true if index X is a PRIMARY KEY index */
+#define IsPrimaryKeyIndex(X)  ((X)->idxType==SQLITE_IDXTYPE_PRIMARYKEY)
+
+/* Return true if index X is a UNIQUE index */
+#define IsUniqueIndex(X)      ((X)->onError!=OE_None)
+
+/*
+** Each sample stored in the sqlite_stat3 table is represented in memory 
+** using a structure of this type.  See documentation at the top of the
+** analyze.c source file for additional information.
+*/
+struct IndexSample {
+  void *p;          /* Pointer to sampled record */
+  int n;            /* Size of record in bytes */
+  tRowcnt *anEq;    /* Est. number of rows where the key equals this sample */
+  tRowcnt *anLt;    /* Est. number of rows where key is less than this sample */
+  tRowcnt *anDLt;   /* Est. number of distinct keys less than this sample */
+};
+
+/*
+** Each token coming out of the lexer is an instance of
+** this structure.  Tokens are also used as part of an expression.
+**
+** Note if Token.z==0 then Token.dyn and Token.n are undefined and
+** may contain random values.  Do not make any assumptions about Token.dyn
+** and Token.n when Token.z==0.
+*/
+struct Token {
+  const char *z;     /* Text of the token.  Not NULL-terminated! */
+  unsigned int n;    /* Number of characters in this token */
+};
+
