@@ -11126,3 +11126,247 @@ struct Savepoint {
   char *zName;                        /* Savepoint name (nul-terminated) */
   i64 nDeferredCons;                  /* Number of deferred fk violations */
   i64 nDeferredImmCons;               /* Number of deferred imm fk. */
+  Savepoint *pNext;                   /* Parent savepoint (if any) */
+};
+
+/*
+** The following are used as the second parameter to sqlite3Savepoint(),
+** and as the P1 argument to the OP_Savepoint instruction.
+*/
+#define SAVEPOINT_BEGIN      0
+#define SAVEPOINT_RELEASE    1
+#define SAVEPOINT_ROLLBACK   2
+
+
+/*
+** Each SQLite module (virtual table definition) is defined by an
+** instance of the following structure, stored in the sqlite3.aModule
+** hash table.
+*/
+struct Module {
+  const sqlite3_module *pModule;       /* Callback pointers */
+  const char *zName;                   /* Name passed to create_module() */
+  void *pAux;                          /* pAux passed to create_module() */
+  void (*xDestroy)(void *);            /* Module destructor function */
+};
+
+/*
+** information about each column of an SQL table is held in an instance
+** of this structure.
+*/
+struct Column {
+  char *zName;     /* Name of this column */
+  Expr *pDflt;     /* Default value of this column */
+  char *zDflt;     /* Original text of the default value */
+  char *zType;     /* Data type for this column */
+  char *zColl;     /* Collating sequence.  If NULL, use the default */
+  u8 notNull;      /* An OE_ code for handling a NOT NULL constraint */
+  char affinity;   /* One of the SQLITE_AFF_... values */
+  u8 szEst;        /* Estimated size of this column.  INT==1 */
+  u8 colFlags;     /* Boolean properties.  See COLFLAG_ defines below */
+};
+
+/* Allowed values for Column.colFlags:
+*/
+#define COLFLAG_PRIMKEY  0x0001    /* Column is part of the primary key */
+#define COLFLAG_HIDDEN   0x0002    /* A hidden column in a virtual table */
+
+/*
+** A "Collating Sequence" is defined by an instance of the following
+** structure. Conceptually, a collating sequence consists of a name and
+** a comparison routine that defines the order of that sequence.
+**
+** If CollSeq.xCmp is NULL, it means that the
+** collating sequence is undefined.  Indices built on an undefined
+** collating sequence may not be read or written.
+*/
+struct CollSeq {
+  char *zName;          /* Name of the collating sequence, UTF-8 encoded */
+  u8 enc;               /* Text encoding handled by xCmp() */
+  void *pUser;          /* First argument to xCmp() */
+  int (*xCmp)(void*,int, const void*, int, const void*);
+  void (*xDel)(void*);  /* Destructor for pUser */
+};
+
+/*
+** A sort order can be either ASC or DESC.
+*/
+#define SQLITE_SO_ASC       0  /* Sort in ascending order */
+#define SQLITE_SO_DESC      1  /* Sort in ascending order */
+
+/*
+** Column affinity types.
+**
+** These used to have mnemonic name like 'i' for SQLITE_AFF_INTEGER and
+** 't' for SQLITE_AFF_TEXT.  But we can save a little space and improve
+** the speed a little by numbering the values consecutively.  
+**
+** But rather than start with 0 or 1, we begin with 'A'.  That way,
+** when multiple affinity types are concatenated into a string and
+** used as the P4 operand, they will be more readable.
+**
+** Note also that the numeric types are grouped together so that testing
+** for a numeric type is a single comparison.  And the NONE type is first.
+*/
+#define SQLITE_AFF_NONE     'A'
+#define SQLITE_AFF_TEXT     'B'
+#define SQLITE_AFF_NUMERIC  'C'
+#define SQLITE_AFF_INTEGER  'D'
+#define SQLITE_AFF_REAL     'E'
+
+#define sqlite3IsNumericAffinity(X)  ((X)>=SQLITE_AFF_NUMERIC)
+
+/*
+** The SQLITE_AFF_MASK values masks off the significant bits of an
+** affinity value. 
+*/
+#define SQLITE_AFF_MASK     0x47
+
+/*
+** Additional bit values that can be ORed with an affinity without
+** changing the affinity.
+**
+** The SQLITE_NOTNULL flag is a combination of NULLEQ and JUMPIFNULL.
+** It causes an assert() to fire if either operand to a comparison
+** operator is NULL.  It is added to certain comparison operators to
+** prove that the operands are always NOT NULL.
+*/
+#define SQLITE_JUMPIFNULL   0x10  /* jumps if either operand is NULL */
+#define SQLITE_STOREP2      0x20  /* Store result in reg[P2] rather than jump */
+#define SQLITE_NULLEQ       0x80  /* NULL=NULL */
+#define SQLITE_NOTNULL      0x90  /* Assert that operands are never NULL */
+
+/*
+** An object of this type is created for each virtual table present in
+** the database schema. 
+**
+** If the database schema is shared, then there is one instance of this
+** structure for each database connection (sqlite3*) that uses the shared
+** schema. This is because each database connection requires its own unique
+** instance of the sqlite3_vtab* handle used to access the virtual table 
+** implementation. sqlite3_vtab* handles can not be shared between 
+** database connections, even when the rest of the in-memory database 
+** schema is shared, as the implementation often stores the database
+** connection handle passed to it via the xConnect() or xCreate() method
+** during initialization internally. This database connection handle may
+** then be used by the virtual table implementation to access real tables 
+** within the database. So that they appear as part of the callers 
+** transaction, these accesses need to be made via the same database 
+** connection as that used to execute SQL operations on the virtual table.
+**
+** All VTable objects that correspond to a single table in a shared
+** database schema are initially stored in a linked-list pointed to by
+** the Table.pVTable member variable of the corresponding Table object.
+** When an sqlite3_prepare() operation is required to access the virtual
+** table, it searches the list for the VTable that corresponds to the
+** database connection doing the preparing so as to use the correct
+** sqlite3_vtab* handle in the compiled query.
+**
+** When an in-memory Table object is deleted (for example when the
+** schema is being reloaded for some reason), the VTable objects are not 
+** deleted and the sqlite3_vtab* handles are not xDisconnect()ed 
+** immediately. Instead, they are moved from the Table.pVTable list to
+** another linked list headed by the sqlite3.pDisconnect member of the
+** corresponding sqlite3 structure. They are then deleted/xDisconnected 
+** next time a statement is prepared using said sqlite3*. This is done
+** to avoid deadlock issues involving multiple sqlite3.mutex mutexes.
+** Refer to comments above function sqlite3VtabUnlockList() for an
+** explanation as to why it is safe to add an entry to an sqlite3.pDisconnect
+** list without holding the corresponding sqlite3.mutex mutex.
+**
+** The memory for objects of this type is always allocated by 
+** sqlite3DbMalloc(), using the connection handle stored in VTable.db as 
+** the first argument.
+*/
+struct VTable {
+  sqlite3 *db;              /* Database connection associated with this table */
+  Module *pMod;             /* Pointer to module implementation */
+  sqlite3_vtab *pVtab;      /* Pointer to vtab instance */
+  int nRef;                 /* Number of pointers to this structure */
+  u8 bConstraint;           /* True if constraints are supported */
+  int iSavepoint;           /* Depth of the SAVEPOINT stack */
+  VTable *pNext;            /* Next in linked list (see above) */
+};
+
+/*
+** Each SQL table is represented in memory by an instance of the
+** following structure.
+**
+** Table.zName is the name of the table.  The case of the original
+** CREATE TABLE statement is stored, but case is not significant for
+** comparisons.
+**
+** Table.nCol is the number of columns in this table.  Table.aCol is a
+** pointer to an array of Column structures, one for each column.
+**
+** If the table has an INTEGER PRIMARY KEY, then Table.iPKey is the index of
+** the column that is that key.   Otherwise Table.iPKey is negative.  Note
+** that the datatype of the PRIMARY KEY must be INTEGER for this field to
+** be set.  An INTEGER PRIMARY KEY is used as the rowid for each row of
+** the table.  If a table has no INTEGER PRIMARY KEY, then a random rowid
+** is generated for each row of the table.  TF_HasPrimaryKey is set if
+** the table has any PRIMARY KEY, INTEGER or otherwise.
+**
+** Table.tnum is the page number for the root BTree page of the table in the
+** database file.  If Table.iDb is the index of the database table backend
+** in sqlite.aDb[].  0 is for the main database and 1 is for the file that
+** holds temporary tables and indices.  If TF_Ephemeral is set
+** then the table is stored in a file that is automatically deleted
+** when the VDBE cursor to the table is closed.  In this case Table.tnum 
+** refers VDBE cursor number that holds the table open, not to the root
+** page number.  Transient tables are used to hold the results of a
+** sub-query that appears instead of a real table name in the FROM clause 
+** of a SELECT statement.
+*/
+struct Table {
+  char *zName;         /* Name of the table or view */
+  Column *aCol;        /* Information about each column */
+  Index *pIndex;       /* List of SQL indexes on this table. */
+  Select *pSelect;     /* NULL for tables.  Points to definition if a view. */
+  FKey *pFKey;         /* Linked list of all foreign keys in this table */
+  char *zColAff;       /* String defining the affinity of each column */
+#ifndef SQLITE_OMIT_CHECK
+  ExprList *pCheck;    /* All CHECK constraints */
+#endif
+  LogEst nRowLogEst;   /* Estimated rows in table - from sqlite_stat1 table */
+  int tnum;            /* Root BTree node for this table (see note above) */
+  i16 iPKey;           /* If not negative, use aCol[iPKey] as the primary key */
+  i16 nCol;            /* Number of columns in this table */
+  u16 nRef;            /* Number of pointers to this Table */
+  LogEst szTabRow;     /* Estimated size of each table row in bytes */
+#ifdef SQLITE_ENABLE_COSTMULT
+  LogEst costMult;     /* Cost multiplier for using this table */
+#endif
+  u8 tabFlags;         /* Mask of TF_* values */
+  u8 keyConf;          /* What to do in case of uniqueness conflict on iPKey */
+#ifndef SQLITE_OMIT_ALTERTABLE
+  int addColOffset;    /* Offset in CREATE TABLE stmt to add a new column */
+#endif
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  int nModuleArg;      /* Number of arguments to the module */
+  char **azModuleArg;  /* Text of all module args. [0] is module name */
+  VTable *pVTable;     /* List of VTable objects. */
+#endif
+  Trigger *pTrigger;   /* List of triggers stored in pSchema */
+  Schema *pSchema;     /* Schema that contains this table */
+  Table *pNextZombie;  /* Next on the Parse.pZombieTab list */
+};
+
+/*
+** Allowed values for Table.tabFlags.
+*/
+#define TF_Readonly        0x01    /* Read-only system table */
+#define TF_Ephemeral       0x02    /* An ephemeral table */
+#define TF_HasPrimaryKey   0x04    /* Table has a primary key */
+#define TF_Autoincrement   0x08    /* Integer primary key is autoincrement */
+#define TF_Virtual         0x10    /* Is a virtual table */
+#define TF_WithoutRowid    0x20    /* No rowid used. PRIMARY KEY is the key */
+
+
+/*
+** Test to see whether or not a table is a virtual table.  This is
+** done as a macro so that it will be optimized out when virtual
+** table support is omitted from the build.
+*/
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+#  define IsVirtual(X)      (((X)->tabFlags & TF_Virtual)!=0)
