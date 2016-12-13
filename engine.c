@@ -13447,3 +13447,236 @@ SQLITE_PRIVATE   int sqlite3FkLocateIndex(Parse*,Table*,FKey*,Index**,int**);
 #define SQLITE_FAULTINJECTOR_COUNT      1
 
 /*
+** The interface to the code in fault.c used for identifying "benign"
+** malloc failures. This is only present if SQLITE_OMIT_BUILTIN_TEST
+** is not defined.
+*/
+#ifndef SQLITE_OMIT_BUILTIN_TEST
+SQLITE_PRIVATE   void sqlite3BeginBenignMalloc(void);
+SQLITE_PRIVATE   void sqlite3EndBenignMalloc(void);
+#else
+  #define sqlite3BeginBenignMalloc()
+  #define sqlite3EndBenignMalloc()
+#endif
+
+/*
+** Allowed return values from sqlite3FindInIndex()
+*/
+#define IN_INDEX_ROWID        1   /* Search the rowid of the table */
+#define IN_INDEX_EPH          2   /* Search an ephemeral b-tree */
+#define IN_INDEX_INDEX_ASC    3   /* Existing index ASCENDING */
+#define IN_INDEX_INDEX_DESC   4   /* Existing index DESCENDING */
+#define IN_INDEX_NOOP         5   /* No table available. Use comparisons */
+/*
+** Allowed flags for the 3rd parameter to sqlite3FindInIndex().
+*/
+#define IN_INDEX_NOOP_OK     0x0001  /* OK to return IN_INDEX_NOOP */
+#define IN_INDEX_MEMBERSHIP  0x0002  /* IN operator used for membership test */
+#define IN_INDEX_LOOP        0x0004  /* IN operator used as a loop */
+SQLITE_PRIVATE int sqlite3FindInIndex(Parse *, Expr *, u32, int*);
+
+#ifdef SQLITE_ENABLE_ATOMIC_WRITE
+SQLITE_PRIVATE   int sqlite3JournalOpen(sqlite3_vfs *, const char *, sqlite3_file *, int, int);
+SQLITE_PRIVATE   int sqlite3JournalSize(sqlite3_vfs *);
+SQLITE_PRIVATE   int sqlite3JournalCreate(sqlite3_file *);
+SQLITE_PRIVATE   int sqlite3JournalExists(sqlite3_file *p);
+#else
+  #define sqlite3JournalSize(pVfs) ((pVfs)->szOsFile)
+  #define sqlite3JournalExists(p) 1
+#endif
+
+SQLITE_PRIVATE void sqlite3MemJournalOpen(sqlite3_file *);
+SQLITE_PRIVATE int sqlite3MemJournalSize(void);
+SQLITE_PRIVATE int sqlite3IsMemJournal(sqlite3_file *);
+
+#if SQLITE_MAX_EXPR_DEPTH>0
+SQLITE_PRIVATE   void sqlite3ExprSetHeight(Parse *pParse, Expr *p);
+SQLITE_PRIVATE   int sqlite3SelectExprHeight(Select *);
+SQLITE_PRIVATE   int sqlite3ExprCheckHeight(Parse*, int);
+#else
+  #define sqlite3ExprSetHeight(x,y)
+  #define sqlite3SelectExprHeight(x) 0
+  #define sqlite3ExprCheckHeight(x,y)
+#endif
+
+SQLITE_PRIVATE u32 sqlite3Get4byte(const u8*);
+SQLITE_PRIVATE void sqlite3Put4byte(u8*, u32);
+
+#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY
+SQLITE_PRIVATE   void sqlite3ConnectionBlocked(sqlite3 *, sqlite3 *);
+SQLITE_PRIVATE   void sqlite3ConnectionUnlocked(sqlite3 *db);
+SQLITE_PRIVATE   void sqlite3ConnectionClosed(sqlite3 *db);
+#else
+  #define sqlite3ConnectionBlocked(x,y)
+  #define sqlite3ConnectionUnlocked(x)
+  #define sqlite3ConnectionClosed(x)
+#endif
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   void sqlite3ParserTrace(FILE*, char *);
+#endif
+
+/*
+** If the SQLITE_ENABLE IOTRACE exists then the global variable
+** sqlite3IoTrace is a pointer to a printf-like routine used to
+** print I/O tracing messages. 
+*/
+#ifdef SQLITE_ENABLE_IOTRACE
+# define IOTRACE(A)  if( sqlite3IoTrace ){ sqlite3IoTrace A; }
+SQLITE_PRIVATE   void sqlite3VdbeIOTraceSql(Vdbe*);
+void (*sqlite3IoTrace)(const char*,...);
+#else
+# define IOTRACE(A)
+# define sqlite3VdbeIOTraceSql(X)
+#endif
+
+/*
+** These routines are available for the mem2.c debugging memory allocator
+** only.  They are used to verify that different "types" of memory
+** allocations are properly tracked by the system.
+**
+** sqlite3MemdebugSetType() sets the "type" of an allocation to one of
+** the MEMTYPE_* macros defined below.  The type must be a bitmask with
+** a single bit set.
+**
+** sqlite3MemdebugHasType() returns true if any of the bits in its second
+** argument match the type set by the previous sqlite3MemdebugSetType().
+** sqlite3MemdebugHasType() is intended for use inside assert() statements.
+**
+** sqlite3MemdebugNoType() returns true if none of the bits in its second
+** argument match the type set by the previous sqlite3MemdebugSetType().
+**
+** Perhaps the most important point is the difference between MEMTYPE_HEAP
+** and MEMTYPE_LOOKASIDE.  If an allocation is MEMTYPE_LOOKASIDE, that means
+** it might have been allocated by lookaside, except the allocation was
+** too large or lookaside was already full.  It is important to verify
+** that allocations that might have been satisfied by lookaside are not
+** passed back to non-lookaside free() routines.  Asserts such as the
+** example above are placed on the non-lookaside free() routines to verify
+** this constraint. 
+**
+** All of this is no-op for a production build.  It only comes into
+** play when the SQLITE_MEMDEBUG compile-time option is used.
+*/
+#ifdef SQLITE_MEMDEBUG
+SQLITE_PRIVATE   void sqlite3MemdebugSetType(void*,u8);
+SQLITE_PRIVATE   int sqlite3MemdebugHasType(void*,u8);
+SQLITE_PRIVATE   int sqlite3MemdebugNoType(void*,u8);
+#else
+# define sqlite3MemdebugSetType(X,Y)  /* no-op */
+# define sqlite3MemdebugHasType(X,Y)  1
+# define sqlite3MemdebugNoType(X,Y)   1
+#endif
+#define MEMTYPE_HEAP       0x01  /* General heap allocations */
+#define MEMTYPE_LOOKASIDE  0x02  /* Heap that might have been lookaside */
+#define MEMTYPE_SCRATCH    0x04  /* Scratch allocations */
+#define MEMTYPE_PCACHE     0x08  /* Page cache allocations */
+
+/*
+** Threading interface
+*/
+#if SQLITE_MAX_WORKER_THREADS>0
+SQLITE_PRIVATE int sqlite3ThreadCreate(SQLiteThread**,void*(*)(void*),void*);
+SQLITE_PRIVATE int sqlite3ThreadJoin(SQLiteThread*, void**);
+#endif
+
+#endif /* _SQLITEINT_H_ */
+
+/************** End of sqliteInt.h *******************************************/
+/************** Begin file global.c ******************************************/
+/*
+** 2008 June 13
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains definitions of global variables and constants.
+*/
+
+/* An array to map all upper-case characters into their corresponding
+** lower-case character. 
+**
+** SQLite only considers US-ASCII (or EBCDIC) characters.  We do not
+** handle case conversions for the UTF character set since the tables
+** involved are nearly as big or bigger than SQLite itself.
+*/
+SQLITE_PRIVATE const unsigned char sqlite3UpperToLower[] = {
+#ifdef SQLITE_ASCII
+      0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+     18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+     36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+     54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 97, 98, 99,100,101,102,103,
+    104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,
+    122, 91, 92, 93, 94, 95, 96, 97, 98, 99,100,101,102,103,104,105,106,107,
+    108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,
+    126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,
+    144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,
+    162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,
+    180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,
+    198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,
+    216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,
+    234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,
+    252,253,254,255
+#endif
+#ifdef SQLITE_EBCDIC
+      0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, /* 0x */
+     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, /* 1x */
+     32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, /* 2x */
+     48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, /* 3x */
+     64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, /* 4x */
+     80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, /* 5x */
+     96, 97, 66, 67, 68, 69, 70, 71, 72, 73,106,107,108,109,110,111, /* 6x */
+    112, 81, 82, 83, 84, 85, 86, 87, 88, 89,122,123,124,125,126,127, /* 7x */
+    128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143, /* 8x */
+    144,145,146,147,148,149,150,151,152,153,154,155,156,157,156,159, /* 9x */
+    160,161,162,163,164,165,166,167,168,169,170,171,140,141,142,175, /* Ax */
+    176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191, /* Bx */
+    192,129,130,131,132,133,134,135,136,137,202,203,204,205,206,207, /* Cx */
+    208,145,146,147,148,149,150,151,152,153,218,219,220,221,222,223, /* Dx */
+    224,225,162,163,164,165,166,167,168,169,232,203,204,205,206,207, /* Ex */
+    239,240,241,242,243,244,245,246,247,248,249,219,220,221,222,255, /* Fx */
+#endif
+};
+
+/*
+** The following 256 byte lookup table is used to support SQLites built-in
+** equivalents to the following standard library functions:
+**
+**   isspace()                        0x01
+**   isalpha()                        0x02
+**   isdigit()                        0x04
+**   isalnum()                        0x06
+**   isxdigit()                       0x08
+**   toupper()                        0x20
+**   SQLite identifier character      0x40
+**
+** Bit 0x20 is set if the mapped character requires translation to upper
+** case. i.e. if the character is a lower-case ASCII character.
+** If x is a lower-case ASCII character, then its upper-case equivalent
+** is (x - 0x20). Therefore toupper() can be implemented as:
+**
+**   (x & ~(map[x]&0x20))
+**
+** Standard function tolower() is implemented using the sqlite3UpperToLower[]
+** array. tolower() is used more often than toupper() by SQLite.
+**
+** Bit 0x40 is set if the character non-alphanumeric and can be used in an 
+** SQLite identifier.  Identifiers are alphanumerics, "_", "$", and any
+** non-ASCII UTF character. Hence the test for whether or not a character is
+** part of an identifier is 0x46.
+**
+** SQLite's versions are identical to the standard versions assuming a
+** locale of "C". They are implemented as macros in sqliteInt.h.
+*/
+#ifdef SQLITE_ASCII
+SQLITE_PRIVATE const unsigned char sqlite3CtypeMap[256] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 00..07    ........ */
+  0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00,  /* 08..0f    ........ */
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 10..17    ........ */
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 18..1f    ........ */
