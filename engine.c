@@ -13680,3 +13680,272 @@ SQLITE_PRIVATE const unsigned char sqlite3CtypeMap[256] = {
   0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00,  /* 08..0f    ........ */
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 10..17    ........ */
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 18..1f    ........ */
+  0x01, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,  /* 20..27     !"#$%&' */
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 28..2f    ()*+,-./ */
+  0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,  /* 30..37    01234567 */
+  0x0c, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 38..3f    89:;<=>? */
+
+  0x00, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x02,  /* 40..47    @ABCDEFG */
+  0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,  /* 48..4f    HIJKLMNO */
+  0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,  /* 50..57    PQRSTUVW */
+  0x02, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x40,  /* 58..5f    XYZ[\]^_ */
+  0x00, 0x2a, 0x2a, 0x2a, 0x2a, 0x2a, 0x2a, 0x22,  /* 60..67    `abcdefg */
+  0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,  /* 68..6f    hijklmno */
+  0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,  /* 70..77    pqrstuvw */
+  0x22, 0x22, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00,  /* 78..7f    xyz{|}~. */
+
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* 80..87    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* 88..8f    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* 90..97    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* 98..9f    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* a0..a7    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* a8..af    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* b0..b7    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* b8..bf    ........ */
+
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* c0..c7    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* c8..cf    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* d0..d7    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* d8..df    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* e0..e7    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* e8..ef    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,  /* f0..f7    ........ */
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40   /* f8..ff    ........ */
+};
+#endif
+
+/* EVIDENCE-OF: R-02982-34736 In order to maintain full backwards
+** compatibility for legacy applications, the URI filename capability is
+** disabled by default.
+**
+** EVIDENCE-OF: R-38799-08373 URI filenames can be enabled or disabled
+** using the SQLITE_USE_URI=1 or SQLITE_USE_URI=0 compile-time options.
+**
+** EVIDENCE-OF: R-43642-56306 By default, URI handling is globally
+** disabled. The default value may be changed by compiling with the
+** SQLITE_USE_URI symbol defined.
+*/
+#ifndef SQLITE_USE_URI
+# define  SQLITE_USE_URI 0
+#endif
+
+/* EVIDENCE-OF: R-38720-18127 The default setting is determined by the
+** SQLITE_ALLOW_COVERING_INDEX_SCAN compile-time option, or is "on" if
+** that compile-time option is omitted.
+*/
+#ifndef SQLITE_ALLOW_COVERING_INDEX_SCAN
+# define SQLITE_ALLOW_COVERING_INDEX_SCAN 1
+#endif
+
+/* The minimum PMA size is set to this value multiplied by the database
+** page size in bytes.
+*/
+#ifndef SQLITE_SORTER_PMASZ
+# define SQLITE_SORTER_PMASZ 250
+#endif
+
+/*
+** The following singleton contains the global configuration for
+** the SQLite library.
+*/
+SQLITE_PRIVATE SQLITE_WSD struct Sqlite3Config sqlite3Config = {
+   SQLITE_DEFAULT_MEMSTATUS,  /* bMemstat */
+   1,                         /* bCoreMutex */
+   SQLITE_THREADSAFE==1,      /* bFullMutex */
+   SQLITE_USE_URI,            /* bOpenUri */
+   SQLITE_ALLOW_COVERING_INDEX_SCAN,   /* bUseCis */
+   0x7ffffffe,                /* mxStrlen */
+   0,                         /* neverCorrupt */
+   128,                       /* szLookaside */
+   500,                       /* nLookaside */
+   {0,0,0,0,0,0,0,0},         /* m */
+   {0,0,0,0,0,0,0,0,0},       /* mutex */
+   {0,0,0,0,0,0,0,0,0,0,0,0,0},/* pcache2 */
+   (void*)0,                  /* pHeap */
+   0,                         /* nHeap */
+   0, 0,                      /* mnHeap, mxHeap */
+   SQLITE_DEFAULT_MMAP_SIZE,  /* szMmap */
+   SQLITE_MAX_MMAP_SIZE,      /* mxMmap */
+   (void*)0,                  /* pScratch */
+   0,                         /* szScratch */
+   0,                         /* nScratch */
+   (void*)0,                  /* pPage */
+   0,                         /* szPage */
+   0,                         /* nPage */
+   0,                         /* mxParserStack */
+   0,                         /* sharedCacheEnabled */
+   SQLITE_SORTER_PMASZ,       /* szPma */
+   /* All the rest should always be initialized to zero */
+   0,                         /* isInit */
+   0,                         /* inProgress */
+   0,                         /* isMutexInit */
+   0,                         /* isMallocInit */
+   0,                         /* isPCacheInit */
+   0,                         /* nRefInitMutex */
+   0,                         /* pInitMutex */
+   0,                         /* xLog */
+   0,                         /* pLogArg */
+#ifdef SQLITE_ENABLE_SQLLOG
+   0,                         /* xSqllog */
+   0,                         /* pSqllogArg */
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+   0,                         /* xVdbeBranch */
+   0,                         /* pVbeBranchArg */
+#endif
+#ifndef SQLITE_OMIT_BUILTIN_TEST
+   0,                         /* xTestCallback */
+#endif
+   0                          /* bLocaltimeFault */
+};
+
+/*
+** Hash table for global functions - functions common to all
+** database connections.  After initialization, this table is
+** read-only.
+*/
+SQLITE_PRIVATE SQLITE_WSD FuncDefHash sqlite3GlobalFunctions;
+
+/*
+** Constant tokens for values 0 and 1.
+*/
+SQLITE_PRIVATE const Token sqlite3IntTokens[] = {
+   { "0", 1 },
+   { "1", 1 }
+};
+
+
+/*
+** The value of the "pending" byte must be 0x40000000 (1 byte past the
+** 1-gibabyte boundary) in a compatible database.  SQLite never uses
+** the database page that contains the pending byte.  It never attempts
+** to read or write that page.  The pending byte page is set assign
+** for use by the VFS layers as space for managing file locks.
+**
+** During testing, it is often desirable to move the pending byte to
+** a different position in the file.  This allows code that has to
+** deal with the pending byte to run on files that are much smaller
+** than 1 GiB.  The sqlite3_test_control() interface can be used to
+** move the pending byte.
+**
+** IMPORTANT:  Changing the pending byte to any value other than
+** 0x40000000 results in an incompatible database file format!
+** Changing the pending byte during operation will result in undefined
+** and incorrect behavior.
+*/
+#ifndef SQLITE_OMIT_WSD
+SQLITE_PRIVATE int sqlite3PendingByte = 0x40000000;
+#endif
+
+/*
+** Properties of opcodes.  The OPFLG_INITIALIZER macro is
+** created by mkopcodeh.awk during compilation.  Data is obtained
+** from the comments following the "case OP_xxxx:" statements in
+** the vdbe.c file.  
+*/
+SQLITE_PRIVATE const unsigned char sqlite3OpcodeProperty[] = OPFLG_INITIALIZER;
+
+/************** End of global.c **********************************************/
+/************** Begin file ctime.c *******************************************/
+/*
+** 2010 February 23
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file implements routines used to report what compile-time options
+** SQLite was built with.
+*/
+
+#ifndef SQLITE_OMIT_COMPILEOPTION_DIAGS
+
+
+/*
+** An array of names of all compile-time options.  This array should 
+** be sorted A-Z.
+**
+** This array looks large, but in a typical installation actually uses
+** only a handful of compile-time options, so most times this array is usually
+** rather short and uses little memory space.
+*/
+static const char * const azCompileOpt[] = {
+
+/* These macros are provided to "stringify" the value of the define
+** for those options in which the value is meaningful. */
+#define CTIMEOPT_VAL_(opt) #opt
+#define CTIMEOPT_VAL(opt) CTIMEOPT_VAL_(opt)
+
+#if SQLITE_32BIT_ROWID
+  "32BIT_ROWID",
+#endif
+#if SQLITE_4_BYTE_ALIGNED_MALLOC
+  "4_BYTE_ALIGNED_MALLOC",
+#endif
+#if SQLITE_CASE_SENSITIVE_LIKE
+  "CASE_SENSITIVE_LIKE",
+#endif
+#if SQLITE_CHECK_PAGES
+  "CHECK_PAGES",
+#endif
+#if SQLITE_COVERAGE_TEST
+  "COVERAGE_TEST",
+#endif
+#if SQLITE_DEBUG
+  "DEBUG",
+#endif
+#if SQLITE_DEFAULT_LOCKING_MODE
+  "DEFAULT_LOCKING_MODE=" CTIMEOPT_VAL(SQLITE_DEFAULT_LOCKING_MODE),
+#endif
+#if defined(SQLITE_DEFAULT_MMAP_SIZE) && !defined(SQLITE_DEFAULT_MMAP_SIZE_xc)
+  "DEFAULT_MMAP_SIZE=" CTIMEOPT_VAL(SQLITE_DEFAULT_MMAP_SIZE),
+#endif
+#if SQLITE_DISABLE_DIRSYNC
+  "DISABLE_DIRSYNC",
+#endif
+#if SQLITE_DISABLE_LFS
+  "DISABLE_LFS",
+#endif
+#if SQLITE_ENABLE_API_ARMOR
+  "ENABLE_API_ARMOR",
+#endif
+#if SQLITE_ENABLE_ATOMIC_WRITE
+  "ENABLE_ATOMIC_WRITE",
+#endif
+#if SQLITE_ENABLE_CEROD
+  "ENABLE_CEROD",
+#endif
+#if SQLITE_ENABLE_COLUMN_METADATA
+  "ENABLE_COLUMN_METADATA",
+#endif
+#if SQLITE_ENABLE_EXPENSIVE_ASSERT
+  "ENABLE_EXPENSIVE_ASSERT",
+#endif
+#if SQLITE_ENABLE_FTS1
+  "ENABLE_FTS1",
+#endif
+#if SQLITE_ENABLE_FTS2
+  "ENABLE_FTS2",
+#endif
+#if SQLITE_ENABLE_FTS3
+  "ENABLE_FTS3",
+#endif
+#if SQLITE_ENABLE_FTS3_PARENTHESIS
+  "ENABLE_FTS3_PARENTHESIS",
+#endif
+#if SQLITE_ENABLE_FTS4
+  "ENABLE_FTS4",
+#endif
+#if SQLITE_ENABLE_ICU
+  "ENABLE_ICU",
+#endif
+#if SQLITE_ENABLE_IOTRACE
+  "ENABLE_IOTRACE",
+#endif
+#if SQLITE_ENABLE_LOAD_EXTENSION
+  "ENABLE_LOAD_EXTENSION",
