@@ -14192,3 +14192,234 @@ static const char * const azCompileOpt[] = {
 #if SQLITE_RTREE_INT_ONLY
   "RTREE_INT_ONLY",
 #endif
+#if SQLITE_SECURE_DELETE
+  "SECURE_DELETE",
+#endif
+#if SQLITE_SMALL_STACK
+  "SMALL_STACK",
+#endif
+#if SQLITE_SOUNDEX
+  "SOUNDEX",
+#endif
+#if SQLITE_SYSTEM_MALLOC
+  "SYSTEM_MALLOC",
+#endif
+#if SQLITE_TCL
+  "TCL",
+#endif
+#if defined(SQLITE_TEMP_STORE) && !defined(SQLITE_TEMP_STORE_xc)
+  "TEMP_STORE=" CTIMEOPT_VAL(SQLITE_TEMP_STORE),
+#endif
+#if SQLITE_TEST
+  "TEST",
+#endif
+#if defined(SQLITE_THREADSAFE)
+  "THREADSAFE=" CTIMEOPT_VAL(SQLITE_THREADSAFE),
+#endif
+#if SQLITE_USE_ALLOCA
+  "USE_ALLOCA",
+#endif
+#if SQLITE_USER_AUTHENTICATION
+  "USER_AUTHENTICATION",
+#endif
+#if SQLITE_WIN32_MALLOC
+  "WIN32_MALLOC",
+#endif
+#if SQLITE_ZERO_MALLOC
+  "ZERO_MALLOC"
+#endif
+};
+
+/*
+** Given the name of a compile-time option, return true if that option
+** was used and false if not.
+**
+** The name can optionally begin with "SQLITE_" but the "SQLITE_" prefix
+** is not required for a match.
+*/
+SQLITE_API int sqlite3_compileoption_used(const char *zOptName){
+  int i, n;
+
+#if SQLITE_ENABLE_API_ARMOR
+  if( zOptName==0 ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+  if( sqlite3StrNICmp(zOptName, "SQLITE_", 7)==0 ) zOptName += 7;
+  n = sqlite3Strlen30(zOptName);
+
+  /* Since ArraySize(azCompileOpt) is normally in single digits, a
+  ** linear search is adequate.  No need for a binary search. */
+  for(i=0; i<ArraySize(azCompileOpt); i++){
+    if( sqlite3StrNICmp(zOptName, azCompileOpt[i], n)==0
+     && sqlite3IsIdChar((unsigned char)azCompileOpt[i][n])==0
+    ){
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** Return the N-th compile-time option string.  If N is out of range,
+** return a NULL pointer.
+*/
+SQLITE_API const char *sqlite3_compileoption_get(int N){
+  if( N>=0 && N<ArraySize(azCompileOpt) ){
+    return azCompileOpt[N];
+  }
+  return 0;
+}
+
+#endif /* SQLITE_OMIT_COMPILEOPTION_DIAGS */
+
+/************** End of ctime.c ***********************************************/
+/************** Begin file status.c ******************************************/
+/*
+** 2008 June 18
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This module implements the sqlite3_status() interface and related
+** functionality.
+*/
+/************** Include vdbeInt.h in the middle of status.c ******************/
+/************** Begin file vdbeInt.h *****************************************/
+/*
+** 2003 September 6
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This is the header file for information that is private to the
+** VDBE.  This information used to all be at the top of the single
+** source code file "vdbe.c".  When that file became too big (over
+** 6000 lines long) it was split up into several smaller files and
+** this header information was factored out.
+*/
+#ifndef _VDBEINT_H_
+#define _VDBEINT_H_
+
+/*
+** The maximum number of times that a statement will try to reparse
+** itself before giving up and returning SQLITE_SCHEMA.
+*/
+#ifndef SQLITE_MAX_SCHEMA_RETRY
+# define SQLITE_MAX_SCHEMA_RETRY 50
+#endif
+
+/*
+** SQL is translated into a sequence of instructions to be
+** executed by a virtual machine.  Each instruction is an instance
+** of the following structure.
+*/
+typedef struct VdbeOp Op;
+
+/*
+** Boolean values
+*/
+typedef unsigned Bool;
+
+/* Opaque type used by code in vdbesort.c */
+typedef struct VdbeSorter VdbeSorter;
+
+/* Opaque type used by the explainer */
+typedef struct Explain Explain;
+
+/* Elements of the linked list at Vdbe.pAuxData */
+typedef struct AuxData AuxData;
+
+/*
+** A cursor is a pointer into a single BTree within a database file.
+** The cursor can seek to a BTree entry with a particular key, or
+** loop over all entries of the Btree.  You can also insert new BTree
+** entries or retrieve the key or data from the entry that the cursor
+** is currently pointing to.
+**
+** Cursors can also point to virtual tables, sorters, or "pseudo-tables".
+** A pseudo-table is a single-row table implemented by registers.
+** 
+** Every cursor that the virtual machine has open is represented by an
+** instance of the following structure.
+*/
+struct VdbeCursor {
+  BtCursor *pCursor;    /* The cursor structure of the backend */
+  Btree *pBt;           /* Separate file holding temporary table */
+  KeyInfo *pKeyInfo;    /* Info about index keys needed by index cursors */
+  int seekResult;       /* Result of previous sqlite3BtreeMoveto() */
+  int pseudoTableReg;   /* Register holding pseudotable content. */
+  i16 nField;           /* Number of fields in the header */
+  u16 nHdrParsed;       /* Number of header fields parsed so far */
+#ifdef SQLITE_DEBUG
+  u8 seekOp;            /* Most recent seek operation on this cursor */
+#endif
+  i8 iDb;               /* Index of cursor database in db->aDb[] (or -1) */
+  u8 nullRow;           /* True if pointing to a row with no data */
+  u8 deferredMoveto;    /* A call to sqlite3BtreeMoveto() is needed */
+  Bool isEphemeral:1;   /* True for an ephemeral table */
+  Bool useRandomRowid:1;/* Generate new record numbers semi-randomly */
+  Bool isTable:1;       /* True if a table requiring integer keys */
+  Bool isOrdered:1;     /* True if the underlying table is BTREE_UNORDERED */
+  Pgno pgnoRoot;        /* Root page of the open btree cursor */
+  sqlite3_vtab_cursor *pVtabCursor;  /* The cursor for a virtual table */
+  i64 seqCount;         /* Sequence counter */
+  i64 movetoTarget;     /* Argument to the deferred sqlite3BtreeMoveto() */
+  VdbeSorter *pSorter;  /* Sorter object for OP_SorterOpen cursors */
+
+  /* Cached information about the header for the data record that the
+  ** cursor is currently pointing to.  Only valid if cacheStatus matches
+  ** Vdbe.cacheCtr.  Vdbe.cacheCtr will never take on the value of
+  ** CACHE_STALE and so setting cacheStatus=CACHE_STALE guarantees that
+  ** the cache is out of date.
+  **
+  ** aRow might point to (ephemeral) data for the current row, or it might
+  ** be NULL.
+  */
+  u32 cacheStatus;      /* Cache is valid if this matches Vdbe.cacheCtr */
+  u32 payloadSize;      /* Total number of bytes in the record */
+  u32 szRow;            /* Byte available in aRow */
+  u32 iHdrOffset;       /* Offset to next unparsed byte of the header */
+  const u8 *aRow;       /* Data for the current row, if all on one page */
+  u32 *aOffset;         /* Pointer to aType[nField] */
+  u32 aType[1];         /* Type values for all entries in the record */
+  /* 2*nField extra array elements allocated for aType[], beyond the one
+  ** static element declared in the structure.  nField total array slots for
+  ** aType[] and nField+1 array slots for aOffset[] */
+};
+typedef struct VdbeCursor VdbeCursor;
+
+/*
+** When a sub-program is executed (OP_Program), a structure of this type
+** is allocated to store the current value of the program counter, as
+** well as the current memory cell array and various other frame specific
+** values stored in the Vdbe struct. When the sub-program is finished, 
+** these values are copied back to the Vdbe from the VdbeFrame structure,
+** restoring the state of the VM to as it was before the sub-program
+** began executing.
+**
+** The memory for a VdbeFrame object is allocated and managed by a memory
+** cell in the parent (calling) frame. When the memory cell is deleted or
+** overwritten, the VdbeFrame object is not freed immediately. Instead, it
+** is linked into the Vdbe.pDelFrame list. The contents of the Vdbe.pDelFrame
+** list is deleted when the VM is reset in VdbeHalt(). The reason for doing
+** this instead of deleting the VdbeFrame immediately is to avoid recursive
+** calls to sqlite3VdbeMemRelease() when the memory cells belonging to the
+** child frame are released.
+**
+** The currently executing frame is stored in Vdbe.pFrame. Vdbe.pFrame is
+** set to NULL if the currently executing frame is the main program.
+*/
+typedef struct VdbeFrame VdbeFrame;
