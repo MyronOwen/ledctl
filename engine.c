@@ -14660,3 +14660,229 @@ struct Vdbe {
 #ifndef SQLITE_OMIT_TRACE
   i64 startTime;          /* Time when query started - used for profiling */
 #endif
+  i64 iCurrentTime;       /* Value of julianday('now') for this statement */
+  i64 nFkConstraint;      /* Number of imm. FK constraints this VM */
+  i64 nStmtDefCons;       /* Number of def. constraints when stmt started */
+  i64 nStmtDefImmCons;    /* Number of def. imm constraints when stmt started */
+  char *zSql;             /* Text of the SQL statement that generated this */
+  void *pFree;            /* Free this when deleting the vdbe */
+  VdbeFrame *pFrame;      /* Parent frame */
+  VdbeFrame *pDelFrame;   /* List of frame objects to free on VM reset */
+  int nFrame;             /* Number of frames in pFrame list */
+  u32 expmask;            /* Binding to these vars invalidates VM */
+  SubProgram *pProgram;   /* Linked list of all sub-programs used by VM */
+  int nOnceFlag;          /* Size of array aOnceFlag[] */
+  u8 *aOnceFlag;          /* Flags for OP_Once */
+  AuxData *pAuxData;      /* Linked list of auxdata allocations */
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  i64 *anExec;            /* Number of times each op has been executed */
+  int nScan;              /* Entries in aScan[] */
+  ScanStatus *aScan;      /* Scan definitions for sqlite3_stmt_scanstatus() */
+#endif
+};
+
+/*
+** The following are allowed values for Vdbe.magic
+*/
+#define VDBE_MAGIC_INIT     0x26bceaa5    /* Building a VDBE program */
+#define VDBE_MAGIC_RUN      0xbdf20da3    /* VDBE is ready to execute */
+#define VDBE_MAGIC_HALT     0x519c2973    /* VDBE has completed execution */
+#define VDBE_MAGIC_DEAD     0xb606c3c8    /* The VDBE has been deallocated */
+
+/*
+** Function prototypes
+*/
+SQLITE_PRIVATE void sqlite3VdbeFreeCursor(Vdbe *, VdbeCursor*);
+void sqliteVdbePopStack(Vdbe*,int);
+SQLITE_PRIVATE int sqlite3VdbeCursorMoveto(VdbeCursor*);
+SQLITE_PRIVATE int sqlite3VdbeCursorRestore(VdbeCursor*);
+#if defined(SQLITE_DEBUG) || defined(VDBE_PROFILE)
+SQLITE_PRIVATE void sqlite3VdbePrintOp(FILE*, int, Op*);
+#endif
+SQLITE_PRIVATE u32 sqlite3VdbeSerialTypeLen(u32);
+SQLITE_PRIVATE u32 sqlite3VdbeSerialType(Mem*, int);
+SQLITE_PRIVATE u32 sqlite3VdbeSerialPut(unsigned char*, Mem*, u32);
+SQLITE_PRIVATE u32 sqlite3VdbeSerialGet(const unsigned char*, u32, Mem*);
+SQLITE_PRIVATE void sqlite3VdbeDeleteAuxData(Vdbe*, int, int);
+
+int sqlite2BtreeKeyCompare(BtCursor *, const void *, int, int, int *);
+SQLITE_PRIVATE int sqlite3VdbeIdxKeyCompare(sqlite3*,VdbeCursor*,UnpackedRecord*,int*);
+SQLITE_PRIVATE int sqlite3VdbeIdxRowid(sqlite3*, BtCursor*, i64*);
+SQLITE_PRIVATE int sqlite3VdbeExec(Vdbe*);
+SQLITE_PRIVATE int sqlite3VdbeList(Vdbe*);
+SQLITE_PRIVATE int sqlite3VdbeHalt(Vdbe*);
+SQLITE_PRIVATE int sqlite3VdbeChangeEncoding(Mem *, int);
+SQLITE_PRIVATE int sqlite3VdbeMemTooBig(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemCopy(Mem*, const Mem*);
+SQLITE_PRIVATE void sqlite3VdbeMemShallowCopy(Mem*, const Mem*, int);
+SQLITE_PRIVATE void sqlite3VdbeMemMove(Mem*, Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemNulTerminate(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemSetStr(Mem*, const char*, int, u8, void(*)(void*));
+SQLITE_PRIVATE void sqlite3VdbeMemSetInt64(Mem*, i64);
+#ifdef SQLITE_OMIT_FLOATING_POINT
+# define sqlite3VdbeMemSetDouble sqlite3VdbeMemSetInt64
+#else
+SQLITE_PRIVATE   void sqlite3VdbeMemSetDouble(Mem*, double);
+#endif
+SQLITE_PRIVATE void sqlite3VdbeMemInit(Mem*,sqlite3*,u16);
+SQLITE_PRIVATE void sqlite3VdbeMemSetNull(Mem*);
+SQLITE_PRIVATE void sqlite3VdbeMemSetZeroBlob(Mem*,int);
+SQLITE_PRIVATE void sqlite3VdbeMemSetRowSet(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemMakeWriteable(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemStringify(Mem*, u8, u8);
+SQLITE_PRIVATE i64 sqlite3VdbeIntValue(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemIntegerify(Mem*);
+SQLITE_PRIVATE double sqlite3VdbeRealValue(Mem*);
+SQLITE_PRIVATE void sqlite3VdbeIntegerAffinity(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemRealify(Mem*);
+SQLITE_PRIVATE int sqlite3VdbeMemNumerify(Mem*);
+SQLITE_PRIVATE void sqlite3VdbeMemCast(Mem*,u8,u8);
+SQLITE_PRIVATE int sqlite3VdbeMemFromBtree(BtCursor*,u32,u32,int,Mem*);
+SQLITE_PRIVATE void sqlite3VdbeMemRelease(Mem *p);
+#define VdbeMemDynamic(X)  \
+  (((X)->flags&(MEM_Agg|MEM_Dyn|MEM_RowSet|MEM_Frame))!=0)
+SQLITE_PRIVATE int sqlite3VdbeMemFinalize(Mem*, FuncDef*);
+SQLITE_PRIVATE const char *sqlite3OpcodeName(int);
+SQLITE_PRIVATE int sqlite3VdbeMemGrow(Mem *pMem, int n, int preserve);
+SQLITE_PRIVATE int sqlite3VdbeMemClearAndResize(Mem *pMem, int n);
+SQLITE_PRIVATE int sqlite3VdbeCloseStatement(Vdbe *, int);
+SQLITE_PRIVATE void sqlite3VdbeFrameDelete(VdbeFrame*);
+SQLITE_PRIVATE int sqlite3VdbeFrameRestore(VdbeFrame *);
+SQLITE_PRIVATE int sqlite3VdbeTransferError(Vdbe *p);
+
+SQLITE_PRIVATE int sqlite3VdbeSorterInit(sqlite3 *, int, VdbeCursor *);
+SQLITE_PRIVATE void sqlite3VdbeSorterReset(sqlite3 *, VdbeSorter *);
+SQLITE_PRIVATE void sqlite3VdbeSorterClose(sqlite3 *, VdbeCursor *);
+SQLITE_PRIVATE int sqlite3VdbeSorterRowkey(const VdbeCursor *, Mem *);
+SQLITE_PRIVATE int sqlite3VdbeSorterNext(sqlite3 *, const VdbeCursor *, int *);
+SQLITE_PRIVATE int sqlite3VdbeSorterRewind(const VdbeCursor *, int *);
+SQLITE_PRIVATE int sqlite3VdbeSorterWrite(const VdbeCursor *, Mem *);
+SQLITE_PRIVATE int sqlite3VdbeSorterCompare(const VdbeCursor *, Mem *, int, int *);
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0
+SQLITE_PRIVATE   void sqlite3VdbeEnter(Vdbe*);
+SQLITE_PRIVATE   void sqlite3VdbeLeave(Vdbe*);
+#else
+# define sqlite3VdbeEnter(X)
+# define sqlite3VdbeLeave(X)
+#endif
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE void sqlite3VdbeMemAboutToChange(Vdbe*,Mem*);
+SQLITE_PRIVATE int sqlite3VdbeCheckMemInvariants(Mem*);
+#endif
+
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+SQLITE_PRIVATE int sqlite3VdbeCheckFk(Vdbe *, int);
+#else
+# define sqlite3VdbeCheckFk(p,i) 0
+#endif
+
+SQLITE_PRIVATE int sqlite3VdbeMemTranslate(Mem*, u8);
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   void sqlite3VdbePrintSql(Vdbe*);
+SQLITE_PRIVATE   void sqlite3VdbeMemPrettyPrint(Mem *pMem, char *zBuf);
+#endif
+SQLITE_PRIVATE int sqlite3VdbeMemHandleBom(Mem *pMem);
+
+#ifndef SQLITE_OMIT_INCRBLOB
+SQLITE_PRIVATE   int sqlite3VdbeMemExpandBlob(Mem *);
+  #define ExpandBlob(P) (((P)->flags&MEM_Zero)?sqlite3VdbeMemExpandBlob(P):0)
+#else
+  #define sqlite3VdbeMemExpandBlob(x) SQLITE_OK
+  #define ExpandBlob(P) SQLITE_OK
+#endif
+
+#endif /* !defined(_VDBEINT_H_) */
+
+/************** End of vdbeInt.h *********************************************/
+/************** Continuing where we left off in status.c *********************/
+
+/*
+** Variables in which to record status information.
+*/
+typedef struct sqlite3StatType sqlite3StatType;
+static SQLITE_WSD struct sqlite3StatType {
+  int nowValue[10];         /* Current value */
+  int mxValue[10];          /* Maximum value */
+} sqlite3Stat = { {0,}, {0,} };
+
+
+/* The "wsdStat" macro will resolve to the status information
+** state vector.  If writable static data is unsupported on the target,
+** we have to locate the state vector at run-time.  In the more common
+** case where writable static data is supported, wsdStat can refer directly
+** to the "sqlite3Stat" state vector declared above.
+*/
+#ifdef SQLITE_OMIT_WSD
+# define wsdStatInit  sqlite3StatType *x = &GLOBAL(sqlite3StatType,sqlite3Stat)
+# define wsdStat x[0]
+#else
+# define wsdStatInit
+# define wsdStat sqlite3Stat
+#endif
+
+/*
+** Return the current value of a status parameter.
+*/
+SQLITE_PRIVATE int sqlite3StatusValue(int op){
+  wsdStatInit;
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  return wsdStat.nowValue[op];
+}
+
+/*
+** Add N to the value of a status record.  It is assumed that the
+** caller holds appropriate locks.
+*/
+SQLITE_PRIVATE void sqlite3StatusAdd(int op, int N){
+  wsdStatInit;
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  wsdStat.nowValue[op] += N;
+  if( wsdStat.nowValue[op]>wsdStat.mxValue[op] ){
+    wsdStat.mxValue[op] = wsdStat.nowValue[op];
+  }
+}
+
+/*
+** Set the value of a status to X.
+*/
+SQLITE_PRIVATE void sqlite3StatusSet(int op, int X){
+  wsdStatInit;
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  wsdStat.nowValue[op] = X;
+  if( wsdStat.nowValue[op]>wsdStat.mxValue[op] ){
+    wsdStat.mxValue[op] = wsdStat.nowValue[op];
+  }
+}
+
+/*
+** Query status information.
+**
+** This implementation assumes that reading or writing an aligned
+** 32-bit integer is an atomic operation.  If that assumption is not true,
+** then this routine is not threadsafe.
+*/
+SQLITE_API int sqlite3_status(int op, int *pCurrent, int *pHighwater, int resetFlag){
+  wsdStatInit;
+  if( op<0 || op>=ArraySize(wsdStat.nowValue) ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pCurrent==0 || pHighwater==0 ) return SQLITE_MISUSE_BKPT;
+#endif
+  *pCurrent = wsdStat.nowValue[op];
+  *pHighwater = wsdStat.mxValue[op];
+  if( resetFlag ){
+    wsdStat.mxValue[op] = wsdStat.nowValue[op];
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Query status information for a single database connection
+*/
+SQLITE_API int sqlite3_db_status(
+  sqlite3 *db,          /* The database connection whose status is desired */
+  int op,               /* Status verb */
+  int *pCurrent,        /* Write current value here */
