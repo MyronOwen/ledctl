@@ -14886,3 +14886,224 @@ SQLITE_API int sqlite3_db_status(
   sqlite3 *db,          /* The database connection whose status is desired */
   int op,               /* Status verb */
   int *pCurrent,        /* Write current value here */
+  int *pHighwater,      /* Write high-water mark here */
+  int resetFlag         /* Reset high-water mark if true */
+){
+  int rc = SQLITE_OK;   /* Return code */
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || pCurrent==0|| pHighwater==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  sqlite3_mutex_enter(db->mutex);
+  switch( op ){
+    case SQLITE_DBSTATUS_LOOKASIDE_USED: {
+      *pCurrent = db->lookaside.nOut;
+      *pHighwater = db->lookaside.mxOut;
+      if( resetFlag ){
+        db->lookaside.mxOut = db->lookaside.nOut;
+      }
+      break;
+    }
+
+    case SQLITE_DBSTATUS_LOOKASIDE_HIT:
+    case SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE:
+    case SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL: {
+      testcase( op==SQLITE_DBSTATUS_LOOKASIDE_HIT );
+      testcase( op==SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE );
+      testcase( op==SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL );
+      assert( (op-SQLITE_DBSTATUS_LOOKASIDE_HIT)>=0 );
+      assert( (op-SQLITE_DBSTATUS_LOOKASIDE_HIT)<3 );
+      *pCurrent = 0;
+      *pHighwater = db->lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT];
+      if( resetFlag ){
+        db->lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT] = 0;
+      }
+      break;
+    }
+
+    /* 
+    ** Return an approximation for the amount of memory currently used
+    ** by all pagers associated with the given database connection.  The
+    ** highwater mark is meaningless and is returned as zero.
+    */
+    case SQLITE_DBSTATUS_CACHE_USED: {
+      int totalUsed = 0;
+      int i;
+      sqlite3BtreeEnterAll(db);
+      for(i=0; i<db->nDb; i++){
+        Btree *pBt = db->aDb[i].pBt;
+        if( pBt ){
+          Pager *pPager = sqlite3BtreePager(pBt);
+          totalUsed += sqlite3PagerMemUsed(pPager);
+        }
+      }
+      sqlite3BtreeLeaveAll(db);
+      *pCurrent = totalUsed;
+      *pHighwater = 0;
+      break;
+    }
+
+    /*
+    ** *pCurrent gets an accurate estimate of the amount of memory used
+    ** to store the schema for all databases (main, temp, and any ATTACHed
+    ** databases.  *pHighwater is set to zero.
+    */
+    case SQLITE_DBSTATUS_SCHEMA_USED: {
+      int i;                      /* Used to iterate through schemas */
+      int nByte = 0;              /* Used to accumulate return value */
+
+      sqlite3BtreeEnterAll(db);
+      db->pnBytesFreed = &nByte;
+      for(i=0; i<db->nDb; i++){
+        Schema *pSchema = db->aDb[i].pSchema;
+        if( ALWAYS(pSchema!=0) ){
+          HashElem *p;
+
+          nByte += sqlite3GlobalConfig.m.xRoundup(sizeof(HashElem)) * (
+              pSchema->tblHash.count 
+            + pSchema->trigHash.count
+            + pSchema->idxHash.count
+            + pSchema->fkeyHash.count
+          );
+          nByte += sqlite3MallocSize(pSchema->tblHash.ht);
+          nByte += sqlite3MallocSize(pSchema->trigHash.ht);
+          nByte += sqlite3MallocSize(pSchema->idxHash.ht);
+          nByte += sqlite3MallocSize(pSchema->fkeyHash.ht);
+
+          for(p=sqliteHashFirst(&pSchema->trigHash); p; p=sqliteHashNext(p)){
+            sqlite3DeleteTrigger(db, (Trigger*)sqliteHashData(p));
+          }
+          for(p=sqliteHashFirst(&pSchema->tblHash); p; p=sqliteHashNext(p)){
+            sqlite3DeleteTable(db, (Table *)sqliteHashData(p));
+          }
+        }
+      }
+      db->pnBytesFreed = 0;
+      sqlite3BtreeLeaveAll(db);
+
+      *pHighwater = 0;
+      *pCurrent = nByte;
+      break;
+    }
+
+    /*
+    ** *pCurrent gets an accurate estimate of the amount of memory used
+    ** to store all prepared statements.
+    ** *pHighwater is set to zero.
+    */
+    case SQLITE_DBSTATUS_STMT_USED: {
+      struct Vdbe *pVdbe;         /* Used to iterate through VMs */
+      int nByte = 0;              /* Used to accumulate return value */
+
+      db->pnBytesFreed = &nByte;
+      for(pVdbe=db->pVdbe; pVdbe; pVdbe=pVdbe->pNext){
+        sqlite3VdbeClearObject(db, pVdbe);
+        sqlite3DbFree(db, pVdbe);
+      }
+      db->pnBytesFreed = 0;
+
+      *pHighwater = 0;  /* IMP: R-64479-57858 */
+      *pCurrent = nByte;
+
+      break;
+    }
+
+    /*
+    ** Set *pCurrent to the total cache hits or misses encountered by all
+    ** pagers the database handle is connected to. *pHighwater is always set 
+    ** to zero.
+    */
+    case SQLITE_DBSTATUS_CACHE_HIT:
+    case SQLITE_DBSTATUS_CACHE_MISS:
+    case SQLITE_DBSTATUS_CACHE_WRITE:{
+      int i;
+      int nRet = 0;
+      assert( SQLITE_DBSTATUS_CACHE_MISS==SQLITE_DBSTATUS_CACHE_HIT+1 );
+      assert( SQLITE_DBSTATUS_CACHE_WRITE==SQLITE_DBSTATUS_CACHE_HIT+2 );
+
+      for(i=0; i<db->nDb; i++){
+        if( db->aDb[i].pBt ){
+          Pager *pPager = sqlite3BtreePager(db->aDb[i].pBt);
+          sqlite3PagerCacheStat(pPager, op, resetFlag, &nRet);
+        }
+      }
+      *pHighwater = 0; /* IMP: R-42420-56072 */
+                       /* IMP: R-54100-20147 */
+                       /* IMP: R-29431-39229 */
+      *pCurrent = nRet;
+      break;
+    }
+
+    /* Set *pCurrent to non-zero if there are unresolved deferred foreign
+    ** key constraints.  Set *pCurrent to zero if all foreign key constraints
+    ** have been satisfied.  The *pHighwater is always set to zero.
+    */
+    case SQLITE_DBSTATUS_DEFERRED_FKS: {
+      *pHighwater = 0;  /* IMP: R-11967-56545 */
+      *pCurrent = db->nDeferredImmCons>0 || db->nDeferredCons>0;
+      break;
+    }
+
+    default: {
+      rc = SQLITE_ERROR;
+    }
+  }
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+/************** End of status.c **********************************************/
+/************** Begin file date.c ********************************************/
+/*
+** 2003 October 31
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C functions that implement date and time
+** functions for SQLite.  
+**
+** There is only one exported symbol in this file - the function
+** sqlite3RegisterDateTimeFunctions() found at the bottom of the file.
+** All other code has file scope.
+**
+** SQLite processes all times and dates as julian day numbers.  The
+** dates and times are stored as the number of days since noon
+** in Greenwich on November 24, 4714 B.C. according to the Gregorian
+** calendar system. 
+**
+** 1970-01-01 00:00:00 is JD 2440587.5
+** 2000-01-01 00:00:00 is JD 2451544.5
+**
+** This implementation requires years to be expressed as a 4-digit number
+** which means that only dates between 0000-01-01 and 9999-12-31 can
+** be represented, even though julian day numbers allow a much wider
+** range of dates.
+**
+** The Gregorian calendar system is used for all dates and times,
+** even those that predate the Gregorian calendar.  Historians usually
+** use the julian calendar for dates prior to 1582-10-15 and for some
+** dates afterwards, depending on locale.  Beware of this difference.
+**
+** The conversion algorithms are implemented based on descriptions
+** in the following text:
+**
+**      Jean Meeus
+**      Astronomical Algorithms, 2nd Edition, 1998
+**      ISBM 0-943396-61-1
+**      Willmann-Bell, Inc
+**      Richmond, Virginia (USA)
+*/
+/* #include <stdlib.h> */
+/* #include <assert.h> */
+#include <time.h>
+
+#ifndef SQLITE_OMIT_DATETIME_FUNCS
+
+
