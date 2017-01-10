@@ -16500,3 +16500,207 @@ SQLITE_PRIVATE int sqlite3OsInit(void){
 ** The list of all registered VFS implementations.
 */
 static sqlite3_vfs * SQLITE_WSD vfsList = 0;
+#define vfsList GLOBAL(sqlite3_vfs *, vfsList)
+
+/*
+** Locate a VFS by name.  If no name is given, simply return the
+** first VFS on the list.
+*/
+SQLITE_API sqlite3_vfs *sqlite3_vfs_find(const char *zVfs){
+  sqlite3_vfs *pVfs = 0;
+#if SQLITE_THREADSAFE
+  sqlite3_mutex *mutex;
+#endif
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return 0;
+#endif
+#if SQLITE_THREADSAFE
+  mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+#endif
+  sqlite3_mutex_enter(mutex);
+  for(pVfs = vfsList; pVfs; pVfs=pVfs->pNext){
+    if( zVfs==0 ) break;
+    if( strcmp(zVfs, pVfs->zName)==0 ) break;
+  }
+  sqlite3_mutex_leave(mutex);
+  return pVfs;
+}
+
+/*
+** Unlink a VFS from the linked list
+*/
+static void vfsUnlink(sqlite3_vfs *pVfs){
+  assert( sqlite3_mutex_held(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER)) );
+  if( pVfs==0 ){
+    /* No-op */
+  }else if( vfsList==pVfs ){
+    vfsList = pVfs->pNext;
+  }else if( vfsList ){
+    sqlite3_vfs *p = vfsList;
+    while( p->pNext && p->pNext!=pVfs ){
+      p = p->pNext;
+    }
+    if( p->pNext==pVfs ){
+      p->pNext = pVfs->pNext;
+    }
+  }
+}
+
+/*
+** Register a VFS with the system.  It is harmless to register the same
+** VFS multiple times.  The new VFS becomes the default if makeDflt is
+** true.
+*/
+SQLITE_API int sqlite3_vfs_register(sqlite3_vfs *pVfs, int makeDflt){
+  MUTEX_LOGIC(sqlite3_mutex *mutex;)
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return rc;
+#endif
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pVfs==0 ) return SQLITE_MISUSE_BKPT;
+#endif
+
+  MUTEX_LOGIC( mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER); )
+  sqlite3_mutex_enter(mutex);
+  vfsUnlink(pVfs);
+  if( makeDflt || vfsList==0 ){
+    pVfs->pNext = vfsList;
+    vfsList = pVfs;
+  }else{
+    pVfs->pNext = vfsList->pNext;
+    vfsList->pNext = pVfs;
+  }
+  assert(vfsList);
+  sqlite3_mutex_leave(mutex);
+  return SQLITE_OK;
+}
+
+/*
+** Unregister a VFS so that it is no longer accessible.
+*/
+SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs *pVfs){
+#if SQLITE_THREADSAFE
+  sqlite3_mutex *mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+#endif
+  sqlite3_mutex_enter(mutex);
+  vfsUnlink(pVfs);
+  sqlite3_mutex_leave(mutex);
+  return SQLITE_OK;
+}
+
+/************** End of os.c **************************************************/
+/************** Begin file fault.c *******************************************/
+/*
+** 2008 Jan 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code to support the concept of "benign" 
+** malloc failures (when the xMalloc() or xRealloc() method of the
+** sqlite3_mem_methods structure fails to allocate a block of memory
+** and returns 0). 
+**
+** Most malloc failures are non-benign. After they occur, SQLite
+** abandons the current operation and returns an error code (usually
+** SQLITE_NOMEM) to the user. However, sometimes a fault is not necessarily
+** fatal. For example, if a malloc fails while resizing a hash table, this 
+** is completely recoverable simply by not carrying out the resize. The 
+** hash table will continue to function normally.  So a malloc failure 
+** during a hash table resize is a benign fault.
+*/
+
+
+#ifndef SQLITE_OMIT_BUILTIN_TEST
+
+/*
+** Global variables.
+*/
+typedef struct BenignMallocHooks BenignMallocHooks;
+static SQLITE_WSD struct BenignMallocHooks {
+  void (*xBenignBegin)(void);
+  void (*xBenignEnd)(void);
+} sqlite3Hooks = { 0, 0 };
+
+/* The "wsdHooks" macro will resolve to the appropriate BenignMallocHooks
+** structure.  If writable static data is unsupported on the target,
+** we have to locate the state vector at run-time.  In the more common
+** case where writable static data is supported, wsdHooks can refer directly
+** to the "sqlite3Hooks" state vector declared above.
+*/
+#ifdef SQLITE_OMIT_WSD
+# define wsdHooksInit \
+  BenignMallocHooks *x = &GLOBAL(BenignMallocHooks,sqlite3Hooks)
+# define wsdHooks x[0]
+#else
+# define wsdHooksInit
+# define wsdHooks sqlite3Hooks
+#endif
+
+
+/*
+** Register hooks to call when sqlite3BeginBenignMalloc() and
+** sqlite3EndBenignMalloc() are called, respectively.
+*/
+SQLITE_PRIVATE void sqlite3BenignMallocHooks(
+  void (*xBenignBegin)(void),
+  void (*xBenignEnd)(void)
+){
+  wsdHooksInit;
+  wsdHooks.xBenignBegin = xBenignBegin;
+  wsdHooks.xBenignEnd = xBenignEnd;
+}
+
+/*
+** This (sqlite3EndBenignMalloc()) is called by SQLite code to indicate that
+** subsequent malloc failures are benign. A call to sqlite3EndBenignMalloc()
+** indicates that subsequent malloc failures are non-benign.
+*/
+SQLITE_PRIVATE void sqlite3BeginBenignMalloc(void){
+  wsdHooksInit;
+  if( wsdHooks.xBenignBegin ){
+    wsdHooks.xBenignBegin();
+  }
+}
+SQLITE_PRIVATE void sqlite3EndBenignMalloc(void){
+  wsdHooksInit;
+  if( wsdHooks.xBenignEnd ){
+    wsdHooks.xBenignEnd();
+  }
+}
+
+#endif   /* #ifndef SQLITE_OMIT_BUILTIN_TEST */
+
+/************** End of fault.c ***********************************************/
+/************** Begin file mem0.c ********************************************/
+/*
+** 2008 October 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains a no-op memory allocation drivers for use when
+** SQLITE_ZERO_MALLOC is defined.  The allocation drivers implemented
+** here always fail.  SQLite will not operate with these drivers.  These
+** are merely placeholders.  Real drivers must be substituted using
+** sqlite3_config() before SQLite will operate.
+*/
+
+/*
+** This version of the memory allocator is the default.  It is
+** used when no other memory allocator is specified using compile-time
+** macros.
