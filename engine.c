@@ -15812,3 +15812,222 @@ static int parseModifier(sqlite3_context *pCtx, const char *zMod, DateTime *p){
 ** then assume a default value of "now" for argv[0].
 */
 static int isDate(
+  sqlite3_context *context, 
+  int argc, 
+  sqlite3_value **argv, 
+  DateTime *p
+){
+  int i;
+  const unsigned char *z;
+  int eType;
+  memset(p, 0, sizeof(*p));
+  if( argc==0 ){
+    return setDateTimeToCurrent(context, p);
+  }
+  if( (eType = sqlite3_value_type(argv[0]))==SQLITE_FLOAT
+                   || eType==SQLITE_INTEGER ){
+    p->iJD = (sqlite3_int64)(sqlite3_value_double(argv[0])*86400000.0 + 0.5);
+    p->validJD = 1;
+  }else{
+    z = sqlite3_value_text(argv[0]);
+    if( !z || parseDateOrTime(context, (char*)z, p) ){
+      return 1;
+    }
+  }
+  for(i=1; i<argc; i++){
+    z = sqlite3_value_text(argv[i]);
+    if( z==0 || parseModifier(context, (char*)z, p) ) return 1;
+  }
+  return 0;
+}
+
+
+/*
+** The following routines implement the various date and time functions
+** of SQLite.
+*/
+
+/*
+**    julianday( TIMESTRING, MOD, MOD, ...)
+**
+** Return the julian day number of the date specified in the arguments
+*/
+static void juliandayFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  DateTime x;
+  if( isDate(context, argc, argv, &x)==0 ){
+    computeJD(&x);
+    sqlite3_result_double(context, x.iJD/86400000.0);
+  }
+}
+
+/*
+**    datetime( TIMESTRING, MOD, MOD, ...)
+**
+** Return YYYY-MM-DD HH:MM:SS
+*/
+static void datetimeFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  DateTime x;
+  if( isDate(context, argc, argv, &x)==0 ){
+    char zBuf[100];
+    computeYMD_HMS(&x);
+    sqlite3_snprintf(sizeof(zBuf), zBuf, "%04d-%02d-%02d %02d:%02d:%02d",
+                     x.Y, x.M, x.D, x.h, x.m, (int)(x.s));
+    sqlite3_result_text(context, zBuf, -1, SQLITE_TRANSIENT);
+  }
+}
+
+/*
+**    time( TIMESTRING, MOD, MOD, ...)
+**
+** Return HH:MM:SS
+*/
+static void timeFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  DateTime x;
+  if( isDate(context, argc, argv, &x)==0 ){
+    char zBuf[100];
+    computeHMS(&x);
+    sqlite3_snprintf(sizeof(zBuf), zBuf, "%02d:%02d:%02d", x.h, x.m, (int)x.s);
+    sqlite3_result_text(context, zBuf, -1, SQLITE_TRANSIENT);
+  }
+}
+
+/*
+**    date( TIMESTRING, MOD, MOD, ...)
+**
+** Return YYYY-MM-DD
+*/
+static void dateFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  DateTime x;
+  if( isDate(context, argc, argv, &x)==0 ){
+    char zBuf[100];
+    computeYMD(&x);
+    sqlite3_snprintf(sizeof(zBuf), zBuf, "%04d-%02d-%02d", x.Y, x.M, x.D);
+    sqlite3_result_text(context, zBuf, -1, SQLITE_TRANSIENT);
+  }
+}
+
+/*
+**    strftime( FORMAT, TIMESTRING, MOD, MOD, ...)
+**
+** Return a string described by FORMAT.  Conversions as follows:
+**
+**   %d  day of month
+**   %f  ** fractional seconds  SS.SSS
+**   %H  hour 00-24
+**   %j  day of year 000-366
+**   %J  ** julian day number
+**   %m  month 01-12
+**   %M  minute 00-59
+**   %s  seconds since 1970-01-01
+**   %S  seconds 00-59
+**   %w  day of week 0-6  sunday==0
+**   %W  week of year 00-53
+**   %Y  year 0000-9999
+**   %%  %
+*/
+static void strftimeFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  DateTime x;
+  u64 n;
+  size_t i,j;
+  char *z;
+  sqlite3 *db;
+  const char *zFmt;
+  char zBuf[100];
+  if( argc==0 ) return;
+  zFmt = (const char*)sqlite3_value_text(argv[0]);
+  if( zFmt==0 || isDate(context, argc-1, argv+1, &x) ) return;
+  db = sqlite3_context_db_handle(context);
+  for(i=0, n=1; zFmt[i]; i++, n++){
+    if( zFmt[i]=='%' ){
+      switch( zFmt[i+1] ){
+        case 'd':
+        case 'H':
+        case 'm':
+        case 'M':
+        case 'S':
+        case 'W':
+          n++;
+          /* fall thru */
+        case 'w':
+        case '%':
+          break;
+        case 'f':
+          n += 8;
+          break;
+        case 'j':
+          n += 3;
+          break;
+        case 'Y':
+          n += 8;
+          break;
+        case 's':
+        case 'J':
+          n += 50;
+          break;
+        default:
+          return;  /* ERROR.  return a NULL */
+      }
+      i++;
+    }
+  }
+  testcase( n==sizeof(zBuf)-1 );
+  testcase( n==sizeof(zBuf) );
+  testcase( n==(u64)db->aLimit[SQLITE_LIMIT_LENGTH]+1 );
+  testcase( n==(u64)db->aLimit[SQLITE_LIMIT_LENGTH] );
+  if( n<sizeof(zBuf) ){
+    z = zBuf;
+  }else if( n>(u64)db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    sqlite3_result_error_toobig(context);
+    return;
+  }else{
+    z = sqlite3DbMallocRaw(db, (int)n);
+    if( z==0 ){
+      sqlite3_result_error_nomem(context);
+      return;
+    }
+  }
+  computeJD(&x);
+  computeYMD_HMS(&x);
+  for(i=j=0; zFmt[i]; i++){
+    if( zFmt[i]!='%' ){
+      z[j++] = zFmt[i];
+    }else{
+      i++;
+      switch( zFmt[i] ){
+        case 'd':  sqlite3_snprintf(3, &z[j],"%02d",x.D); j+=2; break;
+        case 'f': {
+          double s = x.s;
+          if( s>59.999 ) s = 59.999;
+          sqlite3_snprintf(7, &z[j],"%06.3f", s);
+          j += sqlite3Strlen30(&z[j]);
+          break;
+        }
+        case 'H':  sqlite3_snprintf(3, &z[j],"%02d",x.h); j+=2; break;
+        case 'W': /* Fall thru */
+        case 'j': {
+          int nDay;             /* Number of days since 1st day of year */
+          DateTime y = x;
+          y.validJD = 0;
+          y.M = 1;
+          y.D = 1;
+          computeJD(&y);
