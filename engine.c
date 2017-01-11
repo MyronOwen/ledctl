@@ -17908,3 +17908,240 @@ static void memsys3Merge(u32 *pRoot){
       size /= 4;
     }
     if( size>mem3.szMaster ){
+      mem3.iMaster = i;
+      mem3.szMaster = size;
+    }
+  }
+}
+
+/*
+** Return a block of memory of at least nBytes in size.
+** Return NULL if unable.
+**
+** This function assumes that the necessary mutexes, if any, are
+** already held by the caller. Hence "Unsafe".
+*/
+static void *memsys3MallocUnsafe(int nByte){
+  u32 i;
+  u32 nBlock;
+  u32 toFree;
+
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  assert( sizeof(Mem3Block)==8 );
+  if( nByte<=12 ){
+    nBlock = 2;
+  }else{
+    nBlock = (nByte + 11)/8;
+  }
+  assert( nBlock>=2 );
+
+  /* STEP 1:
+  ** Look for an entry of the correct size in either the small
+  ** chunk table or in the large chunk hash table.  This is
+  ** successful most of the time (about 9 times out of 10).
+  */
+  if( nBlock <= MX_SMALL ){
+    i = mem3.aiSmall[nBlock-2];
+    if( i>0 ){
+      memsys3UnlinkFromList(i, &mem3.aiSmall[nBlock-2]);
+      return memsys3Checkout(i, nBlock);
+    }
+  }else{
+    int hash = nBlock % N_HASH;
+    for(i=mem3.aiHash[hash]; i>0; i=mem3.aPool[i].u.list.next){
+      if( mem3.aPool[i-1].u.hdr.size4x/4==nBlock ){
+        memsys3UnlinkFromList(i, &mem3.aiHash[hash]);
+        return memsys3Checkout(i, nBlock);
+      }
+    }
+  }
+
+  /* STEP 2:
+  ** Try to satisfy the allocation by carving a piece off of the end
+  ** of the master chunk.  This step usually works if step 1 fails.
+  */
+  if( mem3.szMaster>=nBlock ){
+    return memsys3FromMaster(nBlock);
+  }
+
+
+  /* STEP 3:  
+  ** Loop through the entire memory pool.  Coalesce adjacent free
+  ** chunks.  Recompute the master chunk as the largest free chunk.
+  ** Then try again to satisfy the allocation by carving a piece off
+  ** of the end of the master chunk.  This step happens very
+  ** rarely (we hope!)
+  */
+  for(toFree=nBlock*16; toFree<(mem3.nPool*16); toFree *= 2){
+    memsys3OutOfMemory(toFree);
+    if( mem3.iMaster ){
+      memsys3Link(mem3.iMaster);
+      mem3.iMaster = 0;
+      mem3.szMaster = 0;
+    }
+    for(i=0; i<N_HASH; i++){
+      memsys3Merge(&mem3.aiHash[i]);
+    }
+    for(i=0; i<MX_SMALL-1; i++){
+      memsys3Merge(&mem3.aiSmall[i]);
+    }
+    if( mem3.szMaster ){
+      memsys3Unlink(mem3.iMaster);
+      if( mem3.szMaster>=nBlock ){
+        return memsys3FromMaster(nBlock);
+      }
+    }
+  }
+
+  /* If none of the above worked, then we fail. */
+  return 0;
+}
+
+/*
+** Free an outstanding memory allocation.
+**
+** This function assumes that the necessary mutexes, if any, are
+** already held by the caller. Hence "Unsafe".
+*/
+static void memsys3FreeUnsafe(void *pOld){
+  Mem3Block *p = (Mem3Block*)pOld;
+  int i;
+  u32 size, x;
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  assert( p>mem3.aPool && p<&mem3.aPool[mem3.nPool] );
+  i = p - mem3.aPool;
+  assert( (mem3.aPool[i-1].u.hdr.size4x&1)==1 );
+  size = mem3.aPool[i-1].u.hdr.size4x/4;
+  assert( i+size<=mem3.nPool+1 );
+  mem3.aPool[i-1].u.hdr.size4x &= ~1;
+  mem3.aPool[i+size-1].u.hdr.prevSize = size;
+  mem3.aPool[i+size-1].u.hdr.size4x &= ~2;
+  memsys3Link(i);
+
+  /* Try to expand the master using the newly freed chunk */
+  if( mem3.iMaster ){
+    while( (mem3.aPool[mem3.iMaster-1].u.hdr.size4x&2)==0 ){
+      size = mem3.aPool[mem3.iMaster-1].u.hdr.prevSize;
+      mem3.iMaster -= size;
+      mem3.szMaster += size;
+      memsys3Unlink(mem3.iMaster);
+      x = mem3.aPool[mem3.iMaster-1].u.hdr.size4x & 2;
+      mem3.aPool[mem3.iMaster-1].u.hdr.size4x = mem3.szMaster*4 | x;
+      mem3.aPool[mem3.iMaster+mem3.szMaster-1].u.hdr.prevSize = mem3.szMaster;
+    }
+    x = mem3.aPool[mem3.iMaster-1].u.hdr.size4x & 2;
+    while( (mem3.aPool[mem3.iMaster+mem3.szMaster-1].u.hdr.size4x&1)==0 ){
+      memsys3Unlink(mem3.iMaster+mem3.szMaster);
+      mem3.szMaster += mem3.aPool[mem3.iMaster+mem3.szMaster-1].u.hdr.size4x/4;
+      mem3.aPool[mem3.iMaster-1].u.hdr.size4x = mem3.szMaster*4 | x;
+      mem3.aPool[mem3.iMaster+mem3.szMaster-1].u.hdr.prevSize = mem3.szMaster;
+    }
+  }
+}
+
+/*
+** Return the size of an outstanding allocation, in bytes.  The
+** size returned omits the 8-byte header overhead.  This only
+** works for chunks that are currently checked out.
+*/
+static int memsys3Size(void *p){
+  Mem3Block *pBlock;
+  if( p==0 ) return 0;
+  pBlock = (Mem3Block*)p;
+  assert( (pBlock[-1].u.hdr.size4x&1)!=0 );
+  return (pBlock[-1].u.hdr.size4x&~3)*2 - 4;
+}
+
+/*
+** Round up a request size to the next valid allocation size.
+*/
+static int memsys3Roundup(int n){
+  if( n<=12 ){
+    return 12;
+  }else{
+    return ((n+11)&~7) - 4;
+  }
+}
+
+/*
+** Allocate nBytes of memory.
+*/
+static void *memsys3Malloc(int nBytes){
+  sqlite3_int64 *p;
+  assert( nBytes>0 );          /* malloc.c filters out 0 byte requests */
+  memsys3Enter();
+  p = memsys3MallocUnsafe(nBytes);
+  memsys3Leave();
+  return (void*)p; 
+}
+
+/*
+** Free memory.
+*/
+static void memsys3Free(void *pPrior){
+  assert( pPrior );
+  memsys3Enter();
+  memsys3FreeUnsafe(pPrior);
+  memsys3Leave();
+}
+
+/*
+** Change the size of an existing memory allocation
+*/
+static void *memsys3Realloc(void *pPrior, int nBytes){
+  int nOld;
+  void *p;
+  if( pPrior==0 ){
+    return sqlite3_malloc(nBytes);
+  }
+  if( nBytes<=0 ){
+    sqlite3_free(pPrior);
+    return 0;
+  }
+  nOld = memsys3Size(pPrior);
+  if( nBytes<=nOld && nBytes>=nOld-128 ){
+    return pPrior;
+  }
+  memsys3Enter();
+  p = memsys3MallocUnsafe(nBytes);
+  if( p ){
+    if( nOld<nBytes ){
+      memcpy(p, pPrior, nOld);
+    }else{
+      memcpy(p, pPrior, nBytes);
+    }
+    memsys3FreeUnsafe(pPrior);
+  }
+  memsys3Leave();
+  return p;
+}
+
+/*
+** Initialize this module.
+*/
+static int memsys3Init(void *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  if( !sqlite3GlobalConfig.pHeap ){
+    return SQLITE_ERROR;
+  }
+
+  /* Store a pointer to the memory block in global structure mem3. */
+  assert( sizeof(Mem3Block)==8 );
+  mem3.aPool = (Mem3Block *)sqlite3GlobalConfig.pHeap;
+  mem3.nPool = (sqlite3GlobalConfig.nHeap / sizeof(Mem3Block)) - 2;
+
+  /* Initialize the master block. */
+  mem3.szMaster = mem3.nPool;
+  mem3.mnMaster = mem3.szMaster;
+  mem3.iMaster = 1;
+  mem3.aPool[0].u.hdr.size4x = (mem3.szMaster<<2) + 2;
+  mem3.aPool[mem3.nPool].u.hdr.prevSize = mem3.nPool;
+  mem3.aPool[mem3.nPool].u.hdr.size4x = 1;
+
+  return SQLITE_OK;
+}
+
+/*
+** Deinitialize this module.
+*/
+static void memsys3Shutdown(void *NotUsed){
