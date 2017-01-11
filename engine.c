@@ -16945,3 +16945,236 @@ static void *sqlite3MemRealloc(void *pPrior, int nByte){
       SQLITE_MALLOCSIZE(pPrior), nByte);
   }
   return p;
+#else
+  sqlite3_int64 *p = (sqlite3_int64*)pPrior;
+  assert( pPrior!=0 && nByte>0 );
+  assert( nByte==ROUND8(nByte) ); /* EV: R-46199-30249 */
+  p--;
+  p = SQLITE_REALLOC(p, nByte+8 );
+  if( p ){
+    p[0] = nByte;
+    p++;
+  }else{
+    testcase( sqlite3GlobalConfig.xLog!=0 );
+    sqlite3_log(SQLITE_NOMEM,
+      "failed memory resize %u to %u bytes",
+      sqlite3MemSize(pPrior), nByte);
+  }
+  return (void*)p;
+#endif
+}
+
+/*
+** Round up a request size to the next valid allocation size.
+*/
+static int sqlite3MemRoundup(int n){
+  return ROUND8(n);
+}
+
+/*
+** Initialize this module.
+*/
+static int sqlite3MemInit(void *NotUsed){
+#if defined(__APPLE__) && !defined(SQLITE_WITHOUT_ZONEMALLOC)
+  int cpuCount;
+  size_t len;
+  if( _sqliteZone_ ){
+    return SQLITE_OK;
+  }
+  len = sizeof(cpuCount);
+  /* One usually wants to use hw.acctivecpu for MT decisions, but not here */
+  sysctlbyname("hw.ncpu", &cpuCount, &len, NULL, 0);
+  if( cpuCount>1 ){
+    /* defer MT decisions to system malloc */
+    _sqliteZone_ = malloc_default_zone();
+  }else{
+    /* only 1 core, use our own zone to contention over global locks, 
+    ** e.g. we have our own dedicated locks */
+    bool success;
+    malloc_zone_t* newzone = malloc_create_zone(4096, 0);
+    malloc_set_zone_name(newzone, "Sqlite_Heap");
+    do{
+      success = OSAtomicCompareAndSwapPtrBarrier(NULL, newzone, 
+                                 (void * volatile *)&_sqliteZone_);
+    }while(!_sqliteZone_);
+    if( !success ){
+      /* somebody registered a zone first */
+      malloc_destroy_zone(newzone);
+    }
+  }
+#endif
+  UNUSED_PARAMETER(NotUsed);
+  return SQLITE_OK;
+}
+
+/*
+** Deinitialize this module.
+*/
+static void sqlite3MemShutdown(void *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  return;
+}
+
+/*
+** This routine is the only routine in this file with external linkage.
+**
+** Populate the low-level memory allocation function pointers in
+** sqlite3GlobalConfig.m with pointers to the routines in this file.
+*/
+SQLITE_PRIVATE void sqlite3MemSetDefault(void){
+  static const sqlite3_mem_methods defaultMethods = {
+     sqlite3MemMalloc,
+     sqlite3MemFree,
+     sqlite3MemRealloc,
+     sqlite3MemSize,
+     sqlite3MemRoundup,
+     sqlite3MemInit,
+     sqlite3MemShutdown,
+     0
+  };
+  sqlite3_config(SQLITE_CONFIG_MALLOC, &defaultMethods);
+}
+
+#endif /* SQLITE_SYSTEM_MALLOC */
+
+/************** End of mem1.c ************************************************/
+/************** Begin file mem2.c ********************************************/
+/*
+** 2007 August 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains low-level memory allocation drivers for when
+** SQLite will use the standard C-library malloc/realloc/free interface
+** to obtain the memory it needs while adding lots of additional debugging
+** information to each allocation in order to help detect and fix memory
+** leaks and memory usage errors.
+**
+** This file contains implementations of the low-level memory allocation
+** routines specified in the sqlite3_mem_methods object.
+*/
+
+/*
+** This version of the memory allocator is used only if the
+** SQLITE_MEMDEBUG macro is defined
+*/
+#ifdef SQLITE_MEMDEBUG
+
+/*
+** The backtrace functionality is only available with GLIBC
+*/
+#ifdef __GLIBC__
+  extern int backtrace(void**,int);
+  extern void backtrace_symbols_fd(void*const*,int,int);
+#else
+# define backtrace(A,B) 1
+# define backtrace_symbols_fd(A,B,C)
+#endif
+/* #include <stdio.h> */
+
+/*
+** Each memory allocation looks like this:
+**
+**  ------------------------------------------------------------------------
+**  | Title |  backtrace pointers |  MemBlockHdr |  allocation |  EndGuard |
+**  ------------------------------------------------------------------------
+**
+** The application code sees only a pointer to the allocation.  We have
+** to back up from the allocation pointer to find the MemBlockHdr.  The
+** MemBlockHdr tells us the size of the allocation and the number of
+** backtrace pointers.  There is also a guard word at the end of the
+** MemBlockHdr.
+*/
+struct MemBlockHdr {
+  i64 iSize;                          /* Size of this allocation */
+  struct MemBlockHdr *pNext, *pPrev;  /* Linked list of all unfreed memory */
+  char nBacktrace;                    /* Number of backtraces on this alloc */
+  char nBacktraceSlots;               /* Available backtrace slots */
+  u8 nTitle;                          /* Bytes of title; includes '\0' */
+  u8 eType;                           /* Allocation type code */
+  int iForeGuard;                     /* Guard word for sanity */
+};
+
+/*
+** Guard words
+*/
+#define FOREGUARD 0x80F5E153
+#define REARGUARD 0xE4676B53
+
+/*
+** Number of malloc size increments to track.
+*/
+#define NCSIZE  1000
+
+/*
+** All of the static variables used by this module are collected
+** into a single structure named "mem".  This is to keep the
+** static variables organized and to reduce namespace pollution
+** when this module is combined with other in the amalgamation.
+*/
+static struct {
+  
+  /*
+  ** Mutex to control access to the memory allocation subsystem.
+  */
+  sqlite3_mutex *mutex;
+
+  /*
+  ** Head and tail of a linked list of all outstanding allocations
+  */
+  struct MemBlockHdr *pFirst;
+  struct MemBlockHdr *pLast;
+  
+  /*
+  ** The number of levels of backtrace to save in new allocations.
+  */
+  int nBacktrace;
+  void (*xBacktrace)(int, int, void **);
+
+  /*
+  ** Title text to insert in front of each block
+  */
+  int nTitle;        /* Bytes of zTitle to save.  Includes '\0' and padding */
+  char zTitle[100];  /* The title text */
+
+  /* 
+  ** sqlite3MallocDisallow() increments the following counter.
+  ** sqlite3MallocAllow() decrements it.
+  */
+  int disallow; /* Do not allow memory allocation */
+
+  /*
+  ** Gather statistics on the sizes of memory allocations.
+  ** nAlloc[i] is the number of allocation attempts of i*8
+  ** bytes.  i==NCSIZE is the number of allocation attempts for
+  ** sizes more than NCSIZE*8 bytes.
+  */
+  int nAlloc[NCSIZE];      /* Total number of allocations */
+  int nCurrent[NCSIZE];    /* Current number of allocations */
+  int mxCurrent[NCSIZE];   /* Highwater mark for nCurrent */
+
+} mem;
+
+
+/*
+** Adjust memory usage statistics
+*/
+static void adjustStats(int iSize, int increment){
+  int i = ROUND8(iSize)/8;
+  if( i>NCSIZE-1 ){
+    i = NCSIZE - 1;
+  }
+  if( increment>0 ){
+    mem.nAlloc[i]++;
+    mem.nCurrent[i]++;
+    if( mem.nCurrent[i]>mem.mxCurrent[i] ){
+      mem.mxCurrent[i] = mem.nCurrent[i];
+    }
+  }else{
