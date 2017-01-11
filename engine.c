@@ -17423,3 +17423,241 @@ SQLITE_PRIVATE void sqlite3MemdebugSetType(void *p, u8 eType){
     struct MemBlockHdr *pHdr;
     pHdr = sqlite3MemsysGetHeader(p);
     assert( pHdr->iForeGuard==FOREGUARD );
+    pHdr->eType = eType;
+  }
+}
+
+/*
+** Return TRUE if the mask of type in eType matches the type of the
+** allocation p.  Also return true if p==NULL.
+**
+** This routine is designed for use within an assert() statement, to
+** verify the type of an allocation.  For example:
+**
+**     assert( sqlite3MemdebugHasType(p, MEMTYPE_HEAP) );
+*/
+SQLITE_PRIVATE int sqlite3MemdebugHasType(void *p, u8 eType){
+  int rc = 1;
+  if( p && sqlite3GlobalConfig.m.xMalloc==sqlite3MemMalloc ){
+    struct MemBlockHdr *pHdr;
+    pHdr = sqlite3MemsysGetHeader(p);
+    assert( pHdr->iForeGuard==FOREGUARD );         /* Allocation is valid */
+    if( (pHdr->eType&eType)==0 ){
+      rc = 0;
+    }
+  }
+  return rc;
+}
+
+/*
+** Return TRUE if the mask of type in eType matches no bits of the type of the
+** allocation p.  Also return true if p==NULL.
+**
+** This routine is designed for use within an assert() statement, to
+** verify the type of an allocation.  For example:
+**
+**     assert( sqlite3MemdebugNoType(p, MEMTYPE_LOOKASIDE) );
+*/
+SQLITE_PRIVATE int sqlite3MemdebugNoType(void *p, u8 eType){
+  int rc = 1;
+  if( p && sqlite3GlobalConfig.m.xMalloc==sqlite3MemMalloc ){
+    struct MemBlockHdr *pHdr;
+    pHdr = sqlite3MemsysGetHeader(p);
+    assert( pHdr->iForeGuard==FOREGUARD );         /* Allocation is valid */
+    if( (pHdr->eType&eType)!=0 ){
+      rc = 0;
+    }
+  }
+  return rc;
+}
+
+/*
+** Set the number of backtrace levels kept for each allocation.
+** A value of zero turns off backtracing.  The number is always rounded
+** up to a multiple of 2.
+*/
+SQLITE_PRIVATE void sqlite3MemdebugBacktrace(int depth){
+  if( depth<0 ){ depth = 0; }
+  if( depth>20 ){ depth = 20; }
+  depth = (depth+1)&0xfe;
+  mem.nBacktrace = depth;
+}
+
+SQLITE_PRIVATE void sqlite3MemdebugBacktraceCallback(void (*xBacktrace)(int, int, void **)){
+  mem.xBacktrace = xBacktrace;
+}
+
+/*
+** Set the title string for subsequent allocations.
+*/
+SQLITE_PRIVATE void sqlite3MemdebugSettitle(const char *zTitle){
+  unsigned int n = sqlite3Strlen30(zTitle) + 1;
+  sqlite3_mutex_enter(mem.mutex);
+  if( n>=sizeof(mem.zTitle) ) n = sizeof(mem.zTitle)-1;
+  memcpy(mem.zTitle, zTitle, n);
+  mem.zTitle[n] = 0;
+  mem.nTitle = ROUND8(n);
+  sqlite3_mutex_leave(mem.mutex);
+}
+
+SQLITE_PRIVATE void sqlite3MemdebugSync(){
+  struct MemBlockHdr *pHdr;
+  for(pHdr=mem.pFirst; pHdr; pHdr=pHdr->pNext){
+    void **pBt = (void**)pHdr;
+    pBt -= pHdr->nBacktraceSlots;
+    mem.xBacktrace((int)pHdr->iSize, pHdr->nBacktrace-1, &pBt[1]);
+  }
+}
+
+/*
+** Open the file indicated and write a log of all unfreed memory 
+** allocations into that log.
+*/
+SQLITE_PRIVATE void sqlite3MemdebugDump(const char *zFilename){
+  FILE *out;
+  struct MemBlockHdr *pHdr;
+  void **pBt;
+  int i;
+  out = fopen(zFilename, "w");
+  if( out==0 ){
+    fprintf(stderr, "** Unable to output memory debug output log: %s **\n",
+                    zFilename);
+    return;
+  }
+  for(pHdr=mem.pFirst; pHdr; pHdr=pHdr->pNext){
+    char *z = (char*)pHdr;
+    z -= pHdr->nBacktraceSlots*sizeof(void*) + pHdr->nTitle;
+    fprintf(out, "**** %lld bytes at %p from %s ****\n", 
+            pHdr->iSize, &pHdr[1], pHdr->nTitle ? z : "???");
+    if( pHdr->nBacktrace ){
+      fflush(out);
+      pBt = (void**)pHdr;
+      pBt -= pHdr->nBacktraceSlots;
+      backtrace_symbols_fd(pBt, pHdr->nBacktrace, fileno(out));
+      fprintf(out, "\n");
+    }
+  }
+  fprintf(out, "COUNTS:\n");
+  for(i=0; i<NCSIZE-1; i++){
+    if( mem.nAlloc[i] ){
+      fprintf(out, "   %5d: %10d %10d %10d\n", 
+            i*8, mem.nAlloc[i], mem.nCurrent[i], mem.mxCurrent[i]);
+    }
+  }
+  if( mem.nAlloc[NCSIZE-1] ){
+    fprintf(out, "   %5d: %10d %10d %10d\n",
+             NCSIZE*8-8, mem.nAlloc[NCSIZE-1],
+             mem.nCurrent[NCSIZE-1], mem.mxCurrent[NCSIZE-1]);
+  }
+  fclose(out);
+}
+
+/*
+** Return the number of times sqlite3MemMalloc() has been called.
+*/
+SQLITE_PRIVATE int sqlite3MemdebugMallocCount(){
+  int i;
+  int nTotal = 0;
+  for(i=0; i<NCSIZE; i++){
+    nTotal += mem.nAlloc[i];
+  }
+  return nTotal;
+}
+
+
+#endif /* SQLITE_MEMDEBUG */
+
+/************** End of mem2.c ************************************************/
+/************** Begin file mem3.c ********************************************/
+/*
+** 2007 October 14
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C functions that implement a memory
+** allocation subsystem for use by SQLite. 
+**
+** This version of the memory allocation subsystem omits all
+** use of malloc(). The SQLite user supplies a block of memory
+** before calling sqlite3_initialize() from which allocations
+** are made and returned by the xMalloc() and xRealloc() 
+** implementations. Once sqlite3_initialize() has been called,
+** the amount of memory available to SQLite is fixed and cannot
+** be changed.
+**
+** This version of the memory allocation subsystem is included
+** in the build only if SQLITE_ENABLE_MEMSYS3 is defined.
+*/
+
+/*
+** This version of the memory allocator is only built into the library
+** SQLITE_ENABLE_MEMSYS3 is defined. Defining this symbol does not
+** mean that the library will use a memory-pool by default, just that
+** it is available. The mempool allocator is activated by calling
+** sqlite3_config().
+*/
+#ifdef SQLITE_ENABLE_MEMSYS3
+
+/*
+** Maximum size (in Mem3Blocks) of a "small" chunk.
+*/
+#define MX_SMALL 10
+
+
+/*
+** Number of freelist hash slots
+*/
+#define N_HASH  61
+
+/*
+** A memory allocation (also called a "chunk") consists of two or 
+** more blocks where each block is 8 bytes.  The first 8 bytes are 
+** a header that is not returned to the user.
+**
+** A chunk is two or more blocks that is either checked out or
+** free.  The first block has format u.hdr.  u.hdr.size4x is 4 times the
+** size of the allocation in blocks if the allocation is free.
+** The u.hdr.size4x&1 bit is true if the chunk is checked out and
+** false if the chunk is on the freelist.  The u.hdr.size4x&2 bit
+** is true if the previous chunk is checked out and false if the
+** previous chunk is free.  The u.hdr.prevSize field is the size of
+** the previous chunk in blocks if the previous chunk is on the
+** freelist. If the previous chunk is checked out, then
+** u.hdr.prevSize can be part of the data for that chunk and should
+** not be read or written.
+**
+** We often identify a chunk by its index in mem3.aPool[].  When
+** this is done, the chunk index refers to the second block of
+** the chunk.  In this way, the first chunk has an index of 1.
+** A chunk index of 0 means "no such chunk" and is the equivalent
+** of a NULL pointer.
+**
+** The second block of free chunks is of the form u.list.  The
+** two fields form a double-linked list of chunks of related sizes.
+** Pointers to the head of the list are stored in mem3.aiSmall[] 
+** for smaller chunks and mem3.aiHash[] for larger chunks.
+**
+** The second block of a chunk is user data if the chunk is checked 
+** out.  If a chunk is checked out, the user data may extend into
+** the u.hdr.prevSize value of the following chunk.
+*/
+typedef struct Mem3Block Mem3Block;
+struct Mem3Block {
+  union {
+    struct {
+      u32 prevSize;   /* Size of previous chunk in Mem3Block elements */
+      u32 size4x;     /* 4x the size of current chunk in Mem3Block elements */
+    } hdr;
+    struct {
+      u32 next;       /* Index in mem3.aPool[] of next free chunk */
+      u32 prev;       /* Index in mem3.aPool[] of previous free chunk */
+    } list;
+  } u;
+};
+
