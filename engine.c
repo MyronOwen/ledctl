@@ -17661,3 +17661,250 @@ struct Mem3Block {
   } u;
 };
 
+/*
+** All of the static variables used by this module are collected
+** into a single structure named "mem3".  This is to keep the
+** static variables organized and to reduce namespace pollution
+** when this module is combined with other in the amalgamation.
+*/
+static SQLITE_WSD struct Mem3Global {
+  /*
+  ** Memory available for allocation. nPool is the size of the array
+  ** (in Mem3Blocks) pointed to by aPool less 2.
+  */
+  u32 nPool;
+  Mem3Block *aPool;
+
+  /*
+  ** True if we are evaluating an out-of-memory callback.
+  */
+  int alarmBusy;
+  
+  /*
+  ** Mutex to control access to the memory allocation subsystem.
+  */
+  sqlite3_mutex *mutex;
+  
+  /*
+  ** The minimum amount of free space that we have seen.
+  */
+  u32 mnMaster;
+
+  /*
+  ** iMaster is the index of the master chunk.  Most new allocations
+  ** occur off of this chunk.  szMaster is the size (in Mem3Blocks)
+  ** of the current master.  iMaster is 0 if there is not master chunk.
+  ** The master chunk is not in either the aiHash[] or aiSmall[].
+  */
+  u32 iMaster;
+  u32 szMaster;
+
+  /*
+  ** Array of lists of free blocks according to the block size 
+  ** for smaller chunks, or a hash on the block size for larger
+  ** chunks.
+  */
+  u32 aiSmall[MX_SMALL-1];   /* For sizes 2 through MX_SMALL, inclusive */
+  u32 aiHash[N_HASH];        /* For sizes MX_SMALL+1 and larger */
+} mem3 = { 97535575 };
+
+#define mem3 GLOBAL(struct Mem3Global, mem3)
+
+/*
+** Unlink the chunk at mem3.aPool[i] from list it is currently
+** on.  *pRoot is the list that i is a member of.
+*/
+static void memsys3UnlinkFromList(u32 i, u32 *pRoot){
+  u32 next = mem3.aPool[i].u.list.next;
+  u32 prev = mem3.aPool[i].u.list.prev;
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  if( prev==0 ){
+    *pRoot = next;
+  }else{
+    mem3.aPool[prev].u.list.next = next;
+  }
+  if( next ){
+    mem3.aPool[next].u.list.prev = prev;
+  }
+  mem3.aPool[i].u.list.next = 0;
+  mem3.aPool[i].u.list.prev = 0;
+}
+
+/*
+** Unlink the chunk at index i from 
+** whatever list is currently a member of.
+*/
+static void memsys3Unlink(u32 i){
+  u32 size, hash;
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  assert( (mem3.aPool[i-1].u.hdr.size4x & 1)==0 );
+  assert( i>=1 );
+  size = mem3.aPool[i-1].u.hdr.size4x/4;
+  assert( size==mem3.aPool[i+size-1].u.hdr.prevSize );
+  assert( size>=2 );
+  if( size <= MX_SMALL ){
+    memsys3UnlinkFromList(i, &mem3.aiSmall[size-2]);
+  }else{
+    hash = size % N_HASH;
+    memsys3UnlinkFromList(i, &mem3.aiHash[hash]);
+  }
+}
+
+/*
+** Link the chunk at mem3.aPool[i] so that is on the list rooted
+** at *pRoot.
+*/
+static void memsys3LinkIntoList(u32 i, u32 *pRoot){
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  mem3.aPool[i].u.list.next = *pRoot;
+  mem3.aPool[i].u.list.prev = 0;
+  if( *pRoot ){
+    mem3.aPool[*pRoot].u.list.prev = i;
+  }
+  *pRoot = i;
+}
+
+/*
+** Link the chunk at index i into either the appropriate
+** small chunk list, or into the large chunk hash table.
+*/
+static void memsys3Link(u32 i){
+  u32 size, hash;
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  assert( i>=1 );
+  assert( (mem3.aPool[i-1].u.hdr.size4x & 1)==0 );
+  size = mem3.aPool[i-1].u.hdr.size4x/4;
+  assert( size==mem3.aPool[i+size-1].u.hdr.prevSize );
+  assert( size>=2 );
+  if( size <= MX_SMALL ){
+    memsys3LinkIntoList(i, &mem3.aiSmall[size-2]);
+  }else{
+    hash = size % N_HASH;
+    memsys3LinkIntoList(i, &mem3.aiHash[hash]);
+  }
+}
+
+/*
+** If the STATIC_MEM mutex is not already held, obtain it now. The mutex
+** will already be held (obtained by code in malloc.c) if
+** sqlite3GlobalConfig.bMemStat is true.
+*/
+static void memsys3Enter(void){
+  if( sqlite3GlobalConfig.bMemstat==0 && mem3.mutex==0 ){
+    mem3.mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MEM);
+  }
+  sqlite3_mutex_enter(mem3.mutex);
+}
+static void memsys3Leave(void){
+  sqlite3_mutex_leave(mem3.mutex);
+}
+
+/*
+** Called when we are unable to satisfy an allocation of nBytes.
+*/
+static void memsys3OutOfMemory(int nByte){
+  if( !mem3.alarmBusy ){
+    mem3.alarmBusy = 1;
+    assert( sqlite3_mutex_held(mem3.mutex) );
+    sqlite3_mutex_leave(mem3.mutex);
+    sqlite3_release_memory(nByte);
+    sqlite3_mutex_enter(mem3.mutex);
+    mem3.alarmBusy = 0;
+  }
+}
+
+
+/*
+** Chunk i is a free chunk that has been unlinked.  Adjust its 
+** size parameters for check-out and return a pointer to the 
+** user portion of the chunk.
+*/
+static void *memsys3Checkout(u32 i, u32 nBlock){
+  u32 x;
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  assert( i>=1 );
+  assert( mem3.aPool[i-1].u.hdr.size4x/4==nBlock );
+  assert( mem3.aPool[i+nBlock-1].u.hdr.prevSize==nBlock );
+  x = mem3.aPool[i-1].u.hdr.size4x;
+  mem3.aPool[i-1].u.hdr.size4x = nBlock*4 | 1 | (x&2);
+  mem3.aPool[i+nBlock-1].u.hdr.prevSize = nBlock;
+  mem3.aPool[i+nBlock-1].u.hdr.size4x |= 2;
+  return &mem3.aPool[i];
+}
+
+/*
+** Carve a piece off of the end of the mem3.iMaster free chunk.
+** Return a pointer to the new allocation.  Or, if the master chunk
+** is not large enough, return 0.
+*/
+static void *memsys3FromMaster(u32 nBlock){
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  assert( mem3.szMaster>=nBlock );
+  if( nBlock>=mem3.szMaster-1 ){
+    /* Use the entire master */
+    void *p = memsys3Checkout(mem3.iMaster, mem3.szMaster);
+    mem3.iMaster = 0;
+    mem3.szMaster = 0;
+    mem3.mnMaster = 0;
+    return p;
+  }else{
+    /* Split the master block.  Return the tail. */
+    u32 newi, x;
+    newi = mem3.iMaster + mem3.szMaster - nBlock;
+    assert( newi > mem3.iMaster+1 );
+    mem3.aPool[mem3.iMaster+mem3.szMaster-1].u.hdr.prevSize = nBlock;
+    mem3.aPool[mem3.iMaster+mem3.szMaster-1].u.hdr.size4x |= 2;
+    mem3.aPool[newi-1].u.hdr.size4x = nBlock*4 + 1;
+    mem3.szMaster -= nBlock;
+    mem3.aPool[newi-1].u.hdr.prevSize = mem3.szMaster;
+    x = mem3.aPool[mem3.iMaster-1].u.hdr.size4x & 2;
+    mem3.aPool[mem3.iMaster-1].u.hdr.size4x = mem3.szMaster*4 | x;
+    if( mem3.szMaster < mem3.mnMaster ){
+      mem3.mnMaster = mem3.szMaster;
+    }
+    return (void*)&mem3.aPool[newi];
+  }
+}
+
+/*
+** *pRoot is the head of a list of free chunks of the same size
+** or same size hash.  In other words, *pRoot is an entry in either
+** mem3.aiSmall[] or mem3.aiHash[].  
+**
+** This routine examines all entries on the given list and tries
+** to coalesce each entries with adjacent free chunks.  
+**
+** If it sees a chunk that is larger than mem3.iMaster, it replaces 
+** the current mem3.iMaster with the new larger chunk.  In order for
+** this mem3.iMaster replacement to work, the master chunk must be
+** linked into the hash tables.  That is not the normal state of
+** affairs, of course.  The calling routine must link the master
+** chunk before invoking this routine, then must unlink the (possibly
+** changed) master chunk once this routine has finished.
+*/
+static void memsys3Merge(u32 *pRoot){
+  u32 iNext, prev, size, i, x;
+
+  assert( sqlite3_mutex_held(mem3.mutex) );
+  for(i=*pRoot; i>0; i=iNext){
+    iNext = mem3.aPool[i].u.list.next;
+    size = mem3.aPool[i-1].u.hdr.size4x;
+    assert( (size&1)==0 );
+    if( (size&2)==0 ){
+      memsys3UnlinkFromList(i, pRoot);
+      assert( i > mem3.aPool[i-1].u.hdr.prevSize );
+      prev = i - mem3.aPool[i-1].u.hdr.prevSize;
+      if( prev==iNext ){
+        iNext = mem3.aPool[prev].u.list.next;
+      }
+      memsys3Unlink(prev);
+      size = i + size/4 - prev;
+      x = mem3.aPool[prev-1].u.hdr.size4x & 2;
+      mem3.aPool[prev-1].u.hdr.size4x = size*4 | x;
+      mem3.aPool[prev+size-1].u.hdr.prevSize = size;
+      memsys3Link(prev);
+      i = prev;
+    }else{
+      size /= 4;
+    }
+    if( size>mem3.szMaster ){
