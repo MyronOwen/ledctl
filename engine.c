@@ -18145,3 +18145,249 @@ static int memsys3Init(void *NotUsed){
 ** Deinitialize this module.
 */
 static void memsys3Shutdown(void *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  mem3.mutex = 0;
+  return;
+}
+
+
+
+/*
+** Open the file indicated and write a log of all unfreed memory 
+** allocations into that log.
+*/
+SQLITE_PRIVATE void sqlite3Memsys3Dump(const char *zFilename){
+#ifdef SQLITE_DEBUG
+  FILE *out;
+  u32 i, j;
+  u32 size;
+  if( zFilename==0 || zFilename[0]==0 ){
+    out = stdout;
+  }else{
+    out = fopen(zFilename, "w");
+    if( out==0 ){
+      fprintf(stderr, "** Unable to output memory debug output log: %s **\n",
+                      zFilename);
+      return;
+    }
+  }
+  memsys3Enter();
+  fprintf(out, "CHUNKS:\n");
+  for(i=1; i<=mem3.nPool; i+=size/4){
+    size = mem3.aPool[i-1].u.hdr.size4x;
+    if( size/4<=1 ){
+      fprintf(out, "%p size error\n", &mem3.aPool[i]);
+      assert( 0 );
+      break;
+    }
+    if( (size&1)==0 && mem3.aPool[i+size/4-1].u.hdr.prevSize!=size/4 ){
+      fprintf(out, "%p tail size does not match\n", &mem3.aPool[i]);
+      assert( 0 );
+      break;
+    }
+    if( ((mem3.aPool[i+size/4-1].u.hdr.size4x&2)>>1)!=(size&1) ){
+      fprintf(out, "%p tail checkout bit is incorrect\n", &mem3.aPool[i]);
+      assert( 0 );
+      break;
+    }
+    if( size&1 ){
+      fprintf(out, "%p %6d bytes checked out\n", &mem3.aPool[i], (size/4)*8-8);
+    }else{
+      fprintf(out, "%p %6d bytes free%s\n", &mem3.aPool[i], (size/4)*8-8,
+                  i==mem3.iMaster ? " **master**" : "");
+    }
+  }
+  for(i=0; i<MX_SMALL-1; i++){
+    if( mem3.aiSmall[i]==0 ) continue;
+    fprintf(out, "small(%2d):", i);
+    for(j = mem3.aiSmall[i]; j>0; j=mem3.aPool[j].u.list.next){
+      fprintf(out, " %p(%d)", &mem3.aPool[j],
+              (mem3.aPool[j-1].u.hdr.size4x/4)*8-8);
+    }
+    fprintf(out, "\n"); 
+  }
+  for(i=0; i<N_HASH; i++){
+    if( mem3.aiHash[i]==0 ) continue;
+    fprintf(out, "hash(%2d):", i);
+    for(j = mem3.aiHash[i]; j>0; j=mem3.aPool[j].u.list.next){
+      fprintf(out, " %p(%d)", &mem3.aPool[j],
+              (mem3.aPool[j-1].u.hdr.size4x/4)*8-8);
+    }
+    fprintf(out, "\n"); 
+  }
+  fprintf(out, "master=%d\n", mem3.iMaster);
+  fprintf(out, "nowUsed=%d\n", mem3.nPool*8 - mem3.szMaster*8);
+  fprintf(out, "mxUsed=%d\n", mem3.nPool*8 - mem3.mnMaster*8);
+  sqlite3_mutex_leave(mem3.mutex);
+  if( out==stdout ){
+    fflush(stdout);
+  }else{
+    fclose(out);
+  }
+#else
+  UNUSED_PARAMETER(zFilename);
+#endif
+}
+
+/*
+** This routine is the only routine in this file with external 
+** linkage.
+**
+** Populate the low-level memory allocation function pointers in
+** sqlite3GlobalConfig.m with pointers to the routines in this file. The
+** arguments specify the block of memory to manage.
+**
+** This routine is only called by sqlite3_config(), and therefore
+** is not required to be threadsafe (it is not).
+*/
+SQLITE_PRIVATE const sqlite3_mem_methods *sqlite3MemGetMemsys3(void){
+  static const sqlite3_mem_methods mempoolMethods = {
+     memsys3Malloc,
+     memsys3Free,
+     memsys3Realloc,
+     memsys3Size,
+     memsys3Roundup,
+     memsys3Init,
+     memsys3Shutdown,
+     0
+  };
+  return &mempoolMethods;
+}
+
+#endif /* SQLITE_ENABLE_MEMSYS3 */
+
+/************** End of mem3.c ************************************************/
+/************** Begin file mem5.c ********************************************/
+/*
+** 2007 October 14
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C functions that implement a memory
+** allocation subsystem for use by SQLite. 
+**
+** This version of the memory allocation subsystem omits all
+** use of malloc(). The application gives SQLite a block of memory
+** before calling sqlite3_initialize() from which allocations
+** are made and returned by the xMalloc() and xRealloc() 
+** implementations. Once sqlite3_initialize() has been called,
+** the amount of memory available to SQLite is fixed and cannot
+** be changed.
+**
+** This version of the memory allocation subsystem is included
+** in the build only if SQLITE_ENABLE_MEMSYS5 is defined.
+**
+** This memory allocator uses the following algorithm:
+**
+**   1.  All memory allocations sizes are rounded up to a power of 2.
+**
+**   2.  If two adjacent free blocks are the halves of a larger block,
+**       then the two blocks are coalesced into the single larger block.
+**
+**   3.  New memory is allocated from the first available free block.
+**
+** This algorithm is described in: J. M. Robson. "Bounds for Some Functions
+** Concerning Dynamic Storage Allocation". Journal of the Association for
+** Computing Machinery, Volume 21, Number 8, July 1974, pages 491-499.
+** 
+** Let n be the size of the largest allocation divided by the minimum
+** allocation size (after rounding all sizes up to a power of 2.)  Let M
+** be the maximum amount of memory ever outstanding at one time.  Let
+** N be the total amount of memory available for allocation.  Robson
+** proved that this memory allocator will never breakdown due to 
+** fragmentation as long as the following constraint holds:
+**
+**      N >=  M*(1 + log2(n)/2) - n + 1
+**
+** The sqlite3_status() logic tracks the maximum values of n and M so
+** that an application can, at any time, verify this constraint.
+*/
+
+/*
+** This version of the memory allocator is used only when 
+** SQLITE_ENABLE_MEMSYS5 is defined.
+*/
+#ifdef SQLITE_ENABLE_MEMSYS5
+
+/*
+** A minimum allocation is an instance of the following structure.
+** Larger allocations are an array of these structures where the
+** size of the array is a power of 2.
+**
+** The size of this object must be a power of two.  That fact is
+** verified in memsys5Init().
+*/
+typedef struct Mem5Link Mem5Link;
+struct Mem5Link {
+  int next;       /* Index of next free chunk */
+  int prev;       /* Index of previous free chunk */
+};
+
+/*
+** Maximum size of any allocation is ((1<<LOGMAX)*mem5.szAtom). Since
+** mem5.szAtom is always at least 8 and 32-bit integers are used,
+** it is not actually possible to reach this limit.
+*/
+#define LOGMAX 30
+
+/*
+** Masks used for mem5.aCtrl[] elements.
+*/
+#define CTRL_LOGSIZE  0x1f    /* Log2 Size of this block */
+#define CTRL_FREE     0x20    /* True if not checked out */
+
+/*
+** All of the static variables used by this module are collected
+** into a single structure named "mem5".  This is to keep the
+** static variables organized and to reduce namespace pollution
+** when this module is combined with other in the amalgamation.
+*/
+static SQLITE_WSD struct Mem5Global {
+  /*
+  ** Memory available for allocation
+  */
+  int szAtom;      /* Smallest possible allocation in bytes */
+  int nBlock;      /* Number of szAtom sized blocks in zPool */
+  u8 *zPool;       /* Memory available to be allocated */
+  
+  /*
+  ** Mutex to control access to the memory allocation subsystem.
+  */
+  sqlite3_mutex *mutex;
+
+  /*
+  ** Performance statistics
+  */
+  u64 nAlloc;         /* Total number of calls to malloc */
+  u64 totalAlloc;     /* Total of all malloc calls - includes internal frag */
+  u64 totalExcess;    /* Total internal fragmentation */
+  u32 currentOut;     /* Current checkout, including internal fragmentation */
+  u32 currentCount;   /* Current number of distinct checkouts */
+  u32 maxOut;         /* Maximum instantaneous currentOut */
+  u32 maxCount;       /* Maximum instantaneous currentCount */
+  u32 maxRequest;     /* Largest allocation (exclusive of internal frag) */
+  
+  /*
+  ** Lists of free blocks.  aiFreelist[0] is a list of free blocks of
+  ** size mem5.szAtom.  aiFreelist[1] holds blocks of size szAtom*2.
+  ** and so forth.
+  */
+  int aiFreelist[LOGMAX+1];
+
+  /*
+  ** Space for tracking which blocks are checked out and the size
+  ** of each block.  One byte per block.
+  */
+  u8 *aCtrl;
+
+} mem5;
+
+/*
+** Access the static variable through a macro for SQLITE_OMIT_WSD.
+*/
