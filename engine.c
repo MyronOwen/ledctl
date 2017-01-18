@@ -18391,3 +18391,250 @@ static SQLITE_WSD struct Mem5Global {
 /*
 ** Access the static variable through a macro for SQLITE_OMIT_WSD.
 */
+#define mem5 GLOBAL(struct Mem5Global, mem5)
+
+/*
+** Assuming mem5.zPool is divided up into an array of Mem5Link
+** structures, return a pointer to the idx-th such link.
+*/
+#define MEM5LINK(idx) ((Mem5Link *)(&mem5.zPool[(idx)*mem5.szAtom]))
+
+/*
+** Unlink the chunk at mem5.aPool[i] from list it is currently
+** on.  It should be found on mem5.aiFreelist[iLogsize].
+*/
+static void memsys5Unlink(int i, int iLogsize){
+  int next, prev;
+  assert( i>=0 && i<mem5.nBlock );
+  assert( iLogsize>=0 && iLogsize<=LOGMAX );
+  assert( (mem5.aCtrl[i] & CTRL_LOGSIZE)==iLogsize );
+
+  next = MEM5LINK(i)->next;
+  prev = MEM5LINK(i)->prev;
+  if( prev<0 ){
+    mem5.aiFreelist[iLogsize] = next;
+  }else{
+    MEM5LINK(prev)->next = next;
+  }
+  if( next>=0 ){
+    MEM5LINK(next)->prev = prev;
+  }
+}
+
+/*
+** Link the chunk at mem5.aPool[i] so that is on the iLogsize
+** free list.
+*/
+static void memsys5Link(int i, int iLogsize){
+  int x;
+  assert( sqlite3_mutex_held(mem5.mutex) );
+  assert( i>=0 && i<mem5.nBlock );
+  assert( iLogsize>=0 && iLogsize<=LOGMAX );
+  assert( (mem5.aCtrl[i] & CTRL_LOGSIZE)==iLogsize );
+
+  x = MEM5LINK(i)->next = mem5.aiFreelist[iLogsize];
+  MEM5LINK(i)->prev = -1;
+  if( x>=0 ){
+    assert( x<mem5.nBlock );
+    MEM5LINK(x)->prev = i;
+  }
+  mem5.aiFreelist[iLogsize] = i;
+}
+
+/*
+** If the STATIC_MEM mutex is not already held, obtain it now. The mutex
+** will already be held (obtained by code in malloc.c) if
+** sqlite3GlobalConfig.bMemStat is true.
+*/
+static void memsys5Enter(void){
+  sqlite3_mutex_enter(mem5.mutex);
+}
+static void memsys5Leave(void){
+  sqlite3_mutex_leave(mem5.mutex);
+}
+
+/*
+** Return the size of an outstanding allocation, in bytes.  The
+** size returned omits the 8-byte header overhead.  This only
+** works for chunks that are currently checked out.
+*/
+static int memsys5Size(void *p){
+  int iSize = 0;
+  if( p ){
+    int i = (int)(((u8 *)p-mem5.zPool)/mem5.szAtom);
+    assert( i>=0 && i<mem5.nBlock );
+    iSize = mem5.szAtom * (1 << (mem5.aCtrl[i]&CTRL_LOGSIZE));
+  }
+  return iSize;
+}
+
+/*
+** Return a block of memory of at least nBytes in size.
+** Return NULL if unable.  Return NULL if nBytes==0.
+**
+** The caller guarantees that nByte is positive.
+**
+** The caller has obtained a mutex prior to invoking this
+** routine so there is never any chance that two or more
+** threads can be in this routine at the same time.
+*/
+static void *memsys5MallocUnsafe(int nByte){
+  int i;           /* Index of a mem5.aPool[] slot */
+  int iBin;        /* Index into mem5.aiFreelist[] */
+  int iFullSz;     /* Size of allocation rounded up to power of 2 */
+  int iLogsize;    /* Log2 of iFullSz/POW2_MIN */
+
+  /* nByte must be a positive */
+  assert( nByte>0 );
+
+  /* Keep track of the maximum allocation request.  Even unfulfilled
+  ** requests are counted */
+  if( (u32)nByte>mem5.maxRequest ){
+    mem5.maxRequest = nByte;
+  }
+
+  /* Abort if the requested allocation size is larger than the largest
+  ** power of two that we can represent using 32-bit signed integers.
+  */
+  if( nByte > 0x40000000 ){
+    return 0;
+  }
+
+  /* Round nByte up to the next valid power of two */
+  for(iFullSz=mem5.szAtom, iLogsize=0; iFullSz<nByte; iFullSz *= 2, iLogsize++){}
+
+  /* Make sure mem5.aiFreelist[iLogsize] contains at least one free
+  ** block.  If not, then split a block of the next larger power of
+  ** two in order to create a new free block of size iLogsize.
+  */
+  for(iBin=iLogsize; iBin<=LOGMAX && mem5.aiFreelist[iBin]<0; iBin++){}
+  if( iBin>LOGMAX ){
+    testcase( sqlite3GlobalConfig.xLog!=0 );
+    sqlite3_log(SQLITE_NOMEM, "failed to allocate %u bytes", nByte);
+    return 0;
+  }
+  i = mem5.aiFreelist[iBin];
+  memsys5Unlink(i, iBin);
+  while( iBin>iLogsize ){
+    int newSize;
+
+    iBin--;
+    newSize = 1 << iBin;
+    mem5.aCtrl[i+newSize] = CTRL_FREE | iBin;
+    memsys5Link(i+newSize, iBin);
+  }
+  mem5.aCtrl[i] = iLogsize;
+
+  /* Update allocator performance statistics. */
+  mem5.nAlloc++;
+  mem5.totalAlloc += iFullSz;
+  mem5.totalExcess += iFullSz - nByte;
+  mem5.currentCount++;
+  mem5.currentOut += iFullSz;
+  if( mem5.maxCount<mem5.currentCount ) mem5.maxCount = mem5.currentCount;
+  if( mem5.maxOut<mem5.currentOut ) mem5.maxOut = mem5.currentOut;
+
+#ifdef SQLITE_DEBUG
+  /* Make sure the allocated memory does not assume that it is set to zero
+  ** or retains a value from a previous allocation */
+  memset(&mem5.zPool[i*mem5.szAtom], 0xAA, iFullSz);
+#endif
+
+  /* Return a pointer to the allocated memory. */
+  return (void*)&mem5.zPool[i*mem5.szAtom];
+}
+
+/*
+** Free an outstanding memory allocation.
+*/
+static void memsys5FreeUnsafe(void *pOld){
+  u32 size, iLogsize;
+  int iBlock;
+
+  /* Set iBlock to the index of the block pointed to by pOld in 
+  ** the array of mem5.szAtom byte blocks pointed to by mem5.zPool.
+  */
+  iBlock = (int)(((u8 *)pOld-mem5.zPool)/mem5.szAtom);
+
+  /* Check that the pointer pOld points to a valid, non-free block. */
+  assert( iBlock>=0 && iBlock<mem5.nBlock );
+  assert( ((u8 *)pOld-mem5.zPool)%mem5.szAtom==0 );
+  assert( (mem5.aCtrl[iBlock] & CTRL_FREE)==0 );
+
+  iLogsize = mem5.aCtrl[iBlock] & CTRL_LOGSIZE;
+  size = 1<<iLogsize;
+  assert( iBlock+size-1<(u32)mem5.nBlock );
+
+  mem5.aCtrl[iBlock] |= CTRL_FREE;
+  mem5.aCtrl[iBlock+size-1] |= CTRL_FREE;
+  assert( mem5.currentCount>0 );
+  assert( mem5.currentOut>=(size*mem5.szAtom) );
+  mem5.currentCount--;
+  mem5.currentOut -= size*mem5.szAtom;
+  assert( mem5.currentOut>0 || mem5.currentCount==0 );
+  assert( mem5.currentCount>0 || mem5.currentOut==0 );
+
+  mem5.aCtrl[iBlock] = CTRL_FREE | iLogsize;
+  while( ALWAYS(iLogsize<LOGMAX) ){
+    int iBuddy;
+    if( (iBlock>>iLogsize) & 1 ){
+      iBuddy = iBlock - size;
+    }else{
+      iBuddy = iBlock + size;
+    }
+    assert( iBuddy>=0 );
+    if( (iBuddy+(1<<iLogsize))>mem5.nBlock ) break;
+    if( mem5.aCtrl[iBuddy]!=(CTRL_FREE | iLogsize) ) break;
+    memsys5Unlink(iBuddy, iLogsize);
+    iLogsize++;
+    if( iBuddy<iBlock ){
+      mem5.aCtrl[iBuddy] = CTRL_FREE | iLogsize;
+      mem5.aCtrl[iBlock] = 0;
+      iBlock = iBuddy;
+    }else{
+      mem5.aCtrl[iBlock] = CTRL_FREE | iLogsize;
+      mem5.aCtrl[iBuddy] = 0;
+    }
+    size *= 2;
+  }
+
+#ifdef SQLITE_DEBUG
+  /* Overwrite freed memory with the 0x55 bit pattern to verify that it is
+  ** not used after being freed */
+  memset(&mem5.zPool[iBlock*mem5.szAtom], 0x55, size);
+#endif
+
+  memsys5Link(iBlock, iLogsize);
+}
+
+/*
+** Allocate nBytes of memory.
+*/
+static void *memsys5Malloc(int nBytes){
+  sqlite3_int64 *p = 0;
+  if( nBytes>0 ){
+    memsys5Enter();
+    p = memsys5MallocUnsafe(nBytes);
+    memsys5Leave();
+  }
+  return (void*)p; 
+}
+
+/*
+** Free memory.
+**
+** The outer layer memory allocator prevents this routine from
+** being called with pPrior==0.
+*/
+static void memsys5Free(void *pPrior){
+  assert( pPrior!=0 );
+  memsys5Enter();
+  memsys5FreeUnsafe(pPrior);
+  memsys5Leave();  
+}
+
+/*
+** Change the size of an existing memory allocation.
+**
+** The outer layer memory allocator prevents this routine from
+** being called with pPrior==0.  
