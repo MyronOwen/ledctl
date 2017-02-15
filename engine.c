@@ -19088,3 +19088,232 @@ static int debugMutexNotheld(sqlite3_mutex *pX){
   return p==0 || p->cnt==0;
 }
 
+/*
+** Initialize and deinitialize the mutex subsystem.
+*/
+static int debugMutexInit(void){ return SQLITE_OK; }
+static int debugMutexEnd(void){ return SQLITE_OK; }
+
+/*
+** The sqlite3_mutex_alloc() routine allocates a new
+** mutex and returns a pointer to it.  If it returns NULL
+** that means that a mutex could not be allocated. 
+*/
+static sqlite3_mutex *debugMutexAlloc(int id){
+  static sqlite3_debug_mutex aStatic[SQLITE_MUTEX_STATIC_APP3 - 1];
+  sqlite3_debug_mutex *pNew = 0;
+  switch( id ){
+    case SQLITE_MUTEX_FAST:
+    case SQLITE_MUTEX_RECURSIVE: {
+      pNew = sqlite3Malloc(sizeof(*pNew));
+      if( pNew ){
+        pNew->id = id;
+        pNew->cnt = 0;
+      }
+      break;
+    }
+    default: {
+      assert( id-2 >= 0 );
+      assert( id-2 < (int)(sizeof(aStatic)/sizeof(aStatic[0])) );
+      pNew = &aStatic[id-2];
+      pNew->id = id;
+      break;
+    }
+  }
+  return (sqlite3_mutex*)pNew;
+}
+
+/*
+** This routine deallocates a previously allocated mutex.
+*/
+static void debugMutexFree(sqlite3_mutex *pX){
+  sqlite3_debug_mutex *p = (sqlite3_debug_mutex*)pX;
+  assert( p->cnt==0 );
+  assert( p->id==SQLITE_MUTEX_FAST || p->id==SQLITE_MUTEX_RECURSIVE );
+  sqlite3_free(p);
+}
+
+/*
+** The sqlite3_mutex_enter() and sqlite3_mutex_try() routines attempt
+** to enter a mutex.  If another thread is already within the mutex,
+** sqlite3_mutex_enter() will block and sqlite3_mutex_try() will return
+** SQLITE_BUSY.  The sqlite3_mutex_try() interface returns SQLITE_OK
+** upon successful entry.  Mutexes created using SQLITE_MUTEX_RECURSIVE can
+** be entered multiple times by the same thread.  In such cases the,
+** mutex must be exited an equal number of times before another thread
+** can enter.  If the same thread tries to enter any other kind of mutex
+** more than once, the behavior is undefined.
+*/
+static void debugMutexEnter(sqlite3_mutex *pX){
+  sqlite3_debug_mutex *p = (sqlite3_debug_mutex*)pX;
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || debugMutexNotheld(pX) );
+  p->cnt++;
+}
+static int debugMutexTry(sqlite3_mutex *pX){
+  sqlite3_debug_mutex *p = (sqlite3_debug_mutex*)pX;
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || debugMutexNotheld(pX) );
+  p->cnt++;
+  return SQLITE_OK;
+}
+
+/*
+** The sqlite3_mutex_leave() routine exits a mutex that was
+** previously entered by the same thread.  The behavior
+** is undefined if the mutex is not currently entered or
+** is not currently allocated.  SQLite will never do either.
+*/
+static void debugMutexLeave(sqlite3_mutex *pX){
+  sqlite3_debug_mutex *p = (sqlite3_debug_mutex*)pX;
+  assert( debugMutexHeld(pX) );
+  p->cnt--;
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || debugMutexNotheld(pX) );
+}
+
+SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3NoopMutex(void){
+  static const sqlite3_mutex_methods sMutex = {
+    debugMutexInit,
+    debugMutexEnd,
+    debugMutexAlloc,
+    debugMutexFree,
+    debugMutexEnter,
+    debugMutexTry,
+    debugMutexLeave,
+
+    debugMutexHeld,
+    debugMutexNotheld
+  };
+
+  return &sMutex;
+}
+#endif /* SQLITE_DEBUG */
+
+/*
+** If compiled with SQLITE_MUTEX_NOOP, then the no-op mutex implementation
+** is used regardless of the run-time threadsafety setting.
+*/
+#ifdef SQLITE_MUTEX_NOOP
+SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3DefaultMutex(void){
+  return sqlite3NoopMutex();
+}
+#endif /* defined(SQLITE_MUTEX_NOOP) */
+#endif /* !defined(SQLITE_MUTEX_OMIT) */
+
+/************** End of mutex_noop.c ******************************************/
+/************** Begin file mutex_unix.c **************************************/
+/*
+** 2007 August 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C functions that implement mutexes for pthreads
+*/
+
+/*
+** The code in this file is only used if we are compiling threadsafe
+** under unix with pthreads.
+**
+** Note that this implementation requires a version of pthreads that
+** supports recursive mutexes.
+*/
+#ifdef SQLITE_MUTEX_PTHREADS
+
+#include <pthread.h>
+
+/*
+** The sqlite3_mutex.id, sqlite3_mutex.nRef, and sqlite3_mutex.owner fields
+** are necessary under two condidtions:  (1) Debug builds and (2) using
+** home-grown mutexes.  Encapsulate these conditions into a single #define.
+*/
+#if defined(SQLITE_DEBUG) || defined(SQLITE_HOMEGROWN_RECURSIVE_MUTEX)
+# define SQLITE_MUTEX_NREF 1
+#else
+# define SQLITE_MUTEX_NREF 0
+#endif
+
+/*
+** Each recursive mutex is an instance of the following structure.
+*/
+struct sqlite3_mutex {
+  pthread_mutex_t mutex;     /* Mutex controlling the lock */
+#if SQLITE_MUTEX_NREF
+  int id;                    /* Mutex type */
+  volatile int nRef;         /* Number of entrances */
+  volatile pthread_t owner;  /* Thread that is within this mutex */
+  int trace;                 /* True to trace changes */
+#endif
+};
+#if SQLITE_MUTEX_NREF
+#define SQLITE3_MUTEX_INITIALIZER { PTHREAD_MUTEX_INITIALIZER, 0, 0, (pthread_t)0, 0 }
+#else
+#define SQLITE3_MUTEX_INITIALIZER { PTHREAD_MUTEX_INITIALIZER }
+#endif
+
+/*
+** The sqlite3_mutex_held() and sqlite3_mutex_notheld() routine are
+** intended for use only inside assert() statements.  On some platforms,
+** there might be race conditions that can cause these routines to
+** deliver incorrect results.  In particular, if pthread_equal() is
+** not an atomic operation, then these routines might delivery
+** incorrect results.  On most platforms, pthread_equal() is a 
+** comparison of two integers and is therefore atomic.  But we are
+** told that HPUX is not such a platform.  If so, then these routines
+** will not always work correctly on HPUX.
+**
+** On those platforms where pthread_equal() is not atomic, SQLite
+** should be compiled without -DSQLITE_DEBUG and with -DNDEBUG to
+** make sure no assert() statements are evaluated and hence these
+** routines are never called.
+*/
+#if !defined(NDEBUG) || defined(SQLITE_DEBUG)
+static int pthreadMutexHeld(sqlite3_mutex *p){
+  return (p->nRef!=0 && pthread_equal(p->owner, pthread_self()));
+}
+static int pthreadMutexNotheld(sqlite3_mutex *p){
+  return p->nRef==0 || pthread_equal(p->owner, pthread_self())==0;
+}
+#endif
+
+/*
+** Initialize and deinitialize the mutex subsystem.
+*/
+static int pthreadMutexInit(void){ return SQLITE_OK; }
+static int pthreadMutexEnd(void){ return SQLITE_OK; }
+
+/*
+** The sqlite3_mutex_alloc() routine allocates a new
+** mutex and returns a pointer to it.  If it returns NULL
+** that means that a mutex could not be allocated.  SQLite
+** will unwind its stack and return an error.  The argument
+** to sqlite3_mutex_alloc() is one of these integer constants:
+**
+** <ul>
+** <li>  SQLITE_MUTEX_FAST
+** <li>  SQLITE_MUTEX_RECURSIVE
+** <li>  SQLITE_MUTEX_STATIC_MASTER
+** <li>  SQLITE_MUTEX_STATIC_MEM
+** <li>  SQLITE_MUTEX_STATIC_OPEN
+** <li>  SQLITE_MUTEX_STATIC_PRNG
+** <li>  SQLITE_MUTEX_STATIC_LRU
+** <li>  SQLITE_MUTEX_STATIC_PMEM
+** <li>  SQLITE_MUTEX_STATIC_APP1
+** <li>  SQLITE_MUTEX_STATIC_APP2
+** <li>  SQLITE_MUTEX_STATIC_APP3
+** </ul>
+**
+** The first two constants cause sqlite3_mutex_alloc() to create
+** a new mutex.  The new mutex is recursive when SQLITE_MUTEX_RECURSIVE
+** is used but not necessarily so when SQLITE_MUTEX_FAST is used.
+** The mutex implementation does not need to make a distinction
+** between SQLITE_MUTEX_RECURSIVE and SQLITE_MUTEX_FAST if it does
+** not want to.  But SQLite will only request a recursive mutex in
+** cases where it really needs one.  If a faster non-recursive mutex
+** implementation is available on the host platform, the mutex subsystem
+** might return such a mutex in response to SQLITE_MUTEX_FAST.
+**
+** The other allowed parameters to sqlite3_mutex_alloc() each return
