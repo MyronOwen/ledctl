@@ -19778,3 +19778,236 @@ static void local_ioerr(){
 
 /*
 ** When testing, keep a count of the number of open files.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_open_file_count = 0;
+#define OpenCounter(X)  sqlite3_open_file_count+=(X)
+#else
+#define OpenCounter(X)
+#endif
+
+#endif /* !defined(_OS_COMMON_H_) */
+
+/************** End of os_common.h *******************************************/
+/************** Continuing where we left off in mutex_w32.c ******************/
+
+/*
+** Include the header file for the Windows VFS.
+*/
+/************** Include os_win.h in the middle of mutex_w32.c ****************/
+/************** Begin file os_win.h ******************************************/
+/*
+** 2013 November 25
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains code that is specific to Windows.
+*/
+#ifndef _OS_WIN_H_
+#define _OS_WIN_H_
+
+/*
+** Include the primary Windows SDK header file.
+*/
+#include "windows.h"
+
+#ifdef __CYGWIN__
+# include <sys/cygwin.h>
+# include <errno.h> /* amalgamator: dontcache */
+#endif
+
+/*
+** Determine if we are dealing with Windows NT.
+**
+** We ought to be able to determine if we are compiling for Windows 9x or
+** Windows NT using the _WIN32_WINNT macro as follows:
+**
+** #if defined(_WIN32_WINNT)
+** # define SQLITE_OS_WINNT 1
+** #else
+** # define SQLITE_OS_WINNT 0
+** #endif
+**
+** However, Visual Studio 2005 does not set _WIN32_WINNT by default, as
+** it ought to, so the above test does not work.  We'll just assume that
+** everything is Windows NT unless the programmer explicitly says otherwise
+** by setting SQLITE_OS_WINNT to 0.
+*/
+#if SQLITE_OS_WIN && !defined(SQLITE_OS_WINNT)
+# define SQLITE_OS_WINNT 1
+#endif
+
+/*
+** Determine if we are dealing with Windows CE - which has a much reduced
+** API.
+*/
+#if defined(_WIN32_WCE)
+# define SQLITE_OS_WINCE 1
+#else
+# define SQLITE_OS_WINCE 0
+#endif
+
+/*
+** Determine if we are dealing with WinRT, which provides only a subset of
+** the full Win32 API.
+*/
+#if !defined(SQLITE_OS_WINRT)
+# define SQLITE_OS_WINRT 0
+#endif
+
+/*
+** For WinCE, some API function parameters do not appear to be declared as
+** volatile.
+*/
+#if SQLITE_OS_WINCE
+# define SQLITE_WIN32_VOLATILE
+#else
+# define SQLITE_WIN32_VOLATILE volatile
+#endif
+
+#endif /* _OS_WIN_H_ */
+
+/************** End of os_win.h **********************************************/
+/************** Continuing where we left off in mutex_w32.c ******************/
+#endif
+
+/*
+** The code in this file is only used if we are compiling multithreaded
+** on a Win32 system.
+*/
+#ifdef SQLITE_MUTEX_W32
+
+/*
+** Each recursive mutex is an instance of the following structure.
+*/
+struct sqlite3_mutex {
+  CRITICAL_SECTION mutex;    /* Mutex controlling the lock */
+  int id;                    /* Mutex type */
+#ifdef SQLITE_DEBUG
+  volatile int nRef;         /* Number of enterances */
+  volatile DWORD owner;      /* Thread holding this mutex */
+  volatile int trace;        /* True to trace changes */
+#endif
+};
+
+/*
+** These are the initializer values used when declaring a "static" mutex
+** on Win32.  It should be noted that all mutexes require initialization
+** on the Win32 platform.
+*/
+#define SQLITE_W32_MUTEX_INITIALIZER { 0 }
+
+#ifdef SQLITE_DEBUG
+#define SQLITE3_MUTEX_INITIALIZER { SQLITE_W32_MUTEX_INITIALIZER, 0, \
+                                    0L, (DWORD)0, 0 }
+#else
+#define SQLITE3_MUTEX_INITIALIZER { SQLITE_W32_MUTEX_INITIALIZER, 0 }
+#endif
+
+#ifdef SQLITE_DEBUG
+/*
+** The sqlite3_mutex_held() and sqlite3_mutex_notheld() routine are
+** intended for use only inside assert() statements.
+*/
+static int winMutexHeld(sqlite3_mutex *p){
+  return p->nRef!=0 && p->owner==GetCurrentThreadId();
+}
+
+static int winMutexNotheld2(sqlite3_mutex *p, DWORD tid){
+  return p->nRef==0 || p->owner!=tid;
+}
+
+static int winMutexNotheld(sqlite3_mutex *p){
+  DWORD tid = GetCurrentThreadId();
+  return winMutexNotheld2(p, tid);
+}
+#endif
+
+/*
+** Initialize and deinitialize the mutex subsystem.
+*/
+static sqlite3_mutex winMutex_staticMutexes[] = {
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER,
+  SQLITE3_MUTEX_INITIALIZER
+};
+
+static int winMutex_isInit = 0;
+static int winMutex_isNt = -1; /* <0 means "need to query" */
+
+/* As the winMutexInit() and winMutexEnd() functions are called as part
+** of the sqlite3_initialize() and sqlite3_shutdown() processing, the
+** "interlocked" magic used here is probably not strictly necessary.
+*/
+static LONG SQLITE_WIN32_VOLATILE winMutex_lock = 0;
+
+SQLITE_API int sqlite3_win32_is_nt(void); /* os_win.c */
+SQLITE_API void sqlite3_win32_sleep(DWORD milliseconds); /* os_win.c */
+
+static int winMutexInit(void){
+  /* The first to increment to 1 does actual initialization */
+  if( InterlockedCompareExchange(&winMutex_lock, 1, 0)==0 ){
+    int i;
+    for(i=0; i<ArraySize(winMutex_staticMutexes); i++){
+#if SQLITE_OS_WINRT
+      InitializeCriticalSectionEx(&winMutex_staticMutexes[i].mutex, 0, 0);
+#else
+      InitializeCriticalSection(&winMutex_staticMutexes[i].mutex);
+#endif
+    }
+    winMutex_isInit = 1;
+  }else{
+    /* Another thread is (in the process of) initializing the static
+    ** mutexes */
+    while( !winMutex_isInit ){
+      sqlite3_win32_sleep(1);
+    }
+  }
+  return SQLITE_OK;
+}
+
+static int winMutexEnd(void){
+  /* The first to decrement to 0 does actual shutdown
+  ** (which should be the last to shutdown.) */
+  if( InterlockedCompareExchange(&winMutex_lock, 0, 1)==1 ){
+    if( winMutex_isInit==1 ){
+      int i;
+      for(i=0; i<ArraySize(winMutex_staticMutexes); i++){
+        DeleteCriticalSection(&winMutex_staticMutexes[i].mutex);
+      }
+      winMutex_isInit = 0;
+    }
+  }
+  return SQLITE_OK;
+}
+
+/*
+** The sqlite3_mutex_alloc() routine allocates a new
+** mutex and returns a pointer to it.  If it returns NULL
+** that means that a mutex could not be allocated.  SQLite
+** will unwind its stack and return an error.  The argument
+** to sqlite3_mutex_alloc() is one of these integer constants:
+**
+** <ul>
+** <li>  SQLITE_MUTEX_FAST
+** <li>  SQLITE_MUTEX_RECURSIVE
+** <li>  SQLITE_MUTEX_STATIC_MASTER
+** <li>  SQLITE_MUTEX_STATIC_MEM
+** <li>  SQLITE_MUTEX_STATIC_OPEN
+** <li>  SQLITE_MUTEX_STATIC_PRNG
+** <li>  SQLITE_MUTEX_STATIC_LRU
+** <li>  SQLITE_MUTEX_STATIC_PMEM
+** <li>  SQLITE_MUTEX_STATIC_APP1
