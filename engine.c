@@ -20011,3 +20011,242 @@ static int winMutexEnd(void){
 ** <li>  SQLITE_MUTEX_STATIC_LRU
 ** <li>  SQLITE_MUTEX_STATIC_PMEM
 ** <li>  SQLITE_MUTEX_STATIC_APP1
+** <li>  SQLITE_MUTEX_STATIC_APP2
+** <li>  SQLITE_MUTEX_STATIC_APP3
+** </ul>
+**
+** The first two constants cause sqlite3_mutex_alloc() to create
+** a new mutex.  The new mutex is recursive when SQLITE_MUTEX_RECURSIVE
+** is used but not necessarily so when SQLITE_MUTEX_FAST is used.
+** The mutex implementation does not need to make a distinction
+** between SQLITE_MUTEX_RECURSIVE and SQLITE_MUTEX_FAST if it does
+** not want to.  But SQLite will only request a recursive mutex in
+** cases where it really needs one.  If a faster non-recursive mutex
+** implementation is available on the host platform, the mutex subsystem
+** might return such a mutex in response to SQLITE_MUTEX_FAST.
+**
+** The other allowed parameters to sqlite3_mutex_alloc() each return
+** a pointer to a static preexisting mutex.  Six static mutexes are
+** used by the current version of SQLite.  Future versions of SQLite
+** may add additional static mutexes.  Static mutexes are for internal
+** use by SQLite only.  Applications that use SQLite mutexes should
+** use only the dynamic mutexes returned by SQLITE_MUTEX_FAST or
+** SQLITE_MUTEX_RECURSIVE.
+**
+** Note that if one of the dynamic mutex parameters (SQLITE_MUTEX_FAST
+** or SQLITE_MUTEX_RECURSIVE) is used then sqlite3_mutex_alloc()
+** returns a different mutex on every call.  But for the static
+** mutex types, the same mutex is returned on every call that has
+** the same type number.
+*/
+static sqlite3_mutex *winMutexAlloc(int iType){
+  sqlite3_mutex *p;
+
+  switch( iType ){
+    case SQLITE_MUTEX_FAST:
+    case SQLITE_MUTEX_RECURSIVE: {
+      p = sqlite3MallocZero( sizeof(*p) );
+      if( p ){
+#ifdef SQLITE_DEBUG
+        p->id = iType;
+#ifdef SQLITE_WIN32_MUTEX_TRACE_DYNAMIC
+        p->trace = 1;
+#endif
+#endif
+#if SQLITE_OS_WINRT
+        InitializeCriticalSectionEx(&p->mutex, 0, 0);
+#else
+        InitializeCriticalSection(&p->mutex);
+#endif
+      }
+      break;
+    }
+    default: {
+#ifdef SQLITE_ENABLE_API_ARMOR
+      if( iType-2<0 || iType-2>=ArraySize(winMutex_staticMutexes) ){
+        (void)SQLITE_MISUSE_BKPT;
+        return 0;
+      }
+#endif
+      assert( iType-2 >= 0 );
+      assert( iType-2 < ArraySize(winMutex_staticMutexes) );
+      assert( winMutex_isInit==1 );
+      p = &winMutex_staticMutexes[iType-2];
+#ifdef SQLITE_DEBUG
+      p->id = iType;
+#ifdef SQLITE_WIN32_MUTEX_TRACE_STATIC
+      p->trace = 1;
+#endif
+#endif
+      break;
+    }
+  }
+  return p;
+}
+
+
+/*
+** This routine deallocates a previously
+** allocated mutex.  SQLite is careful to deallocate every
+** mutex that it allocates.
+*/
+static void winMutexFree(sqlite3_mutex *p){
+  assert( p );
+#ifdef SQLITE_DEBUG
+  assert( p->nRef==0 && p->owner==0 );
+  assert( p->id==SQLITE_MUTEX_FAST || p->id==SQLITE_MUTEX_RECURSIVE );
+#endif
+  assert( winMutex_isInit==1 );
+  DeleteCriticalSection(&p->mutex);
+  sqlite3_free(p);
+}
+
+/*
+** The sqlite3_mutex_enter() and sqlite3_mutex_try() routines attempt
+** to enter a mutex.  If another thread is already within the mutex,
+** sqlite3_mutex_enter() will block and sqlite3_mutex_try() will return
+** SQLITE_BUSY.  The sqlite3_mutex_try() interface returns SQLITE_OK
+** upon successful entry.  Mutexes created using SQLITE_MUTEX_RECURSIVE can
+** be entered multiple times by the same thread.  In such cases the,
+** mutex must be exited an equal number of times before another thread
+** can enter.  If the same thread tries to enter any other kind of mutex
+** more than once, the behavior is undefined.
+*/
+static void winMutexEnter(sqlite3_mutex *p){
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  DWORD tid = GetCurrentThreadId();
+#endif
+#ifdef SQLITE_DEBUG
+  assert( p );
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || winMutexNotheld2(p, tid) );
+#else
+  assert( p );
+#endif
+  assert( winMutex_isInit==1 );
+  EnterCriticalSection(&p->mutex);
+#ifdef SQLITE_DEBUG
+  assert( p->nRef>0 || p->owner==0 );
+  p->owner = tid;
+  p->nRef++;
+  if( p->trace ){
+    OSTRACE(("ENTER-MUTEX tid=%lu, mutex=%p (%d), nRef=%d\n",
+             tid, p, p->trace, p->nRef));
+  }
+#endif
+}
+
+static int winMutexTry(sqlite3_mutex *p){
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  DWORD tid = GetCurrentThreadId();
+#endif
+  int rc = SQLITE_BUSY;
+  assert( p );
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || winMutexNotheld2(p, tid) );
+  /*
+  ** The sqlite3_mutex_try() routine is very rarely used, and when it
+  ** is used it is merely an optimization.  So it is OK for it to always
+  ** fail.
+  **
+  ** The TryEnterCriticalSection() interface is only available on WinNT.
+  ** And some windows compilers complain if you try to use it without
+  ** first doing some #defines that prevent SQLite from building on Win98.
+  ** For that reason, we will omit this optimization for now.  See
+  ** ticket #2685.
+  */
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0400
+  assert( winMutex_isInit==1 );
+  assert( winMutex_isNt>=-1 && winMutex_isNt<=1 );
+  if( winMutex_isNt<0 ){
+    winMutex_isNt = sqlite3_win32_is_nt();
+  }
+  assert( winMutex_isNt==0 || winMutex_isNt==1 );
+  if( winMutex_isNt && TryEnterCriticalSection(&p->mutex) ){
+#ifdef SQLITE_DEBUG
+    p->owner = tid;
+    p->nRef++;
+#endif
+    rc = SQLITE_OK;
+  }
+#else
+  UNUSED_PARAMETER(p);
+#endif
+#ifdef SQLITE_DEBUG
+  if( p->trace ){
+    OSTRACE(("TRY-MUTEX tid=%lu, mutex=%p (%d), owner=%lu, nRef=%d, rc=%s\n",
+             tid, p, p->trace, p->owner, p->nRef, sqlite3ErrName(rc)));
+  }
+#endif
+  return rc;
+}
+
+/*
+** The sqlite3_mutex_leave() routine exits a mutex that was
+** previously entered by the same thread.  The behavior
+** is undefined if the mutex is not currently entered or
+** is not currently allocated.  SQLite will never do either.
+*/
+static void winMutexLeave(sqlite3_mutex *p){
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  DWORD tid = GetCurrentThreadId();
+#endif
+  assert( p );
+#ifdef SQLITE_DEBUG
+  assert( p->nRef>0 );
+  assert( p->owner==tid );
+  p->nRef--;
+  if( p->nRef==0 ) p->owner = 0;
+  assert( p->nRef==0 || p->id==SQLITE_MUTEX_RECURSIVE );
+#endif
+  assert( winMutex_isInit==1 );
+  LeaveCriticalSection(&p->mutex);
+#ifdef SQLITE_DEBUG
+  if( p->trace ){
+    OSTRACE(("LEAVE-MUTEX tid=%lu, mutex=%p (%d), nRef=%d\n",
+             tid, p, p->trace, p->nRef));
+  }
+#endif
+}
+
+SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3DefaultMutex(void){
+  static const sqlite3_mutex_methods sMutex = {
+    winMutexInit,
+    winMutexEnd,
+    winMutexAlloc,
+    winMutexFree,
+    winMutexEnter,
+    winMutexTry,
+    winMutexLeave,
+#ifdef SQLITE_DEBUG
+    winMutexHeld,
+    winMutexNotheld
+#else
+    0,
+    0
+#endif
+  };
+  return &sMutex;
+}
+
+#endif /* SQLITE_MUTEX_W32 */
+
+/************** End of mutex_w32.c *******************************************/
+/************** Begin file malloc.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** Memory allocation functions used throughout sqlite.
+*/
+/* #include <stdarg.h> */
+
+/*
+** Attempt to release up to n bytes of non-essential memory currently
+** held by SQLite. An example of non-essential memory is memory used to
