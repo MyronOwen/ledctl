@@ -20250,3 +20250,259 @@ SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3DefaultMutex(void){
 /*
 ** Attempt to release up to n bytes of non-essential memory currently
 ** held by SQLite. An example of non-essential memory is memory used to
+** cache database pages that are not currently in use.
+*/
+SQLITE_API int sqlite3_release_memory(int n){
+#ifdef SQLITE_ENABLE_MEMORY_MANAGEMENT
+  return sqlite3PcacheReleaseMemory(n);
+#else
+  /* IMPLEMENTATION-OF: R-34391-24921 The sqlite3_release_memory() routine
+  ** is a no-op returning zero if SQLite is not compiled with
+  ** SQLITE_ENABLE_MEMORY_MANAGEMENT. */
+  UNUSED_PARAMETER(n);
+  return 0;
+#endif
+}
+
+/*
+** An instance of the following object records the location of
+** each unused scratch buffer.
+*/
+typedef struct ScratchFreeslot {
+  struct ScratchFreeslot *pNext;   /* Next unused scratch buffer */
+} ScratchFreeslot;
+
+/*
+** State information local to the memory allocation subsystem.
+*/
+static SQLITE_WSD struct Mem0Global {
+  sqlite3_mutex *mutex;         /* Mutex to serialize access */
+
+  /*
+  ** The alarm callback and its arguments.  The mem0.mutex lock will
+  ** be held while the callback is running.  Recursive calls into
+  ** the memory subsystem are allowed, but no new callbacks will be
+  ** issued.
+  */
+  sqlite3_int64 alarmThreshold;
+  void (*alarmCallback)(void*, sqlite3_int64,int);
+  void *alarmArg;
+
+  /*
+  ** Pointers to the end of sqlite3GlobalConfig.pScratch memory
+  ** (so that a range test can be used to determine if an allocation
+  ** being freed came from pScratch) and a pointer to the list of
+  ** unused scratch allocations.
+  */
+  void *pScratchEnd;
+  ScratchFreeslot *pScratchFree;
+  u32 nScratchFree;
+
+  /*
+  ** True if heap is nearly "full" where "full" is defined by the
+  ** sqlite3_soft_heap_limit() setting.
+  */
+  int nearlyFull;
+} mem0 = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+#define mem0 GLOBAL(struct Mem0Global, mem0)
+
+/*
+** This routine runs when the memory allocator sees that the
+** total memory allocation is about to exceed the soft heap
+** limit.
+*/
+static void softHeapLimitEnforcer(
+  void *NotUsed, 
+  sqlite3_int64 NotUsed2,
+  int allocSize
+){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  sqlite3_release_memory(allocSize);
+}
+
+/*
+** Change the alarm callback
+*/
+static int sqlite3MemoryAlarm(
+  void(*xCallback)(void *pArg, sqlite3_int64 used,int N),
+  void *pArg,
+  sqlite3_int64 iThreshold
+){
+  int nUsed;
+  sqlite3_mutex_enter(mem0.mutex);
+  mem0.alarmCallback = xCallback;
+  mem0.alarmArg = pArg;
+  mem0.alarmThreshold = iThreshold;
+  nUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+  mem0.nearlyFull = (iThreshold>0 && iThreshold<=nUsed);
+  sqlite3_mutex_leave(mem0.mutex);
+  return SQLITE_OK;
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Deprecated external interface.  Internal/core SQLite code
+** should call sqlite3MemoryAlarm.
+*/
+SQLITE_API int sqlite3_memory_alarm(
+  void(*xCallback)(void *pArg, sqlite3_int64 used,int N),
+  void *pArg,
+  sqlite3_int64 iThreshold
+){
+  return sqlite3MemoryAlarm(xCallback, pArg, iThreshold);
+}
+#endif
+
+/*
+** Set the soft heap-size limit for the library. Passing a zero or 
+** negative value indicates no limit.
+*/
+SQLITE_API sqlite3_int64 sqlite3_soft_heap_limit64(sqlite3_int64 n){
+  sqlite3_int64 priorLimit;
+  sqlite3_int64 excess;
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return -1;
+#endif
+  sqlite3_mutex_enter(mem0.mutex);
+  priorLimit = mem0.alarmThreshold;
+  sqlite3_mutex_leave(mem0.mutex);
+  if( n<0 ) return priorLimit;
+  if( n>0 ){
+    sqlite3MemoryAlarm(softHeapLimitEnforcer, 0, n);
+  }else{
+    sqlite3MemoryAlarm(0, 0, 0);
+  }
+  excess = sqlite3_memory_used() - n;
+  if( excess>0 ) sqlite3_release_memory((int)(excess & 0x7fffffff));
+  return priorLimit;
+}
+SQLITE_API void sqlite3_soft_heap_limit(int n){
+  if( n<0 ) n = 0;
+  sqlite3_soft_heap_limit64(n);
+}
+
+/*
+** Initialize the memory allocation subsystem.
+*/
+SQLITE_PRIVATE int sqlite3MallocInit(void){
+  if( sqlite3GlobalConfig.m.xMalloc==0 ){
+    sqlite3MemSetDefault();
+  }
+  memset(&mem0, 0, sizeof(mem0));
+  if( sqlite3GlobalConfig.bCoreMutex ){
+    mem0.mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MEM);
+  }
+  if( sqlite3GlobalConfig.pScratch && sqlite3GlobalConfig.szScratch>=100
+      && sqlite3GlobalConfig.nScratch>0 ){
+    int i, n, sz;
+    ScratchFreeslot *pSlot;
+    sz = ROUNDDOWN8(sqlite3GlobalConfig.szScratch);
+    sqlite3GlobalConfig.szScratch = sz;
+    pSlot = (ScratchFreeslot*)sqlite3GlobalConfig.pScratch;
+    n = sqlite3GlobalConfig.nScratch;
+    mem0.pScratchFree = pSlot;
+    mem0.nScratchFree = n;
+    for(i=0; i<n-1; i++){
+      pSlot->pNext = (ScratchFreeslot*)(sz+(char*)pSlot);
+      pSlot = pSlot->pNext;
+    }
+    pSlot->pNext = 0;
+    mem0.pScratchEnd = (void*)&pSlot[1];
+  }else{
+    mem0.pScratchEnd = 0;
+    sqlite3GlobalConfig.pScratch = 0;
+    sqlite3GlobalConfig.szScratch = 0;
+    sqlite3GlobalConfig.nScratch = 0;
+  }
+  if( sqlite3GlobalConfig.pPage==0 || sqlite3GlobalConfig.szPage<512
+      || sqlite3GlobalConfig.nPage<1 ){
+    sqlite3GlobalConfig.pPage = 0;
+    sqlite3GlobalConfig.szPage = 0;
+    sqlite3GlobalConfig.nPage = 0;
+  }
+  return sqlite3GlobalConfig.m.xInit(sqlite3GlobalConfig.m.pAppData);
+}
+
+/*
+** Return true if the heap is currently under memory pressure - in other
+** words if the amount of heap used is close to the limit set by
+** sqlite3_soft_heap_limit().
+*/
+SQLITE_PRIVATE int sqlite3HeapNearlyFull(void){
+  return mem0.nearlyFull;
+}
+
+/*
+** Deinitialize the memory allocation subsystem.
+*/
+SQLITE_PRIVATE void sqlite3MallocEnd(void){
+  if( sqlite3GlobalConfig.m.xShutdown ){
+    sqlite3GlobalConfig.m.xShutdown(sqlite3GlobalConfig.m.pAppData);
+  }
+  memset(&mem0, 0, sizeof(mem0));
+}
+
+/*
+** Return the amount of memory currently checked out.
+*/
+SQLITE_API sqlite3_int64 sqlite3_memory_used(void){
+  int n, mx;
+  sqlite3_int64 res;
+  sqlite3_status(SQLITE_STATUS_MEMORY_USED, &n, &mx, 0);
+  res = (sqlite3_int64)n;  /* Work around bug in Borland C. Ticket #3216 */
+  return res;
+}
+
+/*
+** Return the maximum amount of memory that has ever been
+** checked out since either the beginning of this process
+** or since the most recent reset.
+*/
+SQLITE_API sqlite3_int64 sqlite3_memory_highwater(int resetFlag){
+  int n, mx;
+  sqlite3_int64 res;
+  sqlite3_status(SQLITE_STATUS_MEMORY_USED, &n, &mx, resetFlag);
+  res = (sqlite3_int64)mx;  /* Work around bug in Borland C. Ticket #3216 */
+  return res;
+}
+
+/*
+** Trigger the alarm 
+*/
+static void sqlite3MallocAlarm(int nByte){
+  void (*xCallback)(void*,sqlite3_int64,int);
+  sqlite3_int64 nowUsed;
+  void *pArg;
+  if( mem0.alarmCallback==0 ) return;
+  xCallback = mem0.alarmCallback;
+  nowUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+  pArg = mem0.alarmArg;
+  mem0.alarmCallback = 0;
+  sqlite3_mutex_leave(mem0.mutex);
+  xCallback(pArg, nowUsed, nByte);
+  sqlite3_mutex_enter(mem0.mutex);
+  mem0.alarmCallback = xCallback;
+  mem0.alarmArg = pArg;
+}
+
+/*
+** Do a memory allocation with statistics and alarms.  Assume the
+** lock is already held.
+*/
+static int mallocWithAlarm(int n, void **pp){
+  int nFull;
+  void *p;
+  assert( sqlite3_mutex_held(mem0.mutex) );
+  nFull = sqlite3GlobalConfig.m.xRoundup(n);
+  sqlite3StatusSet(SQLITE_STATUS_MALLOC_SIZE, n);
+  if( mem0.alarmCallback!=0 ){
+    int nUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+    if( nUsed >= mem0.alarmThreshold - nFull ){
+      mem0.nearlyFull = 1;
+      sqlite3MallocAlarm(nFull);
+    }else{
+      mem0.nearlyFull = 0;
+    }
+  }
