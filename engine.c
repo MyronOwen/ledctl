@@ -20960,3 +20960,230 @@ SQLITE_PRIVATE void *sqlite3DbReallocOrFree(sqlite3 *db, void *p, u64 n){
   }
   return pNew;
 }
+
+/*
+** Make a copy of a string in memory obtained from sqliteMalloc(). These 
+** functions call sqlite3MallocRaw() directly instead of sqliteMalloc(). This
+** is because when memory debugging is turned on, these two functions are 
+** called via macros that record the current file and line number in the
+** ThreadData structure.
+*/
+SQLITE_PRIVATE char *sqlite3DbStrDup(sqlite3 *db, const char *z){
+  char *zNew;
+  size_t n;
+  if( z==0 ){
+    return 0;
+  }
+  n = sqlite3Strlen30(z) + 1;
+  assert( (n&0x7fffffff)==n );
+  zNew = sqlite3DbMallocRaw(db, (int)n);
+  if( zNew ){
+    memcpy(zNew, z, n);
+  }
+  return zNew;
+}
+SQLITE_PRIVATE char *sqlite3DbStrNDup(sqlite3 *db, const char *z, u64 n){
+  char *zNew;
+  if( z==0 ){
+    return 0;
+  }
+  assert( (n&0x7fffffff)==n );
+  zNew = sqlite3DbMallocRaw(db, n+1);
+  if( zNew ){
+    memcpy(zNew, z, (size_t)n);
+    zNew[n] = 0;
+  }
+  return zNew;
+}
+
+/*
+** Create a string from the zFromat argument and the va_list that follows.
+** Store the string in memory obtained from sqliteMalloc() and make *pz
+** point to that string.
+*/
+SQLITE_PRIVATE void sqlite3SetString(char **pz, sqlite3 *db, const char *zFormat, ...){
+  va_list ap;
+  char *z;
+
+  va_start(ap, zFormat);
+  z = sqlite3VMPrintf(db, zFormat, ap);
+  va_end(ap);
+  sqlite3DbFree(db, *pz);
+  *pz = z;
+}
+
+/*
+** Take actions at the end of an API call to indicate an OOM error
+*/
+static SQLITE_NOINLINE int apiOomError(sqlite3 *db){
+  db->mallocFailed = 0;
+  sqlite3Error(db, SQLITE_NOMEM);
+  return SQLITE_NOMEM;
+}
+
+/*
+** This function must be called before exiting any API function (i.e. 
+** returning control to the user) that has called sqlite3_malloc or
+** sqlite3_realloc.
+**
+** The returned value is normally a copy of the second argument to this
+** function. However, if a malloc() failure has occurred since the previous
+** invocation SQLITE_NOMEM is returned instead. 
+**
+** If the first argument, db, is not NULL and a malloc() error has occurred,
+** then the connection error-code (the value returned by sqlite3_errcode())
+** is set to SQLITE_NOMEM.
+*/
+SQLITE_PRIVATE int sqlite3ApiExit(sqlite3* db, int rc){
+  /* If the db handle is not NULL, then we must hold the connection handle
+  ** mutex here. Otherwise the read (and possible write) of db->mallocFailed 
+  ** is unsafe, as is the call to sqlite3Error().
+  */
+  assert( !db || sqlite3_mutex_held(db->mutex) );
+  if( db==0 ) return rc & 0xff;
+  if( db->mallocFailed || rc==SQLITE_IOERR_NOMEM ){
+    return apiOomError(db);
+  }
+  return rc & db->errMask;
+}
+
+/************** End of malloc.c **********************************************/
+/************** Begin file printf.c ******************************************/
+/*
+** The "printf" code that follows dates from the 1980's.  It is in
+** the public domain.  The original comments are included here for
+** completeness.  They are very out-of-date but might be useful as
+** an historical reference.  Most of the "enhancements" have been backed
+** out so that the functionality is now the same as standard printf().
+**
+**************************************************************************
+**
+** This file contains code for a set of "printf"-like routines.  These
+** routines format strings much like the printf() from the standard C
+** library, though the implementation here has enhancements to support
+** SQLlite.
+*/
+
+/*
+** Conversion types fall into various categories as defined by the
+** following enumeration.
+*/
+#define etRADIX       1 /* Integer types.  %d, %x, %o, and so forth */
+#define etFLOAT       2 /* Floating point.  %f */
+#define etEXP         3 /* Exponentional notation. %e and %E */
+#define etGENERIC     4 /* Floating or exponential, depending on exponent. %g */
+#define etSIZE        5 /* Return number of characters processed so far. %n */
+#define etSTRING      6 /* Strings. %s */
+#define etDYNSTRING   7 /* Dynamically allocated strings. %z */
+#define etPERCENT     8 /* Percent symbol. %% */
+#define etCHARX       9 /* Characters. %c */
+/* The rest are extensions, not normally found in printf() */
+#define etSQLESCAPE  10 /* Strings with '\'' doubled.  %q */
+#define etSQLESCAPE2 11 /* Strings with '\'' doubled and enclosed in '',
+                          NULL pointers replaced by SQL NULL.  %Q */
+#define etTOKEN      12 /* a pointer to a Token structure */
+#define etSRCLIST    13 /* a pointer to a SrcList */
+#define etPOINTER    14 /* The %p conversion */
+#define etSQLESCAPE3 15 /* %w -> Strings with '\"' doubled */
+#define etORDINAL    16 /* %r -> 1st, 2nd, 3rd, 4th, etc.  English only */
+
+#define etINVALID     0 /* Any unrecognized conversion type */
+
+
+/*
+** An "etByte" is an 8-bit unsigned value.
+*/
+typedef unsigned char etByte;
+
+/*
+** Each builtin conversion character (ex: the 'd' in "%d") is described
+** by an instance of the following structure
+*/
+typedef struct et_info {   /* Information about each format field */
+  char fmttype;            /* The format field code letter */
+  etByte base;             /* The base for radix conversion */
+  etByte flags;            /* One or more of FLAG_ constants below */
+  etByte type;             /* Conversion paradigm */
+  etByte charset;          /* Offset into aDigits[] of the digits string */
+  etByte prefix;           /* Offset into aPrefix[] of the prefix string */
+} et_info;
+
+/*
+** Allowed values for et_info.flags
+*/
+#define FLAG_SIGNED  1     /* True if the value to convert is signed */
+#define FLAG_INTERN  2     /* True if for internal use only */
+#define FLAG_STRING  4     /* Allow infinity precision */
+
+
+/*
+** The following table is searched linearly, so it is good to put the
+** most frequently used conversion types first.
+*/
+static const char aDigits[] = "0123456789ABCDEF0123456789abcdef";
+static const char aPrefix[] = "-x0\000X0";
+static const et_info fmtinfo[] = {
+  {  'd', 10, 1, etRADIX,      0,  0 },
+  {  's',  0, 4, etSTRING,     0,  0 },
+  {  'g',  0, 1, etGENERIC,    30, 0 },
+  {  'z',  0, 4, etDYNSTRING,  0,  0 },
+  {  'q',  0, 4, etSQLESCAPE,  0,  0 },
+  {  'Q',  0, 4, etSQLESCAPE2, 0,  0 },
+  {  'w',  0, 4, etSQLESCAPE3, 0,  0 },
+  {  'c',  0, 0, etCHARX,      0,  0 },
+  {  'o',  8, 0, etRADIX,      0,  2 },
+  {  'u', 10, 0, etRADIX,      0,  0 },
+  {  'x', 16, 0, etRADIX,      16, 1 },
+  {  'X', 16, 0, etRADIX,      0,  4 },
+#ifndef SQLITE_OMIT_FLOATING_POINT
+  {  'f',  0, 1, etFLOAT,      0,  0 },
+  {  'e',  0, 1, etEXP,        30, 0 },
+  {  'E',  0, 1, etEXP,        14, 0 },
+  {  'G',  0, 1, etGENERIC,    14, 0 },
+#endif
+  {  'i', 10, 1, etRADIX,      0,  0 },
+  {  'n',  0, 0, etSIZE,       0,  0 },
+  {  '%',  0, 0, etPERCENT,    0,  0 },
+  {  'p', 16, 0, etPOINTER,    0,  1 },
+
+/* All the rest have the FLAG_INTERN bit set and are thus for internal
+** use only */
+  {  'T',  0, 2, etTOKEN,      0,  0 },
+  {  'S',  0, 2, etSRCLIST,    0,  0 },
+  {  'r', 10, 3, etORDINAL,    0,  0 },
+};
+
+/*
+** If SQLITE_OMIT_FLOATING_POINT is defined, then none of the floating point
+** conversions will work.
+*/
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/*
+** "*val" is a double such that 0.1 <= *val < 10.0
+** Return the ascii code for the leading digit of *val, then
+** multiply "*val" by 10.0 to renormalize.
+**
+** Example:
+**     input:     *val = 3.14159
+**     output:    *val = 1.4159    function return = '3'
+**
+** The counter *cnt is incremented each time.  After counter exceeds
+** 16 (the number of significant digits in a 64-bit float) '0' is
+** always returned.
+*/
+static char et_getdigit(LONGDOUBLE_TYPE *val, int *cnt){
+  int digit;
+  LONGDOUBLE_TYPE d;
+  if( (*cnt)<=0 ) return '0';
+  (*cnt)--;
+  digit = (int)*val;
+  d = digit;
+  digit += '0';
+  *val = (*val - d)*10.0;
+  return (char)digit;
+}
+#endif /* SQLITE_OMIT_FLOATING_POINT */
+
+/*
+** Set the StrAccum object to an error mode.
+*/
