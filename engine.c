@@ -21187,3 +21187,240 @@ static char et_getdigit(LONGDOUBLE_TYPE *val, int *cnt){
 /*
 ** Set the StrAccum object to an error mode.
 */
+static void setStrAccumError(StrAccum *p, u8 eError){
+  p->accError = eError;
+  p->nAlloc = 0;
+}
+
+/*
+** Extra argument values from a PrintfArguments object
+*/
+static sqlite3_int64 getIntArg(PrintfArguments *p){
+  if( p->nArg<=p->nUsed ) return 0;
+  return sqlite3_value_int64(p->apArg[p->nUsed++]);
+}
+static double getDoubleArg(PrintfArguments *p){
+  if( p->nArg<=p->nUsed ) return 0.0;
+  return sqlite3_value_double(p->apArg[p->nUsed++]);
+}
+static char *getTextArg(PrintfArguments *p){
+  if( p->nArg<=p->nUsed ) return 0;
+  return (char*)sqlite3_value_text(p->apArg[p->nUsed++]);
+}
+
+
+/*
+** On machines with a small stack size, you can redefine the
+** SQLITE_PRINT_BUF_SIZE to be something smaller, if desired.
+*/
+#ifndef SQLITE_PRINT_BUF_SIZE
+# define SQLITE_PRINT_BUF_SIZE 70
+#endif
+#define etBUFSIZE SQLITE_PRINT_BUF_SIZE  /* Size of the output buffer */
+
+/*
+** Render a string given by "fmt" into the StrAccum object.
+*/
+SQLITE_PRIVATE void sqlite3VXPrintf(
+  StrAccum *pAccum,          /* Accumulate results here */
+  u32 bFlags,                /* SQLITE_PRINTF_* flags */
+  const char *fmt,           /* Format string */
+  va_list ap                 /* arguments */
+){
+  int c;                     /* Next character in the format string */
+  char *bufpt;               /* Pointer to the conversion buffer */
+  int precision;             /* Precision of the current field */
+  int length;                /* Length of the field */
+  int idx;                   /* A general purpose loop counter */
+  int width;                 /* Width of the current field */
+  etByte flag_leftjustify;   /* True if "-" flag is present */
+  etByte flag_plussign;      /* True if "+" flag is present */
+  etByte flag_blanksign;     /* True if " " flag is present */
+  etByte flag_alternateform; /* True if "#" flag is present */
+  etByte flag_altform2;      /* True if "!" flag is present */
+  etByte flag_zeropad;       /* True if field width constant starts with zero */
+  etByte flag_long;          /* True if "l" flag is present */
+  etByte flag_longlong;      /* True if the "ll" flag is present */
+  etByte done;               /* Loop termination flag */
+  etByte xtype = 0;          /* Conversion paradigm */
+  u8 bArgList;               /* True for SQLITE_PRINTF_SQLFUNC */
+  u8 useIntern;              /* Ok to use internal conversions (ex: %T) */
+  char prefix;               /* Prefix character.  "+" or "-" or " " or '\0'. */
+  sqlite_uint64 longvalue;   /* Value for integer types */
+  LONGDOUBLE_TYPE realvalue; /* Value for real types */
+  const et_info *infop;      /* Pointer to the appropriate info structure */
+  char *zOut;                /* Rendering buffer */
+  int nOut;                  /* Size of the rendering buffer */
+  char *zExtra = 0;          /* Malloced memory used by some conversion */
+#ifndef SQLITE_OMIT_FLOATING_POINT
+  int  exp, e2;              /* exponent of real numbers */
+  int nsd;                   /* Number of significant digits returned */
+  double rounder;            /* Used for rounding floating point values */
+  etByte flag_dp;            /* True if decimal point should be shown */
+  etByte flag_rtz;           /* True if trailing zeros should be removed */
+#endif
+  PrintfArguments *pArgList = 0; /* Arguments for SQLITE_PRINTF_SQLFUNC */
+  char buf[etBUFSIZE];       /* Conversion buffer */
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( ap==0 ){
+    (void)SQLITE_MISUSE_BKPT;
+    sqlite3StrAccumReset(pAccum);
+    return;
+  }
+#endif
+  bufpt = 0;
+  if( bFlags ){
+    if( (bArgList = (bFlags & SQLITE_PRINTF_SQLFUNC))!=0 ){
+      pArgList = va_arg(ap, PrintfArguments*);
+    }
+    useIntern = bFlags & SQLITE_PRINTF_INTERNAL;
+  }else{
+    bArgList = useIntern = 0;
+  }
+  for(; (c=(*fmt))!=0; ++fmt){
+    if( c!='%' ){
+      bufpt = (char *)fmt;
+#if HAVE_STRCHRNUL
+      fmt = strchrnul(fmt, '%');
+#else
+      do{ fmt++; }while( *fmt && *fmt != '%' );
+#endif
+      sqlite3StrAccumAppend(pAccum, bufpt, (int)(fmt - bufpt));
+      if( *fmt==0 ) break;
+    }
+    if( (c=(*++fmt))==0 ){
+      sqlite3StrAccumAppend(pAccum, "%", 1);
+      break;
+    }
+    /* Find out what flags are present */
+    flag_leftjustify = flag_plussign = flag_blanksign = 
+     flag_alternateform = flag_altform2 = flag_zeropad = 0;
+    done = 0;
+    do{
+      switch( c ){
+        case '-':   flag_leftjustify = 1;     break;
+        case '+':   flag_plussign = 1;        break;
+        case ' ':   flag_blanksign = 1;       break;
+        case '#':   flag_alternateform = 1;   break;
+        case '!':   flag_altform2 = 1;        break;
+        case '0':   flag_zeropad = 1;         break;
+        default:    done = 1;                 break;
+      }
+    }while( !done && (c=(*++fmt))!=0 );
+    /* Get the field width */
+    width = 0;
+    if( c=='*' ){
+      if( bArgList ){
+        width = (int)getIntArg(pArgList);
+      }else{
+        width = va_arg(ap,int);
+      }
+      if( width<0 ){
+        flag_leftjustify = 1;
+        width = -width;
+      }
+      c = *++fmt;
+    }else{
+      while( c>='0' && c<='9' ){
+        width = width*10 + c - '0';
+        c = *++fmt;
+      }
+    }
+    /* Get the precision */
+    if( c=='.' ){
+      precision = 0;
+      c = *++fmt;
+      if( c=='*' ){
+        if( bArgList ){
+          precision = (int)getIntArg(pArgList);
+        }else{
+          precision = va_arg(ap,int);
+        }
+        if( precision<0 ) precision = -precision;
+        c = *++fmt;
+      }else{
+        while( c>='0' && c<='9' ){
+          precision = precision*10 + c - '0';
+          c = *++fmt;
+        }
+      }
+    }else{
+      precision = -1;
+    }
+    /* Get the conversion type modifier */
+    if( c=='l' ){
+      flag_long = 1;
+      c = *++fmt;
+      if( c=='l' ){
+        flag_longlong = 1;
+        c = *++fmt;
+      }else{
+        flag_longlong = 0;
+      }
+    }else{
+      flag_long = flag_longlong = 0;
+    }
+    /* Fetch the info entry for the field */
+    infop = &fmtinfo[0];
+    xtype = etINVALID;
+    for(idx=0; idx<ArraySize(fmtinfo); idx++){
+      if( c==fmtinfo[idx].fmttype ){
+        infop = &fmtinfo[idx];
+        if( useIntern || (infop->flags & FLAG_INTERN)==0 ){
+          xtype = infop->type;
+        }else{
+          return;
+        }
+        break;
+      }
+    }
+
+    /*
+    ** At this point, variables are initialized as follows:
+    **
+    **   flag_alternateform          TRUE if a '#' is present.
+    **   flag_altform2               TRUE if a '!' is present.
+    **   flag_plussign               TRUE if a '+' is present.
+    **   flag_leftjustify            TRUE if a '-' is present or if the
+    **                               field width was negative.
+    **   flag_zeropad                TRUE if the width began with 0.
+    **   flag_long                   TRUE if the letter 'l' (ell) prefixed
+    **                               the conversion character.
+    **   flag_longlong               TRUE if the letter 'll' (ell ell) prefixed
+    **                               the conversion character.
+    **   flag_blanksign              TRUE if a ' ' is present.
+    **   width                       The specified field width.  This is
+    **                               always non-negative.  Zero is the default.
+    **   precision                   The specified precision.  The default
+    **                               is -1.
+    **   xtype                       The class of the conversion.
+    **   infop                       Pointer to the appropriate info struct.
+    */
+    switch( xtype ){
+      case etPOINTER:
+        flag_longlong = sizeof(char*)==sizeof(i64);
+        flag_long = sizeof(char*)==sizeof(long int);
+        /* Fall through into the next case */
+      case etORDINAL:
+      case etRADIX:
+        if( infop->flags & FLAG_SIGNED ){
+          i64 v;
+          if( bArgList ){
+            v = getIntArg(pArgList);
+          }else if( flag_longlong ){
+            v = va_arg(ap,i64);
+          }else if( flag_long ){
+            v = va_arg(ap,long int);
+          }else{
+            v = va_arg(ap,int);
+          }
+          if( v<0 ){
+            if( v==SMALLEST_INT64 ){
+              longvalue = ((u64)1)<<63;
+            }else{
+              longvalue = -v;
+            }
+            prefix = '-';
+          }else{
+            longvalue = v;
