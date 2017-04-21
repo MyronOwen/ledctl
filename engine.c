@@ -21657,3 +21657,229 @@ SQLITE_PRIVATE void sqlite3VXPrintf(
         buf[0] = '%';
         bufpt = buf;
         length = 1;
+        break;
+      case etCHARX:
+        if( bArgList ){
+          bufpt = getTextArg(pArgList);
+          c = bufpt ? bufpt[0] : 0;
+        }else{
+          c = va_arg(ap,int);
+        }
+        if( precision>1 ){
+          width -= precision-1;
+          if( width>1 && !flag_leftjustify ){
+            sqlite3AppendChar(pAccum, width-1, ' ');
+            width = 0;
+          }
+          sqlite3AppendChar(pAccum, precision-1, c);
+        }
+        length = 1;
+        buf[0] = c;
+        bufpt = buf;
+        break;
+      case etSTRING:
+      case etDYNSTRING:
+        if( bArgList ){
+          bufpt = getTextArg(pArgList);
+        }else{
+          bufpt = va_arg(ap,char*);
+        }
+        if( bufpt==0 ){
+          bufpt = "";
+        }else if( xtype==etDYNSTRING && !bArgList ){
+          zExtra = bufpt;
+        }
+        if( precision>=0 ){
+          for(length=0; length<precision && bufpt[length]; length++){}
+        }else{
+          length = sqlite3Strlen30(bufpt);
+        }
+        break;
+      case etSQLESCAPE:
+      case etSQLESCAPE2:
+      case etSQLESCAPE3: {
+        int i, j, k, n, isnull;
+        int needQuote;
+        char ch;
+        char q = ((xtype==etSQLESCAPE3)?'"':'\'');   /* Quote character */
+        char *escarg;
+
+        if( bArgList ){
+          escarg = getTextArg(pArgList);
+        }else{
+          escarg = va_arg(ap,char*);
+        }
+        isnull = escarg==0;
+        if( isnull ) escarg = (xtype==etSQLESCAPE2 ? "NULL" : "(NULL)");
+        k = precision;
+        for(i=n=0; k!=0 && (ch=escarg[i])!=0; i++, k--){
+          if( ch==q )  n++;
+        }
+        needQuote = !isnull && xtype==etSQLESCAPE2;
+        n += i + 1 + needQuote*2;
+        if( n>etBUFSIZE ){
+          bufpt = zExtra = sqlite3Malloc( n );
+          if( bufpt==0 ){
+            setStrAccumError(pAccum, STRACCUM_NOMEM);
+            return;
+          }
+        }else{
+          bufpt = buf;
+        }
+        j = 0;
+        if( needQuote ) bufpt[j++] = q;
+        k = i;
+        for(i=0; i<k; i++){
+          bufpt[j++] = ch = escarg[i];
+          if( ch==q ) bufpt[j++] = ch;
+        }
+        if( needQuote ) bufpt[j++] = q;
+        bufpt[j] = 0;
+        length = j;
+        /* The precision in %q and %Q means how many input characters to
+        ** consume, not the length of the output...
+        ** if( precision>=0 && precision<length ) length = precision; */
+        break;
+      }
+      case etTOKEN: {
+        Token *pToken = va_arg(ap, Token*);
+        assert( bArgList==0 );
+        if( pToken && pToken->n ){
+          sqlite3StrAccumAppend(pAccum, (const char*)pToken->z, pToken->n);
+        }
+        length = width = 0;
+        break;
+      }
+      case etSRCLIST: {
+        SrcList *pSrc = va_arg(ap, SrcList*);
+        int k = va_arg(ap, int);
+        struct SrcList_item *pItem = &pSrc->a[k];
+        assert( bArgList==0 );
+        assert( k>=0 && k<pSrc->nSrc );
+        if( pItem->zDatabase ){
+          sqlite3StrAccumAppendAll(pAccum, pItem->zDatabase);
+          sqlite3StrAccumAppend(pAccum, ".", 1);
+        }
+        sqlite3StrAccumAppendAll(pAccum, pItem->zName);
+        length = width = 0;
+        break;
+      }
+      default: {
+        assert( xtype==etINVALID );
+        return;
+      }
+    }/* End switch over the format type */
+    /*
+    ** The text of the conversion is pointed to by "bufpt" and is
+    ** "length" characters long.  The field width is "width".  Do
+    ** the output.
+    */
+    width -= length;
+    if( width>0 && !flag_leftjustify ) sqlite3AppendChar(pAccum, width, ' ');
+    sqlite3StrAccumAppend(pAccum, bufpt, length);
+    if( width>0 && flag_leftjustify ) sqlite3AppendChar(pAccum, width, ' ');
+
+    if( zExtra ){
+      sqlite3_free(zExtra);
+      zExtra = 0;
+    }
+  }/* End for loop over the format string */
+} /* End of function */
+
+/*
+** Enlarge the memory allocation on a StrAccum object so that it is
+** able to accept at least N more bytes of text.
+**
+** Return the number of bytes of text that StrAccum is able to accept
+** after the attempted enlargement.  The value returned might be zero.
+*/
+static int sqlite3StrAccumEnlarge(StrAccum *p, int N){
+  char *zNew;
+  assert( p->nChar+N >= p->nAlloc ); /* Only called if really needed */
+  if( p->accError ){
+    testcase(p->accError==STRACCUM_TOOBIG);
+    testcase(p->accError==STRACCUM_NOMEM);
+    return 0;
+  }
+  if( !p->useMalloc ){
+    N = p->nAlloc - p->nChar - 1;
+    setStrAccumError(p, STRACCUM_TOOBIG);
+    return N;
+  }else{
+    char *zOld = (p->zText==p->zBase ? 0 : p->zText);
+    i64 szNew = p->nChar;
+    szNew += N + 1;
+    if( szNew+p->nChar<=p->mxAlloc ){
+      /* Force exponential buffer size growth as long as it does not overflow,
+      ** to avoid having to call this routine too often */
+      szNew += p->nChar;
+    }
+    if( szNew > p->mxAlloc ){
+      sqlite3StrAccumReset(p);
+      setStrAccumError(p, STRACCUM_TOOBIG);
+      return 0;
+    }else{
+      p->nAlloc = (int)szNew;
+    }
+    if( p->useMalloc==1 ){
+      zNew = sqlite3DbRealloc(p->db, zOld, p->nAlloc);
+    }else{
+      zNew = sqlite3_realloc(zOld, p->nAlloc);
+    }
+    if( zNew ){
+      assert( p->zText!=0 || p->nChar==0 );
+      if( zOld==0 && p->nChar>0 ) memcpy(zNew, p->zText, p->nChar);
+      p->zText = zNew;
+      p->nAlloc = sqlite3DbMallocSize(p->db, zNew);
+    }else{
+      sqlite3StrAccumReset(p);
+      setStrAccumError(p, STRACCUM_NOMEM);
+      return 0;
+    }
+  }
+  return N;
+}
+
+/*
+** Append N copies of character c to the given string buffer.
+*/
+SQLITE_PRIVATE void sqlite3AppendChar(StrAccum *p, int N, char c){
+  if( p->nChar+N >= p->nAlloc && (N = sqlite3StrAccumEnlarge(p, N))<=0 ) return;
+  while( (N--)>0 ) p->zText[p->nChar++] = c;
+}
+
+/*
+** The StrAccum "p" is not large enough to accept N new bytes of z[].
+** So enlarge if first, then do the append.
+**
+** This is a helper routine to sqlite3StrAccumAppend() that does special-case
+** work (enlarging the buffer) using tail recursion, so that the
+** sqlite3StrAccumAppend() routine can use fast calling semantics.
+*/
+static void SQLITE_NOINLINE enlargeAndAppend(StrAccum *p, const char *z, int N){
+  N = sqlite3StrAccumEnlarge(p, N);
+  if( N>0 ){
+    memcpy(&p->zText[p->nChar], z, N);
+    p->nChar += N;
+  }
+}
+
+/*
+** Append N bytes of text from z to the StrAccum object.  Increase the
+** size of the memory allocation for StrAccum if necessary.
+*/
+SQLITE_PRIVATE void sqlite3StrAccumAppend(StrAccum *p, const char *z, int N){
+  assert( z!=0 );
+  assert( p->zText!=0 || p->nChar==0 || p->accError );
+  assert( N>=0 );
+  assert( p->accError==0 || p->nAlloc==0 );
+  if( p->nChar+N >= p->nAlloc ){
+    enlargeAndAppend(p,z,N);
+  }else{
+    assert( p->zText );
+    p->nChar += N;
+    memcpy(&p->zText[p->nChar-N], z, N);
+  }
+}
+
+/*
