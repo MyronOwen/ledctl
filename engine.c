@@ -21883,3 +21883,207 @@ SQLITE_PRIVATE void sqlite3StrAccumAppend(StrAccum *p, const char *z, int N){
 }
 
 /*
+** Append the complete text of zero-terminated string z[] to the p string.
+*/
+SQLITE_PRIVATE void sqlite3StrAccumAppendAll(StrAccum *p, const char *z){
+  sqlite3StrAccumAppend(p, z, sqlite3Strlen30(z));
+}
+
+
+/*
+** Finish off a string by making sure it is zero-terminated.
+** Return a pointer to the resulting string.  Return a NULL
+** pointer if any kind of error was encountered.
+*/
+SQLITE_PRIVATE char *sqlite3StrAccumFinish(StrAccum *p){
+  if( p->zText ){
+    p->zText[p->nChar] = 0;
+    if( p->useMalloc && p->zText==p->zBase ){
+      if( p->useMalloc==1 ){
+        p->zText = sqlite3DbMallocRaw(p->db, p->nChar+1 );
+      }else{
+        p->zText = sqlite3_malloc(p->nChar+1);
+      }
+      if( p->zText ){
+        memcpy(p->zText, p->zBase, p->nChar+1);
+      }else{
+        setStrAccumError(p, STRACCUM_NOMEM);
+      }
+    }
+  }
+  return p->zText;
+}
+
+/*
+** Reset an StrAccum string.  Reclaim all malloced memory.
+*/
+SQLITE_PRIVATE void sqlite3StrAccumReset(StrAccum *p){
+  if( p->zText!=p->zBase ){
+    if( p->useMalloc==1 ){
+      sqlite3DbFree(p->db, p->zText);
+    }else{
+      sqlite3_free(p->zText);
+    }
+  }
+  p->zText = 0;
+}
+
+/*
+** Initialize a string accumulator
+*/
+SQLITE_PRIVATE void sqlite3StrAccumInit(StrAccum *p, char *zBase, int n, int mx){
+  p->zText = p->zBase = zBase;
+  p->db = 0;
+  p->nChar = 0;
+  p->nAlloc = n;
+  p->mxAlloc = mx;
+  p->useMalloc = 1;
+  p->accError = 0;
+}
+
+/*
+** Print into memory obtained from sqliteMalloc().  Use the internal
+** %-conversion extensions.
+*/
+SQLITE_PRIVATE char *sqlite3VMPrintf(sqlite3 *db, const char *zFormat, va_list ap){
+  char *z;
+  char zBase[SQLITE_PRINT_BUF_SIZE];
+  StrAccum acc;
+  assert( db!=0 );
+  sqlite3StrAccumInit(&acc, zBase, sizeof(zBase),
+                      db->aLimit[SQLITE_LIMIT_LENGTH]);
+  acc.db = db;
+  sqlite3VXPrintf(&acc, SQLITE_PRINTF_INTERNAL, zFormat, ap);
+  z = sqlite3StrAccumFinish(&acc);
+  if( acc.accError==STRACCUM_NOMEM ){
+    db->mallocFailed = 1;
+  }
+  return z;
+}
+
+/*
+** Print into memory obtained from sqliteMalloc().  Use the internal
+** %-conversion extensions.
+*/
+SQLITE_PRIVATE char *sqlite3MPrintf(sqlite3 *db, const char *zFormat, ...){
+  va_list ap;
+  char *z;
+  va_start(ap, zFormat);
+  z = sqlite3VMPrintf(db, zFormat, ap);
+  va_end(ap);
+  return z;
+}
+
+/*
+** Like sqlite3MPrintf(), but call sqlite3DbFree() on zStr after formatting
+** the string and before returning.  This routine is intended to be used
+** to modify an existing string.  For example:
+**
+**       x = sqlite3MPrintf(db, x, "prefix %s suffix", x);
+**
+*/
+SQLITE_PRIVATE char *sqlite3MAppendf(sqlite3 *db, char *zStr, const char *zFormat, ...){
+  va_list ap;
+  char *z;
+  va_start(ap, zFormat);
+  z = sqlite3VMPrintf(db, zFormat, ap);
+  va_end(ap);
+  sqlite3DbFree(db, zStr);
+  return z;
+}
+
+/*
+** Print into memory obtained from sqlite3_malloc().  Omit the internal
+** %-conversion extensions.
+*/
+SQLITE_API char *sqlite3_vmprintf(const char *zFormat, va_list ap){
+  char *z;
+  char zBase[SQLITE_PRINT_BUF_SIZE];
+  StrAccum acc;
+
+#ifdef SQLITE_ENABLE_API_ARMOR  
+  if( zFormat==0 ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return 0;
+#endif
+  sqlite3StrAccumInit(&acc, zBase, sizeof(zBase), SQLITE_MAX_LENGTH);
+  acc.useMalloc = 2;
+  sqlite3VXPrintf(&acc, 0, zFormat, ap);
+  z = sqlite3StrAccumFinish(&acc);
+  return z;
+}
+
+/*
+** Print into memory obtained from sqlite3_malloc()().  Omit the internal
+** %-conversion extensions.
+*/
+SQLITE_API char *sqlite3_mprintf(const char *zFormat, ...){
+  va_list ap;
+  char *z;
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return 0;
+#endif
+  va_start(ap, zFormat);
+  z = sqlite3_vmprintf(zFormat, ap);
+  va_end(ap);
+  return z;
+}
+
+/*
+** sqlite3_snprintf() works like snprintf() except that it ignores the
+** current locale settings.  This is important for SQLite because we
+** are not able to use a "," as the decimal point in place of "." as
+** specified by some locales.
+**
+** Oops:  The first two arguments of sqlite3_snprintf() are backwards
+** from the snprintf() standard.  Unfortunately, it is too late to change
+** this without breaking compatibility, so we just have to live with the
+** mistake.
+**
+** sqlite3_vsnprintf() is the varargs version.
+*/
+SQLITE_API char *sqlite3_vsnprintf(int n, char *zBuf, const char *zFormat, va_list ap){
+  StrAccum acc;
+  if( n<=0 ) return zBuf;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( zBuf==0 || zFormat==0 ) {
+    (void)SQLITE_MISUSE_BKPT;
+    if( zBuf && n>0 ) zBuf[0] = 0;
+    return zBuf;
+  }
+#endif
+  sqlite3StrAccumInit(&acc, zBuf, n, 0);
+  acc.useMalloc = 0;
+  sqlite3VXPrintf(&acc, 0, zFormat, ap);
+  return sqlite3StrAccumFinish(&acc);
+}
+SQLITE_API char *sqlite3_snprintf(int n, char *zBuf, const char *zFormat, ...){
+  char *z;
+  va_list ap;
+  va_start(ap,zFormat);
+  z = sqlite3_vsnprintf(n, zBuf, zFormat, ap);
+  va_end(ap);
+  return z;
+}
+
+/*
+** This is the routine that actually formats the sqlite3_log() message.
+** We house it in a separate routine from sqlite3_log() to avoid using
+** stack space on small-stack systems when logging is disabled.
+**
+** sqlite3_log() must render into a static buffer.  It cannot dynamically
+** allocate memory because it might be called while the memory allocator
+** mutex is held.
+*/
+static void renderLogMsg(int iErrCode, const char *zFormat, va_list ap){
+  StrAccum acc;                          /* String accumulator */
+  char zMsg[SQLITE_PRINT_BUF_SIZE*3];    /* Complete log message */
+
+  sqlite3StrAccumInit(&acc, zMsg, sizeof(zMsg), 0);
+  acc.useMalloc = 0;
+  sqlite3VXPrintf(&acc, 0, zFormat, ap);
+  sqlite3GlobalConfig.xLog(sqlite3GlobalConfig.pLogArg, iErrCode,
