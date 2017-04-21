@@ -21424,3 +21424,236 @@ SQLITE_PRIVATE void sqlite3VXPrintf(
             prefix = '-';
           }else{
             longvalue = v;
+            if( flag_plussign )        prefix = '+';
+            else if( flag_blanksign )  prefix = ' ';
+            else                       prefix = 0;
+          }
+        }else{
+          if( bArgList ){
+            longvalue = (u64)getIntArg(pArgList);
+          }else if( flag_longlong ){
+            longvalue = va_arg(ap,u64);
+          }else if( flag_long ){
+            longvalue = va_arg(ap,unsigned long int);
+          }else{
+            longvalue = va_arg(ap,unsigned int);
+          }
+          prefix = 0;
+        }
+        if( longvalue==0 ) flag_alternateform = 0;
+        if( flag_zeropad && precision<width-(prefix!=0) ){
+          precision = width-(prefix!=0);
+        }
+        if( precision<etBUFSIZE-10 ){
+          nOut = etBUFSIZE;
+          zOut = buf;
+        }else{
+          nOut = precision + 10;
+          zOut = zExtra = sqlite3Malloc( nOut );
+          if( zOut==0 ){
+            setStrAccumError(pAccum, STRACCUM_NOMEM);
+            return;
+          }
+        }
+        bufpt = &zOut[nOut-1];
+        if( xtype==etORDINAL ){
+          static const char zOrd[] = "thstndrd";
+          int x = (int)(longvalue % 10);
+          if( x>=4 || (longvalue/10)%10==1 ){
+            x = 0;
+          }
+          *(--bufpt) = zOrd[x*2+1];
+          *(--bufpt) = zOrd[x*2];
+        }
+        {
+          const char *cset = &aDigits[infop->charset];
+          u8 base = infop->base;
+          do{                                           /* Convert to ascii */
+            *(--bufpt) = cset[longvalue%base];
+            longvalue = longvalue/base;
+          }while( longvalue>0 );
+        }
+        length = (int)(&zOut[nOut-1]-bufpt);
+        for(idx=precision-length; idx>0; idx--){
+          *(--bufpt) = '0';                             /* Zero pad */
+        }
+        if( prefix ) *(--bufpt) = prefix;               /* Add sign */
+        if( flag_alternateform && infop->prefix ){      /* Add "0" or "0x" */
+          const char *pre;
+          char x;
+          pre = &aPrefix[infop->prefix];
+          for(; (x=(*pre))!=0; pre++) *(--bufpt) = x;
+        }
+        length = (int)(&zOut[nOut-1]-bufpt);
+        break;
+      case etFLOAT:
+      case etEXP:
+      case etGENERIC:
+        if( bArgList ){
+          realvalue = getDoubleArg(pArgList);
+        }else{
+          realvalue = va_arg(ap,double);
+        }
+#ifdef SQLITE_OMIT_FLOATING_POINT
+        length = 0;
+#else
+        if( precision<0 ) precision = 6;         /* Set default precision */
+        if( realvalue<0.0 ){
+          realvalue = -realvalue;
+          prefix = '-';
+        }else{
+          if( flag_plussign )          prefix = '+';
+          else if( flag_blanksign )    prefix = ' ';
+          else                         prefix = 0;
+        }
+        if( xtype==etGENERIC && precision>0 ) precision--;
+        for(idx=precision, rounder=0.5; idx>0; idx--, rounder*=0.1){}
+        if( xtype==etFLOAT ) realvalue += rounder;
+        /* Normalize realvalue to within 10.0 > realvalue >= 1.0 */
+        exp = 0;
+        if( sqlite3IsNaN((double)realvalue) ){
+          bufpt = "NaN";
+          length = 3;
+          break;
+        }
+        if( realvalue>0.0 ){
+          LONGDOUBLE_TYPE scale = 1.0;
+          while( realvalue>=1e100*scale && exp<=350 ){ scale *= 1e100;exp+=100;}
+          while( realvalue>=1e64*scale && exp<=350 ){ scale *= 1e64; exp+=64; }
+          while( realvalue>=1e8*scale && exp<=350 ){ scale *= 1e8; exp+=8; }
+          while( realvalue>=10.0*scale && exp<=350 ){ scale *= 10.0; exp++; }
+          realvalue /= scale;
+          while( realvalue<1e-8 ){ realvalue *= 1e8; exp-=8; }
+          while( realvalue<1.0 ){ realvalue *= 10.0; exp--; }
+          if( exp>350 ){
+            if( prefix=='-' ){
+              bufpt = "-Inf";
+            }else if( prefix=='+' ){
+              bufpt = "+Inf";
+            }else{
+              bufpt = "Inf";
+            }
+            length = sqlite3Strlen30(bufpt);
+            break;
+          }
+        }
+        bufpt = buf;
+        /*
+        ** If the field type is etGENERIC, then convert to either etEXP
+        ** or etFLOAT, as appropriate.
+        */
+        if( xtype!=etFLOAT ){
+          realvalue += rounder;
+          if( realvalue>=10.0 ){ realvalue *= 0.1; exp++; }
+        }
+        if( xtype==etGENERIC ){
+          flag_rtz = !flag_alternateform;
+          if( exp<-4 || exp>precision ){
+            xtype = etEXP;
+          }else{
+            precision = precision - exp;
+            xtype = etFLOAT;
+          }
+        }else{
+          flag_rtz = flag_altform2;
+        }
+        if( xtype==etEXP ){
+          e2 = 0;
+        }else{
+          e2 = exp;
+        }
+        if( MAX(e2,0)+precision+width > etBUFSIZE - 15 ){
+          bufpt = zExtra = sqlite3Malloc( MAX(e2,0)+precision+width+15 );
+          if( bufpt==0 ){
+            setStrAccumError(pAccum, STRACCUM_NOMEM);
+            return;
+          }
+        }
+        zOut = bufpt;
+        nsd = 16 + flag_altform2*10;
+        flag_dp = (precision>0 ?1:0) | flag_alternateform | flag_altform2;
+        /* The sign in front of the number */
+        if( prefix ){
+          *(bufpt++) = prefix;
+        }
+        /* Digits prior to the decimal point */
+        if( e2<0 ){
+          *(bufpt++) = '0';
+        }else{
+          for(; e2>=0; e2--){
+            *(bufpt++) = et_getdigit(&realvalue,&nsd);
+          }
+        }
+        /* The decimal point */
+        if( flag_dp ){
+          *(bufpt++) = '.';
+        }
+        /* "0" digits after the decimal point but before the first
+        ** significant digit of the number */
+        for(e2++; e2<0; precision--, e2++){
+          assert( precision>0 );
+          *(bufpt++) = '0';
+        }
+        /* Significant digits after the decimal point */
+        while( (precision--)>0 ){
+          *(bufpt++) = et_getdigit(&realvalue,&nsd);
+        }
+        /* Remove trailing zeros and the "." if no digits follow the "." */
+        if( flag_rtz && flag_dp ){
+          while( bufpt[-1]=='0' ) *(--bufpt) = 0;
+          assert( bufpt>zOut );
+          if( bufpt[-1]=='.' ){
+            if( flag_altform2 ){
+              *(bufpt++) = '0';
+            }else{
+              *(--bufpt) = 0;
+            }
+          }
+        }
+        /* Add the "eNNN" suffix */
+        if( xtype==etEXP ){
+          *(bufpt++) = aDigits[infop->charset];
+          if( exp<0 ){
+            *(bufpt++) = '-'; exp = -exp;
+          }else{
+            *(bufpt++) = '+';
+          }
+          if( exp>=100 ){
+            *(bufpt++) = (char)((exp/100)+'0');        /* 100's digit */
+            exp %= 100;
+          }
+          *(bufpt++) = (char)(exp/10+'0');             /* 10's digit */
+          *(bufpt++) = (char)(exp%10+'0');             /* 1's digit */
+        }
+        *bufpt = 0;
+
+        /* The converted number is in buf[] and zero terminated. Output it.
+        ** Note that the number is in the usual order, not reversed as with
+        ** integer conversions. */
+        length = (int)(bufpt-zOut);
+        bufpt = zOut;
+
+        /* Special case:  Add leading zeros if the flag_zeropad flag is
+        ** set and we are not left justified */
+        if( flag_zeropad && !flag_leftjustify && length < width){
+          int i;
+          int nPad = width - length;
+          for(i=width; i>=nPad; i--){
+            bufpt[i] = bufpt[i-nPad];
+          }
+          i = prefix!=0;
+          while( nPad-- ) bufpt[i++] = '0';
+          length = width;
+        }
+#endif /* !defined(SQLITE_OMIT_FLOATING_POINT) */
+        break;
+      case etSIZE:
+        if( !bArgList ){
+          *(va_arg(ap,int*)) = pAccum->nChar;
+        }
+        length = width = 0;
+        break;
+      case etPERCENT:
+        buf[0] = '%';
+        bufpt = buf;
+        length = 1;
