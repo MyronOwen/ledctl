@@ -22087,3 +22087,203 @@ static void renderLogMsg(int iErrCode, const char *zFormat, va_list ap){
   acc.useMalloc = 0;
   sqlite3VXPrintf(&acc, 0, zFormat, ap);
   sqlite3GlobalConfig.xLog(sqlite3GlobalConfig.pLogArg, iErrCode,
+                           sqlite3StrAccumFinish(&acc));
+}
+
+/*
+** Format and write a message to the log if logging is enabled.
+*/
+SQLITE_API void sqlite3_log(int iErrCode, const char *zFormat, ...){
+  va_list ap;                             /* Vararg list */
+  if( sqlite3GlobalConfig.xLog ){
+    va_start(ap, zFormat);
+    renderLogMsg(iErrCode, zFormat, ap);
+    va_end(ap);
+  }
+}
+
+#if defined(SQLITE_DEBUG)
+/*
+** A version of printf() that understands %lld.  Used for debugging.
+** The printf() built into some versions of windows does not understand %lld
+** and segfaults if you give it a long long int.
+*/
+SQLITE_PRIVATE void sqlite3DebugPrintf(const char *zFormat, ...){
+  va_list ap;
+  StrAccum acc;
+  char zBuf[500];
+  sqlite3StrAccumInit(&acc, zBuf, sizeof(zBuf), 0);
+  acc.useMalloc = 0;
+  va_start(ap,zFormat);
+  sqlite3VXPrintf(&acc, 0, zFormat, ap);
+  va_end(ap);
+  sqlite3StrAccumFinish(&acc);
+  fprintf(stdout,"%s", zBuf);
+  fflush(stdout);
+}
+#endif
+
+#ifdef SQLITE_DEBUG
+/*************************************************************************
+** Routines for implementing the "TreeView" display of hierarchical
+** data structures for debugging.
+**
+** The main entry points (coded elsewhere) are:
+**     sqlite3TreeViewExpr(0, pExpr, 0);
+**     sqlite3TreeViewExprList(0, pList, 0, 0);
+**     sqlite3TreeViewSelect(0, pSelect, 0);
+** Insert calls to those routines while debugging in order to display
+** a diagram of Expr, ExprList, and Select objects.
+**
+*/
+/* Add a new subitem to the tree.  The moreToFollow flag indicates that this
+** is not the last item in the tree. */
+SQLITE_PRIVATE TreeView *sqlite3TreeViewPush(TreeView *p, u8 moreToFollow){
+  if( p==0 ){
+    p = sqlite3_malloc( sizeof(*p) );
+    if( p==0 ) return 0;
+    memset(p, 0, sizeof(*p));
+  }else{
+    p->iLevel++;
+  }
+  assert( moreToFollow==0 || moreToFollow==1 );
+  if( p->iLevel<sizeof(p->bLine) ) p->bLine[p->iLevel] = moreToFollow;
+  return p;
+}
+/* Finished with one layer of the tree */
+SQLITE_PRIVATE void sqlite3TreeViewPop(TreeView *p){
+  if( p==0 ) return;
+  p->iLevel--;
+  if( p->iLevel<0 ) sqlite3_free(p);
+}
+/* Generate a single line of output for the tree, with a prefix that contains
+** all the appropriate tree lines */
+SQLITE_PRIVATE void sqlite3TreeViewLine(TreeView *p, const char *zFormat, ...){
+  va_list ap;
+  int i;
+  StrAccum acc;
+  char zBuf[500];
+  sqlite3StrAccumInit(&acc, zBuf, sizeof(zBuf), 0);
+  acc.useMalloc = 0;
+  if( p ){
+    for(i=0; i<p->iLevel && i<sizeof(p->bLine)-1; i++){
+      sqlite3StrAccumAppend(&acc, p->bLine[i] ? "|   " : "    ", 4);
+    }
+    sqlite3StrAccumAppend(&acc, p->bLine[i] ? "|-- " : "'-- ", 4);
+  }
+  va_start(ap, zFormat);
+  sqlite3VXPrintf(&acc, 0, zFormat, ap);
+  va_end(ap);
+  if( zBuf[acc.nChar-1]!='\n' ) sqlite3StrAccumAppend(&acc, "\n", 1);
+  sqlite3StrAccumFinish(&acc);
+  fprintf(stdout,"%s", zBuf);
+  fflush(stdout);
+}
+/* Shorthand for starting a new tree item that consists of a single label */
+SQLITE_PRIVATE void sqlite3TreeViewItem(TreeView *p, const char *zLabel, u8 moreToFollow){
+  p = sqlite3TreeViewPush(p, moreToFollow);
+  sqlite3TreeViewLine(p, "%s", zLabel);
+}
+#endif /* SQLITE_DEBUG */
+
+/*
+** variable-argument wrapper around sqlite3VXPrintf().
+*/
+SQLITE_PRIVATE void sqlite3XPrintf(StrAccum *p, u32 bFlags, const char *zFormat, ...){
+  va_list ap;
+  va_start(ap,zFormat);
+  sqlite3VXPrintf(p, bFlags, zFormat, ap);
+  va_end(ap);
+}
+
+/************** End of printf.c **********************************************/
+/************** Begin file random.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code to implement a pseudo-random number
+** generator (PRNG) for SQLite.
+**
+** Random numbers are used by some of the database backends in order
+** to generate random integer keys for tables or random filenames.
+*/
+
+
+/* All threads share a single random number generator.
+** This structure is the current state of the generator.
+*/
+static SQLITE_WSD struct sqlite3PrngType {
+  unsigned char isInit;          /* True if initialized */
+  unsigned char i, j;            /* State variables */
+  unsigned char s[256];          /* State variables */
+} sqlite3Prng;
+
+/*
+** Return N random bytes.
+*/
+SQLITE_API void sqlite3_randomness(int N, void *pBuf){
+  unsigned char t;
+  unsigned char *zBuf = pBuf;
+
+  /* The "wsdPrng" macro will resolve to the pseudo-random number generator
+  ** state vector.  If writable static data is unsupported on the target,
+  ** we have to locate the state vector at run-time.  In the more common
+  ** case where writable static data is supported, wsdPrng can refer directly
+  ** to the "sqlite3Prng" state vector declared above.
+  */
+#ifdef SQLITE_OMIT_WSD
+  struct sqlite3PrngType *p = &GLOBAL(struct sqlite3PrngType, sqlite3Prng);
+# define wsdPrng p[0]
+#else
+# define wsdPrng sqlite3Prng
+#endif
+
+#if SQLITE_THREADSAFE
+  sqlite3_mutex *mutex;
+#endif
+
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return;
+#endif
+
+#if SQLITE_THREADSAFE
+  mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_PRNG);
+#endif
+
+  sqlite3_mutex_enter(mutex);
+  if( N<=0 || pBuf==0 ){
+    wsdPrng.isInit = 0;
+    sqlite3_mutex_leave(mutex);
+    return;
+  }
+
+  /* Initialize the state of the random number generator once,
+  ** the first time this routine is called.  The seed value does
+  ** not need to contain a lot of randomness since we are not
+  ** trying to do secure encryption or anything like that...
+  **
+  ** Nothing in this file or anywhere else in SQLite does any kind of
+  ** encryption.  The RC4 algorithm is being used as a PRNG (pseudo-random
+  ** number generator) not as an encryption device.
+  */
+  if( !wsdPrng.isInit ){
+    int i;
+    char k[256];
+    wsdPrng.j = 0;
+    wsdPrng.i = 0;
+    sqlite3OsRandomness(sqlite3_vfs_find(0), 256, k);
+    for(i=0; i<256; i++){
+      wsdPrng.s[i] = (u8)i;
+    }
+    for(i=0; i<256; i++){
+      wsdPrng.j += wsdPrng.s[i] + k[i];
+      t = wsdPrng.s[wsdPrng.j];
+      wsdPrng.s[wsdPrng.j] = wsdPrng.s[i];
