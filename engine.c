@@ -24403,3 +24403,256 @@ SQLITE_PRIVATE int sqlite3AbsInt32(int x){
 ** three characters, then shorten the suffix on z[] to be the last three
 ** characters of the original suffix.
 **
+** If SQLITE_ENABLE_8_3_NAMES is set to 2 at compile-time, then always
+** do the suffix shortening regardless of URI parameter.
+**
+** Examples:
+**
+**     test.db-journal    =>   test.nal
+**     test.db-wal        =>   test.wal
+**     test.db-shm        =>   test.shm
+**     test.db-mj7f3319fa =>   test.9fa
+*/
+SQLITE_PRIVATE void sqlite3FileSuffix3(const char *zBaseFilename, char *z){
+#if SQLITE_ENABLE_8_3_NAMES<2
+  if( sqlite3_uri_boolean(zBaseFilename, "8_3_names", 0) )
+#endif
+  {
+    int i, sz;
+    sz = sqlite3Strlen30(z);
+    for(i=sz-1; i>0 && z[i]!='/' && z[i]!='.'; i--){}
+    if( z[i]=='.' && ALWAYS(sz>i+4) ) memmove(&z[i+1], &z[sz-3], 4);
+  }
+}
+#endif
+
+/* 
+** Find (an approximate) sum of two LogEst values.  This computation is
+** not a simple "+" operator because LogEst is stored as a logarithmic
+** value.
+** 
+*/
+SQLITE_PRIVATE LogEst sqlite3LogEstAdd(LogEst a, LogEst b){
+  static const unsigned char x[] = {
+     10, 10,                         /* 0,1 */
+      9, 9,                          /* 2,3 */
+      8, 8,                          /* 4,5 */
+      7, 7, 7,                       /* 6,7,8 */
+      6, 6, 6,                       /* 9,10,11 */
+      5, 5, 5,                       /* 12-14 */
+      4, 4, 4, 4,                    /* 15-18 */
+      3, 3, 3, 3, 3, 3,              /* 19-24 */
+      2, 2, 2, 2, 2, 2, 2,           /* 25-31 */
+  };
+  if( a>=b ){
+    if( a>b+49 ) return a;
+    if( a>b+31 ) return a+1;
+    return a+x[a-b];
+  }else{
+    if( b>a+49 ) return b;
+    if( b>a+31 ) return b+1;
+    return b+x[b-a];
+  }
+}
+
+/*
+** Convert an integer into a LogEst.  In other words, compute an
+** approximation for 10*log2(x).
+*/
+SQLITE_PRIVATE LogEst sqlite3LogEst(u64 x){
+  static LogEst a[] = { 0, 2, 3, 5, 6, 7, 8, 9 };
+  LogEst y = 40;
+  if( x<8 ){
+    if( x<2 ) return 0;
+    while( x<8 ){  y -= 10; x <<= 1; }
+  }else{
+    while( x>255 ){ y += 40; x >>= 4; }
+    while( x>15 ){  y += 10; x >>= 1; }
+  }
+  return a[x&7] + y - 10;
+}
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/*
+** Convert a double into a LogEst
+** In other words, compute an approximation for 10*log2(x).
+*/
+SQLITE_PRIVATE LogEst sqlite3LogEstFromDouble(double x){
+  u64 a;
+  LogEst e;
+  assert( sizeof(x)==8 && sizeof(a)==8 );
+  if( x<=1 ) return 0;
+  if( x<=2000000000 ) return sqlite3LogEst((u64)x);
+  memcpy(&a, &x, 8);
+  e = (a>>52) - 1022;
+  return e*10;
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+/*
+** Convert a LogEst into an integer.
+*/
+SQLITE_PRIVATE u64 sqlite3LogEstToInt(LogEst x){
+  u64 n;
+  if( x<10 ) return 1;
+  n = x%10;
+  x /= 10;
+  if( n>=5 ) n -= 2;
+  else if( n>=1 ) n -= 1;
+  if( x>=3 ){
+    return x>60 ? (u64)LARGEST_INT64 : (n+8)<<(x-3);
+  }
+  return (n+8)>>(3-x);
+}
+
+/************** End of util.c ************************************************/
+/************** Begin file hash.c ********************************************/
+/*
+** 2001 September 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This is the implementation of generic hash-tables
+** used in SQLite.
+*/
+/* #include <assert.h> */
+
+/* Turn bulk memory into a hash table object by initializing the
+** fields of the Hash structure.
+**
+** "pNew" is a pointer to the hash table that is to be initialized.
+*/
+SQLITE_PRIVATE void sqlite3HashInit(Hash *pNew){
+  assert( pNew!=0 );
+  pNew->first = 0;
+  pNew->count = 0;
+  pNew->htsize = 0;
+  pNew->ht = 0;
+}
+
+/* Remove all entries from a hash table.  Reclaim all memory.
+** Call this routine to delete a hash table or to reset a hash table
+** to the empty state.
+*/
+SQLITE_PRIVATE void sqlite3HashClear(Hash *pH){
+  HashElem *elem;         /* For looping over all elements of the table */
+
+  assert( pH!=0 );
+  elem = pH->first;
+  pH->first = 0;
+  sqlite3_free(pH->ht);
+  pH->ht = 0;
+  pH->htsize = 0;
+  while( elem ){
+    HashElem *next_elem = elem->next;
+    sqlite3_free(elem);
+    elem = next_elem;
+  }
+  pH->count = 0;
+}
+
+/*
+** The hashing function.
+*/
+static unsigned int strHash(const char *z){
+  unsigned int h = 0;
+  unsigned char c;
+  while( (c = (unsigned char)*z++)!=0 ){
+    h = (h<<3) ^ h ^ sqlite3UpperToLower[c];
+  }
+  return h;
+}
+
+
+/* Link pNew element into the hash table pH.  If pEntry!=0 then also
+** insert pNew into the pEntry hash bucket.
+*/
+static void insertElement(
+  Hash *pH,              /* The complete hash table */
+  struct _ht *pEntry,    /* The entry into which pNew is inserted */
+  HashElem *pNew         /* The element to be inserted */
+){
+  HashElem *pHead;       /* First element already in pEntry */
+  if( pEntry ){
+    pHead = pEntry->count ? pEntry->chain : 0;
+    pEntry->count++;
+    pEntry->chain = pNew;
+  }else{
+    pHead = 0;
+  }
+  if( pHead ){
+    pNew->next = pHead;
+    pNew->prev = pHead->prev;
+    if( pHead->prev ){ pHead->prev->next = pNew; }
+    else             { pH->first = pNew; }
+    pHead->prev = pNew;
+  }else{
+    pNew->next = pH->first;
+    if( pH->first ){ pH->first->prev = pNew; }
+    pNew->prev = 0;
+    pH->first = pNew;
+  }
+}
+
+
+/* Resize the hash table so that it cantains "new_size" buckets.
+**
+** The hash table might fail to resize if sqlite3_malloc() fails or
+** if the new size is the same as the prior size.
+** Return TRUE if the resize occurs and false if not.
+*/
+static int rehash(Hash *pH, unsigned int new_size){
+  struct _ht *new_ht;            /* The new hash table */
+  HashElem *elem, *next_elem;    /* For looping over existing elements */
+
+#if SQLITE_MALLOC_SOFT_LIMIT>0
+  if( new_size*sizeof(struct _ht)>SQLITE_MALLOC_SOFT_LIMIT ){
+    new_size = SQLITE_MALLOC_SOFT_LIMIT/sizeof(struct _ht);
+  }
+  if( new_size==pH->htsize ) return 0;
+#endif
+
+  /* The inability to allocates space for a larger hash table is
+  ** a performance hit but it is not a fatal error.  So mark the
+  ** allocation as a benign. Use sqlite3Malloc()/memset(0) instead of 
+  ** sqlite3MallocZero() to make the allocation, as sqlite3MallocZero()
+  ** only zeroes the requested number of bytes whereas this module will
+  ** use the actual amount of space allocated for the hash table (which
+  ** may be larger than the requested amount).
+  */
+  sqlite3BeginBenignMalloc();
+  new_ht = (struct _ht *)sqlite3Malloc( new_size*sizeof(struct _ht) );
+  sqlite3EndBenignMalloc();
+
+  if( new_ht==0 ) return 0;
+  sqlite3_free(pH->ht);
+  pH->ht = new_ht;
+  pH->htsize = new_size = sqlite3MallocSize(new_ht)/sizeof(struct _ht);
+  memset(new_ht, 0, new_size*sizeof(struct _ht));
+  for(elem=pH->first, pH->first=0; elem; elem = next_elem){
+    unsigned int h = strHash(elem->pKey) % new_size;
+    next_elem = elem->next;
+    insertElement(pH, &new_ht[h], elem);
+  }
+  return 1;
+}
+
+/* This function (for internal use only) locates an element in an
+** hash table that matches the given key.  The hash for this key is
+** also computed and returned in the *pH parameter.
+*/
+static HashElem *findElementWithHash(
+  const Hash *pH,     /* The pH to be searched */
+  const char *pKey,   /* The key we are searching for */
+  unsigned int *pHash /* Write the hash value here */
+){
+  HashElem *elem;                /* Used to loop thru the element list */
+  int count;                     /* Number of elements left to test */
+  unsigned int h;                /* The computed hash */
+
