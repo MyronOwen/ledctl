@@ -23202,3 +23202,232 @@ SQLITE_PRIVATE int sqlite3IsNaN(double x){
   ** warning:
   **
   **      This option [-ffast-math] should never be turned on by any
+  **      -O option since it can result in incorrect output for programs
+  **      which depend on an exact implementation of IEEE or ISO 
+  **      rules/specifications for math functions.
+  **
+  ** Under MSVC, this NaN test may fail if compiled with a floating-
+  ** point precision mode other than /fp:precise.  From the MSDN 
+  ** documentation:
+  **
+  **      The compiler [with /fp:precise] will properly handle comparisons 
+  **      involving NaN. For example, x != x evaluates to true if x is NaN 
+  **      ...
+  */
+#ifdef __FAST_MATH__
+# error SQLite will not work correctly with the -ffast-math option of GCC.
+#endif
+  volatile double y = x;
+  volatile double z = y;
+  rc = (y!=z);
+#else  /* if HAVE_ISNAN */
+  rc = isnan(x);
+#endif /* HAVE_ISNAN */
+  testcase( rc );
+  return rc;
+}
+#endif /* SQLITE_OMIT_FLOATING_POINT */
+
+/*
+** Compute a string length that is limited to what can be stored in
+** lower 30 bits of a 32-bit signed integer.
+**
+** The value returned will never be negative.  Nor will it ever be greater
+** than the actual length of the string.  For very long strings (greater
+** than 1GiB) the value returned might be less than the true string length.
+*/
+SQLITE_PRIVATE int sqlite3Strlen30(const char *z){
+  const char *z2 = z;
+  if( z==0 ) return 0;
+  while( *z2 ){ z2++; }
+  return 0x3fffffff & (int)(z2 - z);
+}
+
+/*
+** Set the current error code to err_code and clear any prior error message.
+*/
+SQLITE_PRIVATE void sqlite3Error(sqlite3 *db, int err_code){
+  assert( db!=0 );
+  db->errCode = err_code;
+  if( db->pErr ) sqlite3ValueSetNull(db->pErr);
+}
+
+/*
+** Set the most recent error code and error string for the sqlite
+** handle "db". The error code is set to "err_code".
+**
+** If it is not NULL, string zFormat specifies the format of the
+** error string in the style of the printf functions: The following
+** format characters are allowed:
+**
+**      %s      Insert a string
+**      %z      A string that should be freed after use
+**      %d      Insert an integer
+**      %T      Insert a token
+**      %S      Insert the first element of a SrcList
+**
+** zFormat and any string tokens that follow it are assumed to be
+** encoded in UTF-8.
+**
+** To clear the most recent error for sqlite handle "db", sqlite3Error
+** should be called with err_code set to SQLITE_OK and zFormat set
+** to NULL.
+*/
+SQLITE_PRIVATE void sqlite3ErrorWithMsg(sqlite3 *db, int err_code, const char *zFormat, ...){
+  assert( db!=0 );
+  db->errCode = err_code;
+  if( zFormat==0 ){
+    sqlite3Error(db, err_code);
+  }else if( db->pErr || (db->pErr = sqlite3ValueNew(db))!=0 ){
+    char *z;
+    va_list ap;
+    va_start(ap, zFormat);
+    z = sqlite3VMPrintf(db, zFormat, ap);
+    va_end(ap);
+    sqlite3ValueSetStr(db->pErr, -1, z, SQLITE_UTF8, SQLITE_DYNAMIC);
+  }
+}
+
+/*
+** Add an error message to pParse->zErrMsg and increment pParse->nErr.
+** The following formatting characters are allowed:
+**
+**      %s      Insert a string
+**      %z      A string that should be freed after use
+**      %d      Insert an integer
+**      %T      Insert a token
+**      %S      Insert the first element of a SrcList
+**
+** This function should be used to report any error that occurs while
+** compiling an SQL statement (i.e. within sqlite3_prepare()). The
+** last thing the sqlite3_prepare() function does is copy the error
+** stored by this function into the database handle using sqlite3Error().
+** Functions sqlite3Error() or sqlite3ErrorWithMsg() should be used
+** during statement execution (sqlite3_step() etc.).
+*/
+SQLITE_PRIVATE void sqlite3ErrorMsg(Parse *pParse, const char *zFormat, ...){
+  char *zMsg;
+  va_list ap;
+  sqlite3 *db = pParse->db;
+  va_start(ap, zFormat);
+  zMsg = sqlite3VMPrintf(db, zFormat, ap);
+  va_end(ap);
+  if( db->suppressErr ){
+    sqlite3DbFree(db, zMsg);
+  }else{
+    pParse->nErr++;
+    sqlite3DbFree(db, pParse->zErrMsg);
+    pParse->zErrMsg = zMsg;
+    pParse->rc = SQLITE_ERROR;
+  }
+}
+
+/*
+** Convert an SQL-style quoted string into a normal string by removing
+** the quote characters.  The conversion is done in-place.  If the
+** input does not begin with a quote character, then this routine
+** is a no-op.
+**
+** The input string must be zero-terminated.  A new zero-terminator
+** is added to the dequoted string.
+**
+** The return value is -1 if no dequoting occurs or the length of the
+** dequoted string, exclusive of the zero terminator, if dequoting does
+** occur.
+**
+** 2002-Feb-14: This routine is extended to remove MS-Access style
+** brackets from around identifiers.  For example:  "[a-b-c]" becomes
+** "a-b-c".
+*/
+SQLITE_PRIVATE int sqlite3Dequote(char *z){
+  char quote;
+  int i, j;
+  if( z==0 ) return -1;
+  quote = z[0];
+  switch( quote ){
+    case '\'':  break;
+    case '"':   break;
+    case '`':   break;                /* For MySQL compatibility */
+    case '[':   quote = ']';  break;  /* For MS SqlServer compatibility */
+    default:    return -1;
+  }
+  for(i=1, j=0;; i++){
+    assert( z[i] );
+    if( z[i]==quote ){
+      if( z[i+1]==quote ){
+        z[j++] = quote;
+        i++;
+      }else{
+        break;
+      }
+    }else{
+      z[j++] = z[i];
+    }
+  }
+  z[j] = 0;
+  return j;
+}
+
+/* Convenient short-hand */
+#define UpperToLower sqlite3UpperToLower
+
+/*
+** Some systems have stricmp().  Others have strcasecmp().  Because
+** there is no consistency, we will define our own.
+**
+** IMPLEMENTATION-OF: R-30243-02494 The sqlite3_stricmp() and
+** sqlite3_strnicmp() APIs allow applications and extensions to compare
+** the contents of two buffers containing UTF-8 strings in a
+** case-independent fashion, using the same definition of "case
+** independence" that SQLite uses internally when comparing identifiers.
+*/
+SQLITE_API int sqlite3_stricmp(const char *zLeft, const char *zRight){
+  register unsigned char *a, *b;
+  if( zLeft==0 ){
+    return zRight ? -1 : 0;
+  }else if( zRight==0 ){
+    return 1;
+  }
+  a = (unsigned char *)zLeft;
+  b = (unsigned char *)zRight;
+  while( *a!=0 && UpperToLower[*a]==UpperToLower[*b]){ a++; b++; }
+  return UpperToLower[*a] - UpperToLower[*b];
+}
+SQLITE_API int sqlite3_strnicmp(const char *zLeft, const char *zRight, int N){
+  register unsigned char *a, *b;
+  if( zLeft==0 ){
+    return zRight ? -1 : 0;
+  }else if( zRight==0 ){
+    return 1;
+  }
+  a = (unsigned char *)zLeft;
+  b = (unsigned char *)zRight;
+  while( N-- > 0 && *a!=0 && UpperToLower[*a]==UpperToLower[*b]){ a++; b++; }
+  return N<0 ? 0 : UpperToLower[*a] - UpperToLower[*b];
+}
+
+/*
+** The string z[] is an text representation of a real number.
+** Convert this string to a double and write it into *pResult.
+**
+** The string z[] is length bytes in length (bytes, not characters) and
+** uses the encoding enc.  The string is not necessarily zero-terminated.
+**
+** Return TRUE if the result is a valid real number (or integer) and FALSE
+** if the string is empty or contains extraneous text.  Valid numbers
+** are in one of these formats:
+**
+**    [+-]digits[E[+-]digits]
+**    [+-]digits.[digits][E[+-]digits]
+**    [+-].digits[E[+-]digits]
+**
+** Leading and trailing whitespace is ignored for the purpose of determining
+** validity.
+**
+** If some prefix of the input string is a valid number, this routine
+** returns FALSE but it still converts the prefix and writes the result
+** into *pResult.
+*/
+SQLITE_PRIVATE int sqlite3AtoF(const char *z, double *pResult, int length, u8 enc){
+#ifndef SQLITE_OMIT_FLOATING_POINT
+  int incr;
