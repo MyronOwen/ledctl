@@ -24156,3 +24156,250 @@ SQLITE_PRIVATE u8 sqlite3GetVarint32(const unsigned char *p, u32 *v){
   {
     /* Values between 2097152 and 268435455 */
     b &= (0x7f<<14)|(0x7f);
+    a &= (0x7f<<14)|(0x7f);
+    a = a<<7;
+    *v = a | b;
+    return 4;
+  }
+
+  p++;
+  a = a<<14;
+  a |= *p;
+  /* a: p0<<28 | p2<<14 | p4 (unmasked) */
+  if (!(a&0x80))
+  {
+    /* Values  between 268435456 and 34359738367 */
+    a &= SLOT_4_2_0;
+    b &= SLOT_4_2_0;
+    b = b<<7;
+    *v = a | b;
+    return 5;
+  }
+
+  /* We can only reach this point when reading a corrupt database
+  ** file.  In that case we are not in any hurry.  Use the (relatively
+  ** slow) general-purpose sqlite3GetVarint() routine to extract the
+  ** value. */
+  {
+    u64 v64;
+    u8 n;
+
+    p -= 4;
+    n = sqlite3GetVarint(p, &v64);
+    assert( n>5 && n<=9 );
+    *v = (u32)v64;
+    return n;
+  }
+#endif
+}
+
+/*
+** Return the number of bytes that will be needed to store the given
+** 64-bit integer.
+*/
+SQLITE_PRIVATE int sqlite3VarintLen(u64 v){
+  int i = 0;
+  do{
+    i++;
+    v >>= 7;
+  }while( v!=0 && ALWAYS(i<9) );
+  return i;
+}
+
+
+/*
+** Read or write a four-byte big-endian integer value.
+*/
+SQLITE_PRIVATE u32 sqlite3Get4byte(const u8 *p){
+  testcase( p[0]&0x80 );
+  return ((unsigned)p[0]<<24) | (p[1]<<16) | (p[2]<<8) | p[3];
+}
+SQLITE_PRIVATE void sqlite3Put4byte(unsigned char *p, u32 v){
+  p[0] = (u8)(v>>24);
+  p[1] = (u8)(v>>16);
+  p[2] = (u8)(v>>8);
+  p[3] = (u8)v;
+}
+
+
+
+/*
+** Translate a single byte of Hex into an integer.
+** This routine only works if h really is a valid hexadecimal
+** character:  0..9a..fA..F
+*/
+SQLITE_PRIVATE u8 sqlite3HexToInt(int h){
+  assert( (h>='0' && h<='9') ||  (h>='a' && h<='f') ||  (h>='A' && h<='F') );
+#ifdef SQLITE_ASCII
+  h += 9*(1&(h>>6));
+#endif
+#ifdef SQLITE_EBCDIC
+  h += 9*(1&~(h>>4));
+#endif
+  return (u8)(h & 0xf);
+}
+
+#if !defined(SQLITE_OMIT_BLOB_LITERAL) || defined(SQLITE_HAS_CODEC)
+/*
+** Convert a BLOB literal of the form "x'hhhhhh'" into its binary
+** value.  Return a pointer to its binary value.  Space to hold the
+** binary value has been obtained from malloc and must be freed by
+** the calling routine.
+*/
+SQLITE_PRIVATE void *sqlite3HexToBlob(sqlite3 *db, const char *z, int n){
+  char *zBlob;
+  int i;
+
+  zBlob = (char *)sqlite3DbMallocRaw(db, n/2 + 1);
+  n--;
+  if( zBlob ){
+    for(i=0; i<n; i+=2){
+      zBlob[i/2] = (sqlite3HexToInt(z[i])<<4) | sqlite3HexToInt(z[i+1]);
+    }
+    zBlob[i/2] = 0;
+  }
+  return zBlob;
+}
+#endif /* !SQLITE_OMIT_BLOB_LITERAL || SQLITE_HAS_CODEC */
+
+/*
+** Log an error that is an API call on a connection pointer that should
+** not have been used.  The "type" of connection pointer is given as the
+** argument.  The zType is a word like "NULL" or "closed" or "invalid".
+*/
+static void logBadConnection(const char *zType){
+  sqlite3_log(SQLITE_MISUSE, 
+     "API call with %s database connection pointer",
+     zType
+  );
+}
+
+/*
+** Check to make sure we have a valid db pointer.  This test is not
+** foolproof but it does provide some measure of protection against
+** misuse of the interface such as passing in db pointers that are
+** NULL or which have been previously closed.  If this routine returns
+** 1 it means that the db pointer is valid and 0 if it should not be
+** dereferenced for any reason.  The calling function should invoke
+** SQLITE_MISUSE immediately.
+**
+** sqlite3SafetyCheckOk() requires that the db pointer be valid for
+** use.  sqlite3SafetyCheckSickOrOk() allows a db pointer that failed to
+** open properly and is not fit for general use but which can be
+** used as an argument to sqlite3_errmsg() or sqlite3_close().
+*/
+SQLITE_PRIVATE int sqlite3SafetyCheckOk(sqlite3 *db){
+  u32 magic;
+  if( db==0 ){
+    logBadConnection("NULL");
+    return 0;
+  }
+  magic = db->magic;
+  if( magic!=SQLITE_MAGIC_OPEN ){
+    if( sqlite3SafetyCheckSickOrOk(db) ){
+      testcase( sqlite3GlobalConfig.xLog!=0 );
+      logBadConnection("unopened");
+    }
+    return 0;
+  }else{
+    return 1;
+  }
+}
+SQLITE_PRIVATE int sqlite3SafetyCheckSickOrOk(sqlite3 *db){
+  u32 magic;
+  magic = db->magic;
+  if( magic!=SQLITE_MAGIC_SICK &&
+      magic!=SQLITE_MAGIC_OPEN &&
+      magic!=SQLITE_MAGIC_BUSY ){
+    testcase( sqlite3GlobalConfig.xLog!=0 );
+    logBadConnection("invalid");
+    return 0;
+  }else{
+    return 1;
+  }
+}
+
+/*
+** Attempt to add, substract, or multiply the 64-bit signed value iB against
+** the other 64-bit signed integer at *pA and store the result in *pA.
+** Return 0 on success.  Or if the operation would have resulted in an
+** overflow, leave *pA unchanged and return 1.
+*/
+SQLITE_PRIVATE int sqlite3AddInt64(i64 *pA, i64 iB){
+  i64 iA = *pA;
+  testcase( iA==0 ); testcase( iA==1 );
+  testcase( iB==-1 ); testcase( iB==0 );
+  if( iB>=0 ){
+    testcase( iA>0 && LARGEST_INT64 - iA == iB );
+    testcase( iA>0 && LARGEST_INT64 - iA == iB - 1 );
+    if( iA>0 && LARGEST_INT64 - iA < iB ) return 1;
+  }else{
+    testcase( iA<0 && -(iA + LARGEST_INT64) == iB + 1 );
+    testcase( iA<0 && -(iA + LARGEST_INT64) == iB + 2 );
+    if( iA<0 && -(iA + LARGEST_INT64) > iB + 1 ) return 1;
+  }
+  *pA += iB;
+  return 0; 
+}
+SQLITE_PRIVATE int sqlite3SubInt64(i64 *pA, i64 iB){
+  testcase( iB==SMALLEST_INT64+1 );
+  if( iB==SMALLEST_INT64 ){
+    testcase( (*pA)==(-1) ); testcase( (*pA)==0 );
+    if( (*pA)>=0 ) return 1;
+    *pA -= iB;
+    return 0;
+  }else{
+    return sqlite3AddInt64(pA, -iB);
+  }
+}
+#define TWOPOWER32 (((i64)1)<<32)
+#define TWOPOWER31 (((i64)1)<<31)
+SQLITE_PRIVATE int sqlite3MulInt64(i64 *pA, i64 iB){
+  i64 iA = *pA;
+  i64 iA1, iA0, iB1, iB0, r;
+
+  iA1 = iA/TWOPOWER32;
+  iA0 = iA % TWOPOWER32;
+  iB1 = iB/TWOPOWER32;
+  iB0 = iB % TWOPOWER32;
+  if( iA1==0 ){
+    if( iB1==0 ){
+      *pA *= iB;
+      return 0;
+    }
+    r = iA0*iB1;
+  }else if( iB1==0 ){
+    r = iA1*iB0;
+  }else{
+    /* If both iA1 and iB1 are non-zero, overflow will result */
+    return 1;
+  }
+  testcase( r==(-TWOPOWER31)-1 );
+  testcase( r==(-TWOPOWER31) );
+  testcase( r==TWOPOWER31 );
+  testcase( r==TWOPOWER31-1 );
+  if( r<(-TWOPOWER31) || r>=TWOPOWER31 ) return 1;
+  r *= TWOPOWER32;
+  if( sqlite3AddInt64(&r, iA0*iB0) ) return 1;
+  *pA = r;
+  return 0;
+}
+
+/*
+** Compute the absolute value of a 32-bit signed integer, of possible.  Or 
+** if the integer has a value of -2147483648, return +2147483647
+*/
+SQLITE_PRIVATE int sqlite3AbsInt32(int x){
+  if( x>=0 ) return x;
+  if( x==(int)0x80000000 ) return 0x7fffffff;
+  return -x;
+}
+
+#ifdef SQLITE_ENABLE_8_3_NAMES
+/*
+** If SQLITE_ENABLE_8_3_NAMES is set at compile-time and if the database
+** filename in zBaseFilename is a URI with the "8_3_names=1" parameter and
+** if filename in z[] has a suffix (a.k.a. "extension") that is longer than
+** three characters, then shorten the suffix on z[] to be the last three
+** characters of the original suffix.
+**
