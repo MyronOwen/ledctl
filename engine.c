@@ -22980,3 +22980,225 @@ SQLITE_PRIVATE int sqlite3VdbeMemHandleBom(Mem *pMem){
 ** number of unicode characters in the first nByte of pZ (or up to 
 ** the first 0x00, whichever comes first).
 */
+SQLITE_PRIVATE int sqlite3Utf8CharLen(const char *zIn, int nByte){
+  int r = 0;
+  const u8 *z = (const u8*)zIn;
+  const u8 *zTerm;
+  if( nByte>=0 ){
+    zTerm = &z[nByte];
+  }else{
+    zTerm = (const u8*)(-1);
+  }
+  assert( z<=zTerm );
+  while( *z!=0 && z<zTerm ){
+    SQLITE_SKIP_UTF8(z);
+    r++;
+  }
+  return r;
+}
+
+/* This test function is not currently used by the automated test-suite. 
+** Hence it is only available in debug builds.
+*/
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+/*
+** Translate UTF-8 to UTF-8.
+**
+** This has the effect of making sure that the string is well-formed
+** UTF-8.  Miscoded characters are removed.
+**
+** The translation is done in-place and aborted if the output
+** overruns the input.
+*/
+SQLITE_PRIVATE int sqlite3Utf8To8(unsigned char *zIn){
+  unsigned char *zOut = zIn;
+  unsigned char *zStart = zIn;
+  u32 c;
+
+  while( zIn[0] && zOut<=zIn ){
+    c = sqlite3Utf8Read((const u8**)&zIn);
+    if( c!=0xfffd ){
+      WRITE_UTF8(zOut, c);
+    }
+  }
+  *zOut = 0;
+  return (int)(zOut - zStart);
+}
+#endif
+
+#ifndef SQLITE_OMIT_UTF16
+/*
+** Convert a UTF-16 string in the native encoding into a UTF-8 string.
+** Memory to hold the UTF-8 string is obtained from sqlite3_malloc and must
+** be freed by the calling function.
+**
+** NULL is returned if there is an allocation error.
+*/
+SQLITE_PRIVATE char *sqlite3Utf16to8(sqlite3 *db, const void *z, int nByte, u8 enc){
+  Mem m;
+  memset(&m, 0, sizeof(m));
+  m.db = db;
+  sqlite3VdbeMemSetStr(&m, z, nByte, enc, SQLITE_STATIC);
+  sqlite3VdbeChangeEncoding(&m, SQLITE_UTF8);
+  if( db->mallocFailed ){
+    sqlite3VdbeMemRelease(&m);
+    m.z = 0;
+  }
+  assert( (m.flags & MEM_Term)!=0 || db->mallocFailed );
+  assert( (m.flags & MEM_Str)!=0 || db->mallocFailed );
+  assert( m.z || db->mallocFailed );
+  return m.z;
+}
+
+/*
+** zIn is a UTF-16 encoded unicode string at least nChar characters long.
+** Return the number of bytes in the first nChar unicode characters
+** in pZ.  nChar must be non-negative.
+*/
+SQLITE_PRIVATE int sqlite3Utf16ByteLen(const void *zIn, int nChar){
+  int c;
+  unsigned char const *z = zIn;
+  int n = 0;
+  
+  if( SQLITE_UTF16NATIVE==SQLITE_UTF16BE ){
+    while( n<nChar ){
+      READ_UTF16BE(z, 1, c);
+      n++;
+    }
+  }else{
+    while( n<nChar ){
+      READ_UTF16LE(z, 1, c);
+      n++;
+    }
+  }
+  return (int)(z-(unsigned char const *)zIn);
+}
+
+#if defined(SQLITE_TEST)
+/*
+** This routine is called from the TCL test function "translate_selftest".
+** It checks that the primitives for serializing and deserializing
+** characters in each encoding are inverses of each other.
+*/
+SQLITE_PRIVATE void sqlite3UtfSelfTest(void){
+  unsigned int i, t;
+  unsigned char zBuf[20];
+  unsigned char *z;
+  int n;
+  unsigned int c;
+
+  for(i=0; i<0x00110000; i++){
+    z = zBuf;
+    WRITE_UTF8(z, i);
+    n = (int)(z-zBuf);
+    assert( n>0 && n<=4 );
+    z[0] = 0;
+    z = zBuf;
+    c = sqlite3Utf8Read((const u8**)&z);
+    t = i;
+    if( i>=0xD800 && i<=0xDFFF ) t = 0xFFFD;
+    if( (i&0xFFFFFFFE)==0xFFFE ) t = 0xFFFD;
+    assert( c==t );
+    assert( (z-zBuf)==n );
+  }
+  for(i=0; i<0x00110000; i++){
+    if( i>=0xD800 && i<0xE000 ) continue;
+    z = zBuf;
+    WRITE_UTF16LE(z, i);
+    n = (int)(z-zBuf);
+    assert( n>0 && n<=4 );
+    z[0] = 0;
+    z = zBuf;
+    READ_UTF16LE(z, 1, c);
+    assert( c==i );
+    assert( (z-zBuf)==n );
+  }
+  for(i=0; i<0x00110000; i++){
+    if( i>=0xD800 && i<0xE000 ) continue;
+    z = zBuf;
+    WRITE_UTF16BE(z, i);
+    n = (int)(z-zBuf);
+    assert( n>0 && n<=4 );
+    z[0] = 0;
+    z = zBuf;
+    READ_UTF16BE(z, 1, c);
+    assert( c==i );
+    assert( (z-zBuf)==n );
+  }
+}
+#endif /* SQLITE_TEST */
+#endif /* SQLITE_OMIT_UTF16 */
+
+/************** End of utf.c *************************************************/
+/************** Begin file util.c ********************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** Utility functions used throughout sqlite.
+**
+** This file contains functions for allocating memory, comparing
+** strings, and stuff like that.
+**
+*/
+/* #include <stdarg.h> */
+#if HAVE_ISNAN || SQLITE_HAVE_ISNAN
+# include <math.h>
+#endif
+
+/*
+** Routine needed to support the testcase() macro.
+*/
+#ifdef SQLITE_COVERAGE_TEST
+SQLITE_PRIVATE void sqlite3Coverage(int x){
+  static unsigned dummy = 0;
+  dummy += (unsigned)x;
+}
+#endif
+
+/*
+** Give a callback to the test harness that can be used to simulate faults
+** in places where it is difficult or expensive to do so purely by means
+** of inputs.
+**
+** The intent of the integer argument is to let the fault simulator know
+** which of multiple sqlite3FaultSim() calls has been hit.
+**
+** Return whatever integer value the test callback returns, or return
+** SQLITE_OK if no test callback is installed.
+*/
+#ifndef SQLITE_OMIT_BUILTIN_TEST
+SQLITE_PRIVATE int sqlite3FaultSim(int iTest){
+  int (*xCallback)(int) = sqlite3GlobalConfig.xTestCallback;
+  return xCallback ? xCallback(iTest) : SQLITE_OK;
+}
+#endif
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/*
+** Return true if the floating point value is Not a Number (NaN).
+**
+** Use the math library isnan() function if compiled with SQLITE_HAVE_ISNAN.
+** Otherwise, we have our own implementation that works on most systems.
+*/
+SQLITE_PRIVATE int sqlite3IsNaN(double x){
+  int rc;   /* The value return */
+#if !SQLITE_HAVE_ISNAN && !HAVE_ISNAN
+  /*
+  ** Systems that support the isnan() library function should probably
+  ** make use of it by compiling with -DSQLITE_HAVE_ISNAN.  But we have
+  ** found that many systems do not have a working isnan() function so
+  ** this implementation is provided as an alternative.
+  **
+  ** This NaN test sometimes fails if compiled on GCC with -ffast-math.
+  ** On the other hand, the use of -ffast-math comes with the following
+  ** warning:
+  **
+  **      This option [-ffast-math] should never be turned on by any
