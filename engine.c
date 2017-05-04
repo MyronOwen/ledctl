@@ -24656,3 +24656,226 @@ static HashElem *findElementWithHash(
   int count;                     /* Number of elements left to test */
   unsigned int h;                /* The computed hash */
 
+  if( pH->ht ){
+    struct _ht *pEntry;
+    h = strHash(pKey) % pH->htsize;
+    pEntry = &pH->ht[h];
+    elem = pEntry->chain;
+    count = pEntry->count;
+  }else{
+    h = 0;
+    elem = pH->first;
+    count = pH->count;
+  }
+  *pHash = h;
+  while( count-- ){
+    assert( elem!=0 );
+    if( sqlite3StrICmp(elem->pKey,pKey)==0 ){ 
+      return elem;
+    }
+    elem = elem->next;
+  }
+  return 0;
+}
+
+/* Remove a single entry from the hash table given a pointer to that
+** element and a hash on the element's key.
+*/
+static void removeElementGivenHash(
+  Hash *pH,         /* The pH containing "elem" */
+  HashElem* elem,   /* The element to be removed from the pH */
+  unsigned int h    /* Hash value for the element */
+){
+  struct _ht *pEntry;
+  if( elem->prev ){
+    elem->prev->next = elem->next; 
+  }else{
+    pH->first = elem->next;
+  }
+  if( elem->next ){
+    elem->next->prev = elem->prev;
+  }
+  if( pH->ht ){
+    pEntry = &pH->ht[h];
+    if( pEntry->chain==elem ){
+      pEntry->chain = elem->next;
+    }
+    pEntry->count--;
+    assert( pEntry->count>=0 );
+  }
+  sqlite3_free( elem );
+  pH->count--;
+  if( pH->count==0 ){
+    assert( pH->first==0 );
+    assert( pH->count==0 );
+    sqlite3HashClear(pH);
+  }
+}
+
+/* Attempt to locate an element of the hash table pH with a key
+** that matches pKey.  Return the data for this element if it is
+** found, or NULL if there is no match.
+*/
+SQLITE_PRIVATE void *sqlite3HashFind(const Hash *pH, const char *pKey){
+  HashElem *elem;    /* The element that matches key */
+  unsigned int h;    /* A hash on key */
+
+  assert( pH!=0 );
+  assert( pKey!=0 );
+  elem = findElementWithHash(pH, pKey, &h);
+  return elem ? elem->data : 0;
+}
+
+/* Insert an element into the hash table pH.  The key is pKey
+** and the data is "data".
+**
+** If no element exists with a matching key, then a new
+** element is created and NULL is returned.
+**
+** If another element already exists with the same key, then the
+** new data replaces the old data and the old data is returned.
+** The key is not copied in this instance.  If a malloc fails, then
+** the new data is returned and the hash table is unchanged.
+**
+** If the "data" parameter to this function is NULL, then the
+** element corresponding to "key" is removed from the hash table.
+*/
+SQLITE_PRIVATE void *sqlite3HashInsert(Hash *pH, const char *pKey, void *data){
+  unsigned int h;       /* the hash of the key modulo hash table size */
+  HashElem *elem;       /* Used to loop thru the element list */
+  HashElem *new_elem;   /* New element added to the pH */
+
+  assert( pH!=0 );
+  assert( pKey!=0 );
+  elem = findElementWithHash(pH,pKey,&h);
+  if( elem ){
+    void *old_data = elem->data;
+    if( data==0 ){
+      removeElementGivenHash(pH,elem,h);
+    }else{
+      elem->data = data;
+      elem->pKey = pKey;
+    }
+    return old_data;
+  }
+  if( data==0 ) return 0;
+  new_elem = (HashElem*)sqlite3Malloc( sizeof(HashElem) );
+  if( new_elem==0 ) return data;
+  new_elem->pKey = pKey;
+  new_elem->data = data;
+  pH->count++;
+  if( pH->count>=10 && pH->count > 2*pH->htsize ){
+    if( rehash(pH, pH->count*2) ){
+      assert( pH->htsize>0 );
+      h = strHash(pKey) % pH->htsize;
+    }
+  }
+  insertElement(pH, pH->ht ? &pH->ht[h] : 0, new_elem);
+  return 0;
+}
+
+/************** End of hash.c ************************************************/
+/************** Begin file opcodes.c *****************************************/
+/* Automatically generated.  Do not edit */
+/* See the mkopcodec.awk script for details. */
+#if !defined(SQLITE_OMIT_EXPLAIN) || defined(VDBE_PROFILE) || defined(SQLITE_DEBUG)
+#if defined(SQLITE_ENABLE_EXPLAIN_COMMENTS) || defined(SQLITE_DEBUG)
+# define OpHelp(X) "\0" X
+#else
+# define OpHelp(X)
+#endif
+SQLITE_PRIVATE const char *sqlite3OpcodeName(int i){
+ static const char *const azName[] = { "?",
+     /*   1 */ "Function"         OpHelp("r[P3]=func(r[P2@P5])"),
+     /*   2 */ "Savepoint"        OpHelp(""),
+     /*   3 */ "AutoCommit"       OpHelp(""),
+     /*   4 */ "Transaction"      OpHelp(""),
+     /*   5 */ "SorterNext"       OpHelp(""),
+     /*   6 */ "PrevIfOpen"       OpHelp(""),
+     /*   7 */ "NextIfOpen"       OpHelp(""),
+     /*   8 */ "Prev"             OpHelp(""),
+     /*   9 */ "Next"             OpHelp(""),
+     /*  10 */ "AggStep"          OpHelp("accum=r[P3] step(r[P2@P5])"),
+     /*  11 */ "Checkpoint"       OpHelp(""),
+     /*  12 */ "JournalMode"      OpHelp(""),
+     /*  13 */ "Vacuum"           OpHelp(""),
+     /*  14 */ "VFilter"          OpHelp("iplan=r[P3] zplan='P4'"),
+     /*  15 */ "VUpdate"          OpHelp("data=r[P3@P2]"),
+     /*  16 */ "Goto"             OpHelp(""),
+     /*  17 */ "Gosub"            OpHelp(""),
+     /*  18 */ "Return"           OpHelp(""),
+     /*  19 */ "Not"              OpHelp("r[P2]= !r[P1]"),
+     /*  20 */ "InitCoroutine"    OpHelp(""),
+     /*  21 */ "EndCoroutine"     OpHelp(""),
+     /*  22 */ "Yield"            OpHelp(""),
+     /*  23 */ "HaltIfNull"       OpHelp("if r[P3]=null halt"),
+     /*  24 */ "Halt"             OpHelp(""),
+     /*  25 */ "Integer"          OpHelp("r[P2]=P1"),
+     /*  26 */ "Int64"            OpHelp("r[P2]=P4"),
+     /*  27 */ "String"           OpHelp("r[P2]='P4' (len=P1)"),
+     /*  28 */ "Null"             OpHelp("r[P2..P3]=NULL"),
+     /*  29 */ "SoftNull"         OpHelp("r[P1]=NULL"),
+     /*  30 */ "Blob"             OpHelp("r[P2]=P4 (len=P1)"),
+     /*  31 */ "Variable"         OpHelp("r[P2]=parameter(P1,P4)"),
+     /*  32 */ "Move"             OpHelp("r[P2@P3]=r[P1@P3]"),
+     /*  33 */ "Copy"             OpHelp("r[P2@P3+1]=r[P1@P3+1]"),
+     /*  34 */ "SCopy"            OpHelp("r[P2]=r[P1]"),
+     /*  35 */ "ResultRow"        OpHelp("output=r[P1@P2]"),
+     /*  36 */ "CollSeq"          OpHelp(""),
+     /*  37 */ "AddImm"           OpHelp("r[P1]=r[P1]+P2"),
+     /*  38 */ "MustBeInt"        OpHelp(""),
+     /*  39 */ "RealAffinity"     OpHelp(""),
+     /*  40 */ "Cast"             OpHelp("affinity(r[P1])"),
+     /*  41 */ "Permutation"      OpHelp(""),
+     /*  42 */ "Compare"          OpHelp("r[P1@P3] <-> r[P2@P3]"),
+     /*  43 */ "Jump"             OpHelp(""),
+     /*  44 */ "Once"             OpHelp(""),
+     /*  45 */ "If"               OpHelp(""),
+     /*  46 */ "IfNot"            OpHelp(""),
+     /*  47 */ "Column"           OpHelp("r[P3]=PX"),
+     /*  48 */ "Affinity"         OpHelp("affinity(r[P1@P2])"),
+     /*  49 */ "MakeRecord"       OpHelp("r[P3]=mkrec(r[P1@P2])"),
+     /*  50 */ "Count"            OpHelp("r[P2]=count()"),
+     /*  51 */ "ReadCookie"       OpHelp(""),
+     /*  52 */ "SetCookie"        OpHelp(""),
+     /*  53 */ "ReopenIdx"        OpHelp("root=P2 iDb=P3"),
+     /*  54 */ "OpenRead"         OpHelp("root=P2 iDb=P3"),
+     /*  55 */ "OpenWrite"        OpHelp("root=P2 iDb=P3"),
+     /*  56 */ "OpenAutoindex"    OpHelp("nColumn=P2"),
+     /*  57 */ "OpenEphemeral"    OpHelp("nColumn=P2"),
+     /*  58 */ "SorterOpen"       OpHelp(""),
+     /*  59 */ "SequenceTest"     OpHelp("if( cursor[P1].ctr++ ) pc = P2"),
+     /*  60 */ "OpenPseudo"       OpHelp("P3 columns in r[P2]"),
+     /*  61 */ "Close"            OpHelp(""),
+     /*  62 */ "SeekLT"           OpHelp("key=r[P3@P4]"),
+     /*  63 */ "SeekLE"           OpHelp("key=r[P3@P4]"),
+     /*  64 */ "SeekGE"           OpHelp("key=r[P3@P4]"),
+     /*  65 */ "SeekGT"           OpHelp("key=r[P3@P4]"),
+     /*  66 */ "Seek"             OpHelp("intkey=r[P2]"),
+     /*  67 */ "NoConflict"       OpHelp("key=r[P3@P4]"),
+     /*  68 */ "NotFound"         OpHelp("key=r[P3@P4]"),
+     /*  69 */ "Found"            OpHelp("key=r[P3@P4]"),
+     /*  70 */ "NotExists"        OpHelp("intkey=r[P3]"),
+     /*  71 */ "Or"               OpHelp("r[P3]=(r[P1] || r[P2])"),
+     /*  72 */ "And"              OpHelp("r[P3]=(r[P1] && r[P2])"),
+     /*  73 */ "Sequence"         OpHelp("r[P2]=cursor[P1].ctr++"),
+     /*  74 */ "NewRowid"         OpHelp("r[P2]=rowid"),
+     /*  75 */ "Insert"           OpHelp("intkey=r[P3] data=r[P2]"),
+     /*  76 */ "IsNull"           OpHelp("if r[P1]==NULL goto P2"),
+     /*  77 */ "NotNull"          OpHelp("if r[P1]!=NULL goto P2"),
+     /*  78 */ "Ne"               OpHelp("if r[P1]!=r[P3] goto P2"),
+     /*  79 */ "Eq"               OpHelp("if r[P1]==r[P3] goto P2"),
+     /*  80 */ "Gt"               OpHelp("if r[P1]>r[P3] goto P2"),
+     /*  81 */ "Le"               OpHelp("if r[P1]<=r[P3] goto P2"),
+     /*  82 */ "Lt"               OpHelp("if r[P1]<r[P3] goto P2"),
+     /*  83 */ "Ge"               OpHelp("if r[P1]>=r[P3] goto P2"),
+     /*  84 */ "InsertInt"        OpHelp("intkey=P3 data=r[P2]"),
+     /*  85 */ "BitAnd"           OpHelp("r[P3]=r[P1]&r[P2]"),
+     /*  86 */ "BitOr"            OpHelp("r[P3]=r[P1]|r[P2]"),
+     /*  87 */ "ShiftLeft"        OpHelp("r[P3]=r[P2]<<r[P1]"),
+     /*  88 */ "ShiftRight"       OpHelp("r[P3]=r[P2]>>r[P1]"),
+     /*  89 */ "Add"              OpHelp("r[P3]=r[P1]+r[P2]"),
+     /*  90 */ "Subtract"         OpHelp("r[P3]=r[P2]-r[P1]"),
+     /*  91 */ "Multiply"         OpHelp("r[P3]=r[P1]*r[P2]"),
+     /*  92 */ "Divide"           OpHelp("r[P3]=r[P2]/r[P1]"),
+     /*  93 */ "Remainder"        OpHelp("r[P3]=r[P2]%r[P1]"),
