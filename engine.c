@@ -24879,3 +24879,229 @@ SQLITE_PRIVATE const char *sqlite3OpcodeName(int i){
      /*  91 */ "Multiply"         OpHelp("r[P3]=r[P1]*r[P2]"),
      /*  92 */ "Divide"           OpHelp("r[P3]=r[P2]/r[P1]"),
      /*  93 */ "Remainder"        OpHelp("r[P3]=r[P2]%r[P1]"),
+     /*  94 */ "Concat"           OpHelp("r[P3]=r[P2]+r[P1]"),
+     /*  95 */ "Delete"           OpHelp(""),
+     /*  96 */ "BitNot"           OpHelp("r[P1]= ~r[P1]"),
+     /*  97 */ "String8"          OpHelp("r[P2]='P4'"),
+     /*  98 */ "ResetCount"       OpHelp(""),
+     /*  99 */ "SorterCompare"    OpHelp("if key(P1)!=trim(r[P3],P4) goto P2"),
+     /* 100 */ "SorterData"       OpHelp("r[P2]=data"),
+     /* 101 */ "RowKey"           OpHelp("r[P2]=key"),
+     /* 102 */ "RowData"          OpHelp("r[P2]=data"),
+     /* 103 */ "Rowid"            OpHelp("r[P2]=rowid"),
+     /* 104 */ "NullRow"          OpHelp(""),
+     /* 105 */ "Last"             OpHelp(""),
+     /* 106 */ "SorterSort"       OpHelp(""),
+     /* 107 */ "Sort"             OpHelp(""),
+     /* 108 */ "Rewind"           OpHelp(""),
+     /* 109 */ "SorterInsert"     OpHelp(""),
+     /* 110 */ "IdxInsert"        OpHelp("key=r[P2]"),
+     /* 111 */ "IdxDelete"        OpHelp("key=r[P2@P3]"),
+     /* 112 */ "IdxRowid"         OpHelp("r[P2]=rowid"),
+     /* 113 */ "IdxLE"            OpHelp("key=r[P3@P4]"),
+     /* 114 */ "IdxGT"            OpHelp("key=r[P3@P4]"),
+     /* 115 */ "IdxLT"            OpHelp("key=r[P3@P4]"),
+     /* 116 */ "IdxGE"            OpHelp("key=r[P3@P4]"),
+     /* 117 */ "Destroy"          OpHelp(""),
+     /* 118 */ "Clear"            OpHelp(""),
+     /* 119 */ "ResetSorter"      OpHelp(""),
+     /* 120 */ "CreateIndex"      OpHelp("r[P2]=root iDb=P1"),
+     /* 121 */ "CreateTable"      OpHelp("r[P2]=root iDb=P1"),
+     /* 122 */ "ParseSchema"      OpHelp(""),
+     /* 123 */ "LoadAnalysis"     OpHelp(""),
+     /* 124 */ "DropTable"        OpHelp(""),
+     /* 125 */ "DropIndex"        OpHelp(""),
+     /* 126 */ "DropTrigger"      OpHelp(""),
+     /* 127 */ "IntegrityCk"      OpHelp(""),
+     /* 128 */ "RowSetAdd"        OpHelp("rowset(P1)=r[P2]"),
+     /* 129 */ "RowSetRead"       OpHelp("r[P3]=rowset(P1)"),
+     /* 130 */ "RowSetTest"       OpHelp("if r[P3] in rowset(P1) goto P2"),
+     /* 131 */ "Program"          OpHelp(""),
+     /* 132 */ "Param"            OpHelp(""),
+     /* 133 */ "Real"             OpHelp("r[P2]=P4"),
+     /* 134 */ "FkCounter"        OpHelp("fkctr[P1]+=P2"),
+     /* 135 */ "FkIfZero"         OpHelp("if fkctr[P1]==0 goto P2"),
+     /* 136 */ "MemMax"           OpHelp("r[P1]=max(r[P1],r[P2])"),
+     /* 137 */ "IfPos"            OpHelp("if r[P1]>0 goto P2"),
+     /* 138 */ "IfNeg"            OpHelp("r[P1]+=P3, if r[P1]<0 goto P2"),
+     /* 139 */ "IfZero"           OpHelp("r[P1]+=P3, if r[P1]==0 goto P2"),
+     /* 140 */ "AggFinal"         OpHelp("accum=r[P1] N=P2"),
+     /* 141 */ "IncrVacuum"       OpHelp(""),
+     /* 142 */ "Expire"           OpHelp(""),
+     /* 143 */ "TableLock"        OpHelp("iDb=P1 root=P2 write=P3"),
+     /* 144 */ "VBegin"           OpHelp(""),
+     /* 145 */ "VCreate"          OpHelp(""),
+     /* 146 */ "VDestroy"         OpHelp(""),
+     /* 147 */ "VOpen"            OpHelp(""),
+     /* 148 */ "VColumn"          OpHelp("r[P3]=vcolumn(P2)"),
+     /* 149 */ "VNext"            OpHelp(""),
+     /* 150 */ "VRename"          OpHelp(""),
+     /* 151 */ "Pagecount"        OpHelp(""),
+     /* 152 */ "MaxPgcnt"         OpHelp(""),
+     /* 153 */ "Init"             OpHelp("Start at P2"),
+     /* 154 */ "Noop"             OpHelp(""),
+     /* 155 */ "Explain"          OpHelp(""),
+  };
+  return azName[i];
+}
+#endif
+
+/************** End of opcodes.c *********************************************/
+/************** Begin file os_unix.c *****************************************/
+/*
+** 2004 May 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains the VFS implementation for unix-like operating systems
+** include Linux, MacOSX, *BSD, QNX, VxWorks, AIX, HPUX, and others.
+**
+** There are actually several different VFS implementations in this file.
+** The differences are in the way that file locking is done.  The default
+** implementation uses Posix Advisory Locks.  Alternative implementations
+** use flock(), dot-files, various proprietary locking schemas, or simply
+** skip locking all together.
+**
+** This source file is organized into divisions where the logic for various
+** subfunctions is contained within the appropriate division.  PLEASE
+** KEEP THE STRUCTURE OF THIS FILE INTACT.  New code should be placed
+** in the correct division and should be clearly labeled.
+**
+** The layout of divisions is as follows:
+**
+**   *  General-purpose declarations and utility functions.
+**   *  Unique file ID logic used by VxWorks.
+**   *  Various locking primitive implementations (all except proxy locking):
+**      + for Posix Advisory Locks
+**      + for no-op locks
+**      + for dot-file locks
+**      + for flock() locking
+**      + for named semaphore locks (VxWorks only)
+**      + for AFP filesystem locks (MacOSX only)
+**   *  sqlite3_file methods not associated with locking.
+**   *  Definitions of sqlite3_io_methods objects for all locking
+**      methods plus "finder" functions for each locking method.
+**   *  sqlite3_vfs method implementations.
+**   *  Locking primitives for the proxy uber-locking-method. (MacOSX only)
+**   *  Definitions of sqlite3_vfs objects for all locking methods
+**      plus implementations of sqlite3_os_init() and sqlite3_os_end().
+*/
+#if SQLITE_OS_UNIX              /* This file is used on unix only */
+
+/*
+** There are various methods for file locking used for concurrency
+** control:
+**
+**   1. POSIX locking (the default),
+**   2. No locking,
+**   3. Dot-file locking,
+**   4. flock() locking,
+**   5. AFP locking (OSX only),
+**   6. Named POSIX semaphores (VXWorks only),
+**   7. proxy locking. (OSX only)
+**
+** Styles 4, 5, and 7 are only available of SQLITE_ENABLE_LOCKING_STYLE
+** is defined to 1.  The SQLITE_ENABLE_LOCKING_STYLE also enables automatic
+** selection of the appropriate locking style based on the filesystem
+** where the database is located.  
+*/
+#if !defined(SQLITE_ENABLE_LOCKING_STYLE)
+#  if defined(__APPLE__)
+#    define SQLITE_ENABLE_LOCKING_STYLE 1
+#  else
+#    define SQLITE_ENABLE_LOCKING_STYLE 0
+#  endif
+#endif
+
+/*
+** Define the OS_VXWORKS pre-processor macro to 1 if building on 
+** vxworks, or 0 otherwise.
+*/
+#ifndef OS_VXWORKS
+#  if defined(__RTP__) || defined(_WRS_KERNEL)
+#    define OS_VXWORKS 1
+#  else
+#    define OS_VXWORKS 0
+#  endif
+#endif
+
+/*
+** standard include files.
+*/
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+/* #include <time.h> */
+#include <sys/time.h>
+#include <errno.h>
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+# include <sys/mman.h>
+#endif
+
+#if SQLITE_ENABLE_LOCKING_STYLE || OS_VXWORKS
+# include <sys/ioctl.h>
+# if OS_VXWORKS
+#  include <semaphore.h>
+#  include <limits.h>
+# else
+#  include <sys/file.h>
+#  include <sys/param.h>
+# endif
+#endif /* SQLITE_ENABLE_LOCKING_STYLE */
+
+#if defined(__APPLE__) || (SQLITE_ENABLE_LOCKING_STYLE && !OS_VXWORKS)
+# include <sys/mount.h>
+#endif
+
+#ifdef HAVE_UTIME
+# include <utime.h>
+#endif
+
+/*
+** Allowed values of unixFile.fsFlags
+*/
+#define SQLITE_FSFLAGS_IS_MSDOS     0x1
+
+/*
+** If we are to be thread-safe, include the pthreads header and define
+** the SQLITE_UNIX_THREADS macro.
+*/
+#if SQLITE_THREADSAFE
+/* # include <pthread.h> */
+# define SQLITE_UNIX_THREADS 1
+#endif
+
+/*
+** Default permissions when creating a new file
+*/
+#ifndef SQLITE_DEFAULT_FILE_PERMISSIONS
+# define SQLITE_DEFAULT_FILE_PERMISSIONS 0644
+#endif
+
+/*
+** Default permissions when creating auto proxy dir
+*/
+#ifndef SQLITE_DEFAULT_PROXYDIR_PERMISSIONS
+# define SQLITE_DEFAULT_PROXYDIR_PERMISSIONS 0755
+#endif
+
+/*
+** Maximum supported path-length.
+*/
+#define MAX_PATHNAME 512
+
+/*
+** Only set the lastErrno if the error code is a real error and not 
+** a normal expected return code of SQLITE_BUSY or SQLITE_OK
+*/
+#define IS_LOCK_ERROR(x)  ((x != SQLITE_OK) && (x != SQLITE_BUSY))
+
+/* Forward references */
