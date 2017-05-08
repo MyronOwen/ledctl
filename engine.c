@@ -25105,3 +25105,230 @@ SQLITE_PRIVATE const char *sqlite3OpcodeName(int i){
 #define IS_LOCK_ERROR(x)  ((x != SQLITE_OK) && (x != SQLITE_BUSY))
 
 /* Forward references */
+typedef struct unixShm unixShm;               /* Connection shared memory */
+typedef struct unixShmNode unixShmNode;       /* Shared memory instance */
+typedef struct unixInodeInfo unixInodeInfo;   /* An i-node */
+typedef struct UnixUnusedFd UnixUnusedFd;     /* An unused file descriptor */
+
+/*
+** Sometimes, after a file handle is closed by SQLite, the file descriptor
+** cannot be closed immediately. In these cases, instances of the following
+** structure are used to store the file descriptor while waiting for an
+** opportunity to either close or reuse it.
+*/
+struct UnixUnusedFd {
+  int fd;                   /* File descriptor to close */
+  int flags;                /* Flags this file descriptor was opened with */
+  UnixUnusedFd *pNext;      /* Next unused file descriptor on same file */
+};
+
+/*
+** The unixFile structure is subclass of sqlite3_file specific to the unix
+** VFS implementations.
+*/
+typedef struct unixFile unixFile;
+struct unixFile {
+  sqlite3_io_methods const *pMethod;  /* Always the first entry */
+  sqlite3_vfs *pVfs;                  /* The VFS that created this unixFile */
+  unixInodeInfo *pInode;              /* Info about locks on this inode */
+  int h;                              /* The file descriptor */
+  unsigned char eFileLock;            /* The type of lock held on this fd */
+  unsigned short int ctrlFlags;       /* Behavioral bits.  UNIXFILE_* flags */
+  int lastErrno;                      /* The unix errno from last I/O error */
+  void *lockingContext;               /* Locking style specific state */
+  UnixUnusedFd *pUnused;              /* Pre-allocated UnixUnusedFd */
+  const char *zPath;                  /* Name of the file */
+  unixShm *pShm;                      /* Shared memory segment information */
+  int szChunk;                        /* Configured by FCNTL_CHUNK_SIZE */
+#if SQLITE_MAX_MMAP_SIZE>0
+  int nFetchOut;                      /* Number of outstanding xFetch refs */
+  sqlite3_int64 mmapSize;             /* Usable size of mapping at pMapRegion */
+  sqlite3_int64 mmapSizeActual;       /* Actual size of mapping at pMapRegion */
+  sqlite3_int64 mmapSizeMax;          /* Configured FCNTL_MMAP_SIZE value */
+  void *pMapRegion;                   /* Memory mapped region */
+#endif
+#ifdef __QNXNTO__
+  int sectorSize;                     /* Device sector size */
+  int deviceCharacteristics;          /* Precomputed device characteristics */
+#endif
+#if SQLITE_ENABLE_LOCKING_STYLE
+  int openFlags;                      /* The flags specified at open() */
+#endif
+#if SQLITE_ENABLE_LOCKING_STYLE || defined(__APPLE__)
+  unsigned fsFlags;                   /* cached details from statfs() */
+#endif
+#if OS_VXWORKS
+  struct vxworksFileId *pId;          /* Unique file ID */
+#endif
+#ifdef SQLITE_DEBUG
+  /* The next group of variables are used to track whether or not the
+  ** transaction counter in bytes 24-27 of database files are updated
+  ** whenever any part of the database changes.  An assertion fault will
+  ** occur if a file is updated without also updating the transaction
+  ** counter.  This test is made to avoid new problems similar to the
+  ** one described by ticket #3584. 
+  */
+  unsigned char transCntrChng;   /* True if the transaction counter changed */
+  unsigned char dbUpdate;        /* True if any part of database file changed */
+  unsigned char inNormalWrite;   /* True if in a normal write operation */
+
+#endif
+
+#ifdef SQLITE_TEST
+  /* In test mode, increase the size of this structure a bit so that 
+  ** it is larger than the struct CrashFile defined in test6.c.
+  */
+  char aPadding[32];
+#endif
+};
+
+/* This variable holds the process id (pid) from when the xRandomness()
+** method was called.  If xOpen() is called from a different process id,
+** indicating that a fork() has occurred, the PRNG will be reset.
+*/
+static int randomnessPid = 0;
+
+/*
+** Allowed values for the unixFile.ctrlFlags bitmask:
+*/
+#define UNIXFILE_EXCL        0x01     /* Connections from one process only */
+#define UNIXFILE_RDONLY      0x02     /* Connection is read only */
+#define UNIXFILE_PERSIST_WAL 0x04     /* Persistent WAL mode */
+#ifndef SQLITE_DISABLE_DIRSYNC
+# define UNIXFILE_DIRSYNC    0x08     /* Directory sync needed */
+#else
+# define UNIXFILE_DIRSYNC    0x00
+#endif
+#define UNIXFILE_PSOW        0x10     /* SQLITE_IOCAP_POWERSAFE_OVERWRITE */
+#define UNIXFILE_DELETE      0x20     /* Delete on close */
+#define UNIXFILE_URI         0x40     /* Filename might have query parameters */
+#define UNIXFILE_NOLOCK      0x80     /* Do no file locking */
+#define UNIXFILE_WARNED    0x0100     /* verifyDbFile() warnings have been issued */
+
+/*
+** Include code that is common to all os_*.c files
+*/
+/************** Include os_common.h in the middle of os_unix.c ***************/
+/************** Begin file os_common.h ***************************************/
+/*
+** 2004 May 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains macros and a little bit of code that is common to
+** all of the platform-specific files (os_*.c) and is #included into those
+** files.
+**
+** This file should be #included by the os_*.c files only.  It is not a
+** general purpose header file.
+*/
+#ifndef _OS_COMMON_H_
+#define _OS_COMMON_H_
+
+/*
+** At least two bugs have slipped in because we changed the MEMORY_DEBUG
+** macro to SQLITE_DEBUG and some older makefiles have not yet made the
+** switch.  The following code should catch this problem at compile-time.
+*/
+#ifdef MEMORY_DEBUG
+# error "The MEMORY_DEBUG macro is obsolete.  Use SQLITE_DEBUG instead."
+#endif
+
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+# ifndef SQLITE_DEBUG_OS_TRACE
+#   define SQLITE_DEBUG_OS_TRACE 0
+# endif
+  int sqlite3OSTrace = SQLITE_DEBUG_OS_TRACE;
+# define OSTRACE(X)          if( sqlite3OSTrace ) sqlite3DebugPrintf X
+#else
+# define OSTRACE(X)
+#endif
+
+/*
+** Macros for performance tracing.  Normally turned off.  Only works
+** on i486 hardware.
+*/
+#ifdef SQLITE_PERFORMANCE_TRACE
+
+/* 
+** hwtime.h contains inline assembler code for implementing 
+** high-performance timing routines.
+*/
+/************** Include hwtime.h in the middle of os_common.h ****************/
+/************** Begin file hwtime.h ******************************************/
+/*
+** 2008 May 27
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains inline asm code for retrieving "high-performance"
+** counters for x86 class CPUs.
+*/
+#ifndef _HWTIME_H_
+#define _HWTIME_H_
+
+/*
+** The following routine only works on pentium-class (or newer) processors.
+** It uses the RDTSC opcode to read the cycle count value out of the
+** processor and returns that value.  This can be used for high-res
+** profiling.
+*/
+#if (defined(__GNUC__) || defined(_MSC_VER)) && \
+      (defined(i386) || defined(__i386__) || defined(_M_IX86))
+
+  #if defined(__GNUC__)
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+     unsigned int lo, hi;
+     __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+     return (sqlite_uint64)hi << 32 | lo;
+  }
+
+  #elif defined(_MSC_VER)
+
+  __declspec(naked) __inline sqlite_uint64 __cdecl sqlite3Hwtime(void){
+     __asm {
+        rdtsc
+        ret       ; return value at EDX:EAX
+     }
+  }
+
+  #endif
+
+#elif (defined(__GNUC__) && defined(__x86_64__))
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+      unsigned long val;
+      __asm__ __volatile__ ("rdtsc" : "=A" (val));
+      return val;
+  }
+ 
+#elif (defined(__GNUC__) && defined(__ppc__))
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+      unsigned long long retval;
+      unsigned long junk;
+      __asm__ __volatile__ ("\n\
+          1:      mftbu   %1\n\
+                  mftb    %L0\n\
+                  mftbu   %0\n\
+                  cmpw    %0,%1\n\
+                  bne     1b"
+                  : "=r" (retval), "=r" (junk));
+      return retval;
+  }
+
