@@ -26404,3 +26404,221 @@ static int findInodeInfo(
 
   /* Get low-level information about the file that we can used to
   ** create a unique name for the file.
+  */
+  fd = pFile->h;
+  rc = osFstat(fd, &statbuf);
+  if( rc!=0 ){
+    pFile->lastErrno = errno;
+#ifdef EOVERFLOW
+    if( pFile->lastErrno==EOVERFLOW ) return SQLITE_NOLFS;
+#endif
+    return SQLITE_IOERR;
+  }
+
+#ifdef __APPLE__
+  /* On OS X on an msdos filesystem, the inode number is reported
+  ** incorrectly for zero-size files.  See ticket #3260.  To work
+  ** around this problem (we consider it a bug in OS X, not SQLite)
+  ** we always increase the file size to 1 by writing a single byte
+  ** prior to accessing the inode number.  The one byte written is
+  ** an ASCII 'S' character which also happens to be the first byte
+  ** in the header of every SQLite database.  In this way, if there
+  ** is a race condition such that another thread has already populated
+  ** the first page of the database, no damage is done.
+  */
+  if( statbuf.st_size==0 && (pFile->fsFlags & SQLITE_FSFLAGS_IS_MSDOS)!=0 ){
+    do{ rc = osWrite(fd, "S", 1); }while( rc<0 && errno==EINTR );
+    if( rc!=1 ){
+      pFile->lastErrno = errno;
+      return SQLITE_IOERR;
+    }
+    rc = osFstat(fd, &statbuf);
+    if( rc!=0 ){
+      pFile->lastErrno = errno;
+      return SQLITE_IOERR;
+    }
+  }
+#endif
+
+  memset(&fileId, 0, sizeof(fileId));
+  fileId.dev = statbuf.st_dev;
+#if OS_VXWORKS
+  fileId.pId = pFile->pId;
+#else
+  fileId.ino = statbuf.st_ino;
+#endif
+  pInode = inodeList;
+  while( pInode && memcmp(&fileId, &pInode->fileId, sizeof(fileId)) ){
+    pInode = pInode->pNext;
+  }
+  if( pInode==0 ){
+    pInode = sqlite3_malloc( sizeof(*pInode) );
+    if( pInode==0 ){
+      return SQLITE_NOMEM;
+    }
+    memset(pInode, 0, sizeof(*pInode));
+    memcpy(&pInode->fileId, &fileId, sizeof(fileId));
+    pInode->nRef = 1;
+    pInode->pNext = inodeList;
+    pInode->pPrev = 0;
+    if( inodeList ) inodeList->pPrev = pInode;
+    inodeList = pInode;
+  }else{
+    pInode->nRef++;
+  }
+  *ppInode = pInode;
+  return SQLITE_OK;
+}
+
+/*
+** Return TRUE if pFile has been renamed or unlinked since it was first opened.
+*/
+static int fileHasMoved(unixFile *pFile){
+#if OS_VXWORKS
+  return pFile->pInode!=0 && pFile->pId!=pFile->pInode->fileId.pId;
+#else
+  struct stat buf;
+  return pFile->pInode!=0 &&
+      (osStat(pFile->zPath, &buf)!=0 || buf.st_ino!=pFile->pInode->fileId.ino);
+#endif
+}
+
+
+/*
+** Check a unixFile that is a database.  Verify the following:
+**
+** (1) There is exactly one hard link on the file
+** (2) The file is not a symbolic link
+** (3) The file has not been renamed or unlinked
+**
+** Issue sqlite3_log(SQLITE_WARNING,...) messages if anything is not right.
+*/
+static void verifyDbFile(unixFile *pFile){
+  struct stat buf;
+  int rc;
+  if( pFile->ctrlFlags & UNIXFILE_WARNED ){
+    /* One or more of the following warnings have already been issued.  Do not
+    ** repeat them so as not to clutter the error log */
+    return;
+  }
+  rc = osFstat(pFile->h, &buf);
+  if( rc!=0 ){
+    sqlite3_log(SQLITE_WARNING, "cannot fstat db file %s", pFile->zPath);
+    pFile->ctrlFlags |= UNIXFILE_WARNED;
+    return;
+  }
+  if( buf.st_nlink==0 && (pFile->ctrlFlags & UNIXFILE_DELETE)==0 ){
+    sqlite3_log(SQLITE_WARNING, "file unlinked while open: %s", pFile->zPath);
+    pFile->ctrlFlags |= UNIXFILE_WARNED;
+    return;
+  }
+  if( buf.st_nlink>1 ){
+    sqlite3_log(SQLITE_WARNING, "multiple links to file: %s", pFile->zPath);
+    pFile->ctrlFlags |= UNIXFILE_WARNED;
+    return;
+  }
+  if( fileHasMoved(pFile) ){
+    sqlite3_log(SQLITE_WARNING, "file renamed while open: %s", pFile->zPath);
+    pFile->ctrlFlags |= UNIXFILE_WARNED;
+    return;
+  }
+}
+
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+*/
+static int unixCheckReservedLock(sqlite3_file *id, int *pResOut){
+  int rc = SQLITE_OK;
+  int reserved = 0;
+  unixFile *pFile = (unixFile*)id;
+
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK; );
+
+  assert( pFile );
+  unixEnterMutex(); /* Because pFile->pInode is shared across threads */
+
+  /* Check if a thread in this process holds such a lock */
+  if( pFile->pInode->eFileLock>SHARED_LOCK ){
+    reserved = 1;
+  }
+
+  /* Otherwise see if some other process holds it.
+  */
+#ifndef __DJGPP__
+  if( !reserved && !pFile->pInode->bProcessLock ){
+    struct flock lock;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = RESERVED_BYTE;
+    lock.l_len = 1;
+    lock.l_type = F_WRLCK;
+    if( osFcntl(pFile->h, F_GETLK, &lock) ){
+      rc = SQLITE_IOERR_CHECKRESERVEDLOCK;
+      pFile->lastErrno = errno;
+    } else if( lock.l_type!=F_UNLCK ){
+      reserved = 1;
+    }
+  }
+#endif
+  
+  unixLeaveMutex();
+  OSTRACE(("TEST WR-LOCK %d %d %d (unix)\n", pFile->h, rc, reserved));
+
+  *pResOut = reserved;
+  return rc;
+}
+
+/*
+** Attempt to set a system-lock on the file pFile.  The lock is 
+** described by pLock.
+**
+** If the pFile was opened read/write from unix-excl, then the only lock
+** ever obtained is an exclusive lock, and it is obtained exactly once
+** the first time any lock is attempted.  All subsequent system locking
+** operations become no-ops.  Locking operations still happen internally,
+** in order to coordinate access between separate database connections
+** within this process, but all of that is handled in memory and the
+** operating system does not participate.
+**
+** This function is a pass-through to fcntl(F_SETLK) if pFile is using
+** any VFS other than "unix-excl" or if pFile is opened on "unix-excl"
+** and is read-only.
+**
+** Zero is returned if the call completes successfully, or -1 if a call
+** to fcntl() fails. In this case, errno is set appropriately (by fcntl()).
+*/
+static int unixFileLock(unixFile *pFile, struct flock *pLock){
+  int rc;
+  unixInodeInfo *pInode = pFile->pInode;
+  assert( unixMutexHeld() );
+  assert( pInode!=0 );
+  if( ((pFile->ctrlFlags & UNIXFILE_EXCL)!=0 || pInode->bProcessLock)
+   && ((pFile->ctrlFlags & UNIXFILE_RDONLY)==0)
+  ){
+    if( pInode->bProcessLock==0 ){
+      struct flock lock;
+      assert( pInode->nLock==0 );
+      lock.l_whence = SEEK_SET;
+      lock.l_start = SHARED_FIRST;
+      lock.l_len = SHARED_SIZE;
+      lock.l_type = F_WRLCK;
+      rc = osFcntl(pFile->h, F_SETLK, &lock);
+      if( rc<0 ) return rc;
+      pInode->bProcessLock = 1;
+      pInode->nLock++;
+    }else{
+      rc = 0;
+    }
+  }else{
+    rc = osFcntl(pFile->h, F_SETLK, pLock);
+  }
+  return rc;
+}
+
+/*
+** Lock the file with the lock specified by parameter eFileLock - one
+** of the following:
+**
