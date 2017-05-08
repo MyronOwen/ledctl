@@ -25796,3 +25796,193 @@ static int unixMutexHeld(void) {
 #if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
 /*
 ** Helper function for printing out trace information from debugging
+** binaries. This returns the string representation of the supplied
+** integer lock-type.
+*/
+static const char *azFileLock(int eFileLock){
+  switch( eFileLock ){
+    case NO_LOCK: return "NONE";
+    case SHARED_LOCK: return "SHARED";
+    case RESERVED_LOCK: return "RESERVED";
+    case PENDING_LOCK: return "PENDING";
+    case EXCLUSIVE_LOCK: return "EXCLUSIVE";
+  }
+  return "ERROR";
+}
+#endif
+
+#ifdef SQLITE_LOCK_TRACE
+/*
+** Print out information about all locking operations.
+**
+** This routine is used for troubleshooting locks on multithreaded
+** platforms.  Enable by compiling with the -DSQLITE_LOCK_TRACE
+** command-line option on the compiler.  This code is normally
+** turned off.
+*/
+static int lockTrace(int fd, int op, struct flock *p){
+  char *zOpName, *zType;
+  int s;
+  int savedErrno;
+  if( op==F_GETLK ){
+    zOpName = "GETLK";
+  }else if( op==F_SETLK ){
+    zOpName = "SETLK";
+  }else{
+    s = osFcntl(fd, op, p);
+    sqlite3DebugPrintf("fcntl unknown %d %d %d\n", fd, op, s);
+    return s;
+  }
+  if( p->l_type==F_RDLCK ){
+    zType = "RDLCK";
+  }else if( p->l_type==F_WRLCK ){
+    zType = "WRLCK";
+  }else if( p->l_type==F_UNLCK ){
+    zType = "UNLCK";
+  }else{
+    assert( 0 );
+  }
+  assert( p->l_whence==SEEK_SET );
+  s = osFcntl(fd, op, p);
+  savedErrno = errno;
+  sqlite3DebugPrintf("fcntl %d %d %s %s %d %d %d %d\n",
+     threadid, fd, zOpName, zType, (int)p->l_start, (int)p->l_len,
+     (int)p->l_pid, s);
+  if( s==(-1) && op==F_SETLK && (p->l_type==F_RDLCK || p->l_type==F_WRLCK) ){
+    struct flock l2;
+    l2 = *p;
+    osFcntl(fd, F_GETLK, &l2);
+    if( l2.l_type==F_RDLCK ){
+      zType = "RDLCK";
+    }else if( l2.l_type==F_WRLCK ){
+      zType = "WRLCK";
+    }else if( l2.l_type==F_UNLCK ){
+      zType = "UNLCK";
+    }else{
+      assert( 0 );
+    }
+    sqlite3DebugPrintf("fcntl-failure-reason: %s %d %d %d\n",
+       zType, (int)l2.l_start, (int)l2.l_len, (int)l2.l_pid);
+  }
+  errno = savedErrno;
+  return s;
+}
+#undef osFcntl
+#define osFcntl lockTrace
+#endif /* SQLITE_LOCK_TRACE */
+
+/*
+** Retry ftruncate() calls that fail due to EINTR
+**
+** All calls to ftruncate() within this file should be made through this wrapper.
+** On the Android platform, bypassing the logic below could lead to a corrupt
+** database.
+*/
+static int robust_ftruncate(int h, sqlite3_int64 sz){
+  int rc;
+#ifdef __ANDROID__
+  /* On Android, ftruncate() always uses 32-bit offsets, even if 
+  ** _FILE_OFFSET_BITS=64 is defined. This means it is unsafe to attempt to
+  ** truncate a file to any size larger than 2GiB. Silently ignore any
+  ** such attempts.  */
+  if( sz>(sqlite3_int64)0x7FFFFFFF ){
+    rc = SQLITE_OK;
+  }else
+#endif
+  do{ rc = osFtruncate(h,sz); }while( rc<0 && errno==EINTR );
+  return rc;
+}
+
+/*
+** This routine translates a standard POSIX errno code into something
+** useful to the clients of the sqlite3 functions.  Specifically, it is
+** intended to translate a variety of "try again" errors into SQLITE_BUSY
+** and a variety of "please close the file descriptor NOW" errors into 
+** SQLITE_IOERR
+** 
+** Errors during initialization of locks, or file system support for locks,
+** should handle ENOLCK, ENOTSUP, EOPNOTSUPP separately.
+*/
+static int sqliteErrorFromPosixError(int posixError, int sqliteIOErr) {
+  switch (posixError) {
+#if 0
+  /* At one point this code was not commented out. In theory, this branch
+  ** should never be hit, as this function should only be called after
+  ** a locking-related function (i.e. fcntl()) has returned non-zero with
+  ** the value of errno as the first argument. Since a system call has failed,
+  ** errno should be non-zero.
+  **
+  ** Despite this, if errno really is zero, we still don't want to return
+  ** SQLITE_OK. The system call failed, and *some* SQLite error should be
+  ** propagated back to the caller. Commenting this branch out means errno==0
+  ** will be handled by the "default:" case below.
+  */
+  case 0: 
+    return SQLITE_OK;
+#endif
+
+  case EAGAIN:
+  case ETIMEDOUT:
+  case EBUSY:
+  case EINTR:
+  case ENOLCK:  
+    /* random NFS retry error, unless during file system support 
+     * introspection, in which it actually means what it says */
+    return SQLITE_BUSY;
+    
+  case EACCES: 
+    /* EACCES is like EAGAIN during locking operations, but not any other time*/
+    if( (sqliteIOErr == SQLITE_IOERR_LOCK) || 
+        (sqliteIOErr == SQLITE_IOERR_UNLOCK) || 
+        (sqliteIOErr == SQLITE_IOERR_RDLOCK) ||
+        (sqliteIOErr == SQLITE_IOERR_CHECKRESERVEDLOCK) ){
+      return SQLITE_BUSY;
+    }
+    /* else fall through */
+  case EPERM: 
+    return SQLITE_PERM;
+    
+#if EOPNOTSUPP!=ENOTSUP
+  case EOPNOTSUPP: 
+    /* something went terribly awry, unless during file system support 
+     * introspection, in which it actually means what it says */
+#endif
+#ifdef ENOTSUP
+  case ENOTSUP: 
+    /* invalid fd, unless during file system support introspection, in which 
+     * it actually means what it says */
+#endif
+  case EIO:
+  case EBADF:
+  case EINVAL:
+  case ENOTCONN:
+  case ENODEV:
+  case ENXIO:
+  case ENOENT:
+#ifdef ESTALE                     /* ESTALE is not defined on Interix systems */
+  case ESTALE:
+#endif
+  case ENOSYS:
+    /* these should force the client to close the file and reconnect */
+    
+  default: 
+    return sqliteIOErr;
+  }
+}
+
+
+/******************************************************************************
+****************** Begin Unique File ID Utility Used By VxWorks ***************
+**
+** On most versions of unix, we can get a unique ID for a file by concatenating
+** the device number and the inode number.  But this does not work on VxWorks.
+** On VxWorks, a unique file id must be based on the canonical filename.
+**
+** A pointer to an instance of the following structure can be used as a
+** unique file ID in VxWorks.  Each instance of this structure contains
+** a copy of the canonical filename.  There is also a reference count.  
+** The structure is reclaimed when the number of pointers to it drops to
+** zero.
+**
+** There are never very many files open at one time and lookups are not
+** a performance-critical path, so it is sufficient to put these
