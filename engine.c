@@ -25332,3 +25332,225 @@ static int randomnessPid = 0;
       return retval;
   }
 
+#else
+
+  #error Need implementation of sqlite3Hwtime() for your platform.
+
+  /*
+  ** To compile without implementing sqlite3Hwtime() for your platform,
+  ** you can remove the above #error and use the following
+  ** stub function.  You will lose timing support for many
+  ** of the debugging and testing utilities, but it should at
+  ** least compile and run.
+  */
+SQLITE_PRIVATE   sqlite_uint64 sqlite3Hwtime(void){ return ((sqlite_uint64)0); }
+
+#endif
+
+#endif /* !defined(_HWTIME_H_) */
+
+/************** End of hwtime.h **********************************************/
+/************** Continuing where we left off in os_common.h ******************/
+
+static sqlite_uint64 g_start;
+static sqlite_uint64 g_elapsed;
+#define TIMER_START       g_start=sqlite3Hwtime()
+#define TIMER_END         g_elapsed=sqlite3Hwtime()-g_start
+#define TIMER_ELAPSED     g_elapsed
+#else
+#define TIMER_START
+#define TIMER_END
+#define TIMER_ELAPSED     ((sqlite_uint64)0)
+#endif
+
+/*
+** If we compile with the SQLITE_TEST macro set, then the following block
+** of code will give us the ability to simulate a disk I/O error.  This
+** is used for testing the I/O recovery logic.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_io_error_hit = 0;            /* Total number of I/O Errors */
+SQLITE_API int sqlite3_io_error_hardhit = 0;        /* Number of non-benign errors */
+SQLITE_API int sqlite3_io_error_pending = 0;        /* Count down to first I/O error */
+SQLITE_API int sqlite3_io_error_persist = 0;        /* True if I/O errors persist */
+SQLITE_API int sqlite3_io_error_benign = 0;         /* True if errors are benign */
+SQLITE_API int sqlite3_diskfull_pending = 0;
+SQLITE_API int sqlite3_diskfull = 0;
+#define SimulateIOErrorBenign(X) sqlite3_io_error_benign=(X)
+#define SimulateIOError(CODE)  \
+  if( (sqlite3_io_error_persist && sqlite3_io_error_hit) \
+       || sqlite3_io_error_pending-- == 1 )  \
+              { local_ioerr(); CODE; }
+static void local_ioerr(){
+  IOTRACE(("IOERR\n"));
+  sqlite3_io_error_hit++;
+  if( !sqlite3_io_error_benign ) sqlite3_io_error_hardhit++;
+}
+#define SimulateDiskfullError(CODE) \
+   if( sqlite3_diskfull_pending ){ \
+     if( sqlite3_diskfull_pending == 1 ){ \
+       local_ioerr(); \
+       sqlite3_diskfull = 1; \
+       sqlite3_io_error_hit = 1; \
+       CODE; \
+     }else{ \
+       sqlite3_diskfull_pending--; \
+     } \
+   }
+#else
+#define SimulateIOErrorBenign(X)
+#define SimulateIOError(A)
+#define SimulateDiskfullError(A)
+#endif
+
+/*
+** When testing, keep a count of the number of open files.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_open_file_count = 0;
+#define OpenCounter(X)  sqlite3_open_file_count+=(X)
+#else
+#define OpenCounter(X)
+#endif
+
+#endif /* !defined(_OS_COMMON_H_) */
+
+/************** End of os_common.h *******************************************/
+/************** Continuing where we left off in os_unix.c ********************/
+
+/*
+** Define various macros that are missing from some systems.
+*/
+#ifndef O_LARGEFILE
+# define O_LARGEFILE 0
+#endif
+#ifdef SQLITE_DISABLE_LFS
+# undef O_LARGEFILE
+# define O_LARGEFILE 0
+#endif
+#ifndef O_NOFOLLOW
+# define O_NOFOLLOW 0
+#endif
+#ifndef O_BINARY
+# define O_BINARY 0
+#endif
+
+/*
+** The threadid macro resolves to the thread-id or to 0.  Used for
+** testing and debugging only.
+*/
+#if SQLITE_THREADSAFE
+#define threadid pthread_self()
+#else
+#define threadid 0
+#endif
+
+/*
+** HAVE_MREMAP defaults to true on Linux and false everywhere else.
+*/
+#if !defined(HAVE_MREMAP)
+# if defined(__linux__) && defined(_GNU_SOURCE)
+#  define HAVE_MREMAP 1
+# else
+#  define HAVE_MREMAP 0
+# endif
+#endif
+
+/*
+** Explicitly call the 64-bit version of lseek() on Android. Otherwise, lseek()
+** is the 32-bit version, even if _FILE_OFFSET_BITS=64 is defined.
+*/
+#ifdef __ANDROID__
+# define lseek lseek64
+#endif
+
+/*
+** Different Unix systems declare open() in different ways.  Same use
+** open(const char*,int,mode_t).  Others use open(const char*,int,...).
+** The difference is important when using a pointer to the function.
+**
+** The safest way to deal with the problem is to always use this wrapper
+** which always has the same well-defined interface.
+*/
+static int posixOpen(const char *zFile, int flags, int mode){
+  return open(zFile, flags, mode);
+}
+
+/*
+** On some systems, calls to fchown() will trigger a message in a security
+** log if they come from non-root processes.  So avoid calling fchown() if
+** we are not running as root.
+*/
+static int posixFchown(int fd, uid_t uid, gid_t gid){
+#if OS_VXWORKS
+  return 0;
+#else
+  return geteuid() ? 0 : fchown(fd,uid,gid);
+#endif
+}
+
+/* Forward reference */
+static int openDirectory(const char*, int*);
+static int unixGetpagesize(void);
+
+/*
+** Many system calls are accessed through pointer-to-functions so that
+** they may be overridden at runtime to facilitate fault injection during
+** testing and sandboxing.  The following array holds the names and pointers
+** to all overrideable system calls.
+*/
+static struct unix_syscall {
+  const char *zName;            /* Name of the system call */
+  sqlite3_syscall_ptr pCurrent; /* Current value of the system call */
+  sqlite3_syscall_ptr pDefault; /* Default value */
+} aSyscall[] = {
+  { "open",         (sqlite3_syscall_ptr)posixOpen,  0  },
+#define osOpen      ((int(*)(const char*,int,int))aSyscall[0].pCurrent)
+
+  { "close",        (sqlite3_syscall_ptr)close,      0  },
+#define osClose     ((int(*)(int))aSyscall[1].pCurrent)
+
+  { "access",       (sqlite3_syscall_ptr)access,     0  },
+#define osAccess    ((int(*)(const char*,int))aSyscall[2].pCurrent)
+
+  { "getcwd",       (sqlite3_syscall_ptr)getcwd,     0  },
+#define osGetcwd    ((char*(*)(char*,size_t))aSyscall[3].pCurrent)
+
+  { "stat",         (sqlite3_syscall_ptr)stat,       0  },
+#define osStat      ((int(*)(const char*,struct stat*))aSyscall[4].pCurrent)
+
+/*
+** The DJGPP compiler environment looks mostly like Unix, but it
+** lacks the fcntl() system call.  So redefine fcntl() to be something
+** that always succeeds.  This means that locking does not occur under
+** DJGPP.  But it is DOS - what did you expect?
+*/
+#ifdef __DJGPP__
+  { "fstat",        0,                 0  },
+#define osFstat(a,b,c)    0
+#else     
+  { "fstat",        (sqlite3_syscall_ptr)fstat,      0  },
+#define osFstat     ((int(*)(int,struct stat*))aSyscall[5].pCurrent)
+#endif
+
+  { "ftruncate",    (sqlite3_syscall_ptr)ftruncate,  0  },
+#define osFtruncate ((int(*)(int,off_t))aSyscall[6].pCurrent)
+
+  { "fcntl",        (sqlite3_syscall_ptr)fcntl,      0  },
+#define osFcntl     ((int(*)(int,int,...))aSyscall[7].pCurrent)
+
+  { "read",         (sqlite3_syscall_ptr)read,       0  },
+#define osRead      ((ssize_t(*)(int,void*,size_t))aSyscall[8].pCurrent)
+
+#if defined(USE_PREAD) || (SQLITE_ENABLE_LOCKING_STYLE && !OS_VXWORKS)
+  { "pread",        (sqlite3_syscall_ptr)pread,      0  },
+#else
+  { "pread",        (sqlite3_syscall_ptr)0,          0  },
+#endif
+#define osPread     ((ssize_t(*)(int,void*,size_t,off_t))aSyscall[9].pCurrent)
+
+#if defined(USE_PREAD64)
+  { "pread64",      (sqlite3_syscall_ptr)pread64,    0  },
+#else
+  { "pread64",      (sqlite3_syscall_ptr)0,          0  },
+#endif
