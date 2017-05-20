@@ -26818,3 +26818,220 @@ static int unixLock(sqlite3_file *id, int eFileLock){
       lock.l_len = 1L;
     }else{
       lock.l_start = SHARED_FIRST;
+      lock.l_len = SHARED_SIZE;
+    }
+
+    if( unixFileLock(pFile, &lock) ){
+      tErrno = errno;
+      rc = sqliteErrorFromPosixError(tErrno, SQLITE_IOERR_LOCK);
+      if( rc!=SQLITE_BUSY ){
+        pFile->lastErrno = tErrno;
+      }
+    }
+  }
+  
+
+#ifdef SQLITE_DEBUG
+  /* Set up the transaction-counter change checking flags when
+  ** transitioning from a SHARED to a RESERVED lock.  The change
+  ** from SHARED to RESERVED marks the beginning of a normal
+  ** write operation (not a hot journal rollback).
+  */
+  if( rc==SQLITE_OK
+   && pFile->eFileLock<=SHARED_LOCK
+   && eFileLock==RESERVED_LOCK
+  ){
+    pFile->transCntrChng = 0;
+    pFile->dbUpdate = 0;
+    pFile->inNormalWrite = 1;
+  }
+#endif
+
+
+  if( rc==SQLITE_OK ){
+    pFile->eFileLock = eFileLock;
+    pInode->eFileLock = eFileLock;
+  }else if( eFileLock==EXCLUSIVE_LOCK ){
+    pFile->eFileLock = PENDING_LOCK;
+    pInode->eFileLock = PENDING_LOCK;
+  }
+
+end_lock:
+  unixLeaveMutex();
+  OSTRACE(("LOCK    %d %s %s (unix)\n", pFile->h, azFileLock(eFileLock), 
+      rc==SQLITE_OK ? "ok" : "failed"));
+  return rc;
+}
+
+/*
+** Add the file descriptor used by file handle pFile to the corresponding
+** pUnused list.
+*/
+static void setPendingFd(unixFile *pFile){
+  unixInodeInfo *pInode = pFile->pInode;
+  UnixUnusedFd *p = pFile->pUnused;
+  p->pNext = pInode->pUnused;
+  pInode->pUnused = p;
+  pFile->h = -1;
+  pFile->pUnused = 0;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+** 
+** If handleNFSUnlock is true, then on downgrading an EXCLUSIVE_LOCK to SHARED
+** the byte range is divided into 2 parts and the first part is unlocked then
+** set to a read lock, then the other part is simply unlocked.  This works 
+** around a bug in BSD NFS lockd (also seen on MacOSX 10.3+) that fails to 
+** remove the write lock on a region when a read lock is set.
+*/
+static int posixUnlock(sqlite3_file *id, int eFileLock, int handleNFSUnlock){
+  unixFile *pFile = (unixFile*)id;
+  unixInodeInfo *pInode;
+  struct flock lock;
+  int rc = SQLITE_OK;
+
+  assert( pFile );
+  OSTRACE(("UNLOCK  %d %d was %d(%d,%d) pid=%d (unix)\n", pFile->h, eFileLock,
+      pFile->eFileLock, pFile->pInode->eFileLock, pFile->pInode->nShared,
+      getpid()));
+
+  assert( eFileLock<=SHARED_LOCK );
+  if( pFile->eFileLock<=eFileLock ){
+    return SQLITE_OK;
+  }
+  unixEnterMutex();
+  pInode = pFile->pInode;
+  assert( pInode->nShared!=0 );
+  if( pFile->eFileLock>SHARED_LOCK ){
+    assert( pInode->eFileLock==pFile->eFileLock );
+
+#ifdef SQLITE_DEBUG
+    /* When reducing a lock such that other processes can start
+    ** reading the database file again, make sure that the
+    ** transaction counter was updated if any part of the database
+    ** file changed.  If the transaction counter is not updated,
+    ** other connections to the same file might not realize that
+    ** the file has changed and hence might not know to flush their
+    ** cache.  The use of a stale cache can lead to database corruption.
+    */
+    pFile->inNormalWrite = 0;
+#endif
+
+    /* downgrading to a shared lock on NFS involves clearing the write lock
+    ** before establishing the readlock - to avoid a race condition we downgrade
+    ** the lock in 2 blocks, so that part of the range will be covered by a 
+    ** write lock until the rest is covered by a read lock:
+    **  1:   [WWWWW]
+    **  2:   [....W]
+    **  3:   [RRRRW]
+    **  4:   [RRRR.]
+    */
+    if( eFileLock==SHARED_LOCK ){
+
+#if !defined(__APPLE__) || !SQLITE_ENABLE_LOCKING_STYLE
+      (void)handleNFSUnlock;
+      assert( handleNFSUnlock==0 );
+#endif
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+      if( handleNFSUnlock ){
+        int tErrno;               /* Error code from system call errors */
+        off_t divSize = SHARED_SIZE - 1;
+        
+        lock.l_type = F_UNLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = SHARED_FIRST;
+        lock.l_len = divSize;
+        if( unixFileLock(pFile, &lock)==(-1) ){
+          tErrno = errno;
+          rc = SQLITE_IOERR_UNLOCK;
+          if( IS_LOCK_ERROR(rc) ){
+            pFile->lastErrno = tErrno;
+          }
+          goto end_unlock;
+        }
+        lock.l_type = F_RDLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = SHARED_FIRST;
+        lock.l_len = divSize;
+        if( unixFileLock(pFile, &lock)==(-1) ){
+          tErrno = errno;
+          rc = sqliteErrorFromPosixError(tErrno, SQLITE_IOERR_RDLOCK);
+          if( IS_LOCK_ERROR(rc) ){
+            pFile->lastErrno = tErrno;
+          }
+          goto end_unlock;
+        }
+        lock.l_type = F_UNLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = SHARED_FIRST+divSize;
+        lock.l_len = SHARED_SIZE-divSize;
+        if( unixFileLock(pFile, &lock)==(-1) ){
+          tErrno = errno;
+          rc = SQLITE_IOERR_UNLOCK;
+          if( IS_LOCK_ERROR(rc) ){
+            pFile->lastErrno = tErrno;
+          }
+          goto end_unlock;
+        }
+      }else
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+      {
+        lock.l_type = F_RDLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = SHARED_FIRST;
+        lock.l_len = SHARED_SIZE;
+        if( unixFileLock(pFile, &lock) ){
+          /* In theory, the call to unixFileLock() cannot fail because another
+          ** process is holding an incompatible lock. If it does, this 
+          ** indicates that the other process is not following the locking
+          ** protocol. If this happens, return SQLITE_IOERR_RDLOCK. Returning
+          ** SQLITE_BUSY would confuse the upper layer (in practice it causes 
+          ** an assert to fail). */ 
+          rc = SQLITE_IOERR_RDLOCK;
+          pFile->lastErrno = errno;
+          goto end_unlock;
+        }
+      }
+    }
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = PENDING_BYTE;
+    lock.l_len = 2L;  assert( PENDING_BYTE+1==RESERVED_BYTE );
+    if( unixFileLock(pFile, &lock)==0 ){
+      pInode->eFileLock = SHARED_LOCK;
+    }else{
+      rc = SQLITE_IOERR_UNLOCK;
+      pFile->lastErrno = errno;
+      goto end_unlock;
+    }
+  }
+  if( eFileLock==NO_LOCK ){
+    /* Decrement the shared lock counter.  Release the lock using an
+    ** OS call only when all threads in this same process have released
+    ** the lock.
+    */
+    pInode->nShared--;
+    if( pInode->nShared==0 ){
+      lock.l_type = F_UNLCK;
+      lock.l_whence = SEEK_SET;
+      lock.l_start = lock.l_len = 0L;
+      if( unixFileLock(pFile, &lock)==0 ){
+        pInode->eFileLock = NO_LOCK;
+      }else{
+        rc = SQLITE_IOERR_UNLOCK;
+        pFile->lastErrno = errno;
+        pInode->eFileLock = NO_LOCK;
+        pFile->eFileLock = NO_LOCK;
+      }
+    }
+
+    /* Decrement the count of locks against this same file.  When the
+    ** count reaches zero, close any other file descriptors whose close
+    ** was deferred because of outstanding locks.
+    */
+    pInode->nLock--;
