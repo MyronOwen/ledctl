@@ -27035,3 +27035,235 @@ static int posixUnlock(sqlite3_file *id, int eFileLock, int handleNFSUnlock){
     ** was deferred because of outstanding locks.
     */
     pInode->nLock--;
+    assert( pInode->nLock>=0 );
+    if( pInode->nLock==0 ){
+      closePendingFds(pFile);
+    }
+  }
+
+end_unlock:
+  unixLeaveMutex();
+  if( rc==SQLITE_OK ) pFile->eFileLock = eFileLock;
+  return rc;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int unixUnlock(sqlite3_file *id, int eFileLock){
+#if SQLITE_MAX_MMAP_SIZE>0
+  assert( eFileLock==SHARED_LOCK || ((unixFile *)id)->nFetchOut==0 );
+#endif
+  return posixUnlock(id, eFileLock, 0);
+}
+
+#if SQLITE_MAX_MMAP_SIZE>0
+static int unixMapfile(unixFile *pFd, i64 nByte);
+static void unixUnmapfile(unixFile *pFd);
+#endif
+
+/*
+** This function performs the parts of the "close file" operation 
+** common to all locking schemes. It closes the directory and file
+** handles, if they are valid, and sets all fields of the unixFile
+** structure to 0.
+**
+** It is *not* necessary to hold the mutex when this routine is called,
+** even on VxWorks.  A mutex will be acquired on VxWorks by the
+** vxworksReleaseFileId() routine.
+*/
+static int closeUnixFile(sqlite3_file *id){
+  unixFile *pFile = (unixFile*)id;
+#if SQLITE_MAX_MMAP_SIZE>0
+  unixUnmapfile(pFile);
+#endif
+  if( pFile->h>=0 ){
+    robust_close(pFile, pFile->h, __LINE__);
+    pFile->h = -1;
+  }
+#if OS_VXWORKS
+  if( pFile->pId ){
+    if( pFile->ctrlFlags & UNIXFILE_DELETE ){
+      osUnlink(pFile->pId->zCanonicalName);
+    }
+    vxworksReleaseFileId(pFile->pId);
+    pFile->pId = 0;
+  }
+#endif
+#ifdef SQLITE_UNLINK_AFTER_CLOSE
+  if( pFile->ctrlFlags & UNIXFILE_DELETE ){
+    osUnlink(pFile->zPath);
+    sqlite3_free(*(char**)&pFile->zPath);
+    pFile->zPath = 0;
+  }
+#endif
+  OSTRACE(("CLOSE   %-3d\n", pFile->h));
+  OpenCounter(-1);
+  sqlite3_free(pFile->pUnused);
+  memset(pFile, 0, sizeof(unixFile));
+  return SQLITE_OK;
+}
+
+/*
+** Close a file.
+*/
+static int unixClose(sqlite3_file *id){
+  int rc = SQLITE_OK;
+  unixFile *pFile = (unixFile *)id;
+  verifyDbFile(pFile);
+  unixUnlock(id, NO_LOCK);
+  unixEnterMutex();
+
+  /* unixFile.pInode is always valid here. Otherwise, a different close
+  ** routine (e.g. nolockClose()) would be called instead.
+  */
+  assert( pFile->pInode->nLock>0 || pFile->pInode->bProcessLock==0 );
+  if( ALWAYS(pFile->pInode) && pFile->pInode->nLock ){
+    /* If there are outstanding locks, do not actually close the file just
+    ** yet because that would clear those locks.  Instead, add the file
+    ** descriptor to pInode->pUnused list.  It will be automatically closed 
+    ** when the last lock is cleared.
+    */
+    setPendingFd(pFile);
+  }
+  releaseInodeInfo(pFile);
+  rc = closeUnixFile(id);
+  unixLeaveMutex();
+  return rc;
+}
+
+/************** End of the posix advisory lock implementation *****************
+******************************************************************************/
+
+/******************************************************************************
+****************************** No-op Locking **********************************
+**
+** Of the various locking implementations available, this is by far the
+** simplest:  locking is ignored.  No attempt is made to lock the database
+** file for reading or writing.
+**
+** This locking mode is appropriate for use on read-only databases
+** (ex: databases that are burned into CD-ROM, for example.)  It can
+** also be used if the application employs some external mechanism to
+** prevent simultaneous access of the same database by two or more
+** database connections.  But there is a serious risk of database
+** corruption if this locking mode is used in situations where multiple
+** database connections are accessing the same database file at the same
+** time and one or more of those connections are writing.
+*/
+
+static int nolockCheckReservedLock(sqlite3_file *NotUsed, int *pResOut){
+  UNUSED_PARAMETER(NotUsed);
+  *pResOut = 0;
+  return SQLITE_OK;
+}
+static int nolockLock(sqlite3_file *NotUsed, int NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return SQLITE_OK;
+}
+static int nolockUnlock(sqlite3_file *NotUsed, int NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return SQLITE_OK;
+}
+
+/*
+** Close the file.
+*/
+static int nolockClose(sqlite3_file *id) {
+  return closeUnixFile(id);
+}
+
+/******************* End of the no-op lock implementation *********************
+******************************************************************************/
+
+/******************************************************************************
+************************* Begin dot-file Locking ******************************
+**
+** The dotfile locking implementation uses the existence of separate lock
+** files (really a directory) to control access to the database.  This works
+** on just about every filesystem imaginable.  But there are serious downsides:
+**
+**    (1)  There is zero concurrency.  A single reader blocks all other
+**         connections from reading or writing the database.
+**
+**    (2)  An application crash or power loss can leave stale lock files
+**         sitting around that need to be cleared manually.
+**
+** Nevertheless, a dotlock is an appropriate locking mode for use if no
+** other locking strategy is available.
+**
+** Dotfile locking works by creating a subdirectory in the same directory as
+** the database and with the same name but with a ".lock" extension added.
+** The existence of a lock directory implies an EXCLUSIVE lock.  All other
+** lock types (SHARED, RESERVED, PENDING) are mapped into EXCLUSIVE.
+*/
+
+/*
+** The file suffix added to the data base filename in order to create the
+** lock directory.
+*/
+#define DOTLOCK_SUFFIX ".lock"
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+**
+** In dotfile locking, either a lock exists or it does not.  So in this
+** variation of CheckReservedLock(), *pResOut is set to true if any lock
+** is held on the file and false if the file is unlocked.
+*/
+static int dotlockCheckReservedLock(sqlite3_file *id, int *pResOut) {
+  int rc = SQLITE_OK;
+  int reserved = 0;
+  unixFile *pFile = (unixFile*)id;
+
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK; );
+  
+  assert( pFile );
+
+  /* Check if a thread in this process holds such a lock */
+  if( pFile->eFileLock>SHARED_LOCK ){
+    /* Either this connection or some other connection in the same process
+    ** holds a lock on the file.  No need to check further. */
+    reserved = 1;
+  }else{
+    /* The lock is held if and only if the lockfile exists */
+    const char *zLockFile = (const char*)pFile->lockingContext;
+    reserved = osAccess(zLockFile, 0)==0;
+  }
+  OSTRACE(("TEST WR-LOCK %d %d %d (dotlock)\n", pFile->h, rc, reserved));
+  *pResOut = reserved;
+  return rc;
+}
+
+/*
+** Lock the file with the lock specified by parameter eFileLock - one
+** of the following:
+**
+**     (1) SHARED_LOCK
+**     (2) RESERVED_LOCK
+**     (3) PENDING_LOCK
+**     (4) EXCLUSIVE_LOCK
+**
+** Sometimes when requesting one lock state, additional lock states
+** are inserted in between.  The locking might fail on one of the later
+** transitions leaving the lock state different from what it started but
+** still short of its goal.  The following chart shows the allowed
+** transitions and the inserted intermediate states:
+**
+**    UNLOCKED -> SHARED
+**    SHARED -> RESERVED
+**    SHARED -> (PENDING) -> EXCLUSIVE
+**    RESERVED -> (PENDING) -> EXCLUSIVE
+**    PENDING -> EXCLUSIVE
+**
+** This routine will only increase a lock.  Use the sqlite3OsUnlock()
+** routine to lower a locking level.
+**
+** With dotfile locking, we really only support state (4): EXCLUSIVE.
