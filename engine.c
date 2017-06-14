@@ -27499,3 +27499,239 @@ static int flockCheckReservedLock(sqlite3_file *id, int *pResOut){
 static int flockLock(sqlite3_file *id, int eFileLock) {
   int rc = SQLITE_OK;
   unixFile *pFile = (unixFile*)id;
+
+  assert( pFile );
+
+  /* if we already have a lock, it is exclusive.  
+  ** Just adjust level and punt on outta here. */
+  if (pFile->eFileLock > NO_LOCK) {
+    pFile->eFileLock = eFileLock;
+    return SQLITE_OK;
+  }
+  
+  /* grab an exclusive lock */
+  
+  if (robust_flock(pFile->h, LOCK_EX | LOCK_NB)) {
+    int tErrno = errno;
+    /* didn't get, must be busy */
+    rc = sqliteErrorFromPosixError(tErrno, SQLITE_IOERR_LOCK);
+    if( IS_LOCK_ERROR(rc) ){
+      pFile->lastErrno = tErrno;
+    }
+  } else {
+    /* got it, set the type and return ok */
+    pFile->eFileLock = eFileLock;
+  }
+  OSTRACE(("LOCK    %d %s %s (flock)\n", pFile->h, azFileLock(eFileLock), 
+           rc==SQLITE_OK ? "ok" : "failed"));
+#ifdef SQLITE_IGNORE_FLOCK_LOCK_ERRORS
+  if( (rc & SQLITE_IOERR) == SQLITE_IOERR ){
+    rc = SQLITE_BUSY;
+  }
+#endif /* SQLITE_IGNORE_FLOCK_LOCK_ERRORS */
+  return rc;
+}
+
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int flockUnlock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  
+  assert( pFile );
+  OSTRACE(("UNLOCK  %d %d was %d pid=%d (flock)\n", pFile->h, eFileLock,
+           pFile->eFileLock, getpid()));
+  assert( eFileLock<=SHARED_LOCK );
+  
+  /* no-op if possible */
+  if( pFile->eFileLock==eFileLock ){
+    return SQLITE_OK;
+  }
+  
+  /* shared can just be set because we always have an exclusive */
+  if (eFileLock==SHARED_LOCK) {
+    pFile->eFileLock = eFileLock;
+    return SQLITE_OK;
+  }
+  
+  /* no, really, unlock. */
+  if( robust_flock(pFile->h, LOCK_UN) ){
+#ifdef SQLITE_IGNORE_FLOCK_LOCK_ERRORS
+    return SQLITE_OK;
+#endif /* SQLITE_IGNORE_FLOCK_LOCK_ERRORS */
+    return SQLITE_IOERR_UNLOCK;
+  }else{
+    pFile->eFileLock = NO_LOCK;
+    return SQLITE_OK;
+  }
+}
+
+/*
+** Close a file.
+*/
+static int flockClose(sqlite3_file *id) {
+  int rc = SQLITE_OK;
+  if( id ){
+    flockUnlock(id, NO_LOCK);
+    rc = closeUnixFile(id);
+  }
+  return rc;
+}
+
+#endif /* SQLITE_ENABLE_LOCKING_STYLE && !OS_VXWORK */
+
+/******************* End of the flock lock implementation *********************
+******************************************************************************/
+
+/******************************************************************************
+************************ Begin Named Semaphore Locking ************************
+**
+** Named semaphore locking is only supported on VxWorks.
+**
+** Semaphore locking is like dot-lock and flock in that it really only
+** supports EXCLUSIVE locking.  Only a single process can read or write
+** the database file at a time.  This reduces potential concurrency, but
+** makes the lock implementation much easier.
+*/
+#if OS_VXWORKS
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+*/
+static int semCheckReservedLock(sqlite3_file *id, int *pResOut) {
+  int rc = SQLITE_OK;
+  int reserved = 0;
+  unixFile *pFile = (unixFile*)id;
+
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK; );
+  
+  assert( pFile );
+
+  /* Check if a thread in this process holds such a lock */
+  if( pFile->eFileLock>SHARED_LOCK ){
+    reserved = 1;
+  }
+  
+  /* Otherwise see if some other process holds it. */
+  if( !reserved ){
+    sem_t *pSem = pFile->pInode->pSem;
+
+    if( sem_trywait(pSem)==-1 ){
+      int tErrno = errno;
+      if( EAGAIN != tErrno ){
+        rc = sqliteErrorFromPosixError(tErrno, SQLITE_IOERR_CHECKRESERVEDLOCK);
+        pFile->lastErrno = tErrno;
+      } else {
+        /* someone else has the lock when we are in NO_LOCK */
+        reserved = (pFile->eFileLock < SHARED_LOCK);
+      }
+    }else{
+      /* we could have it if we want it */
+      sem_post(pSem);
+    }
+  }
+  OSTRACE(("TEST WR-LOCK %d %d %d (sem)\n", pFile->h, rc, reserved));
+
+  *pResOut = reserved;
+  return rc;
+}
+
+/*
+** Lock the file with the lock specified by parameter eFileLock - one
+** of the following:
+**
+**     (1) SHARED_LOCK
+**     (2) RESERVED_LOCK
+**     (3) PENDING_LOCK
+**     (4) EXCLUSIVE_LOCK
+**
+** Sometimes when requesting one lock state, additional lock states
+** are inserted in between.  The locking might fail on one of the later
+** transitions leaving the lock state different from what it started but
+** still short of its goal.  The following chart shows the allowed
+** transitions and the inserted intermediate states:
+**
+**    UNLOCKED -> SHARED
+**    SHARED -> RESERVED
+**    SHARED -> (PENDING) -> EXCLUSIVE
+**    RESERVED -> (PENDING) -> EXCLUSIVE
+**    PENDING -> EXCLUSIVE
+**
+** Semaphore locks only really support EXCLUSIVE locks.  We track intermediate
+** lock states in the sqlite3_file structure, but all locks SHARED or
+** above are really EXCLUSIVE locks and exclude all other processes from
+** access the file.
+**
+** This routine will only increase a lock.  Use the sqlite3OsUnlock()
+** routine to lower a locking level.
+*/
+static int semLock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  sem_t *pSem = pFile->pInode->pSem;
+  int rc = SQLITE_OK;
+
+  /* if we already have a lock, it is exclusive.  
+  ** Just adjust level and punt on outta here. */
+  if (pFile->eFileLock > NO_LOCK) {
+    pFile->eFileLock = eFileLock;
+    rc = SQLITE_OK;
+    goto sem_end_lock;
+  }
+  
+  /* lock semaphore now but bail out when already locked. */
+  if( sem_trywait(pSem)==-1 ){
+    rc = SQLITE_BUSY;
+    goto sem_end_lock;
+  }
+
+  /* got it, set the type and return ok */
+  pFile->eFileLock = eFileLock;
+
+ sem_end_lock:
+  return rc;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int semUnlock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  sem_t *pSem = pFile->pInode->pSem;
+
+  assert( pFile );
+  assert( pSem );
+  OSTRACE(("UNLOCK  %d %d was %d pid=%d (sem)\n", pFile->h, eFileLock,
+           pFile->eFileLock, getpid()));
+  assert( eFileLock<=SHARED_LOCK );
+  
+  /* no-op if possible */
+  if( pFile->eFileLock==eFileLock ){
+    return SQLITE_OK;
+  }
+  
+  /* shared can just be set because we always have an exclusive */
+  if (eFileLock==SHARED_LOCK) {
+    pFile->eFileLock = eFileLock;
+    return SQLITE_OK;
+  }
+  
+  /* no, really unlock. */
+  if ( sem_post(pSem)==-1 ) {
+    int rc, tErrno = errno;
+    rc = sqliteErrorFromPosixError(tErrno, SQLITE_IOERR_UNLOCK);
+    if( IS_LOCK_ERROR(rc) ){
+      pFile->lastErrno = tErrno;
+    }
+    return rc; 
