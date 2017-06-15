@@ -27735,3 +27735,220 @@ static int semUnlock(sqlite3_file *id, int eFileLock) {
       pFile->lastErrno = tErrno;
     }
     return rc; 
+  }
+  pFile->eFileLock = NO_LOCK;
+  return SQLITE_OK;
+}
+
+/*
+ ** Close a file.
+ */
+static int semClose(sqlite3_file *id) {
+  if( id ){
+    unixFile *pFile = (unixFile*)id;
+    semUnlock(id, NO_LOCK);
+    assert( pFile );
+    unixEnterMutex();
+    releaseInodeInfo(pFile);
+    unixLeaveMutex();
+    closeUnixFile(id);
+  }
+  return SQLITE_OK;
+}
+
+#endif /* OS_VXWORKS */
+/*
+** Named semaphore locking is only available on VxWorks.
+**
+*************** End of the named semaphore lock implementation ****************
+******************************************************************************/
+
+
+/******************************************************************************
+*************************** Begin AFP Locking *********************************
+**
+** AFP is the Apple Filing Protocol.  AFP is a network filesystem found
+** on Apple Macintosh computers - both OS9 and OSX.
+**
+** Third-party implementations of AFP are available.  But this code here
+** only works on OSX.
+*/
+
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+/*
+** The afpLockingContext structure contains all afp lock specific state
+*/
+typedef struct afpLockingContext afpLockingContext;
+struct afpLockingContext {
+  int reserved;
+  const char *dbPath;             /* Name of the open file */
+};
+
+struct ByteRangeLockPB2
+{
+  unsigned long long offset;        /* offset to first byte to lock */
+  unsigned long long length;        /* nbr of bytes to lock */
+  unsigned long long retRangeStart; /* nbr of 1st byte locked if successful */
+  unsigned char unLockFlag;         /* 1 = unlock, 0 = lock */
+  unsigned char startEndFlag;       /* 1=rel to end of fork, 0=rel to start */
+  int fd;                           /* file desc to assoc this lock with */
+};
+
+#define afpfsByteRangeLock2FSCTL        _IOWR('z', 23, struct ByteRangeLockPB2)
+
+/*
+** This is a utility for setting or clearing a bit-range lock on an
+** AFP filesystem.
+** 
+** Return SQLITE_OK on success, SQLITE_BUSY on failure.
+*/
+static int afpSetLock(
+  const char *path,              /* Name of the file to be locked or unlocked */
+  unixFile *pFile,               /* Open file descriptor on path */
+  unsigned long long offset,     /* First byte to be locked */
+  unsigned long long length,     /* Number of bytes to lock */
+  int setLockFlag                /* True to set lock.  False to clear lock */
+){
+  struct ByteRangeLockPB2 pb;
+  int err;
+  
+  pb.unLockFlag = setLockFlag ? 0 : 1;
+  pb.startEndFlag = 0;
+  pb.offset = offset;
+  pb.length = length; 
+  pb.fd = pFile->h;
+  
+  OSTRACE(("AFPSETLOCK [%s] for %d%s in range %llx:%llx\n", 
+    (setLockFlag?"ON":"OFF"), pFile->h, (pb.fd==-1?"[testval-1]":""),
+    offset, length));
+  err = fsctl(path, afpfsByteRangeLock2FSCTL, &pb, 0);
+  if ( err==-1 ) {
+    int rc;
+    int tErrno = errno;
+    OSTRACE(("AFPSETLOCK failed to fsctl() '%s' %d %s\n",
+             path, tErrno, strerror(tErrno)));
+#ifdef SQLITE_IGNORE_AFP_LOCK_ERRORS
+    rc = SQLITE_BUSY;
+#else
+    rc = sqliteErrorFromPosixError(tErrno,
+                    setLockFlag ? SQLITE_IOERR_LOCK : SQLITE_IOERR_UNLOCK);
+#endif /* SQLITE_IGNORE_AFP_LOCK_ERRORS */
+    if( IS_LOCK_ERROR(rc) ){
+      pFile->lastErrno = tErrno;
+    }
+    return rc;
+  } else {
+    return SQLITE_OK;
+  }
+}
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+*/
+static int afpCheckReservedLock(sqlite3_file *id, int *pResOut){
+  int rc = SQLITE_OK;
+  int reserved = 0;
+  unixFile *pFile = (unixFile*)id;
+  afpLockingContext *context;
+  
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK; );
+  
+  assert( pFile );
+  context = (afpLockingContext *) pFile->lockingContext;
+  if( context->reserved ){
+    *pResOut = 1;
+    return SQLITE_OK;
+  }
+  unixEnterMutex(); /* Because pFile->pInode is shared across threads */
+  
+  /* Check if a thread in this process holds such a lock */
+  if( pFile->pInode->eFileLock>SHARED_LOCK ){
+    reserved = 1;
+  }
+  
+  /* Otherwise see if some other process holds it.
+   */
+  if( !reserved ){
+    /* lock the RESERVED byte */
+    int lrc = afpSetLock(context->dbPath, pFile, RESERVED_BYTE, 1,1);  
+    if( SQLITE_OK==lrc ){
+      /* if we succeeded in taking the reserved lock, unlock it to restore
+      ** the original state */
+      lrc = afpSetLock(context->dbPath, pFile, RESERVED_BYTE, 1, 0);
+    } else {
+      /* if we failed to get the lock then someone else must have it */
+      reserved = 1;
+    }
+    if( IS_LOCK_ERROR(lrc) ){
+      rc=lrc;
+    }
+  }
+  
+  unixLeaveMutex();
+  OSTRACE(("TEST WR-LOCK %d %d %d (afp)\n", pFile->h, rc, reserved));
+  
+  *pResOut = reserved;
+  return rc;
+}
+
+/*
+** Lock the file with the lock specified by parameter eFileLock - one
+** of the following:
+**
+**     (1) SHARED_LOCK
+**     (2) RESERVED_LOCK
+**     (3) PENDING_LOCK
+**     (4) EXCLUSIVE_LOCK
+**
+** Sometimes when requesting one lock state, additional lock states
+** are inserted in between.  The locking might fail on one of the later
+** transitions leaving the lock state different from what it started but
+** still short of its goal.  The following chart shows the allowed
+** transitions and the inserted intermediate states:
+**
+**    UNLOCKED -> SHARED
+**    SHARED -> RESERVED
+**    SHARED -> (PENDING) -> EXCLUSIVE
+**    RESERVED -> (PENDING) -> EXCLUSIVE
+**    PENDING -> EXCLUSIVE
+**
+** This routine will only increase a lock.  Use the sqlite3OsUnlock()
+** routine to lower a locking level.
+*/
+static int afpLock(sqlite3_file *id, int eFileLock){
+  int rc = SQLITE_OK;
+  unixFile *pFile = (unixFile*)id;
+  unixInodeInfo *pInode = pFile->pInode;
+  afpLockingContext *context = (afpLockingContext *) pFile->lockingContext;
+  
+  assert( pFile );
+  OSTRACE(("LOCK    %d %s was %s(%s,%d) pid=%d (afp)\n", pFile->h,
+           azFileLock(eFileLock), azFileLock(pFile->eFileLock),
+           azFileLock(pInode->eFileLock), pInode->nShared , getpid()));
+
+  /* If there is already a lock of this type or more restrictive on the
+  ** unixFile, do nothing. Don't use the afp_end_lock: exit path, as
+  ** unixEnterMutex() hasn't been called yet.
+  */
+  if( pFile->eFileLock>=eFileLock ){
+    OSTRACE(("LOCK    %d %s ok (already held) (afp)\n", pFile->h,
+           azFileLock(eFileLock)));
+    return SQLITE_OK;
+  }
+
+  /* Make sure the locking sequence is correct
+  **  (1) We never move from unlocked to anything higher than shared lock.
+  **  (2) SQLite never explicitly requests a pendig lock.
+  **  (3) A shared lock is always held when a reserve lock is requested.
+  */
+  assert( pFile->eFileLock!=NO_LOCK || eFileLock==SHARED_LOCK );
+  assert( eFileLock!=PENDING_LOCK );
+  assert( eFileLock!=RESERVED_LOCK || pFile->eFileLock==SHARED_LOCK );
+  
+  /* This mutex is needed because pFile->pInode is shared across threads
+  */
+  unixEnterMutex();
+  pInode = pFile->pInode;
