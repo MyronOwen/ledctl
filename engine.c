@@ -27952,3 +27952,234 @@ static int afpLock(sqlite3_file *id, int eFileLock){
   */
   unixEnterMutex();
   pInode = pFile->pInode;
+
+  /* If some thread using this PID has a lock via a different unixFile*
+  ** handle that precludes the requested lock, return BUSY.
+  */
+  if( (pFile->eFileLock!=pInode->eFileLock && 
+       (pInode->eFileLock>=PENDING_LOCK || eFileLock>SHARED_LOCK))
+     ){
+    rc = SQLITE_BUSY;
+    goto afp_end_lock;
+  }
+  
+  /* If a SHARED lock is requested, and some thread using this PID already
+  ** has a SHARED or RESERVED lock, then increment reference counts and
+  ** return SQLITE_OK.
+  */
+  if( eFileLock==SHARED_LOCK && 
+     (pInode->eFileLock==SHARED_LOCK || pInode->eFileLock==RESERVED_LOCK) ){
+    assert( eFileLock==SHARED_LOCK );
+    assert( pFile->eFileLock==0 );
+    assert( pInode->nShared>0 );
+    pFile->eFileLock = SHARED_LOCK;
+    pInode->nShared++;
+    pInode->nLock++;
+    goto afp_end_lock;
+  }
+    
+  /* A PENDING lock is needed before acquiring a SHARED lock and before
+  ** acquiring an EXCLUSIVE lock.  For the SHARED lock, the PENDING will
+  ** be released.
+  */
+  if( eFileLock==SHARED_LOCK 
+      || (eFileLock==EXCLUSIVE_LOCK && pFile->eFileLock<PENDING_LOCK)
+  ){
+    int failed;
+    failed = afpSetLock(context->dbPath, pFile, PENDING_BYTE, 1, 1);
+    if (failed) {
+      rc = failed;
+      goto afp_end_lock;
+    }
+  }
+  
+  /* If control gets to this point, then actually go ahead and make
+  ** operating system calls for the specified lock.
+  */
+  if( eFileLock==SHARED_LOCK ){
+    int lrc1, lrc2, lrc1Errno = 0;
+    long lk, mask;
+    
+    assert( pInode->nShared==0 );
+    assert( pInode->eFileLock==0 );
+        
+    mask = (sizeof(long)==8) ? LARGEST_INT64 : 0x7fffffff;
+    /* Now get the read-lock SHARED_LOCK */
+    /* note that the quality of the randomness doesn't matter that much */
+    lk = random(); 
+    pInode->sharedByte = (lk & mask)%(SHARED_SIZE - 1);
+    lrc1 = afpSetLock(context->dbPath, pFile, 
+          SHARED_FIRST+pInode->sharedByte, 1, 1);
+    if( IS_LOCK_ERROR(lrc1) ){
+      lrc1Errno = pFile->lastErrno;
+    }
+    /* Drop the temporary PENDING lock */
+    lrc2 = afpSetLock(context->dbPath, pFile, PENDING_BYTE, 1, 0);
+    
+    if( IS_LOCK_ERROR(lrc1) ) {
+      pFile->lastErrno = lrc1Errno;
+      rc = lrc1;
+      goto afp_end_lock;
+    } else if( IS_LOCK_ERROR(lrc2) ){
+      rc = lrc2;
+      goto afp_end_lock;
+    } else if( lrc1 != SQLITE_OK ) {
+      rc = lrc1;
+    } else {
+      pFile->eFileLock = SHARED_LOCK;
+      pInode->nLock++;
+      pInode->nShared = 1;
+    }
+  }else if( eFileLock==EXCLUSIVE_LOCK && pInode->nShared>1 ){
+    /* We are trying for an exclusive lock but another thread in this
+     ** same process is still holding a shared lock. */
+    rc = SQLITE_BUSY;
+  }else{
+    /* The request was for a RESERVED or EXCLUSIVE lock.  It is
+    ** assumed that there is a SHARED or greater lock on the file
+    ** already.
+    */
+    int failed = 0;
+    assert( 0!=pFile->eFileLock );
+    if (eFileLock >= RESERVED_LOCK && pFile->eFileLock < RESERVED_LOCK) {
+        /* Acquire a RESERVED lock */
+        failed = afpSetLock(context->dbPath, pFile, RESERVED_BYTE, 1,1);
+      if( !failed ){
+        context->reserved = 1;
+      }
+    }
+    if (!failed && eFileLock == EXCLUSIVE_LOCK) {
+      /* Acquire an EXCLUSIVE lock */
+        
+      /* Remove the shared lock before trying the range.  we'll need to 
+      ** reestablish the shared lock if we can't get the  afpUnlock
+      */
+      if( !(failed = afpSetLock(context->dbPath, pFile, SHARED_FIRST +
+                         pInode->sharedByte, 1, 0)) ){
+        int failed2 = SQLITE_OK;
+        /* now attemmpt to get the exclusive lock range */
+        failed = afpSetLock(context->dbPath, pFile, SHARED_FIRST, 
+                               SHARED_SIZE, 1);
+        if( failed && (failed2 = afpSetLock(context->dbPath, pFile, 
+                       SHARED_FIRST + pInode->sharedByte, 1, 1)) ){
+          /* Can't reestablish the shared lock.  Sqlite can't deal, this is
+          ** a critical I/O error
+          */
+          rc = ((failed & SQLITE_IOERR) == SQLITE_IOERR) ? failed2 : 
+               SQLITE_IOERR_LOCK;
+          goto afp_end_lock;
+        } 
+      }else{
+        rc = failed; 
+      }
+    }
+    if( failed ){
+      rc = failed;
+    }
+  }
+  
+  if( rc==SQLITE_OK ){
+    pFile->eFileLock = eFileLock;
+    pInode->eFileLock = eFileLock;
+  }else if( eFileLock==EXCLUSIVE_LOCK ){
+    pFile->eFileLock = PENDING_LOCK;
+    pInode->eFileLock = PENDING_LOCK;
+  }
+  
+afp_end_lock:
+  unixLeaveMutex();
+  OSTRACE(("LOCK    %d %s %s (afp)\n", pFile->h, azFileLock(eFileLock), 
+         rc==SQLITE_OK ? "ok" : "failed"));
+  return rc;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int afpUnlock(sqlite3_file *id, int eFileLock) {
+  int rc = SQLITE_OK;
+  unixFile *pFile = (unixFile*)id;
+  unixInodeInfo *pInode;
+  afpLockingContext *context = (afpLockingContext *) pFile->lockingContext;
+  int skipShared = 0;
+#ifdef SQLITE_TEST
+  int h = pFile->h;
+#endif
+
+  assert( pFile );
+  OSTRACE(("UNLOCK  %d %d was %d(%d,%d) pid=%d (afp)\n", pFile->h, eFileLock,
+           pFile->eFileLock, pFile->pInode->eFileLock, pFile->pInode->nShared,
+           getpid()));
+
+  assert( eFileLock<=SHARED_LOCK );
+  if( pFile->eFileLock<=eFileLock ){
+    return SQLITE_OK;
+  }
+  unixEnterMutex();
+  pInode = pFile->pInode;
+  assert( pInode->nShared!=0 );
+  if( pFile->eFileLock>SHARED_LOCK ){
+    assert( pInode->eFileLock==pFile->eFileLock );
+    SimulateIOErrorBenign(1);
+    SimulateIOError( h=(-1) )
+    SimulateIOErrorBenign(0);
+    
+#ifdef SQLITE_DEBUG
+    /* When reducing a lock such that other processes can start
+    ** reading the database file again, make sure that the
+    ** transaction counter was updated if any part of the database
+    ** file changed.  If the transaction counter is not updated,
+    ** other connections to the same file might not realize that
+    ** the file has changed and hence might not know to flush their
+    ** cache.  The use of a stale cache can lead to database corruption.
+    */
+    assert( pFile->inNormalWrite==0
+           || pFile->dbUpdate==0
+           || pFile->transCntrChng==1 );
+    pFile->inNormalWrite = 0;
+#endif
+    
+    if( pFile->eFileLock==EXCLUSIVE_LOCK ){
+      rc = afpSetLock(context->dbPath, pFile, SHARED_FIRST, SHARED_SIZE, 0);
+      if( rc==SQLITE_OK && (eFileLock==SHARED_LOCK || pInode->nShared>1) ){
+        /* only re-establish the shared lock if necessary */
+        int sharedLockByte = SHARED_FIRST+pInode->sharedByte;
+        rc = afpSetLock(context->dbPath, pFile, sharedLockByte, 1, 1);
+      } else {
+        skipShared = 1;
+      }
+    }
+    if( rc==SQLITE_OK && pFile->eFileLock>=PENDING_LOCK ){
+      rc = afpSetLock(context->dbPath, pFile, PENDING_BYTE, 1, 0);
+    } 
+    if( rc==SQLITE_OK && pFile->eFileLock>=RESERVED_LOCK && context->reserved ){
+      rc = afpSetLock(context->dbPath, pFile, RESERVED_BYTE, 1, 0);
+      if( !rc ){ 
+        context->reserved = 0; 
+      }
+    }
+    if( rc==SQLITE_OK && (eFileLock==SHARED_LOCK || pInode->nShared>1)){
+      pInode->eFileLock = SHARED_LOCK;
+    }
+  }
+  if( rc==SQLITE_OK && eFileLock==NO_LOCK ){
+
+    /* Decrement the shared lock counter.  Release the lock using an
+    ** OS call only when all threads in this same process have released
+    ** the lock.
+    */
+    unsigned long long sharedLockByte = SHARED_FIRST+pInode->sharedByte;
+    pInode->nShared--;
+    if( pInode->nShared==0 ){
+      SimulateIOErrorBenign(1);
+      SimulateIOError( h=(-1) )
+      SimulateIOErrorBenign(0);
+      if( !skipShared ){
+        rc = afpSetLock(context->dbPath, pFile, sharedLockByte, 1, 0);
+      }
+      if( !rc ){
+        pInode->eFileLock = NO_LOCK;
