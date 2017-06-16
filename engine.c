@@ -28183,3 +28183,251 @@ static int afpUnlock(sqlite3_file *id, int eFileLock) {
       }
       if( !rc ){
         pInode->eFileLock = NO_LOCK;
+        pFile->eFileLock = NO_LOCK;
+      }
+    }
+    if( rc==SQLITE_OK ){
+      pInode->nLock--;
+      assert( pInode->nLock>=0 );
+      if( pInode->nLock==0 ){
+        closePendingFds(pFile);
+      }
+    }
+  }
+  
+  unixLeaveMutex();
+  if( rc==SQLITE_OK ) pFile->eFileLock = eFileLock;
+  return rc;
+}
+
+/*
+** Close a file & cleanup AFP specific locking context 
+*/
+static int afpClose(sqlite3_file *id) {
+  int rc = SQLITE_OK;
+  if( id ){
+    unixFile *pFile = (unixFile*)id;
+    afpUnlock(id, NO_LOCK);
+    unixEnterMutex();
+    if( pFile->pInode && pFile->pInode->nLock ){
+      /* If there are outstanding locks, do not actually close the file just
+      ** yet because that would clear those locks.  Instead, add the file
+      ** descriptor to pInode->aPending.  It will be automatically closed when
+      ** the last lock is cleared.
+      */
+      setPendingFd(pFile);
+    }
+    releaseInodeInfo(pFile);
+    sqlite3_free(pFile->lockingContext);
+    rc = closeUnixFile(id);
+    unixLeaveMutex();
+  }
+  return rc;
+}
+
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+/*
+** The code above is the AFP lock implementation.  The code is specific
+** to MacOSX and does not work on other unix platforms.  No alternative
+** is available.  If you don't compile for a mac, then the "unix-afp"
+** VFS is not available.
+**
+********************* End of the AFP lock implementation **********************
+******************************************************************************/
+
+/******************************************************************************
+*************************** Begin NFS Locking ********************************/
+
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+/*
+ ** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+ ** must be either NO_LOCK or SHARED_LOCK.
+ **
+ ** If the locking level of the file descriptor is already at or below
+ ** the requested locking level, this routine is a no-op.
+ */
+static int nfsUnlock(sqlite3_file *id, int eFileLock){
+  return posixUnlock(id, eFileLock, 1);
+}
+
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+/*
+** The code above is the NFS lock implementation.  The code is specific
+** to MacOSX and does not work on other unix platforms.  No alternative
+** is available.  
+**
+********************* End of the NFS lock implementation **********************
+******************************************************************************/
+
+/******************************************************************************
+**************** Non-locking sqlite3_file methods *****************************
+**
+** The next division contains implementations for all methods of the 
+** sqlite3_file object other than the locking methods.  The locking
+** methods were defined in divisions above (one locking method per
+** division).  Those methods that are common to all locking modes
+** are gather together into this division.
+*/
+
+/*
+** Seek to the offset passed as the second argument, then read cnt 
+** bytes into pBuf. Return the number of bytes actually read.
+**
+** NB:  If you define USE_PREAD or USE_PREAD64, then it might also
+** be necessary to define _XOPEN_SOURCE to be 500.  This varies from
+** one system to another.  Since SQLite does not define USE_PREAD
+** in any form by default, we will not attempt to define _XOPEN_SOURCE.
+** See tickets #2741 and #2681.
+**
+** To avoid stomping the errno value on a failed read the lastErrno value
+** is set before returning.
+*/
+static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
+  int got;
+  int prior = 0;
+#if (!defined(USE_PREAD) && !defined(USE_PREAD64))
+  i64 newOffset;
+#endif
+  TIMER_START;
+  assert( cnt==(cnt&0x1ffff) );
+  assert( id->h>2 );
+  cnt &= 0x1ffff;
+  do{
+#if defined(USE_PREAD)
+    got = osPread(id->h, pBuf, cnt, offset);
+    SimulateIOError( got = -1 );
+#elif defined(USE_PREAD64)
+    got = osPread64(id->h, pBuf, cnt, offset);
+    SimulateIOError( got = -1 );
+#else
+    newOffset = lseek(id->h, offset, SEEK_SET);
+    SimulateIOError( newOffset-- );
+    if( newOffset!=offset ){
+      if( newOffset == -1 ){
+        ((unixFile*)id)->lastErrno = errno;
+      }else{
+        ((unixFile*)id)->lastErrno = 0;
+      }
+      return -1;
+    }
+    got = osRead(id->h, pBuf, cnt);
+#endif
+    if( got==cnt ) break;
+    if( got<0 ){
+      if( errno==EINTR ){ got = 1; continue; }
+      prior = 0;
+      ((unixFile*)id)->lastErrno = errno;
+      break;
+    }else if( got>0 ){
+      cnt -= got;
+      offset += got;
+      prior += got;
+      pBuf = (void*)(got + (char*)pBuf);
+    }
+  }while( got>0 );
+  TIMER_END;
+  OSTRACE(("READ    %-3d %5d %7lld %llu\n",
+            id->h, got+prior, offset-prior, TIMER_ELAPSED));
+  return got+prior;
+}
+
+/*
+** Read data from a file into a buffer.  Return SQLITE_OK if all
+** bytes were read successfully and SQLITE_IOERR if anything goes
+** wrong.
+*/
+static int unixRead(
+  sqlite3_file *id, 
+  void *pBuf, 
+  int amt,
+  sqlite3_int64 offset
+){
+  unixFile *pFile = (unixFile *)id;
+  int got;
+  assert( id );
+  assert( offset>=0 );
+  assert( amt>0 );
+
+  /* If this is a database file (not a journal, master-journal or temp
+  ** file), the bytes in the locking range should never be read or written. */
+#if 0
+  assert( pFile->pUnused==0
+       || offset>=PENDING_BYTE+512
+       || offset+amt<=PENDING_BYTE 
+  );
+#endif
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  /* Deal with as much of this read request as possible by transfering
+  ** data from the memory mapping using memcpy().  */
+  if( offset<pFile->mmapSize ){
+    if( offset+amt <= pFile->mmapSize ){
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], amt);
+      return SQLITE_OK;
+    }else{
+      int nCopy = pFile->mmapSize - offset;
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], nCopy);
+      pBuf = &((u8 *)pBuf)[nCopy];
+      amt -= nCopy;
+      offset += nCopy;
+    }
+  }
+#endif
+
+  got = seekAndRead(pFile, offset, pBuf, amt);
+  if( got==amt ){
+    return SQLITE_OK;
+  }else if( got<0 ){
+    /* lastErrno set by seekAndRead */
+    return SQLITE_IOERR_READ;
+  }else{
+    pFile->lastErrno = 0; /* not a system error */
+    /* Unread parts of the buffer must be zero-filled */
+    memset(&((char*)pBuf)[got], 0, amt-got);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+}
+
+/*
+** Attempt to seek the file-descriptor passed as the first argument to
+** absolute offset iOff, then attempt to write nBuf bytes of data from
+** pBuf to it. If an error occurs, return -1 and set *piErrno. Otherwise, 
+** return the actual number of bytes written (which may be less than
+** nBuf).
+*/
+static int seekAndWriteFd(
+  int fd,                         /* File descriptor to write to */
+  i64 iOff,                       /* File offset to begin writing at */
+  const void *pBuf,               /* Copy data from this buffer to the file */
+  int nBuf,                       /* Size of buffer pBuf in bytes */
+  int *piErrno                    /* OUT: Error number if error occurs */
+){
+  int rc = 0;                     /* Value returned by system call */
+
+  assert( nBuf==(nBuf&0x1ffff) );
+  assert( fd>2 );
+  nBuf &= 0x1ffff;
+  TIMER_START;
+
+#if defined(USE_PREAD)
+  do{ rc = osPwrite(fd, pBuf, nBuf, iOff); }while( rc<0 && errno==EINTR );
+#elif defined(USE_PREAD64)
+  do{ rc = osPwrite64(fd, pBuf, nBuf, iOff);}while( rc<0 && errno==EINTR);
+#else
+  do{
+    i64 iSeek = lseek(fd, iOff, SEEK_SET);
+    SimulateIOError( iSeek-- );
+
+    if( iSeek!=iOff ){
+      if( piErrno ) *piErrno = (iSeek==-1 ? errno : 0);
+      return -1;
+    }
+    rc = osWrite(fd, pBuf, nBuf);
+  }while( rc<0 && errno==EINTR );
+#endif
+
+  TIMER_END;
+  OSTRACE(("WRITE   %-3d %5d %7lld %llu\n", fd, rc, iOff, TIMER_ELAPSED));
+
+  if( rc<0 && piErrno ) *piErrno = errno;
+  return rc;
