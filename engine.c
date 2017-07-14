@@ -28631,3 +28631,245 @@ static int full_fsync(int fd, int fullSync, int dataOnly){
   ** It'd be better to detect fullfsync support once and avoid 
   ** the fcntl call every time sync is called.
   */
+  if( rc ) rc = fsync(fd);
+
+#elif defined(__APPLE__)
+  /* fdatasync() on HFS+ doesn't yet flush the file size if it changed correctly
+  ** so currently we default to the macro that redefines fdatasync to fsync
+  */
+  rc = fsync(fd);
+#else 
+  rc = fdatasync(fd);
+#if OS_VXWORKS
+  if( rc==-1 && errno==ENOTSUP ){
+    rc = fsync(fd);
+  }
+#endif /* OS_VXWORKS */
+#endif /* ifdef SQLITE_NO_SYNC elif HAVE_FULLFSYNC */
+
+  if( OS_VXWORKS && rc!= -1 ){
+    rc = 0;
+  }
+  return rc;
+}
+
+/*
+** Open a file descriptor to the directory containing file zFilename.
+** If successful, *pFd is set to the opened file descriptor and
+** SQLITE_OK is returned. If an error occurs, either SQLITE_NOMEM
+** or SQLITE_CANTOPEN is returned and *pFd is set to an undefined
+** value.
+**
+** The directory file descriptor is used for only one thing - to
+** fsync() a directory to make sure file creation and deletion events
+** are flushed to disk.  Such fsyncs are not needed on newer
+** journaling filesystems, but are required on older filesystems.
+**
+** This routine can be overridden using the xSetSysCall interface.
+** The ability to override this routine was added in support of the
+** chromium sandbox.  Opening a directory is a security risk (we are
+** told) so making it overrideable allows the chromium sandbox to
+** replace this routine with a harmless no-op.  To make this routine
+** a no-op, replace it with a stub that returns SQLITE_OK but leaves
+** *pFd set to a negative number.
+**
+** If SQLITE_OK is returned, the caller is responsible for closing
+** the file descriptor *pFd using close().
+*/
+static int openDirectory(const char *zFilename, int *pFd){
+  int ii;
+  int fd = -1;
+  char zDirname[MAX_PATHNAME+1];
+
+  sqlite3_snprintf(MAX_PATHNAME, zDirname, "%s", zFilename);
+  for(ii=(int)strlen(zDirname); ii>1 && zDirname[ii]!='/'; ii--);
+  if( ii>0 ){
+    zDirname[ii] = '\0';
+    fd = robust_open(zDirname, O_RDONLY|O_BINARY, 0);
+    if( fd>=0 ){
+      OSTRACE(("OPENDIR %-3d %s\n", fd, zDirname));
+    }
+  }
+  *pFd = fd;
+  return (fd>=0?SQLITE_OK:unixLogError(SQLITE_CANTOPEN_BKPT, "open", zDirname));
+}
+
+/*
+** Make sure all writes to a particular file are committed to disk.
+**
+** If dataOnly==0 then both the file itself and its metadata (file
+** size, access time, etc) are synced.  If dataOnly!=0 then only the
+** file data is synced.
+**
+** Under Unix, also make sure that the directory entry for the file
+** has been created by fsync-ing the directory that contains the file.
+** If we do not do this and we encounter a power failure, the directory
+** entry for the journal might not exist after we reboot.  The next
+** SQLite to access the file will not know that the journal exists (because
+** the directory entry for the journal was never created) and the transaction
+** will not roll back - possibly leading to database corruption.
+*/
+static int unixSync(sqlite3_file *id, int flags){
+  int rc;
+  unixFile *pFile = (unixFile*)id;
+
+  int isDataOnly = (flags&SQLITE_SYNC_DATAONLY);
+  int isFullsync = (flags&0x0F)==SQLITE_SYNC_FULL;
+
+  /* Check that one of SQLITE_SYNC_NORMAL or FULL was passed */
+  assert((flags&0x0F)==SQLITE_SYNC_NORMAL
+      || (flags&0x0F)==SQLITE_SYNC_FULL
+  );
+
+  /* Unix cannot, but some systems may return SQLITE_FULL from here. This
+  ** line is to test that doing so does not cause any problems.
+  */
+  SimulateDiskfullError( return SQLITE_FULL );
+
+  assert( pFile );
+  OSTRACE(("SYNC    %-3d\n", pFile->h));
+  rc = full_fsync(pFile->h, isFullsync, isDataOnly);
+  SimulateIOError( rc=1 );
+  if( rc ){
+    pFile->lastErrno = errno;
+    return unixLogError(SQLITE_IOERR_FSYNC, "full_fsync", pFile->zPath);
+  }
+
+  /* Also fsync the directory containing the file if the DIRSYNC flag
+  ** is set.  This is a one-time occurrence.  Many systems (examples: AIX)
+  ** are unable to fsync a directory, so ignore errors on the fsync.
+  */
+  if( pFile->ctrlFlags & UNIXFILE_DIRSYNC ){
+    int dirfd;
+    OSTRACE(("DIRSYNC %s (have_fullfsync=%d fullsync=%d)\n", pFile->zPath,
+            HAVE_FULLFSYNC, isFullsync));
+    rc = osOpenDirectory(pFile->zPath, &dirfd);
+    if( rc==SQLITE_OK && dirfd>=0 ){
+      full_fsync(dirfd, 0, 0);
+      robust_close(pFile, dirfd, __LINE__);
+    }else if( rc==SQLITE_CANTOPEN ){
+      rc = SQLITE_OK;
+    }
+    pFile->ctrlFlags &= ~UNIXFILE_DIRSYNC;
+  }
+  return rc;
+}
+
+/*
+** Truncate an open file to a specified size
+*/
+static int unixTruncate(sqlite3_file *id, i64 nByte){
+  unixFile *pFile = (unixFile *)id;
+  int rc;
+  assert( pFile );
+  SimulateIOError( return SQLITE_IOERR_TRUNCATE );
+
+  /* If the user has configured a chunk-size for this file, truncate the
+  ** file so that it consists of an integer number of chunks (i.e. the
+  ** actual file size after the operation may be larger than the requested
+  ** size).
+  */
+  if( pFile->szChunk>0 ){
+    nByte = ((nByte + pFile->szChunk - 1)/pFile->szChunk) * pFile->szChunk;
+  }
+
+  rc = robust_ftruncate(pFile->h, nByte);
+  if( rc ){
+    pFile->lastErrno = errno;
+    return unixLogError(SQLITE_IOERR_TRUNCATE, "ftruncate", pFile->zPath);
+  }else{
+#ifdef SQLITE_DEBUG
+    /* If we are doing a normal write to a database file (as opposed to
+    ** doing a hot-journal rollback or a write to some file other than a
+    ** normal database file) and we truncate the file to zero length,
+    ** that effectively updates the change counter.  This might happen
+    ** when restoring a database using the backup API from a zero-length
+    ** source.
+    */
+    if( pFile->inNormalWrite && nByte==0 ){
+      pFile->transCntrChng = 1;
+    }
+#endif
+
+#if SQLITE_MAX_MMAP_SIZE>0
+    /* If the file was just truncated to a size smaller than the currently
+    ** mapped region, reduce the effective mapping size as well. SQLite will
+    ** use read() and write() to access data beyond this point from now on.  
+    */
+    if( nByte<pFile->mmapSize ){
+      pFile->mmapSize = nByte;
+    }
+#endif
+
+    return SQLITE_OK;
+  }
+}
+
+/*
+** Determine the current size of a file in bytes
+*/
+static int unixFileSize(sqlite3_file *id, i64 *pSize){
+  int rc;
+  struct stat buf;
+  assert( id );
+  rc = osFstat(((unixFile*)id)->h, &buf);
+  SimulateIOError( rc=1 );
+  if( rc!=0 ){
+    ((unixFile*)id)->lastErrno = errno;
+    return SQLITE_IOERR_FSTAT;
+  }
+  *pSize = buf.st_size;
+
+  /* When opening a zero-size database, the findInodeInfo() procedure
+  ** writes a single byte into that file in order to work around a bug
+  ** in the OS-X msdos filesystem.  In order to avoid problems with upper
+  ** layers, we need to report this file size as zero even though it is
+  ** really 1.   Ticket #3260.
+  */
+  if( *pSize==1 ) *pSize = 0;
+
+
+  return SQLITE_OK;
+}
+
+#if SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__)
+/*
+** Handler for proxy-locking file-control verbs.  Defined below in the
+** proxying locking division.
+*/
+static int proxyFileControl(sqlite3_file*,int,void*);
+#endif
+
+/* 
+** This function is called to handle the SQLITE_FCNTL_SIZE_HINT 
+** file-control operation.  Enlarge the database to nBytes in size
+** (rounded up to the next chunk-size).  If the database is already
+** nBytes or larger, this routine is a no-op.
+*/
+static int fcntlSizeHint(unixFile *pFile, i64 nByte){
+  if( pFile->szChunk>0 ){
+    i64 nSize;                    /* Required file size */
+    struct stat buf;              /* Used to hold return values of fstat() */
+   
+    if( osFstat(pFile->h, &buf) ) return SQLITE_IOERR_FSTAT;
+
+    nSize = ((nByte+pFile->szChunk-1) / pFile->szChunk) * pFile->szChunk;
+    if( nSize>(i64)buf.st_size ){
+
+#if defined(HAVE_POSIX_FALLOCATE) && HAVE_POSIX_FALLOCATE
+      /* The code below is handling the return value of osFallocate() 
+      ** correctly. posix_fallocate() is defined to "returns zero on success, 
+      ** or an error number on  failure". See the manpage for details. */
+      int err;
+      do{
+        err = osFallocate(pFile->h, buf.st_size, nSize-buf.st_size);
+      }while( err==EINTR );
+      if( err ) return SQLITE_IOERR_WRITE;
+#else
+      /* If the OS does not have posix_fallocate(), fake it. Write a 
+      ** single byte to the last byte in each block that falls entirely
+      ** within the extended region. Then, if required, a single byte
+      ** at offset (nSize-1), to set the size of the file correctly.
+      ** This is a similar technique to that used by glibc on systems
+      ** that do not have a real fallocate() call.
+      */
