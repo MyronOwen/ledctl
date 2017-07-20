@@ -28873,3 +28873,209 @@ static int fcntlSizeHint(unixFile *pFile, i64 nByte){
       ** This is a similar technique to that used by glibc on systems
       ** that do not have a real fallocate() call.
       */
+      int nBlk = buf.st_blksize;  /* File-system block size */
+      int nWrite = 0;             /* Number of bytes written by seekAndWrite */
+      i64 iWrite;                 /* Next offset to write to */
+
+      iWrite = ((buf.st_size + 2*nBlk - 1)/nBlk)*nBlk-1;
+      assert( iWrite>=buf.st_size );
+      assert( (iWrite/nBlk)==((buf.st_size+nBlk-1)/nBlk) );
+      assert( ((iWrite+1)%nBlk)==0 );
+      for(/*no-op*/; iWrite<nSize; iWrite+=nBlk ){
+        nWrite = seekAndWrite(pFile, iWrite, "", 1);
+        if( nWrite!=1 ) return SQLITE_IOERR_WRITE;
+      }
+      if( nWrite==0 || (nSize%nBlk) ){
+        nWrite = seekAndWrite(pFile, nSize-1, "", 1);
+        if( nWrite!=1 ) return SQLITE_IOERR_WRITE;
+      }
+#endif
+    }
+  }
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  if( pFile->mmapSizeMax>0 && nByte>pFile->mmapSize ){
+    int rc;
+    if( pFile->szChunk<=0 ){
+      if( robust_ftruncate(pFile->h, nByte) ){
+        pFile->lastErrno = errno;
+        return unixLogError(SQLITE_IOERR_TRUNCATE, "ftruncate", pFile->zPath);
+      }
+    }
+
+    rc = unixMapfile(pFile, nByte);
+    return rc;
+  }
+#endif
+
+  return SQLITE_OK;
+}
+
+/*
+** If *pArg is initially negative then this is a query.  Set *pArg to
+** 1 or 0 depending on whether or not bit mask of pFile->ctrlFlags is set.
+**
+** If *pArg is 0 or 1, then clear or set the mask bit of pFile->ctrlFlags.
+*/
+static void unixModeBit(unixFile *pFile, unsigned char mask, int *pArg){
+  if( *pArg<0 ){
+    *pArg = (pFile->ctrlFlags & mask)!=0;
+  }else if( (*pArg)==0 ){
+    pFile->ctrlFlags &= ~mask;
+  }else{
+    pFile->ctrlFlags |= mask;
+  }
+}
+
+/* Forward declaration */
+static int unixGetTempname(int nBuf, char *zBuf);
+
+/*
+** Information and control of an open file handle.
+*/
+static int unixFileControl(sqlite3_file *id, int op, void *pArg){
+  unixFile *pFile = (unixFile*)id;
+  switch( op ){
+    case SQLITE_FCNTL_LOCKSTATE: {
+      *(int*)pArg = pFile->eFileLock;
+      return SQLITE_OK;
+    }
+    case SQLITE_LAST_ERRNO: {
+      *(int*)pArg = pFile->lastErrno;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_CHUNK_SIZE: {
+      pFile->szChunk = *(int *)pArg;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_SIZE_HINT: {
+      int rc;
+      SimulateIOErrorBenign(1);
+      rc = fcntlSizeHint(pFile, *(i64 *)pArg);
+      SimulateIOErrorBenign(0);
+      return rc;
+    }
+    case SQLITE_FCNTL_PERSIST_WAL: {
+      unixModeBit(pFile, UNIXFILE_PERSIST_WAL, (int*)pArg);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_POWERSAFE_OVERWRITE: {
+      unixModeBit(pFile, UNIXFILE_PSOW, (int*)pArg);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_VFSNAME: {
+      *(char**)pArg = sqlite3_mprintf("%s", pFile->pVfs->zName);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_TEMPFILENAME: {
+      char *zTFile = sqlite3_malloc( pFile->pVfs->mxPathname );
+      if( zTFile ){
+        unixGetTempname(pFile->pVfs->mxPathname, zTFile);
+        *(char**)pArg = zTFile;
+      }
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_HAS_MOVED: {
+      *(int*)pArg = fileHasMoved(pFile);
+      return SQLITE_OK;
+    }
+#if SQLITE_MAX_MMAP_SIZE>0
+    case SQLITE_FCNTL_MMAP_SIZE: {
+      i64 newLimit = *(i64*)pArg;
+      int rc = SQLITE_OK;
+      if( newLimit>sqlite3GlobalConfig.mxMmap ){
+        newLimit = sqlite3GlobalConfig.mxMmap;
+      }
+      *(i64*)pArg = pFile->mmapSizeMax;
+      if( newLimit>=0 && newLimit!=pFile->mmapSizeMax && pFile->nFetchOut==0 ){
+        pFile->mmapSizeMax = newLimit;
+        if( pFile->mmapSize>0 ){
+          unixUnmapfile(pFile);
+          rc = unixMapfile(pFile, -1);
+        }
+      }
+      return rc;
+    }
+#endif
+#ifdef SQLITE_DEBUG
+    /* The pager calls this method to signal that it has done
+    ** a rollback and that the database is therefore unchanged and
+    ** it hence it is OK for the transaction change counter to be
+    ** unchanged.
+    */
+    case SQLITE_FCNTL_DB_UNCHANGED: {
+      ((unixFile*)id)->dbUpdate = 0;
+      return SQLITE_OK;
+    }
+#endif
+#if SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__)
+    case SQLITE_SET_LOCKPROXYFILE:
+    case SQLITE_GET_LOCKPROXYFILE: {
+      return proxyFileControl(id,op,pArg);
+    }
+#endif /* SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__) */
+  }
+  return SQLITE_NOTFOUND;
+}
+
+/*
+** Return the sector size in bytes of the underlying block device for
+** the specified file. This is almost always 512 bytes, but may be
+** larger for some devices.
+**
+** SQLite code assumes this function cannot fail. It also assumes that
+** if two files are created in the same file-system directory (i.e.
+** a database and its journal file) that the sector size will be the
+** same for both.
+*/
+#ifndef __QNXNTO__ 
+static int unixSectorSize(sqlite3_file *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  return SQLITE_DEFAULT_SECTOR_SIZE;
+}
+#endif
+
+/*
+** The following version of unixSectorSize() is optimized for QNX.
+*/
+#ifdef __QNXNTO__
+#include <sys/dcmd_blk.h>
+#include <sys/statvfs.h>
+static int unixSectorSize(sqlite3_file *id){
+  unixFile *pFile = (unixFile*)id;
+  if( pFile->sectorSize == 0 ){
+    struct statvfs fsInfo;
+       
+    /* Set defaults for non-supported filesystems */
+    pFile->sectorSize = SQLITE_DEFAULT_SECTOR_SIZE;
+    pFile->deviceCharacteristics = 0;
+    if( fstatvfs(pFile->h, &fsInfo) == -1 ) {
+      return pFile->sectorSize;
+    }
+
+    if( !strcmp(fsInfo.f_basetype, "tmp") ) {
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        SQLITE_IOCAP_ATOMIC4K |       /* All ram filesystem writes are atomic */
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( strstr(fsInfo.f_basetype, "etfs") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        /* etfs cluster size writes are atomic */
+        (pFile->sectorSize / 512 * SQLITE_IOCAP_ATOMIC512) |
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( !strcmp(fsInfo.f_basetype, "qnx6") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        SQLITE_IOCAP_ATOMIC |         /* All filesystem writes are atomic */
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
