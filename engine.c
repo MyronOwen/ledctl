@@ -29777,3 +29777,208 @@ static int unixShmLock(
   sqlite3_mutex_leave(pShmNode->mutex);
   OSTRACE(("SHM-LOCK shmid-%d, pid-%d got %03x,%03x\n",
            p->id, getpid(), p->sharedMask, p->exclMask));
+  return rc;
+}
+
+/*
+** Implement a memory barrier or memory fence on shared memory.  
+**
+** All loads and stores begun before the barrier must complete before
+** any load or store begun after the barrier.
+*/
+static void unixShmBarrier(
+  sqlite3_file *fd                /* Database file holding the shared memory */
+){
+  UNUSED_PARAMETER(fd);
+  unixEnterMutex();
+  unixLeaveMutex();
+}
+
+/*
+** Close a connection to shared-memory.  Delete the underlying 
+** storage if deleteFlag is true.
+**
+** If there is no shared memory associated with the connection then this
+** routine is a harmless no-op.
+*/
+static int unixShmUnmap(
+  sqlite3_file *fd,               /* The underlying database file */
+  int deleteFlag                  /* Delete shared-memory if true */
+){
+  unixShm *p;                     /* The connection to be closed */
+  unixShmNode *pShmNode;          /* The underlying shared-memory file */
+  unixShm **pp;                   /* For looping over sibling connections */
+  unixFile *pDbFd;                /* The underlying database file */
+
+  pDbFd = (unixFile*)fd;
+  p = pDbFd->pShm;
+  if( p==0 ) return SQLITE_OK;
+  pShmNode = p->pShmNode;
+
+  assert( pShmNode==pDbFd->pInode->pShmNode );
+  assert( pShmNode->pInode==pDbFd->pInode );
+
+  /* Remove connection p from the set of connections associated
+  ** with pShmNode */
+  sqlite3_mutex_enter(pShmNode->mutex);
+  for(pp=&pShmNode->pFirst; (*pp)!=p; pp = &(*pp)->pNext){}
+  *pp = p->pNext;
+
+  /* Free the connection p */
+  sqlite3_free(p);
+  pDbFd->pShm = 0;
+  sqlite3_mutex_leave(pShmNode->mutex);
+
+  /* If pShmNode->nRef has reached 0, then close the underlying
+  ** shared-memory file, too */
+  unixEnterMutex();
+  assert( pShmNode->nRef>0 );
+  pShmNode->nRef--;
+  if( pShmNode->nRef==0 ){
+    if( deleteFlag && pShmNode->h>=0 ) osUnlink(pShmNode->zFilename);
+    unixShmPurge(pDbFd);
+  }
+  unixLeaveMutex();
+
+  return SQLITE_OK;
+}
+
+
+#else
+# define unixShmMap     0
+# define unixShmLock    0
+# define unixShmBarrier 0
+# define unixShmUnmap   0
+#endif /* #ifndef SQLITE_OMIT_WAL */
+
+#if SQLITE_MAX_MMAP_SIZE>0
+/*
+** If it is currently memory mapped, unmap file pFd.
+*/
+static void unixUnmapfile(unixFile *pFd){
+  assert( pFd->nFetchOut==0 );
+  if( pFd->pMapRegion ){
+    osMunmap(pFd->pMapRegion, pFd->mmapSizeActual);
+    pFd->pMapRegion = 0;
+    pFd->mmapSize = 0;
+    pFd->mmapSizeActual = 0;
+  }
+}
+
+/*
+** Attempt to set the size of the memory mapping maintained by file 
+** descriptor pFd to nNew bytes. Any existing mapping is discarded.
+**
+** If successful, this function sets the following variables:
+**
+**       unixFile.pMapRegion
+**       unixFile.mmapSize
+**       unixFile.mmapSizeActual
+**
+** If unsuccessful, an error message is logged via sqlite3_log() and
+** the three variables above are zeroed. In this case SQLite should
+** continue accessing the database using the xRead() and xWrite()
+** methods.
+*/
+static void unixRemapfile(
+  unixFile *pFd,                  /* File descriptor object */
+  i64 nNew                        /* Required mapping size */
+){
+  const char *zErr = "mmap";
+  int h = pFd->h;                      /* File descriptor open on db file */
+  u8 *pOrig = (u8 *)pFd->pMapRegion;   /* Pointer to current file mapping */
+  i64 nOrig = pFd->mmapSizeActual;     /* Size of pOrig region in bytes */
+  u8 *pNew = 0;                        /* Location of new mapping */
+  int flags = PROT_READ;               /* Flags to pass to mmap() */
+
+  assert( pFd->nFetchOut==0 );
+  assert( nNew>pFd->mmapSize );
+  assert( nNew<=pFd->mmapSizeMax );
+  assert( nNew>0 );
+  assert( pFd->mmapSizeActual>=pFd->mmapSize );
+  assert( MAP_FAILED!=0 );
+
+  if( (pFd->ctrlFlags & UNIXFILE_RDONLY)==0 ) flags |= PROT_WRITE;
+
+  if( pOrig ){
+#if HAVE_MREMAP
+    i64 nReuse = pFd->mmapSize;
+#else
+    const int szSyspage = osGetpagesize();
+    i64 nReuse = (pFd->mmapSize & ~(szSyspage-1));
+#endif
+    u8 *pReq = &pOrig[nReuse];
+
+    /* Unmap any pages of the existing mapping that cannot be reused. */
+    if( nReuse!=nOrig ){
+      osMunmap(pReq, nOrig-nReuse);
+    }
+
+#if HAVE_MREMAP
+    pNew = osMremap(pOrig, nReuse, nNew, MREMAP_MAYMOVE);
+    zErr = "mremap";
+#else
+    pNew = osMmap(pReq, nNew-nReuse, flags, MAP_SHARED, h, nReuse);
+    if( pNew!=MAP_FAILED ){
+      if( pNew!=pReq ){
+        osMunmap(pNew, nNew - nReuse);
+        pNew = 0;
+      }else{
+        pNew = pOrig;
+      }
+    }
+#endif
+
+    /* The attempt to extend the existing mapping failed. Free it. */
+    if( pNew==MAP_FAILED || pNew==0 ){
+      osMunmap(pOrig, nReuse);
+    }
+  }
+
+  /* If pNew is still NULL, try to create an entirely new mapping. */
+  if( pNew==0 ){
+    pNew = osMmap(0, nNew, flags, MAP_SHARED, h, 0);
+  }
+
+  if( pNew==MAP_FAILED ){
+    pNew = 0;
+    nNew = 0;
+    unixLogError(SQLITE_OK, zErr, pFd->zPath);
+
+    /* If the mmap() above failed, assume that all subsequent mmap() calls
+    ** will probably fail too. Fall back to using xRead/xWrite exclusively
+    ** in this case.  */
+    pFd->mmapSizeMax = 0;
+  }
+  pFd->pMapRegion = (void *)pNew;
+  pFd->mmapSize = pFd->mmapSizeActual = nNew;
+}
+
+/*
+** Memory map or remap the file opened by file-descriptor pFd (if the file
+** is already mapped, the existing mapping is replaced by the new). Or, if 
+** there already exists a mapping for this file, and there are still 
+** outstanding xFetch() references to it, this function is a no-op.
+**
+** If parameter nByte is non-negative, then it is the requested size of 
+** the mapping to create. Otherwise, if nByte is less than zero, then the 
+** requested size is the size of the file on disk. The actual size of the
+** created mapping is either the requested size or the value configured 
+** using SQLITE_FCNTL_MMAP_LIMIT, whichever is smaller.
+**
+** SQLITE_OK is returned if no error occurs (even if the mapping is not
+** recreated as a result of outstanding references) or an SQLite error
+** code otherwise.
+*/
+static int unixMapfile(unixFile *pFd, i64 nByte){
+  i64 nMap = nByte;
+  int rc;
+
+  assert( nMap>=0 || pFd->nFetchOut==0 );
+  if( pFd->nFetchOut>0 ) return SQLITE_OK;
+
+  if( nMap<0 ){
+    struct stat statbuf;          /* Low-level file information */
+    rc = osFstat(pFd->h, &statbuf);
+    if( rc!=SQLITE_OK ){
+      return SQLITE_IOERR_FSTAT;
