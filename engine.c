@@ -29539,3 +29539,241 @@ shm_open_err:
 */
 static int unixShmMap(
   sqlite3_file *fd,               /* Handle open on database file */
+  int iRegion,                    /* Region to retrieve */
+  int szRegion,                   /* Size of regions */
+  int bExtend,                    /* True to extend file if necessary */
+  void volatile **pp              /* OUT: Mapped memory */
+){
+  unixFile *pDbFd = (unixFile*)fd;
+  unixShm *p;
+  unixShmNode *pShmNode;
+  int rc = SQLITE_OK;
+  int nShmPerMap = unixShmRegionPerMap();
+  int nReqRegion;
+
+  /* If the shared-memory file has not yet been opened, open it now. */
+  if( pDbFd->pShm==0 ){
+    rc = unixOpenSharedMemory(pDbFd);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+
+  p = pDbFd->pShm;
+  pShmNode = p->pShmNode;
+  sqlite3_mutex_enter(pShmNode->mutex);
+  assert( szRegion==pShmNode->szRegion || pShmNode->nRegion==0 );
+  assert( pShmNode->pInode==pDbFd->pInode );
+  assert( pShmNode->h>=0 || pDbFd->pInode->bProcessLock==1 );
+  assert( pShmNode->h<0 || pDbFd->pInode->bProcessLock==0 );
+
+  /* Minimum number of regions required to be mapped. */
+  nReqRegion = ((iRegion+nShmPerMap) / nShmPerMap) * nShmPerMap;
+
+  if( pShmNode->nRegion<nReqRegion ){
+    char **apNew;                      /* New apRegion[] array */
+    int nByte = nReqRegion*szRegion;   /* Minimum required file size */
+    struct stat sStat;                 /* Used by fstat() */
+
+    pShmNode->szRegion = szRegion;
+
+    if( pShmNode->h>=0 ){
+      /* The requested region is not mapped into this processes address space.
+      ** Check to see if it has been allocated (i.e. if the wal-index file is
+      ** large enough to contain the requested region).
+      */
+      if( osFstat(pShmNode->h, &sStat) ){
+        rc = SQLITE_IOERR_SHMSIZE;
+        goto shmpage_out;
+      }
+  
+      if( sStat.st_size<nByte ){
+        /* The requested memory region does not exist. If bExtend is set to
+        ** false, exit early. *pp will be set to NULL and SQLITE_OK returned.
+        */
+        if( !bExtend ){
+          goto shmpage_out;
+        }
+
+        /* Alternatively, if bExtend is true, extend the file. Do this by
+        ** writing a single byte to the end of each (OS) page being
+        ** allocated or extended. Technically, we need only write to the
+        ** last page in order to extend the file. But writing to all new
+        ** pages forces the OS to allocate them immediately, which reduces
+        ** the chances of SIGBUS while accessing the mapped region later on.
+        */
+        else{
+          static const int pgsz = 4096;
+          int iPg;
+
+          /* Write to the last byte of each newly allocated or extended page */
+          assert( (nByte % pgsz)==0 );
+          for(iPg=(sStat.st_size/pgsz); iPg<(nByte/pgsz); iPg++){
+            if( seekAndWriteFd(pShmNode->h, iPg*pgsz + pgsz-1, "", 1, 0)!=1 ){
+              const char *zFile = pShmNode->zFilename;
+              rc = unixLogError(SQLITE_IOERR_SHMSIZE, "write", zFile);
+              goto shmpage_out;
+            }
+          }
+        }
+      }
+    }
+
+    /* Map the requested memory region into this processes address space. */
+    apNew = (char **)sqlite3_realloc(
+        pShmNode->apRegion, nReqRegion*sizeof(char *)
+    );
+    if( !apNew ){
+      rc = SQLITE_IOERR_NOMEM;
+      goto shmpage_out;
+    }
+    pShmNode->apRegion = apNew;
+    while( pShmNode->nRegion<nReqRegion ){
+      int nMap = szRegion*nShmPerMap;
+      int i;
+      void *pMem;
+      if( pShmNode->h>=0 ){
+        pMem = osMmap(0, nMap,
+            pShmNode->isReadonly ? PROT_READ : PROT_READ|PROT_WRITE, 
+            MAP_SHARED, pShmNode->h, szRegion*(i64)pShmNode->nRegion
+        );
+        if( pMem==MAP_FAILED ){
+          rc = unixLogError(SQLITE_IOERR_SHMMAP, "mmap", pShmNode->zFilename);
+          goto shmpage_out;
+        }
+      }else{
+        pMem = sqlite3_malloc(szRegion);
+        if( pMem==0 ){
+          rc = SQLITE_NOMEM;
+          goto shmpage_out;
+        }
+        memset(pMem, 0, szRegion);
+      }
+
+      for(i=0; i<nShmPerMap; i++){
+        pShmNode->apRegion[pShmNode->nRegion+i] = &((char*)pMem)[szRegion*i];
+      }
+      pShmNode->nRegion += nShmPerMap;
+    }
+  }
+
+shmpage_out:
+  if( pShmNode->nRegion>iRegion ){
+    *pp = pShmNode->apRegion[iRegion];
+  }else{
+    *pp = 0;
+  }
+  if( pShmNode->isReadonly && rc==SQLITE_OK ) rc = SQLITE_READONLY;
+  sqlite3_mutex_leave(pShmNode->mutex);
+  return rc;
+}
+
+/*
+** Change the lock state for a shared-memory segment.
+**
+** Note that the relationship between SHAREd and EXCLUSIVE locks is a little
+** different here than in posix.  In xShmLock(), one can go from unlocked
+** to shared and back or from unlocked to exclusive and back.  But one may
+** not go from shared to exclusive or from exclusive to shared.
+*/
+static int unixShmLock(
+  sqlite3_file *fd,          /* Database file holding the shared memory */
+  int ofst,                  /* First lock to acquire or release */
+  int n,                     /* Number of locks to acquire or release */
+  int flags                  /* What to do with the lock */
+){
+  unixFile *pDbFd = (unixFile*)fd;      /* Connection holding shared memory */
+  unixShm *p = pDbFd->pShm;             /* The shared memory being locked */
+  unixShm *pX;                          /* For looping over all siblings */
+  unixShmNode *pShmNode = p->pShmNode;  /* The underlying file iNode */
+  int rc = SQLITE_OK;                   /* Result code */
+  u16 mask;                             /* Mask of locks to take or release */
+
+  assert( pShmNode==pDbFd->pInode->pShmNode );
+  assert( pShmNode->pInode==pDbFd->pInode );
+  assert( ofst>=0 && ofst+n<=SQLITE_SHM_NLOCK );
+  assert( n>=1 );
+  assert( flags==(SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+       || flags==(SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+       || flags==(SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+       || flags==(SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE) );
+  assert( n==1 || (flags & SQLITE_SHM_EXCLUSIVE)!=0 );
+  assert( pShmNode->h>=0 || pDbFd->pInode->bProcessLock==1 );
+  assert( pShmNode->h<0 || pDbFd->pInode->bProcessLock==0 );
+
+  mask = (1<<(ofst+n)) - (1<<ofst);
+  assert( n>1 || mask==(1<<ofst) );
+  sqlite3_mutex_enter(pShmNode->mutex);
+  if( flags & SQLITE_SHM_UNLOCK ){
+    u16 allMask = 0; /* Mask of locks held by siblings */
+
+    /* See if any siblings hold this same lock */
+    for(pX=pShmNode->pFirst; pX; pX=pX->pNext){
+      if( pX==p ) continue;
+      assert( (pX->exclMask & (p->exclMask|p->sharedMask))==0 );
+      allMask |= pX->sharedMask;
+    }
+
+    /* Unlock the system-level locks */
+    if( (mask & allMask)==0 ){
+      rc = unixShmSystemLock(pShmNode, F_UNLCK, ofst+UNIX_SHM_BASE, n);
+    }else{
+      rc = SQLITE_OK;
+    }
+
+    /* Undo the local locks */
+    if( rc==SQLITE_OK ){
+      p->exclMask &= ~mask;
+      p->sharedMask &= ~mask;
+    } 
+  }else if( flags & SQLITE_SHM_SHARED ){
+    u16 allShared = 0;  /* Union of locks held by connections other than "p" */
+
+    /* Find out which shared locks are already held by sibling connections.
+    ** If any sibling already holds an exclusive lock, go ahead and return
+    ** SQLITE_BUSY.
+    */
+    for(pX=pShmNode->pFirst; pX; pX=pX->pNext){
+      if( (pX->exclMask & mask)!=0 ){
+        rc = SQLITE_BUSY;
+        break;
+      }
+      allShared |= pX->sharedMask;
+    }
+
+    /* Get shared locks at the system level, if necessary */
+    if( rc==SQLITE_OK ){
+      if( (allShared & mask)==0 ){
+        rc = unixShmSystemLock(pShmNode, F_RDLCK, ofst+UNIX_SHM_BASE, n);
+      }else{
+        rc = SQLITE_OK;
+      }
+    }
+
+    /* Get the local shared locks */
+    if( rc==SQLITE_OK ){
+      p->sharedMask |= mask;
+    }
+  }else{
+    /* Make sure no sibling connections hold locks that will block this
+    ** lock.  If any do, return SQLITE_BUSY right away.
+    */
+    for(pX=pShmNode->pFirst; pX; pX=pX->pNext){
+      if( (pX->exclMask & mask)!=0 || (pX->sharedMask & mask)!=0 ){
+        rc = SQLITE_BUSY;
+        break;
+      }
+    }
+  
+    /* Get the exclusive locks at the system level.  Then if successful
+    ** also mark the local connection as being locked.
+    */
+    if( rc==SQLITE_OK ){
+      rc = unixShmSystemLock(pShmNode, F_WRLCK, ofst+UNIX_SHM_BASE, n);
+      if( rc==SQLITE_OK ){
+        assert( (p->sharedMask & mask)==0 );
+        p->exclMask |= mask;
+      }
+    }
+  }
+  sqlite3_mutex_leave(pShmNode->mutex);
+  OSTRACE(("SHM-LOCK shmid-%d, pid-%d got %03x,%03x\n",
+           p->id, getpid(), p->sharedMask, p->exclMask));
