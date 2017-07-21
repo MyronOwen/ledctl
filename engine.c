@@ -30231,3 +30231,226 @@ static int proxyLock(sqlite3_file*, int);
 static int proxyUnlock(sqlite3_file*, int);
 static int proxyCheckReservedLock(sqlite3_file*, int*);
 IOMETHODS(
+  proxyIoFinder,            /* Finder function name */
+  proxyIoMethods,           /* sqlite3_io_methods object name */
+  1,                        /* shared memory is disabled */
+  proxyClose,               /* xClose method */
+  proxyLock,                /* xLock method */
+  proxyUnlock,              /* xUnlock method */
+  proxyCheckReservedLock,   /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+#endif
+
+/* nfs lockd on OSX 10.3+ doesn't clear write locks when a read lock is set */
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+IOMETHODS(
+  nfsIoFinder,               /* Finder function name */
+  nfsIoMethods,              /* sqlite3_io_methods object name */
+  1,                         /* shared memory is disabled */
+  unixClose,                 /* xClose method */
+  unixLock,                  /* xLock method */
+  nfsUnlock,                 /* xUnlock method */
+  unixCheckReservedLock,     /* xCheckReservedLock method */
+  0                          /* xShmMap method */
+)
+#endif
+
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+/* 
+** This "finder" function attempts to determine the best locking strategy 
+** for the database file "filePath".  It then returns the sqlite3_io_methods
+** object that implements that strategy.
+**
+** This is for MacOSX only.
+*/
+static const sqlite3_io_methods *autolockIoFinderImpl(
+  const char *filePath,    /* name of the database file */
+  unixFile *pNew           /* open file object for the database file */
+){
+  static const struct Mapping {
+    const char *zFilesystem;              /* Filesystem type name */
+    const sqlite3_io_methods *pMethods;   /* Appropriate locking method */
+  } aMap[] = {
+    { "hfs",    &posixIoMethods },
+    { "ufs",    &posixIoMethods },
+    { "afpfs",  &afpIoMethods },
+    { "smbfs",  &afpIoMethods },
+    { "webdav", &nolockIoMethods },
+    { 0, 0 }
+  };
+  int i;
+  struct statfs fsInfo;
+  struct flock lockInfo;
+
+  if( !filePath ){
+    /* If filePath==NULL that means we are dealing with a transient file
+    ** that does not need to be locked. */
+    return &nolockIoMethods;
+  }
+  if( statfs(filePath, &fsInfo) != -1 ){
+    if( fsInfo.f_flags & MNT_RDONLY ){
+      return &nolockIoMethods;
+    }
+    for(i=0; aMap[i].zFilesystem; i++){
+      if( strcmp(fsInfo.f_fstypename, aMap[i].zFilesystem)==0 ){
+        return aMap[i].pMethods;
+      }
+    }
+  }
+
+  /* Default case. Handles, amongst others, "nfs".
+  ** Test byte-range lock using fcntl(). If the call succeeds, 
+  ** assume that the file-system supports POSIX style locks. 
+  */
+  lockInfo.l_len = 1;
+  lockInfo.l_start = 0;
+  lockInfo.l_whence = SEEK_SET;
+  lockInfo.l_type = F_RDLCK;
+  if( osFcntl(pNew->h, F_GETLK, &lockInfo)!=-1 ) {
+    if( strcmp(fsInfo.f_fstypename, "nfs")==0 ){
+      return &nfsIoMethods;
+    } else {
+      return &posixIoMethods;
+    }
+  }else{
+    return &dotlockIoMethods;
+  }
+}
+static const sqlite3_io_methods 
+  *(*const autolockIoFinder)(const char*,unixFile*) = autolockIoFinderImpl;
+
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+
+#if OS_VXWORKS && SQLITE_ENABLE_LOCKING_STYLE
+/* 
+** This "finder" function attempts to determine the best locking strategy 
+** for the database file "filePath".  It then returns the sqlite3_io_methods
+** object that implements that strategy.
+**
+** This is for VXWorks only.
+*/
+static const sqlite3_io_methods *autolockIoFinderImpl(
+  const char *filePath,    /* name of the database file */
+  unixFile *pNew           /* the open file object */
+){
+  struct flock lockInfo;
+
+  if( !filePath ){
+    /* If filePath==NULL that means we are dealing with a transient file
+    ** that does not need to be locked. */
+    return &nolockIoMethods;
+  }
+
+  /* Test if fcntl() is supported and use POSIX style locks.
+  ** Otherwise fall back to the named semaphore method.
+  */
+  lockInfo.l_len = 1;
+  lockInfo.l_start = 0;
+  lockInfo.l_whence = SEEK_SET;
+  lockInfo.l_type = F_RDLCK;
+  if( osFcntl(pNew->h, F_GETLK, &lockInfo)!=-1 ) {
+    return &posixIoMethods;
+  }else{
+    return &semIoMethods;
+  }
+}
+static const sqlite3_io_methods 
+  *(*const autolockIoFinder)(const char*,unixFile*) = autolockIoFinderImpl;
+
+#endif /* OS_VXWORKS && SQLITE_ENABLE_LOCKING_STYLE */
+
+/*
+** An abstract type for a pointer to an IO method finder function:
+*/
+typedef const sqlite3_io_methods *(*finder_type)(const char*,unixFile*);
+
+
+/****************************************************************************
+**************************** sqlite3_vfs methods ****************************
+**
+** This division contains the implementation of methods on the
+** sqlite3_vfs object.
+*/
+
+/*
+** Initialize the contents of the unixFile structure pointed to by pId.
+*/
+static int fillInUnixFile(
+  sqlite3_vfs *pVfs,      /* Pointer to vfs object */
+  int h,                  /* Open file descriptor of file being opened */
+  sqlite3_file *pId,      /* Write to the unixFile structure here */
+  const char *zFilename,  /* Name of the file being opened */
+  int ctrlFlags           /* Zero or more UNIXFILE_* values */
+){
+  const sqlite3_io_methods *pLockingStyle;
+  unixFile *pNew = (unixFile *)pId;
+  int rc = SQLITE_OK;
+
+  assert( pNew->pInode==NULL );
+
+  /* Usually the path zFilename should not be a relative pathname. The
+  ** exception is when opening the proxy "conch" file in builds that
+  ** include the special Apple locking styles.
+  */
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+  assert( zFilename==0 || zFilename[0]=='/' 
+    || pVfs->pAppData==(void*)&autolockIoFinder );
+#else
+  assert( zFilename==0 || zFilename[0]=='/' );
+#endif
+
+  /* No locking occurs in temporary files */
+  assert( zFilename!=0 || (ctrlFlags & UNIXFILE_NOLOCK)!=0 );
+
+  OSTRACE(("OPEN    %-3d %s\n", h, zFilename));
+  pNew->h = h;
+  pNew->pVfs = pVfs;
+  pNew->zPath = zFilename;
+  pNew->ctrlFlags = (u8)ctrlFlags;
+#if SQLITE_MAX_MMAP_SIZE>0
+  pNew->mmapSizeMax = sqlite3GlobalConfig.szMmap;
+#endif
+  if( sqlite3_uri_boolean(((ctrlFlags & UNIXFILE_URI) ? zFilename : 0),
+                           "psow", SQLITE_POWERSAFE_OVERWRITE) ){
+    pNew->ctrlFlags |= UNIXFILE_PSOW;
+  }
+  if( strcmp(pVfs->zName,"unix-excl")==0 ){
+    pNew->ctrlFlags |= UNIXFILE_EXCL;
+  }
+
+#if OS_VXWORKS
+  pNew->pId = vxworksFindFileId(zFilename);
+  if( pNew->pId==0 ){
+    ctrlFlags |= UNIXFILE_NOLOCK;
+    rc = SQLITE_NOMEM;
+  }
+#endif
+
+  if( ctrlFlags & UNIXFILE_NOLOCK ){
+    pLockingStyle = &nolockIoMethods;
+  }else{
+    pLockingStyle = (**(finder_type*)pVfs->pAppData)(zFilename, pNew);
+#if SQLITE_ENABLE_LOCKING_STYLE
+    /* Cache zFilename in the locking context (AFP and dotlock override) for
+    ** proxyLock activation is possible (remote proxy is based on db name)
+    ** zFilename remains valid until file is closed, to support */
+    pNew->lockingContext = (void*)zFilename;
+#endif
+  }
+
+  if( pLockingStyle == &posixIoMethods
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+    || pLockingStyle == &nfsIoMethods
+#endif
+  ){
+    unixEnterMutex();
+    rc = findInodeInfo(pNew, &pNew->pInode);
+    if( rc!=SQLITE_OK ){
+      /* If an error occurred in findInodeInfo(), close the file descriptor
+      ** immediately, before releasing the mutex. findInodeInfo() may fail
+      ** in two scenarios:
+      **
+      **   (a) A call to fstat() failed.
+      **   (b) A malloc failed.
+      **
