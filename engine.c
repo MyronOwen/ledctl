@@ -29079,3 +29079,230 @@ static int unixSectorSize(sqlite3_file *id){
         SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
                                       ** the write succeeds */
         SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( !strcmp(fsInfo.f_basetype, "qnx4") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        /* full bitset of atomics from max sector size and smaller */
+        ((pFile->sectorSize / 512 * SQLITE_IOCAP_ATOMIC512) << 1) - 2 |
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( strstr(fsInfo.f_basetype, "dos") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        /* full bitset of atomics from max sector size and smaller */
+        ((pFile->sectorSize / 512 * SQLITE_IOCAP_ATOMIC512) << 1) - 2 |
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else{
+      pFile->deviceCharacteristics =
+        SQLITE_IOCAP_ATOMIC512 |      /* blocks are atomic */
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        0;
+    }
+  }
+  /* Last chance verification.  If the sector size isn't a multiple of 512
+  ** then it isn't valid.*/
+  if( pFile->sectorSize % 512 != 0 ){
+    pFile->deviceCharacteristics = 0;
+    pFile->sectorSize = SQLITE_DEFAULT_SECTOR_SIZE;
+  }
+  return pFile->sectorSize;
+}
+#endif /* __QNXNTO__ */
+
+/*
+** Return the device characteristics for the file.
+**
+** This VFS is set up to return SQLITE_IOCAP_POWERSAFE_OVERWRITE by default.
+** However, that choice is controversial since technically the underlying
+** file system does not always provide powersafe overwrites.  (In other
+** words, after a power-loss event, parts of the file that were never
+** written might end up being altered.)  However, non-PSOW behavior is very,
+** very rare.  And asserting PSOW makes a large reduction in the amount
+** of required I/O for journaling, since a lot of padding is eliminated.
+**  Hence, while POWERSAFE_OVERWRITE is on by default, there is a file-control
+** available to turn it off and URI query parameter available to turn it off.
+*/
+static int unixDeviceCharacteristics(sqlite3_file *id){
+  unixFile *p = (unixFile*)id;
+  int rc = 0;
+#ifdef __QNXNTO__
+  if( p->sectorSize==0 ) unixSectorSize(id);
+  rc = p->deviceCharacteristics;
+#endif
+  if( p->ctrlFlags & UNIXFILE_PSOW ){
+    rc |= SQLITE_IOCAP_POWERSAFE_OVERWRITE;
+  }
+  return rc;
+}
+
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+
+/*
+** Return the system page size.
+**
+** This function should not be called directly by other code in this file. 
+** Instead, it should be called via macro osGetpagesize().
+*/
+static int unixGetpagesize(void){
+#if defined(_BSD_SOURCE)
+  return getpagesize();
+#else
+  return (int)sysconf(_SC_PAGESIZE);
+#endif
+}
+
+#endif /* !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0 */
+
+#ifndef SQLITE_OMIT_WAL
+
+/*
+** Object used to represent an shared memory buffer.  
+**
+** When multiple threads all reference the same wal-index, each thread
+** has its own unixShm object, but they all point to a single instance
+** of this unixShmNode object.  In other words, each wal-index is opened
+** only once per process.
+**
+** Each unixShmNode object is connected to a single unixInodeInfo object.
+** We could coalesce this object into unixInodeInfo, but that would mean
+** every open file that does not use shared memory (in other words, most
+** open files) would have to carry around this extra information.  So
+** the unixInodeInfo object contains a pointer to this unixShmNode object
+** and the unixShmNode object is created only when needed.
+**
+** unixMutexHeld() must be true when creating or destroying
+** this object or while reading or writing the following fields:
+**
+**      nRef
+**
+** The following fields are read-only after the object is created:
+** 
+**      fid
+**      zFilename
+**
+** Either unixShmNode.mutex must be held or unixShmNode.nRef==0 and
+** unixMutexHeld() is true when reading or writing any other field
+** in this structure.
+*/
+struct unixShmNode {
+  unixInodeInfo *pInode;     /* unixInodeInfo that owns this SHM node */
+  sqlite3_mutex *mutex;      /* Mutex to access this object */
+  char *zFilename;           /* Name of the mmapped file */
+  int h;                     /* Open file descriptor */
+  int szRegion;              /* Size of shared-memory regions */
+  u16 nRegion;               /* Size of array apRegion */
+  u8 isReadonly;             /* True if read-only */
+  char **apRegion;           /* Array of mapped shared-memory regions */
+  int nRef;                  /* Number of unixShm objects pointing to this */
+  unixShm *pFirst;           /* All unixShm objects pointing to this */
+#ifdef SQLITE_DEBUG
+  u8 exclMask;               /* Mask of exclusive locks held */
+  u8 sharedMask;             /* Mask of shared locks held */
+  u8 nextShmId;              /* Next available unixShm.id value */
+#endif
+};
+
+/*
+** Structure used internally by this VFS to record the state of an
+** open shared memory connection.
+**
+** The following fields are initialized when this object is created and
+** are read-only thereafter:
+**
+**    unixShm.pFile
+**    unixShm.id
+**
+** All other fields are read/write.  The unixShm.pFile->mutex must be held
+** while accessing any read/write fields.
+*/
+struct unixShm {
+  unixShmNode *pShmNode;     /* The underlying unixShmNode object */
+  unixShm *pNext;            /* Next unixShm with the same unixShmNode */
+  u8 hasMutex;               /* True if holding the unixShmNode mutex */
+  u8 id;                     /* Id of this connection within its unixShmNode */
+  u16 sharedMask;            /* Mask of shared locks held */
+  u16 exclMask;              /* Mask of exclusive locks held */
+};
+
+/*
+** Constants used for locking
+*/
+#define UNIX_SHM_BASE   ((22+SQLITE_SHM_NLOCK)*4)         /* first lock byte */
+#define UNIX_SHM_DMS    (UNIX_SHM_BASE+SQLITE_SHM_NLOCK)  /* deadman switch */
+
+/*
+** Apply posix advisory locks for all bytes from ofst through ofst+n-1.
+**
+** Locks block if the mask is exactly UNIX_SHM_C and are non-blocking
+** otherwise.
+*/
+static int unixShmSystemLock(
+  unixShmNode *pShmNode, /* Apply locks to this open shared-memory segment */
+  int lockType,          /* F_UNLCK, F_RDLCK, or F_WRLCK */
+  int ofst,              /* First byte of the locking range */
+  int n                  /* Number of bytes to lock */
+){
+  struct flock f;       /* The posix advisory locking structure */
+  int rc = SQLITE_OK;   /* Result code form fcntl() */
+
+  /* Access to the unixShmNode object is serialized by the caller */
+  assert( sqlite3_mutex_held(pShmNode->mutex) || pShmNode->nRef==0 );
+
+  /* Shared locks never span more than one byte */
+  assert( n==1 || lockType!=F_RDLCK );
+
+  /* Locks are within range */
+  assert( n>=1 && n<SQLITE_SHM_NLOCK );
+
+  if( pShmNode->h>=0 ){
+    /* Initialize the locking parameters */
+    memset(&f, 0, sizeof(f));
+    f.l_type = lockType;
+    f.l_whence = SEEK_SET;
+    f.l_start = ofst;
+    f.l_len = n;
+
+    rc = osFcntl(pShmNode->h, F_SETLK, &f);
+    rc = (rc!=(-1)) ? SQLITE_OK : SQLITE_BUSY;
+  }
+
+  /* Update the global lock state and do debug tracing */
+#ifdef SQLITE_DEBUG
+  { u16 mask;
+  OSTRACE(("SHM-LOCK "));
+  mask = ofst>31 ? 0xffff : (1<<(ofst+n)) - (1<<ofst);
+  if( rc==SQLITE_OK ){
+    if( lockType==F_UNLCK ){
+      OSTRACE(("unlock %d ok", ofst));
+      pShmNode->exclMask &= ~mask;
+      pShmNode->sharedMask &= ~mask;
+    }else if( lockType==F_RDLCK ){
+      OSTRACE(("read-lock %d ok", ofst));
+      pShmNode->exclMask &= ~mask;
+      pShmNode->sharedMask |= mask;
+    }else{
+      assert( lockType==F_WRLCK );
+      OSTRACE(("write-lock %d ok", ofst));
+      pShmNode->exclMask |= mask;
+      pShmNode->sharedMask &= ~mask;
+    }
+  }else{
+    if( lockType==F_UNLCK ){
+      OSTRACE(("unlock %d failed", ofst));
+    }else if( lockType==F_RDLCK ){
+      OSTRACE(("read-lock failed"));
+    }else{
+      assert( lockType==F_WRLCK );
+      OSTRACE(("write-lock %d failed", ofst));
+    }
+  }
+  OSTRACE((" - afterwards %03x,%03x\n",
+           pShmNode->sharedMask, pShmNode->exclMask));
+  }
+#endif
