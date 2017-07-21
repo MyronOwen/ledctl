@@ -30454,3 +30454,236 @@ static int fillInUnixFile(
       **   (a) A call to fstat() failed.
       **   (b) A malloc failed.
       **
+      ** Scenario (b) may only occur if the process is holding no other
+      ** file descriptors open on the same file. If there were other file
+      ** descriptors on this file, then no malloc would be required by
+      ** findInodeInfo(). If this is the case, it is quite safe to close
+      ** handle h - as it is guaranteed that no posix locks will be released
+      ** by doing so.
+      **
+      ** If scenario (a) caused the error then things are not so safe. The
+      ** implicit assumption here is that if fstat() fails, things are in
+      ** such bad shape that dropping a lock or two doesn't matter much.
+      */
+      robust_close(pNew, h, __LINE__);
+      h = -1;
+    }
+    unixLeaveMutex();
+  }
+
+#if SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__)
+  else if( pLockingStyle == &afpIoMethods ){
+    /* AFP locking uses the file path so it needs to be included in
+    ** the afpLockingContext.
+    */
+    afpLockingContext *pCtx;
+    pNew->lockingContext = pCtx = sqlite3_malloc( sizeof(*pCtx) );
+    if( pCtx==0 ){
+      rc = SQLITE_NOMEM;
+    }else{
+      /* NB: zFilename exists and remains valid until the file is closed
+      ** according to requirement F11141.  So we do not need to make a
+      ** copy of the filename. */
+      pCtx->dbPath = zFilename;
+      pCtx->reserved = 0;
+      srandomdev();
+      unixEnterMutex();
+      rc = findInodeInfo(pNew, &pNew->pInode);
+      if( rc!=SQLITE_OK ){
+        sqlite3_free(pNew->lockingContext);
+        robust_close(pNew, h, __LINE__);
+        h = -1;
+      }
+      unixLeaveMutex();        
+    }
+  }
+#endif
+
+  else if( pLockingStyle == &dotlockIoMethods ){
+    /* Dotfile locking uses the file path so it needs to be included in
+    ** the dotlockLockingContext 
+    */
+    char *zLockFile;
+    int nFilename;
+    assert( zFilename!=0 );
+    nFilename = (int)strlen(zFilename) + 6;
+    zLockFile = (char *)sqlite3_malloc(nFilename);
+    if( zLockFile==0 ){
+      rc = SQLITE_NOMEM;
+    }else{
+      sqlite3_snprintf(nFilename, zLockFile, "%s" DOTLOCK_SUFFIX, zFilename);
+    }
+    pNew->lockingContext = zLockFile;
+  }
+
+#if OS_VXWORKS
+  else if( pLockingStyle == &semIoMethods ){
+    /* Named semaphore locking uses the file path so it needs to be
+    ** included in the semLockingContext
+    */
+    unixEnterMutex();
+    rc = findInodeInfo(pNew, &pNew->pInode);
+    if( (rc==SQLITE_OK) && (pNew->pInode->pSem==NULL) ){
+      char *zSemName = pNew->pInode->aSemName;
+      int n;
+      sqlite3_snprintf(MAX_PATHNAME, zSemName, "/%s.sem",
+                       pNew->pId->zCanonicalName);
+      for( n=1; zSemName[n]; n++ )
+        if( zSemName[n]=='/' ) zSemName[n] = '_';
+      pNew->pInode->pSem = sem_open(zSemName, O_CREAT, 0666, 1);
+      if( pNew->pInode->pSem == SEM_FAILED ){
+        rc = SQLITE_NOMEM;
+        pNew->pInode->aSemName[0] = '\0';
+      }
+    }
+    unixLeaveMutex();
+  }
+#endif
+  
+  pNew->lastErrno = 0;
+#if OS_VXWORKS
+  if( rc!=SQLITE_OK ){
+    if( h>=0 ) robust_close(pNew, h, __LINE__);
+    h = -1;
+    osUnlink(zFilename);
+    pNew->ctrlFlags |= UNIXFILE_DELETE;
+  }
+#endif
+  if( rc!=SQLITE_OK ){
+    if( h>=0 ) robust_close(pNew, h, __LINE__);
+  }else{
+    pNew->pMethod = pLockingStyle;
+    OpenCounter(+1);
+    verifyDbFile(pNew);
+  }
+  return rc;
+}
+
+/*
+** Return the name of a directory in which to put temporary files.
+** If no suitable temporary file directory can be found, return NULL.
+*/
+static const char *unixTempFileDir(void){
+  static const char *azDirs[] = {
+     0,
+     0,
+     0,
+     "/var/tmp",
+     "/usr/tmp",
+     "/tmp",
+     0        /* List terminator */
+  };
+  unsigned int i;
+  struct stat buf;
+  const char *zDir = 0;
+
+  azDirs[0] = sqlite3_temp_directory;
+  if( !azDirs[1] ) azDirs[1] = getenv("SQLITE_TMPDIR");
+  if( !azDirs[2] ) azDirs[2] = getenv("TMPDIR");
+  for(i=0; i<sizeof(azDirs)/sizeof(azDirs[0]); zDir=azDirs[i++]){
+    if( zDir==0 ) continue;
+    if( osStat(zDir, &buf) ) continue;
+    if( !S_ISDIR(buf.st_mode) ) continue;
+    if( osAccess(zDir, 07) ) continue;
+    break;
+  }
+  return zDir;
+}
+
+/*
+** Create a temporary file name in zBuf.  zBuf must be allocated
+** by the calling process and must be big enough to hold at least
+** pVfs->mxPathname bytes.
+*/
+static int unixGetTempname(int nBuf, char *zBuf){
+  static const unsigned char zChars[] =
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789";
+  unsigned int i, j;
+  const char *zDir;
+
+  /* It's odd to simulate an io-error here, but really this is just
+  ** using the io-error infrastructure to test that SQLite handles this
+  ** function failing. 
+  */
+  SimulateIOError( return SQLITE_IOERR );
+
+  zDir = unixTempFileDir();
+  if( zDir==0 ) zDir = ".";
+
+  /* Check that the output buffer is large enough for the temporary file 
+  ** name. If it is not, return SQLITE_ERROR.
+  */
+  if( (strlen(zDir) + strlen(SQLITE_TEMP_FILE_PREFIX) + 18) >= (size_t)nBuf ){
+    return SQLITE_ERROR;
+  }
+
+  do{
+    sqlite3_snprintf(nBuf-18, zBuf, "%s/"SQLITE_TEMP_FILE_PREFIX, zDir);
+    j = (int)strlen(zBuf);
+    sqlite3_randomness(15, &zBuf[j]);
+    for(i=0; i<15; i++, j++){
+      zBuf[j] = (char)zChars[ ((unsigned char)zBuf[j])%(sizeof(zChars)-1) ];
+    }
+    zBuf[j] = 0;
+    zBuf[j+1] = 0;
+  }while( osAccess(zBuf,0)==0 );
+  return SQLITE_OK;
+}
+
+#if SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__)
+/*
+** Routine to transform a unixFile into a proxy-locking unixFile.
+** Implementation in the proxy-lock division, but used by unixOpen()
+** if SQLITE_PREFER_PROXY_LOCKING is defined.
+*/
+static int proxyTransformUnixFile(unixFile*, const char*);
+#endif
+
+/*
+** Search for an unused file descriptor that was opened on the database 
+** file (not a journal or master-journal file) identified by pathname
+** zPath with SQLITE_OPEN_XXX flags matching those passed as the second
+** argument to this function.
+**
+** Such a file descriptor may exist if a database connection was closed
+** but the associated file descriptor could not be closed because some
+** other file descriptor open on the same file is holding a file-lock.
+** Refer to comments in the unixClose() function and the lengthy comment
+** describing "Posix Advisory Locking" at the start of this file for 
+** further details. Also, ticket #4018.
+**
+** If a suitable file descriptor is found, then it is returned. If no
+** such file descriptor is located, -1 is returned.
+*/
+static UnixUnusedFd *findReusableFd(const char *zPath, int flags){
+  UnixUnusedFd *pUnused = 0;
+
+  /* Do not search for an unused file descriptor on vxworks. Not because
+  ** vxworks would not benefit from the change (it might, we're not sure),
+  ** but because no way to test it is currently available. It is better 
+  ** not to risk breaking vxworks support for the sake of such an obscure 
+  ** feature.  */
+#if !OS_VXWORKS
+  struct stat sStat;                   /* Results of stat() call */
+
+  /* A stat() call may fail for various reasons. If this happens, it is
+  ** almost certain that an open() call on the same path will also fail.
+  ** For this reason, if an error occurs in the stat() call here, it is
+  ** ignored and -1 is returned. The caller will try to open a new file
+  ** descriptor on the same path, fail, and return an error to SQLite.
+  **
+  ** Even if a subsequent open() call does succeed, the consequences of
+  ** not searching for a reusable file descriptor are not dire.  */
+  if( 0==osStat(zPath, &sStat) ){
+    unixInodeInfo *pInode;
+
+    unixEnterMutex();
+    pInode = inodeList;
+    while( pInode && (pInode->fileId.dev!=sStat.st_dev
+                     || pInode->fileId.ino!=sStat.st_ino) ){
+       pInode = pInode->pNext;
+    }
+    if( pInode ){
+      UnixUnusedFd **pp;
