@@ -30895,3 +30895,228 @@ static int unixOpen(
     ** URIs with parameters.  Hence, they can always be passed into
     ** sqlite3_uri_parameter(). */
     assert( (flags & SQLITE_OPEN_URI) || zName[strlen(zName)+1]==0 );
+
+  }else if( !zName ){
+    /* If zName is NULL, the upper layer is requesting a temp file. */
+    assert(isDelete && !syncDir);
+    rc = unixGetTempname(MAX_PATHNAME+2, zTmpname);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    zName = zTmpname;
+
+    /* Generated temporary filenames are always double-zero terminated
+    ** for use by sqlite3_uri_parameter(). */
+    assert( zName[strlen(zName)+1]==0 );
+  }
+
+  /* Determine the value of the flags parameter passed to POSIX function
+  ** open(). These must be calculated even if open() is not called, as
+  ** they may be stored as part of the file handle and used by the 
+  ** 'conch file' locking functions later on.  */
+  if( isReadonly )  openFlags |= O_RDONLY;
+  if( isReadWrite ) openFlags |= O_RDWR;
+  if( isCreate )    openFlags |= O_CREAT;
+  if( isExclusive ) openFlags |= (O_EXCL|O_NOFOLLOW);
+  openFlags |= (O_LARGEFILE|O_BINARY);
+
+  if( fd<0 ){
+    mode_t openMode;              /* Permissions to create file with */
+    uid_t uid;                    /* Userid for the file */
+    gid_t gid;                    /* Groupid for the file */
+    rc = findCreateFileMode(zName, flags, &openMode, &uid, &gid);
+    if( rc!=SQLITE_OK ){
+      assert( !p->pUnused );
+      assert( eType==SQLITE_OPEN_WAL || eType==SQLITE_OPEN_MAIN_JOURNAL );
+      return rc;
+    }
+    fd = robust_open(zName, openFlags, openMode);
+    OSTRACE(("OPENX   %-3d %s 0%o\n", fd, zName, openFlags));
+    if( fd<0 && errno!=EISDIR && isReadWrite && !isExclusive ){
+      /* Failed to open the file for read/write access. Try read-only. */
+      flags &= ~(SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+      openFlags &= ~(O_RDWR|O_CREAT);
+      flags |= SQLITE_OPEN_READONLY;
+      openFlags |= O_RDONLY;
+      isReadonly = 1;
+      fd = robust_open(zName, openFlags, openMode);
+    }
+    if( fd<0 ){
+      rc = unixLogError(SQLITE_CANTOPEN_BKPT, "open", zName);
+      goto open_finished;
+    }
+
+    /* If this process is running as root and if creating a new rollback
+    ** journal or WAL file, set the ownership of the journal or WAL to be
+    ** the same as the original database.
+    */
+    if( flags & (SQLITE_OPEN_WAL|SQLITE_OPEN_MAIN_JOURNAL) ){
+      osFchown(fd, uid, gid);
+    }
+  }
+  assert( fd>=0 );
+  if( pOutFlags ){
+    *pOutFlags = flags;
+  }
+
+  if( p->pUnused ){
+    p->pUnused->fd = fd;
+    p->pUnused->flags = flags;
+  }
+
+  if( isDelete ){
+#if OS_VXWORKS
+    zPath = zName;
+#elif defined(SQLITE_UNLINK_AFTER_CLOSE)
+    zPath = sqlite3_mprintf("%s", zName);
+    if( zPath==0 ){
+      robust_close(p, fd, __LINE__);
+      return SQLITE_NOMEM;
+    }
+#else
+    osUnlink(zName);
+#endif
+  }
+#if SQLITE_ENABLE_LOCKING_STYLE
+  else{
+    p->openFlags = openFlags;
+  }
+#endif
+
+  noLock = eType!=SQLITE_OPEN_MAIN_DB;
+
+  
+#if defined(__APPLE__) || SQLITE_ENABLE_LOCKING_STYLE
+  if( fstatfs(fd, &fsInfo) == -1 ){
+    ((unixFile*)pFile)->lastErrno = errno;
+    robust_close(p, fd, __LINE__);
+    return SQLITE_IOERR_ACCESS;
+  }
+  if (0 == strncmp("msdos", fsInfo.f_fstypename, 5)) {
+    ((unixFile*)pFile)->fsFlags |= SQLITE_FSFLAGS_IS_MSDOS;
+  }
+#endif
+
+  /* Set up appropriate ctrlFlags */
+  if( isDelete )                ctrlFlags |= UNIXFILE_DELETE;
+  if( isReadonly )              ctrlFlags |= UNIXFILE_RDONLY;
+  if( noLock )                  ctrlFlags |= UNIXFILE_NOLOCK;
+  if( syncDir )                 ctrlFlags |= UNIXFILE_DIRSYNC;
+  if( flags & SQLITE_OPEN_URI ) ctrlFlags |= UNIXFILE_URI;
+
+#if SQLITE_ENABLE_LOCKING_STYLE
+#if SQLITE_PREFER_PROXY_LOCKING
+  isAutoProxy = 1;
+#endif
+  if( isAutoProxy && (zPath!=NULL) && (!noLock) && pVfs->xOpen ){
+    char *envforce = getenv("SQLITE_FORCE_PROXY_LOCKING");
+    int useProxy = 0;
+
+    /* SQLITE_FORCE_PROXY_LOCKING==1 means force always use proxy, 0 means 
+    ** never use proxy, NULL means use proxy for non-local files only.  */
+    if( envforce!=NULL ){
+      useProxy = atoi(envforce)>0;
+    }else{
+      if( statfs(zPath, &fsInfo) == -1 ){
+        /* In theory, the close(fd) call is sub-optimal. If the file opened
+        ** with fd is a database file, and there are other connections open
+        ** on that file that are currently holding advisory locks on it,
+        ** then the call to close() will cancel those locks. In practice,
+        ** we're assuming that statfs() doesn't fail very often. At least
+        ** not while other file descriptors opened by the same process on
+        ** the same file are working.  */
+        p->lastErrno = errno;
+        robust_close(p, fd, __LINE__);
+        rc = SQLITE_IOERR_ACCESS;
+        goto open_finished;
+      }
+      useProxy = !(fsInfo.f_flags&MNT_LOCAL);
+    }
+    if( useProxy ){
+      rc = fillInUnixFile(pVfs, fd, pFile, zPath, ctrlFlags);
+      if( rc==SQLITE_OK ){
+        rc = proxyTransformUnixFile((unixFile*)pFile, ":auto:");
+        if( rc!=SQLITE_OK ){
+          /* Use unixClose to clean up the resources added in fillInUnixFile 
+          ** and clear all the structure's references.  Specifically, 
+          ** pFile->pMethods will be NULL so sqlite3OsClose will be a no-op 
+          */
+          unixClose(pFile);
+          return rc;
+        }
+      }
+      goto open_finished;
+    }
+  }
+#endif
+  
+  rc = fillInUnixFile(pVfs, fd, pFile, zPath, ctrlFlags);
+
+open_finished:
+  if( rc!=SQLITE_OK ){
+    sqlite3_free(p->pUnused);
+  }
+  return rc;
+}
+
+
+/*
+** Delete the file at zPath. If the dirSync argument is true, fsync()
+** the directory after deleting the file.
+*/
+static int unixDelete(
+  sqlite3_vfs *NotUsed,     /* VFS containing this as the xDelete method */
+  const char *zPath,        /* Name of file to be deleted */
+  int dirSync               /* If true, fsync() directory after deleting file */
+){
+  int rc = SQLITE_OK;
+  UNUSED_PARAMETER(NotUsed);
+  SimulateIOError(return SQLITE_IOERR_DELETE);
+  if( osUnlink(zPath)==(-1) ){
+    if( errno==ENOENT
+#if OS_VXWORKS
+        || osAccess(zPath,0)!=0
+#endif
+    ){
+      rc = SQLITE_IOERR_DELETE_NOENT;
+    }else{
+      rc = unixLogError(SQLITE_IOERR_DELETE, "unlink", zPath);
+    }
+    return rc;
+  }
+#ifndef SQLITE_DISABLE_DIRSYNC
+  if( (dirSync & 1)!=0 ){
+    int fd;
+    rc = osOpenDirectory(zPath, &fd);
+    if( rc==SQLITE_OK ){
+#if OS_VXWORKS
+      if( fsync(fd)==-1 )
+#else
+      if( fsync(fd) )
+#endif
+      {
+        rc = unixLogError(SQLITE_IOERR_DIR_FSYNC, "fsync", zPath);
+      }
+      robust_close(0, fd, __LINE__);
+    }else if( rc==SQLITE_CANTOPEN ){
+      rc = SQLITE_OK;
+    }
+  }
+#endif
+  return rc;
+}
+
+/*
+** Test the existence of or access permissions of file zPath. The
+** test performed depends on the value of flags:
+**
+**     SQLITE_ACCESS_EXISTS: Return 1 if the file exists
+**     SQLITE_ACCESS_READWRITE: Return 1 if the file is read and writable.
+**     SQLITE_ACCESS_READONLY: Return 1 if the file is readable.
+**
+** Otherwise return 0.
+*/
+static int unixAccess(
+  sqlite3_vfs *NotUsed,   /* The VFS containing this xAccess method */
+  const char *zPath,      /* Path of the file to examine */
+  int flags,              /* What do we want to learn about the zPath file? */
