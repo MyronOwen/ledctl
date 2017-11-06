@@ -32903,3 +32903,221 @@ static void local_ioerr(){
      } \
    }
 #else
+#define SimulateIOErrorBenign(X)
+#define SimulateIOError(A)
+#define SimulateDiskfullError(A)
+#endif
+
+/*
+** When testing, keep a count of the number of open files.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_open_file_count = 0;
+#define OpenCounter(X)  sqlite3_open_file_count+=(X)
+#else
+#define OpenCounter(X)
+#endif
+
+#endif /* !defined(_OS_COMMON_H_) */
+
+/************** End of os_common.h *******************************************/
+/************** Continuing where we left off in os_win.c *********************/
+
+/*
+** Include the header file for the Windows VFS.
+*/
+
+/*
+** Compiling and using WAL mode requires several APIs that are only
+** available in Windows platforms based on the NT kernel.
+*/
+#if !SQLITE_OS_WINNT && !defined(SQLITE_OMIT_WAL)
+#  error "WAL mode requires support from the Windows NT kernel, compile\
+ with SQLITE_OMIT_WAL."
+#endif
+
+#if !SQLITE_OS_WINNT && SQLITE_MAX_MMAP_SIZE>0
+#  error "Memory mapped files require support from the Windows NT kernel,\
+ compile with SQLITE_MAX_MMAP_SIZE=0."
+#endif
+
+/*
+** Are most of the Win32 ANSI APIs available (i.e. with certain exceptions
+** based on the sub-platform)?
+*/
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && !defined(SQLITE_WIN32_NO_ANSI)
+#  define SQLITE_WIN32_HAS_ANSI
+#endif
+
+/*
+** Are most of the Win32 Unicode APIs available (i.e. with certain exceptions
+** based on the sub-platform)?
+*/
+#if (SQLITE_OS_WINCE || SQLITE_OS_WINNT || SQLITE_OS_WINRT) && \
+    !defined(SQLITE_WIN32_NO_WIDE)
+#  define SQLITE_WIN32_HAS_WIDE
+#endif
+
+/*
+** Make sure at least one set of Win32 APIs is available.
+*/
+#if !defined(SQLITE_WIN32_HAS_ANSI) && !defined(SQLITE_WIN32_HAS_WIDE)
+#  error "At least one of SQLITE_WIN32_HAS_ANSI and SQLITE_WIN32_HAS_WIDE\
+ must be defined."
+#endif
+
+/*
+** Define the required Windows SDK version constants if they are not
+** already available.
+*/
+#ifndef NTDDI_WIN8
+#  define NTDDI_WIN8                        0x06020000
+#endif
+
+#ifndef NTDDI_WINBLUE
+#  define NTDDI_WINBLUE                     0x06030000
+#endif
+
+/*
+** Check to see if the GetVersionEx[AW] functions are deprecated on the
+** target system.  GetVersionEx was first deprecated in Win8.1.
+*/
+#ifndef SQLITE_WIN32_GETVERSIONEX
+#  if defined(NTDDI_VERSION) && NTDDI_VERSION >= NTDDI_WINBLUE
+#    define SQLITE_WIN32_GETVERSIONEX   0   /* GetVersionEx() is deprecated */
+#  else
+#    define SQLITE_WIN32_GETVERSIONEX   1   /* GetVersionEx() is current */
+#  endif
+#endif
+
+/*
+** This constant should already be defined (in the "WinDef.h" SDK file).
+*/
+#ifndef MAX_PATH
+#  define MAX_PATH                      (260)
+#endif
+
+/*
+** Maximum pathname length (in chars) for Win32.  This should normally be
+** MAX_PATH.
+*/
+#ifndef SQLITE_WIN32_MAX_PATH_CHARS
+#  define SQLITE_WIN32_MAX_PATH_CHARS   (MAX_PATH)
+#endif
+
+/*
+** This constant should already be defined (in the "WinNT.h" SDK file).
+*/
+#ifndef UNICODE_STRING_MAX_CHARS
+#  define UNICODE_STRING_MAX_CHARS      (32767)
+#endif
+
+/*
+** Maximum pathname length (in chars) for WinNT.  This should normally be
+** UNICODE_STRING_MAX_CHARS.
+*/
+#ifndef SQLITE_WINNT_MAX_PATH_CHARS
+#  define SQLITE_WINNT_MAX_PATH_CHARS   (UNICODE_STRING_MAX_CHARS)
+#endif
+
+/*
+** Maximum pathname length (in bytes) for Win32.  The MAX_PATH macro is in
+** characters, so we allocate 4 bytes per character assuming worst-case of
+** 4-bytes-per-character for UTF8.
+*/
+#ifndef SQLITE_WIN32_MAX_PATH_BYTES
+#  define SQLITE_WIN32_MAX_PATH_BYTES   (SQLITE_WIN32_MAX_PATH_CHARS*4)
+#endif
+
+/*
+** Maximum pathname length (in bytes) for WinNT.  This should normally be
+** UNICODE_STRING_MAX_CHARS * sizeof(WCHAR).
+*/
+#ifndef SQLITE_WINNT_MAX_PATH_BYTES
+#  define SQLITE_WINNT_MAX_PATH_BYTES   \
+                            (sizeof(WCHAR) * SQLITE_WINNT_MAX_PATH_CHARS)
+#endif
+
+/*
+** Maximum error message length (in chars) for WinRT.
+*/
+#ifndef SQLITE_WIN32_MAX_ERRMSG_CHARS
+#  define SQLITE_WIN32_MAX_ERRMSG_CHARS (1024)
+#endif
+
+/*
+** Returns non-zero if the character should be treated as a directory
+** separator.
+*/
+#ifndef winIsDirSep
+#  define winIsDirSep(a)                (((a) == '/') || ((a) == '\\'))
+#endif
+
+/*
+** This macro is used when a local variable is set to a value that is
+** [sometimes] not used by the code (e.g. via conditional compilation).
+*/
+#ifndef UNUSED_VARIABLE_VALUE
+#  define UNUSED_VARIABLE_VALUE(x)      (void)(x)
+#endif
+
+/*
+** Returns the character that should be used as the directory separator.
+*/
+#ifndef winGetDirSep
+#  define winGetDirSep()                '\\'
+#endif
+
+/*
+** Do we need to manually define the Win32 file mapping APIs for use with WAL
+** mode or memory mapped files (e.g. these APIs are available in the Windows
+** CE SDK; however, they are not present in the header file)?
+*/
+#if SQLITE_WIN32_FILEMAPPING_API && \
+        (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0)
+/*
+** Two of the file mapping APIs are different under WinRT.  Figure out which
+** set we need.
+*/
+#if SQLITE_OS_WINRT
+WINBASEAPI HANDLE WINAPI CreateFileMappingFromApp(HANDLE, \
+        LPSECURITY_ATTRIBUTES, ULONG, ULONG64, LPCWSTR);
+
+WINBASEAPI LPVOID WINAPI MapViewOfFileFromApp(HANDLE, ULONG, ULONG64, SIZE_T);
+#else
+#if defined(SQLITE_WIN32_HAS_ANSI)
+WINBASEAPI HANDLE WINAPI CreateFileMappingA(HANDLE, LPSECURITY_ATTRIBUTES, \
+        DWORD, DWORD, DWORD, LPCSTR);
+#endif /* defined(SQLITE_WIN32_HAS_ANSI) */
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+WINBASEAPI HANDLE WINAPI CreateFileMappingW(HANDLE, LPSECURITY_ATTRIBUTES, \
+        DWORD, DWORD, DWORD, LPCWSTR);
+#endif /* defined(SQLITE_WIN32_HAS_WIDE) */
+
+WINBASEAPI LPVOID WINAPI MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+#endif /* SQLITE_OS_WINRT */
+
+/*
+** This file mapping API is common to both Win32 and WinRT.
+*/
+WINBASEAPI BOOL WINAPI UnmapViewOfFile(LPCVOID);
+#endif /* SQLITE_WIN32_FILEMAPPING_API */
+
+/*
+** Some Microsoft compilers lack this definition.
+*/
+#ifndef INVALID_FILE_ATTRIBUTES
+# define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#endif
+
+#ifndef FILE_FLAG_MASK
+# define FILE_FLAG_MASK          (0xFF3C0000)
+#endif
+
+#ifndef FILE_ATTRIBUTE_MASK
+# define FILE_ATTRIBUTE_MASK     (0x0003FFF7)
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+/* Forward references to structures used for WAL */
