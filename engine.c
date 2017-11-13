@@ -33348,3 +33348,246 @@ static struct win_syscall {
 } aSyscall[] = {
 #if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
   { "AreFileApisANSI",         (SYSCALL)AreFileApisANSI,         0 },
+#else
+  { "AreFileApisANSI",         (SYSCALL)0,                       0 },
+#endif
+
+#ifndef osAreFileApisANSI
+#define osAreFileApisANSI ((BOOL(WINAPI*)(VOID))aSyscall[0].pCurrent)
+#endif
+
+#if SQLITE_OS_WINCE && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CharLowerW",              (SYSCALL)CharLowerW,              0 },
+#else
+  { "CharLowerW",              (SYSCALL)0,                       0 },
+#endif
+
+#define osCharLowerW ((LPWSTR(WINAPI*)(LPWSTR))aSyscall[1].pCurrent)
+
+#if SQLITE_OS_WINCE && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CharUpperW",              (SYSCALL)CharUpperW,              0 },
+#else
+  { "CharUpperW",              (SYSCALL)0,                       0 },
+#endif
+
+#define osCharUpperW ((LPWSTR(WINAPI*)(LPWSTR))aSyscall[2].pCurrent)
+
+  { "CloseHandle",             (SYSCALL)CloseHandle,             0 },
+
+#define osCloseHandle ((BOOL(WINAPI*)(HANDLE))aSyscall[3].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "CreateFileA",             (SYSCALL)CreateFileA,             0 },
+#else
+  { "CreateFileA",             (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileA ((HANDLE(WINAPI*)(LPCSTR,DWORD,DWORD, \
+        LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE))aSyscall[4].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CreateFileW",             (SYSCALL)CreateFileW,             0 },
+#else
+  { "CreateFileW",             (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileW ((HANDLE(WINAPI*)(LPCWSTR,DWORD,DWORD, \
+        LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE))aSyscall[5].pCurrent)
+
+#if (!SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_ANSI) && \
+        (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0))
+  { "CreateFileMappingA",      (SYSCALL)CreateFileMappingA,      0 },
+#else
+  { "CreateFileMappingA",      (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileMappingA ((HANDLE(WINAPI*)(HANDLE,LPSECURITY_ATTRIBUTES, \
+        DWORD,DWORD,DWORD,LPCSTR))aSyscall[6].pCurrent)
+
+#if SQLITE_OS_WINCE || (!SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE) && \
+        (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0))
+  { "CreateFileMappingW",      (SYSCALL)CreateFileMappingW,      0 },
+#else
+  { "CreateFileMappingW",      (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileMappingW ((HANDLE(WINAPI*)(HANDLE,LPSECURITY_ATTRIBUTES, \
+        DWORD,DWORD,DWORD,LPCWSTR))aSyscall[7].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CreateMutexW",            (SYSCALL)CreateMutexW,            0 },
+#else
+  { "CreateMutexW",            (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateMutexW ((HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES,BOOL, \
+        LPCWSTR))aSyscall[8].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "DeleteFileA",             (SYSCALL)DeleteFileA,             0 },
+#else
+  { "DeleteFileA",             (SYSCALL)0,                       0 },
+#endif
+
+#define osDeleteFileA ((BOOL(WINAPI*)(LPCSTR))aSyscall[9].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  { "DeleteFileW",             (SYSCALL)DeleteFileW,             0 },
+#else
+  { "DeleteFileW",             (SYSCALL)0,                       0 },
+#endif
+
+#define osDeleteFileW ((BOOL(WINAPI*)(LPCWSTR))aSyscall[10].pCurrent)
+
+#if SQLITE_OS_WINCE
+  { "FileTimeToLocalFileTime", (SYSCALL)FileTimeToLocalFileTime, 0 },
+#else
+  { "FileTimeToLocalFileTime", (SYSCALL)0,                       0 },
+#endif
+
+#define osFileTimeToLocalFileTime ((BOOL(WINAPI*)(CONST FILETIME*, \
+        LPFILETIME))aSyscall[11].pCurrent)
+
+#if SQLITE_OS_WINCE
+  { "FileTimeToSystemTime",    (SYSCALL)FileTimeToSystemTime,    0 },
+#else
+  { "FileTimeToSystemTime",    (SYSCALL)0,                       0 },
+#endif
+
+#define osFileTimeToSystemTime ((BOOL(WINAPI*)(CONST FILETIME*, \
+        LPSYSTEMTIME))aSyscall[12].pCurrent)
+
+  { "FlushFileBuffers",        (SYSCALL)FlushFileBuffers,        0 },
+
+#define osFlushFileBuffers ((BOOL(WINAPI*)(HANDLE))aSyscall[13].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "FormatMessageA",          (SYSCALL)FormatMessageA,          0 },
+#else
+  { "FormatMessageA",          (SYSCALL)0,                       0 },
+#endif
+
+#define osFormatMessageA ((DWORD(WINAPI*)(DWORD,LPCVOID,DWORD,DWORD,LPSTR, \
+        DWORD,va_list*))aSyscall[14].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  { "FormatMessageW",          (SYSCALL)FormatMessageW,          0 },
+#else
+  { "FormatMessageW",          (SYSCALL)0,                       0 },
+#endif
+
+#define osFormatMessageW ((DWORD(WINAPI*)(DWORD,LPCVOID,DWORD,DWORD,LPWSTR, \
+        DWORD,va_list*))aSyscall[15].pCurrent)
+
+#if !defined(SQLITE_OMIT_LOAD_EXTENSION)
+  { "FreeLibrary",             (SYSCALL)FreeLibrary,             0 },
+#else
+  { "FreeLibrary",             (SYSCALL)0,                       0 },
+#endif
+
+#define osFreeLibrary ((BOOL(WINAPI*)(HMODULE))aSyscall[16].pCurrent)
+
+  { "GetCurrentProcessId",     (SYSCALL)GetCurrentProcessId,     0 },
+
+#define osGetCurrentProcessId ((DWORD(WINAPI*)(VOID))aSyscall[17].pCurrent)
+
+#if !SQLITE_OS_WINCE && defined(SQLITE_WIN32_HAS_ANSI)
+  { "GetDiskFreeSpaceA",       (SYSCALL)GetDiskFreeSpaceA,       0 },
+#else
+  { "GetDiskFreeSpaceA",       (SYSCALL)0,                       0 },
+#endif
+
+#define osGetDiskFreeSpaceA ((BOOL(WINAPI*)(LPCSTR,LPDWORD,LPDWORD,LPDWORD, \
+        LPDWORD))aSyscall[18].pCurrent)
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "GetDiskFreeSpaceW",       (SYSCALL)GetDiskFreeSpaceW,       0 },
+#else
+  { "GetDiskFreeSpaceW",       (SYSCALL)0,                       0 },
+#endif
+
+#define osGetDiskFreeSpaceW ((BOOL(WINAPI*)(LPCWSTR,LPDWORD,LPDWORD,LPDWORD, \
+        LPDWORD))aSyscall[19].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "GetFileAttributesA",      (SYSCALL)GetFileAttributesA,      0 },
+#else
+  { "GetFileAttributesA",      (SYSCALL)0,                       0 },
+#endif
+
+#define osGetFileAttributesA ((DWORD(WINAPI*)(LPCSTR))aSyscall[20].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "GetFileAttributesW",      (SYSCALL)GetFileAttributesW,      0 },
+#else
+  { "GetFileAttributesW",      (SYSCALL)0,                       0 },
+#endif
+
+#define osGetFileAttributesW ((DWORD(WINAPI*)(LPCWSTR))aSyscall[21].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  { "GetFileAttributesExW",    (SYSCALL)GetFileAttributesExW,    0 },
+#else
+  { "GetFileAttributesExW",    (SYSCALL)0,                       0 },
+#endif
+
+#define osGetFileAttributesExW ((BOOL(WINAPI*)(LPCWSTR,GET_FILEEX_INFO_LEVELS, \
+        LPVOID))aSyscall[22].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "GetFileSize",             (SYSCALL)GetFileSize,             0 },
+#else
+  { "GetFileSize",             (SYSCALL)0,                       0 },
+#endif
+
+#define osGetFileSize ((DWORD(WINAPI*)(HANDLE,LPDWORD))aSyscall[23].pCurrent)
+
+#if !SQLITE_OS_WINCE && defined(SQLITE_WIN32_HAS_ANSI)
+  { "GetFullPathNameA",        (SYSCALL)GetFullPathNameA,        0 },
+#else
+  { "GetFullPathNameA",        (SYSCALL)0,                       0 },
+#endif
+
+#define osGetFullPathNameA ((DWORD(WINAPI*)(LPCSTR,DWORD,LPSTR, \
+        LPSTR*))aSyscall[24].pCurrent)
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "GetFullPathNameW",        (SYSCALL)GetFullPathNameW,        0 },
+#else
+  { "GetFullPathNameW",        (SYSCALL)0,                       0 },
+#endif
+
+#define osGetFullPathNameW ((DWORD(WINAPI*)(LPCWSTR,DWORD,LPWSTR, \
+        LPWSTR*))aSyscall[25].pCurrent)
+
+  { "GetLastError",            (SYSCALL)GetLastError,            0 },
+
+#define osGetLastError ((DWORD(WINAPI*)(VOID))aSyscall[26].pCurrent)
+
+#if !defined(SQLITE_OMIT_LOAD_EXTENSION)
+#if SQLITE_OS_WINCE
+  /* The GetProcAddressA() routine is only available on Windows CE. */
+  { "GetProcAddressA",         (SYSCALL)GetProcAddressA,         0 },
+#else
+  /* All other Windows platforms expect GetProcAddress() to take
+  ** an ANSI string regardless of the _UNICODE setting */
+  { "GetProcAddressA",         (SYSCALL)GetProcAddress,          0 },
+#endif
+#else
+  { "GetProcAddressA",         (SYSCALL)0,                       0 },
+#endif
+
+#define osGetProcAddressA ((FARPROC(WINAPI*)(HMODULE, \
+        LPCSTR))aSyscall[27].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "GetSystemInfo",           (SYSCALL)GetSystemInfo,           0 },
+#else
+  { "GetSystemInfo",           (SYSCALL)0,                       0 },
+#endif
+
+#define osGetSystemInfo ((VOID(WINAPI*)(LPSYSTEM_INFO))aSyscall[28].pCurrent)
+
+  { "GetSystemTime",           (SYSCALL)GetSystemTime,           0 },
+
+#define osGetSystemTime ((VOID(WINAPI*)(LPSYSTEMTIME))aSyscall[29].pCurrent)
