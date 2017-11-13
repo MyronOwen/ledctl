@@ -33121,3 +33121,230 @@ WINBASEAPI BOOL WINAPI UnmapViewOfFile(LPCVOID);
 
 #ifndef SQLITE_OMIT_WAL
 /* Forward references to structures used for WAL */
+typedef struct winShm winShm;           /* A connection to shared-memory */
+typedef struct winShmNode winShmNode;   /* A region of shared-memory */
+#endif
+
+/*
+** WinCE lacks native support for file locking so we have to fake it
+** with some code of our own.
+*/
+#if SQLITE_OS_WINCE
+typedef struct winceLock {
+  int nReaders;       /* Number of reader locks obtained */
+  BOOL bPending;      /* Indicates a pending lock has been obtained */
+  BOOL bReserved;     /* Indicates a reserved lock has been obtained */
+  BOOL bExclusive;    /* Indicates an exclusive lock has been obtained */
+} winceLock;
+#endif
+
+/*
+** The winFile structure is a subclass of sqlite3_file* specific to the win32
+** portability layer.
+*/
+typedef struct winFile winFile;
+struct winFile {
+  const sqlite3_io_methods *pMethod; /*** Must be first ***/
+  sqlite3_vfs *pVfs;      /* The VFS used to open this file */
+  HANDLE h;               /* Handle for accessing the file */
+  u8 locktype;            /* Type of lock currently held on this file */
+  short sharedLockByte;   /* Randomly chosen byte used as a shared lock */
+  u8 ctrlFlags;           /* Flags.  See WINFILE_* below */
+  DWORD lastErrno;        /* The Windows errno from the last I/O error */
+#ifndef SQLITE_OMIT_WAL
+  winShm *pShm;           /* Instance of shared memory on this file */
+#endif
+  const char *zPath;      /* Full pathname of this file */
+  int szChunk;            /* Chunk size configured by FCNTL_CHUNK_SIZE */
+#if SQLITE_OS_WINCE
+  LPWSTR zDeleteOnClose;  /* Name of file to delete when closing */
+  HANDLE hMutex;          /* Mutex used to control access to shared lock */
+  HANDLE hShared;         /* Shared memory segment used for locking */
+  winceLock local;        /* Locks obtained by this instance of winFile */
+  winceLock *shared;      /* Global shared lock memory for the file  */
+#endif
+#if SQLITE_MAX_MMAP_SIZE>0
+  int nFetchOut;                /* Number of outstanding xFetch references */
+  HANDLE hMap;                  /* Handle for accessing memory mapping */
+  void *pMapRegion;             /* Area memory mapped */
+  sqlite3_int64 mmapSize;       /* Usable size of mapped region */
+  sqlite3_int64 mmapSizeActual; /* Actual size of mapped region */
+  sqlite3_int64 mmapSizeMax;    /* Configured FCNTL_MMAP_SIZE value */
+#endif
+};
+
+/*
+** Allowed values for winFile.ctrlFlags
+*/
+#define WINFILE_RDONLY          0x02   /* Connection is read only */
+#define WINFILE_PERSIST_WAL     0x04   /* Persistent WAL mode */
+#define WINFILE_PSOW            0x10   /* SQLITE_IOCAP_POWERSAFE_OVERWRITE */
+
+/*
+ * The size of the buffer used by sqlite3_win32_write_debug().
+ */
+#ifndef SQLITE_WIN32_DBG_BUF_SIZE
+#  define SQLITE_WIN32_DBG_BUF_SIZE   ((int)(4096-sizeof(DWORD)))
+#endif
+
+/*
+ * The value used with sqlite3_win32_set_directory() to specify that
+ * the data directory should be changed.
+ */
+#ifndef SQLITE_WIN32_DATA_DIRECTORY_TYPE
+#  define SQLITE_WIN32_DATA_DIRECTORY_TYPE (1)
+#endif
+
+/*
+ * The value used with sqlite3_win32_set_directory() to specify that
+ * the temporary directory should be changed.
+ */
+#ifndef SQLITE_WIN32_TEMP_DIRECTORY_TYPE
+#  define SQLITE_WIN32_TEMP_DIRECTORY_TYPE (2)
+#endif
+
+/*
+ * If compiled with SQLITE_WIN32_MALLOC on Windows, we will use the
+ * various Win32 API heap functions instead of our own.
+ */
+#ifdef SQLITE_WIN32_MALLOC
+
+/*
+ * If this is non-zero, an isolated heap will be created by the native Win32
+ * allocator subsystem; otherwise, the default process heap will be used.  This
+ * setting has no effect when compiling for WinRT.  By default, this is enabled
+ * and an isolated heap will be created to store all allocated data.
+ *
+ ******************************************************************************
+ * WARNING: It is important to note that when this setting is non-zero and the
+ *          winMemShutdown function is called (e.g. by the sqlite3_shutdown
+ *          function), all data that was allocated using the isolated heap will
+ *          be freed immediately and any attempt to access any of that freed
+ *          data will almost certainly result in an immediate access violation.
+ ******************************************************************************
+ */
+#ifndef SQLITE_WIN32_HEAP_CREATE
+#  define SQLITE_WIN32_HEAP_CREATE    (TRUE)
+#endif
+
+/*
+ * The initial size of the Win32-specific heap.  This value may be zero.
+ */
+#ifndef SQLITE_WIN32_HEAP_INIT_SIZE
+#  define SQLITE_WIN32_HEAP_INIT_SIZE ((SQLITE_DEFAULT_CACHE_SIZE) * \
+                                       (SQLITE_DEFAULT_PAGE_SIZE) + 4194304)
+#endif
+
+/*
+ * The maximum size of the Win32-specific heap.  This value may be zero.
+ */
+#ifndef SQLITE_WIN32_HEAP_MAX_SIZE
+#  define SQLITE_WIN32_HEAP_MAX_SIZE  (0)
+#endif
+
+/*
+ * The extra flags to use in calls to the Win32 heap APIs.  This value may be
+ * zero for the default behavior.
+ */
+#ifndef SQLITE_WIN32_HEAP_FLAGS
+#  define SQLITE_WIN32_HEAP_FLAGS     (0)
+#endif
+
+
+/*
+** The winMemData structure stores information required by the Win32-specific
+** sqlite3_mem_methods implementation.
+*/
+typedef struct winMemData winMemData;
+struct winMemData {
+#ifndef NDEBUG
+  u32 magic1;   /* Magic number to detect structure corruption. */
+#endif
+  HANDLE hHeap; /* The handle to our heap. */
+  BOOL bOwned;  /* Do we own the heap (i.e. destroy it on shutdown)? */
+#ifndef NDEBUG
+  u32 magic2;   /* Magic number to detect structure corruption. */
+#endif
+};
+
+#ifndef NDEBUG
+#define WINMEM_MAGIC1     0x42b2830b
+#define WINMEM_MAGIC2     0xbd4d7cf4
+#endif
+
+static struct winMemData win_mem_data = {
+#ifndef NDEBUG
+  WINMEM_MAGIC1,
+#endif
+  NULL, FALSE
+#ifndef NDEBUG
+  ,WINMEM_MAGIC2
+#endif
+};
+
+#ifndef NDEBUG
+#define winMemAssertMagic1() assert( win_mem_data.magic1==WINMEM_MAGIC1 )
+#define winMemAssertMagic2() assert( win_mem_data.magic2==WINMEM_MAGIC2 )
+#define winMemAssertMagic()  winMemAssertMagic1(); winMemAssertMagic2();
+#else
+#define winMemAssertMagic()
+#endif
+
+#define winMemGetDataPtr()  &win_mem_data
+#define winMemGetHeap()     win_mem_data.hHeap
+#define winMemGetOwned()    win_mem_data.bOwned
+
+static void *winMemMalloc(int nBytes);
+static void winMemFree(void *pPrior);
+static void *winMemRealloc(void *pPrior, int nBytes);
+static int winMemSize(void *p);
+static int winMemRoundup(int n);
+static int winMemInit(void *pAppData);
+static void winMemShutdown(void *pAppData);
+
+SQLITE_PRIVATE const sqlite3_mem_methods *sqlite3MemGetWin32(void);
+#endif /* SQLITE_WIN32_MALLOC */
+
+/*
+** The following variable is (normally) set once and never changes
+** thereafter.  It records whether the operating system is Win9x
+** or WinNT.
+**
+** 0:   Operating system unknown.
+** 1:   Operating system is Win9x.
+** 2:   Operating system is WinNT.
+**
+** In order to facilitate testing on a WinNT system, the test fixture
+** can manually set this value to 1 to emulate Win98 behavior.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API LONG SQLITE_WIN32_VOLATILE sqlite3_os_type = 0;
+#else
+static LONG SQLITE_WIN32_VOLATILE sqlite3_os_type = 0;
+#endif
+
+#ifndef SYSCALL
+#  define SYSCALL sqlite3_syscall_ptr
+#endif
+
+/*
+** This function is not available on Windows CE or WinRT.
+ */
+
+#if SQLITE_OS_WINCE || SQLITE_OS_WINRT
+#  define osAreFileApisANSI()       1
+#endif
+
+/*
+** Many system calls are accessed through pointer-to-functions so that
+** they may be overridden at runtime to facilitate fault injection during
+** testing and sandboxing.  The following array holds the names and pointers
+** to all overrideable system calls.
+*/
+static struct win_syscall {
+  const char *zName;            /* Name of the system call */
+  sqlite3_syscall_ptr pCurrent; /* Current value of the system call */
+  sqlite3_syscall_ptr pDefault; /* Default value */
+} aSyscall[] = {
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
+  { "AreFileApisANSI",         (SYSCALL)AreFileApisANSI,         0 },
