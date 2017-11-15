@@ -33591,3 +33591,245 @@ static struct win_syscall {
   { "GetSystemTime",           (SYSCALL)GetSystemTime,           0 },
 
 #define osGetSystemTime ((VOID(WINAPI*)(LPSYSTEMTIME))aSyscall[29].pCurrent)
+
+#if !SQLITE_OS_WINCE
+  { "GetSystemTimeAsFileTime", (SYSCALL)GetSystemTimeAsFileTime, 0 },
+#else
+  { "GetSystemTimeAsFileTime", (SYSCALL)0,                       0 },
+#endif
+
+#define osGetSystemTimeAsFileTime ((VOID(WINAPI*)( \
+        LPFILETIME))aSyscall[30].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "GetTempPathA",            (SYSCALL)GetTempPathA,            0 },
+#else
+  { "GetTempPathA",            (SYSCALL)0,                       0 },
+#endif
+
+#define osGetTempPathA ((DWORD(WINAPI*)(DWORD,LPSTR))aSyscall[31].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "GetTempPathW",            (SYSCALL)GetTempPathW,            0 },
+#else
+  { "GetTempPathW",            (SYSCALL)0,                       0 },
+#endif
+
+#define osGetTempPathW ((DWORD(WINAPI*)(DWORD,LPWSTR))aSyscall[32].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "GetTickCount",            (SYSCALL)GetTickCount,            0 },
+#else
+  { "GetTickCount",            (SYSCALL)0,                       0 },
+#endif
+
+#define osGetTickCount ((DWORD(WINAPI*)(VOID))aSyscall[33].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI) && defined(SQLITE_WIN32_GETVERSIONEX) && \
+        SQLITE_WIN32_GETVERSIONEX
+  { "GetVersionExA",           (SYSCALL)GetVersionExA,           0 },
+#else
+  { "GetVersionExA",           (SYSCALL)0,                       0 },
+#endif
+
+#define osGetVersionExA ((BOOL(WINAPI*)( \
+        LPOSVERSIONINFOA))aSyscall[34].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE) && \
+        defined(SQLITE_WIN32_GETVERSIONEX) && SQLITE_WIN32_GETVERSIONEX
+  { "GetVersionExW",           (SYSCALL)GetVersionExW,           0 },
+#else
+  { "GetVersionExW",           (SYSCALL)0,                       0 },
+#endif
+
+#define osGetVersionExW ((BOOL(WINAPI*)( \
+        LPOSVERSIONINFOW))aSyscall[35].pCurrent)
+
+  { "HeapAlloc",               (SYSCALL)HeapAlloc,               0 },
+
+#define osHeapAlloc ((LPVOID(WINAPI*)(HANDLE,DWORD, \
+        SIZE_T))aSyscall[36].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "HeapCreate",              (SYSCALL)HeapCreate,              0 },
+#else
+  { "HeapCreate",              (SYSCALL)0,                       0 },
+#endif
+
+#define osHeapCreate ((HANDLE(WINAPI*)(DWORD,SIZE_T, \
+        SIZE_T))aSyscall[37].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "HeapDestroy",             (SYSCALL)HeapDestroy,             0 },
+#else
+  { "HeapDestroy",             (SYSCALL)0,                       0 },
+#endif
+
+#define osHeapDestroy ((BOOL(WINAPI*)(HANDLE))aSyscall[38].pCurrent)
+
+  { "HeapFree",                (SYSCALL)HeapFree,                0 },
+
+#define osHeapFree ((BOOL(WINAPI*)(HANDLE,DWORD,LPVOID))aSyscall[39].pCurrent)
+
+  { "HeapReAlloc",             (SYSCALL)HeapReAlloc,             0 },
+
+#define osHeapReAlloc ((LPVOID(WINAPI*)(HANDLE,DWORD,LPVOID, \
+        SIZE_T))aSyscall[40].pCurrent)
+
+  { "HeapSize",                (SYSCALL)HeapSize,                0 },
+
+#define osHeapSize ((SIZE_T(WINAPI*)(HANDLE,DWORD, \
+        LPCVOID))aSyscall[41].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "HeapValidate",            (SYSCALL)HeapValidate,            0 },
+#else
+  { "HeapValidate",            (SYSCALL)0,                       0 },
+#endif
+
+#define osHeapValidate ((BOOL(WINAPI*)(HANDLE,DWORD, \
+        LPCVOID))aSyscall[42].pCurrent)
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
+  { "HeapCompact",             (SYSCALL)HeapCompact,             0 },
+#else
+  { "HeapCompact",             (SYSCALL)0,                       0 },
+#endif
+
+#define osHeapCompact ((UINT(WINAPI*)(HANDLE,DWORD))aSyscall[43].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI) && !defined(SQLITE_OMIT_LOAD_EXTENSION)
+  { "LoadLibraryA",            (SYSCALL)LoadLibraryA,            0 },
+#else
+  { "LoadLibraryA",            (SYSCALL)0,                       0 },
+#endif
+
+#define osLoadLibraryA ((HMODULE(WINAPI*)(LPCSTR))aSyscall[44].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE) && \
+        !defined(SQLITE_OMIT_LOAD_EXTENSION)
+  { "LoadLibraryW",            (SYSCALL)LoadLibraryW,            0 },
+#else
+  { "LoadLibraryW",            (SYSCALL)0,                       0 },
+#endif
+
+#define osLoadLibraryW ((HMODULE(WINAPI*)(LPCWSTR))aSyscall[45].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "LocalFree",               (SYSCALL)LocalFree,               0 },
+#else
+  { "LocalFree",               (SYSCALL)0,                       0 },
+#endif
+
+#define osLocalFree ((HLOCAL(WINAPI*)(HLOCAL))aSyscall[46].pCurrent)
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
+  { "LockFile",                (SYSCALL)LockFile,                0 },
+#else
+  { "LockFile",                (SYSCALL)0,                       0 },
+#endif
+
+#ifndef osLockFile
+#define osLockFile ((BOOL(WINAPI*)(HANDLE,DWORD,DWORD,DWORD, \
+        DWORD))aSyscall[47].pCurrent)
+#endif
+
+#if !SQLITE_OS_WINCE
+  { "LockFileEx",              (SYSCALL)LockFileEx,              0 },
+#else
+  { "LockFileEx",              (SYSCALL)0,                       0 },
+#endif
+
+#ifndef osLockFileEx
+#define osLockFileEx ((BOOL(WINAPI*)(HANDLE,DWORD,DWORD,DWORD,DWORD, \
+        LPOVERLAPPED))aSyscall[48].pCurrent)
+#endif
+
+#if SQLITE_OS_WINCE || (!SQLITE_OS_WINRT && \
+        (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0))
+  { "MapViewOfFile",           (SYSCALL)MapViewOfFile,           0 },
+#else
+  { "MapViewOfFile",           (SYSCALL)0,                       0 },
+#endif
+
+#define osMapViewOfFile ((LPVOID(WINAPI*)(HANDLE,DWORD,DWORD,DWORD, \
+        SIZE_T))aSyscall[49].pCurrent)
+
+  { "MultiByteToWideChar",     (SYSCALL)MultiByteToWideChar,     0 },
+
+#define osMultiByteToWideChar ((int(WINAPI*)(UINT,DWORD,LPCSTR,int,LPWSTR, \
+        int))aSyscall[50].pCurrent)
+
+  { "QueryPerformanceCounter", (SYSCALL)QueryPerformanceCounter, 0 },
+
+#define osQueryPerformanceCounter ((BOOL(WINAPI*)( \
+        LARGE_INTEGER*))aSyscall[51].pCurrent)
+
+  { "ReadFile",                (SYSCALL)ReadFile,                0 },
+
+#define osReadFile ((BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD, \
+        LPOVERLAPPED))aSyscall[52].pCurrent)
+
+  { "SetEndOfFile",            (SYSCALL)SetEndOfFile,            0 },
+
+#define osSetEndOfFile ((BOOL(WINAPI*)(HANDLE))aSyscall[53].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "SetFilePointer",          (SYSCALL)SetFilePointer,          0 },
+#else
+  { "SetFilePointer",          (SYSCALL)0,                       0 },
+#endif
+
+#define osSetFilePointer ((DWORD(WINAPI*)(HANDLE,LONG,PLONG, \
+        DWORD))aSyscall[54].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "Sleep",                   (SYSCALL)Sleep,                   0 },
+#else
+  { "Sleep",                   (SYSCALL)0,                       0 },
+#endif
+
+#define osSleep ((VOID(WINAPI*)(DWORD))aSyscall[55].pCurrent)
+
+  { "SystemTimeToFileTime",    (SYSCALL)SystemTimeToFileTime,    0 },
+
+#define osSystemTimeToFileTime ((BOOL(WINAPI*)(CONST SYSTEMTIME*, \
+        LPFILETIME))aSyscall[56].pCurrent)
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
+  { "UnlockFile",              (SYSCALL)UnlockFile,              0 },
+#else
+  { "UnlockFile",              (SYSCALL)0,                       0 },
+#endif
+
+#ifndef osUnlockFile
+#define osUnlockFile ((BOOL(WINAPI*)(HANDLE,DWORD,DWORD,DWORD, \
+        DWORD))aSyscall[57].pCurrent)
+#endif
+
+#if !SQLITE_OS_WINCE
+  { "UnlockFileEx",            (SYSCALL)UnlockFileEx,            0 },
+#else
+  { "UnlockFileEx",            (SYSCALL)0,                       0 },
+#endif
+
+#define osUnlockFileEx ((BOOL(WINAPI*)(HANDLE,DWORD,DWORD,DWORD, \
+        LPOVERLAPPED))aSyscall[58].pCurrent)
+
+#if SQLITE_OS_WINCE || !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+  { "UnmapViewOfFile",         (SYSCALL)UnmapViewOfFile,         0 },
+#else
+  { "UnmapViewOfFile",         (SYSCALL)0,                       0 },
+#endif
+
+#define osUnmapViewOfFile ((BOOL(WINAPI*)(LPCVOID))aSyscall[59].pCurrent)
+
+  { "WideCharToMultiByte",     (SYSCALL)WideCharToMultiByte,     0 },
+
+#define osWideCharToMultiByte ((int(WINAPI*)(UINT,DWORD,LPCWSTR,int,LPSTR,int, \
+        LPCSTR,LPBOOL))aSyscall[60].pCurrent)
+
+  { "WriteFile",               (SYSCALL)WriteFile,               0 },
+
+#define osWriteFile ((BOOL(WINAPI*)(HANDLE,LPCVOID,DWORD,LPDWORD, \
+        LPOVERLAPPED))aSyscall[61].pCurrent)
