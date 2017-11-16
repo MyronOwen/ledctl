@@ -34304,3 +34304,241 @@ static void winMemFree(void *pPrior){
   hHeap = winMemGetHeap();
   assert( hHeap!=0 );
   assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior) );
+#endif
+  if( !pPrior ) return; /* Passing NULL to HeapFree is undefined. */
+  if( !osHeapFree(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior) ){
+    sqlite3_log(SQLITE_NOMEM, "failed to HeapFree block %p (%lu), heap=%p",
+                pPrior, osGetLastError(), (void*)hHeap);
+  }
+}
+
+/*
+** Change the size of an existing memory allocation
+*/
+static void *winMemRealloc(void *pPrior, int nBytes){
+  HANDLE hHeap;
+  void *p;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior) );
+#endif
+  assert( nBytes>=0 );
+  if( !pPrior ){
+    p = osHeapAlloc(hHeap, SQLITE_WIN32_HEAP_FLAGS, (SIZE_T)nBytes);
+  }else{
+    p = osHeapReAlloc(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior, (SIZE_T)nBytes);
+  }
+  if( !p ){
+    sqlite3_log(SQLITE_NOMEM, "failed to %s %u bytes (%lu), heap=%p",
+                pPrior ? "HeapReAlloc" : "HeapAlloc", nBytes, osGetLastError(),
+                (void*)hHeap);
+  }
+  return p;
+}
+
+/*
+** Return the size of an outstanding allocation, in bytes.
+*/
+static int winMemSize(void *p){
+  HANDLE hHeap;
+  SIZE_T n;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, p) );
+#endif
+  if( !p ) return 0;
+  n = osHeapSize(hHeap, SQLITE_WIN32_HEAP_FLAGS, p);
+  if( n==(SIZE_T)-1 ){
+    sqlite3_log(SQLITE_NOMEM, "failed to HeapSize block %p (%lu), heap=%p",
+                p, osGetLastError(), (void*)hHeap);
+    return 0;
+  }
+  return (int)n;
+}
+
+/*
+** Round up a request size to the next valid allocation size.
+*/
+static int winMemRoundup(int n){
+  return n;
+}
+
+/*
+** Initialize this module.
+*/
+static int winMemInit(void *pAppData){
+  winMemData *pWinMemData = (winMemData *)pAppData;
+
+  if( !pWinMemData ) return SQLITE_ERROR;
+  assert( pWinMemData->magic1==WINMEM_MAGIC1 );
+  assert( pWinMemData->magic2==WINMEM_MAGIC2 );
+
+#if !SQLITE_OS_WINRT && SQLITE_WIN32_HEAP_CREATE
+  if( !pWinMemData->hHeap ){
+    DWORD dwInitialSize = SQLITE_WIN32_HEAP_INIT_SIZE;
+    DWORD dwMaximumSize = (DWORD)sqlite3GlobalConfig.nHeap;
+    if( dwMaximumSize==0 ){
+      dwMaximumSize = SQLITE_WIN32_HEAP_MAX_SIZE;
+    }else if( dwInitialSize>dwMaximumSize ){
+      dwInitialSize = dwMaximumSize;
+    }
+    pWinMemData->hHeap = osHeapCreate(SQLITE_WIN32_HEAP_FLAGS,
+                                      dwInitialSize, dwMaximumSize);
+    if( !pWinMemData->hHeap ){
+      sqlite3_log(SQLITE_NOMEM,
+          "failed to HeapCreate (%lu), flags=%u, initSize=%lu, maxSize=%lu",
+          osGetLastError(), SQLITE_WIN32_HEAP_FLAGS, dwInitialSize,
+          dwMaximumSize);
+      return SQLITE_NOMEM;
+    }
+    pWinMemData->bOwned = TRUE;
+    assert( pWinMemData->bOwned );
+  }
+#else
+  pWinMemData->hHeap = osGetProcessHeap();
+  if( !pWinMemData->hHeap ){
+    sqlite3_log(SQLITE_NOMEM,
+        "failed to GetProcessHeap (%lu)", osGetLastError());
+    return SQLITE_NOMEM;
+  }
+  pWinMemData->bOwned = FALSE;
+  assert( !pWinMemData->bOwned );
+#endif
+  assert( pWinMemData->hHeap!=0 );
+  assert( pWinMemData->hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(pWinMemData->hHeap, SQLITE_WIN32_HEAP_FLAGS, NULL) );
+#endif
+  return SQLITE_OK;
+}
+
+/*
+** Deinitialize this module.
+*/
+static void winMemShutdown(void *pAppData){
+  winMemData *pWinMemData = (winMemData *)pAppData;
+
+  if( !pWinMemData ) return;
+  assert( pWinMemData->magic1==WINMEM_MAGIC1 );
+  assert( pWinMemData->magic2==WINMEM_MAGIC2 );
+
+  if( pWinMemData->hHeap ){
+    assert( pWinMemData->hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+    assert( osHeapValidate(pWinMemData->hHeap, SQLITE_WIN32_HEAP_FLAGS, NULL) );
+#endif
+    if( pWinMemData->bOwned ){
+      if( !osHeapDestroy(pWinMemData->hHeap) ){
+        sqlite3_log(SQLITE_NOMEM, "failed to HeapDestroy (%lu), heap=%p",
+                    osGetLastError(), (void*)pWinMemData->hHeap);
+      }
+      pWinMemData->bOwned = FALSE;
+    }
+    pWinMemData->hHeap = NULL;
+  }
+}
+
+/*
+** Populate the low-level memory allocation function pointers in
+** sqlite3GlobalConfig.m with pointers to the routines in this file. The
+** arguments specify the block of memory to manage.
+**
+** This routine is only called by sqlite3_config(), and therefore
+** is not required to be threadsafe (it is not).
+*/
+SQLITE_PRIVATE const sqlite3_mem_methods *sqlite3MemGetWin32(void){
+  static const sqlite3_mem_methods winMemMethods = {
+    winMemMalloc,
+    winMemFree,
+    winMemRealloc,
+    winMemSize,
+    winMemRoundup,
+    winMemInit,
+    winMemShutdown,
+    &win_mem_data
+  };
+  return &winMemMethods;
+}
+
+SQLITE_PRIVATE void sqlite3MemSetDefault(void){
+  sqlite3_config(SQLITE_CONFIG_MALLOC, sqlite3MemGetWin32());
+}
+#endif /* SQLITE_WIN32_MALLOC */
+
+/*
+** Convert a UTF-8 string to Microsoft Unicode (UTF-16?).
+**
+** Space to hold the returned string is obtained from malloc.
+*/
+static LPWSTR winUtf8ToUnicode(const char *zFilename){
+  int nChar;
+  LPWSTR zWideFilename;
+
+  nChar = osMultiByteToWideChar(CP_UTF8, 0, zFilename, -1, NULL, 0);
+  if( nChar==0 ){
+    return 0;
+  }
+  zWideFilename = sqlite3MallocZero( nChar*sizeof(zWideFilename[0]) );
+  if( zWideFilename==0 ){
+    return 0;
+  }
+  nChar = osMultiByteToWideChar(CP_UTF8, 0, zFilename, -1, zWideFilename,
+                                nChar);
+  if( nChar==0 ){
+    sqlite3_free(zWideFilename);
+    zWideFilename = 0;
+  }
+  return zWideFilename;
+}
+
+/*
+** Convert Microsoft Unicode to UTF-8.  Space to hold the returned string is
+** obtained from sqlite3_malloc().
+*/
+static char *winUnicodeToUtf8(LPCWSTR zWideFilename){
+  int nByte;
+  char *zFilename;
+
+  nByte = osWideCharToMultiByte(CP_UTF8, 0, zWideFilename, -1, 0, 0, 0, 0);
+  if( nByte == 0 ){
+    return 0;
+  }
+  zFilename = sqlite3MallocZero( nByte );
+  if( zFilename==0 ){
+    return 0;
+  }
+  nByte = osWideCharToMultiByte(CP_UTF8, 0, zWideFilename, -1, zFilename, nByte,
+                                0, 0);
+  if( nByte == 0 ){
+    sqlite3_free(zFilename);
+    zFilename = 0;
+  }
+  return zFilename;
+}
+
+/*
+** Convert an ANSI string to Microsoft Unicode, based on the
+** current codepage settings for file apis.
+**
+** Space to hold the returned string is obtained
+** from sqlite3_malloc.
+*/
+static LPWSTR winMbcsToUnicode(const char *zFilename){
+  int nByte;
+  LPWSTR zMbcsFilename;
+  int codepage = osAreFileApisANSI() ? CP_ACP : CP_OEMCP;
+
+  nByte = osMultiByteToWideChar(codepage, 0, zFilename, -1, NULL,
+                                0)*sizeof(WCHAR);
+  if( nByte==0 ){
+    return 0;
