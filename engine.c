@@ -34079,3 +34079,228 @@ SQLITE_API int sqlite3_win32_compact_heap(LPUINT pnLargest){
     if( lastErrno==NO_ERROR ){
       sqlite3_log(SQLITE_NOMEM, "failed to HeapCompact (no space), heap=%p",
                   (void*)hHeap);
+      rc = SQLITE_NOMEM;
+    }else{
+      sqlite3_log(SQLITE_ERROR, "failed to HeapCompact (%lu), heap=%p",
+                  osGetLastError(), (void*)hHeap);
+      rc = SQLITE_ERROR;
+    }
+  }
+#else
+  sqlite3_log(SQLITE_NOTFOUND, "failed to HeapCompact, heap=%p",
+              (void*)hHeap);
+  rc = SQLITE_NOTFOUND;
+#endif
+  if( pnLargest ) *pnLargest = nLargest;
+  return rc;
+}
+
+/*
+** If a Win32 native heap has been configured, this function will attempt to
+** destroy and recreate it.  If the Win32 native heap is not isolated and/or
+** the sqlite3_memory_used() function does not return zero, SQLITE_BUSY will
+** be returned and no changes will be made to the Win32 native heap.
+*/
+SQLITE_API int sqlite3_win32_reset_heap(){
+  int rc;
+  MUTEX_LOGIC( sqlite3_mutex *pMaster; ) /* The main static mutex */
+  MUTEX_LOGIC( sqlite3_mutex *pMem; )    /* The memsys static mutex */
+  MUTEX_LOGIC( pMaster = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MASTER); )
+  MUTEX_LOGIC( pMem = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MEM); )
+  sqlite3_mutex_enter(pMaster);
+  sqlite3_mutex_enter(pMem);
+  winMemAssertMagic();
+  if( winMemGetHeap()!=NULL && winMemGetOwned() && sqlite3_memory_used()==0 ){
+    /*
+    ** At this point, there should be no outstanding memory allocations on
+    ** the heap.  Also, since both the master and memsys locks are currently
+    ** being held by us, no other function (i.e. from another thread) should
+    ** be able to even access the heap.  Attempt to destroy and recreate our
+    ** isolated Win32 native heap now.
+    */
+    assert( winMemGetHeap()!=NULL );
+    assert( winMemGetOwned() );
+    assert( sqlite3_memory_used()==0 );
+    winMemShutdown(winMemGetDataPtr());
+    assert( winMemGetHeap()==NULL );
+    assert( !winMemGetOwned() );
+    assert( sqlite3_memory_used()==0 );
+    rc = winMemInit(winMemGetDataPtr());
+    assert( rc!=SQLITE_OK || winMemGetHeap()!=NULL );
+    assert( rc!=SQLITE_OK || winMemGetOwned() );
+    assert( rc!=SQLITE_OK || sqlite3_memory_used()==0 );
+  }else{
+    /*
+    ** The Win32 native heap cannot be modified because it may be in use.
+    */
+    rc = SQLITE_BUSY;
+  }
+  sqlite3_mutex_leave(pMem);
+  sqlite3_mutex_leave(pMaster);
+  return rc;
+}
+#endif /* SQLITE_WIN32_MALLOC */
+
+/*
+** This function outputs the specified (ANSI) string to the Win32 debugger
+** (if available).
+*/
+
+SQLITE_API void sqlite3_win32_write_debug(const char *zBuf, int nBuf){
+  char zDbgBuf[SQLITE_WIN32_DBG_BUF_SIZE];
+  int nMin = MIN(nBuf, (SQLITE_WIN32_DBG_BUF_SIZE - 1)); /* may be negative. */
+  if( nMin<-1 ) nMin = -1; /* all negative values become -1. */
+  assert( nMin==-1 || nMin==0 || nMin<SQLITE_WIN32_DBG_BUF_SIZE );
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  if( nMin>0 ){
+    memset(zDbgBuf, 0, SQLITE_WIN32_DBG_BUF_SIZE);
+    memcpy(zDbgBuf, zBuf, nMin);
+    osOutputDebugStringA(zDbgBuf);
+  }else{
+    osOutputDebugStringA(zBuf);
+  }
+#elif defined(SQLITE_WIN32_HAS_WIDE)
+  memset(zDbgBuf, 0, SQLITE_WIN32_DBG_BUF_SIZE);
+  if ( osMultiByteToWideChar(
+          osAreFileApisANSI() ? CP_ACP : CP_OEMCP, 0, zBuf,
+          nMin, (LPWSTR)zDbgBuf, SQLITE_WIN32_DBG_BUF_SIZE/sizeof(WCHAR))<=0 ){
+    return;
+  }
+  osOutputDebugStringW((LPCWSTR)zDbgBuf);
+#else
+  if( nMin>0 ){
+    memset(zDbgBuf, 0, SQLITE_WIN32_DBG_BUF_SIZE);
+    memcpy(zDbgBuf, zBuf, nMin);
+    fprintf(stderr, "%s", zDbgBuf);
+  }else{
+    fprintf(stderr, "%s", zBuf);
+  }
+#endif
+}
+
+/*
+** The following routine suspends the current thread for at least ms
+** milliseconds.  This is equivalent to the Win32 Sleep() interface.
+*/
+#if SQLITE_OS_WINRT
+static HANDLE sleepObj = NULL;
+#endif
+
+SQLITE_API void sqlite3_win32_sleep(DWORD milliseconds){
+#if SQLITE_OS_WINRT
+  if ( sleepObj==NULL ){
+    sleepObj = osCreateEventExW(NULL, NULL, CREATE_EVENT_MANUAL_RESET,
+                                SYNCHRONIZE);
+  }
+  assert( sleepObj!=NULL );
+  osWaitForSingleObjectEx(sleepObj, milliseconds, FALSE);
+#else
+  osSleep(milliseconds);
+#endif
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0 && !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && \
+        SQLITE_THREADSAFE>0
+SQLITE_PRIVATE DWORD sqlite3Win32Wait(HANDLE hObject){
+  DWORD rc;
+  while( (rc = osWaitForSingleObjectEx(hObject, INFINITE,
+                                       TRUE))==WAIT_IO_COMPLETION ){}
+  return rc;
+}
+#endif
+
+/*
+** Return true (non-zero) if we are running under WinNT, Win2K, WinXP,
+** or WinCE.  Return false (zero) for Win95, Win98, or WinME.
+**
+** Here is an interesting observation:  Win95, Win98, and WinME lack
+** the LockFileEx() API.  But we can still statically link against that
+** API as long as we don't call it when running Win95/98/ME.  A call to
+** this routine is used to determine if the host is Win95/98/ME or
+** WinNT/2K/XP so that we will know whether or not we can safely call
+** the LockFileEx() API.
+*/
+
+#if !defined(SQLITE_WIN32_GETVERSIONEX) || !SQLITE_WIN32_GETVERSIONEX
+# define osIsNT()  (1)
+#elif SQLITE_OS_WINCE || SQLITE_OS_WINRT || !defined(SQLITE_WIN32_HAS_ANSI)
+# define osIsNT()  (1)
+#elif !defined(SQLITE_WIN32_HAS_WIDE)
+# define osIsNT()  (0)
+#else
+# define osIsNT()  ((sqlite3_os_type==2) || sqlite3_win32_is_nt())
+#endif
+
+/*
+** This function determines if the machine is running a version of Windows
+** based on the NT kernel.
+*/
+SQLITE_API int sqlite3_win32_is_nt(void){
+#if SQLITE_OS_WINRT
+  /*
+  ** NOTE: The WinRT sub-platform is always assumed to be based on the NT
+  **       kernel.
+  */
+  return 1;
+#elif defined(SQLITE_WIN32_GETVERSIONEX) && SQLITE_WIN32_GETVERSIONEX
+  if( osInterlockedCompareExchange(&sqlite3_os_type, 0, 0)==0 ){
+#if defined(SQLITE_WIN32_HAS_ANSI)
+    OSVERSIONINFOA sInfo;
+    sInfo.dwOSVersionInfoSize = sizeof(sInfo);
+    osGetVersionExA(&sInfo);
+    osInterlockedCompareExchange(&sqlite3_os_type,
+        (sInfo.dwPlatformId == VER_PLATFORM_WIN32_NT) ? 2 : 1, 0);
+#elif defined(SQLITE_WIN32_HAS_WIDE)
+    OSVERSIONINFOW sInfo;
+    sInfo.dwOSVersionInfoSize = sizeof(sInfo);
+    osGetVersionExW(&sInfo);
+    osInterlockedCompareExchange(&sqlite3_os_type,
+        (sInfo.dwPlatformId == VER_PLATFORM_WIN32_NT) ? 2 : 1, 0);
+#endif
+  }
+  return osInterlockedCompareExchange(&sqlite3_os_type, 2, 2)==2;
+#elif SQLITE_TEST
+  return osInterlockedCompareExchange(&sqlite3_os_type, 2, 2)==2;
+#else
+  /*
+  ** NOTE: All sub-platforms where the GetVersionEx[AW] functions are
+  **       deprecated are always assumed to be based on the NT kernel.
+  */
+  return 1;
+#endif
+}
+
+#ifdef SQLITE_WIN32_MALLOC
+/*
+** Allocate nBytes of memory.
+*/
+static void *winMemMalloc(int nBytes){
+  HANDLE hHeap;
+  void *p;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, NULL) );
+#endif
+  assert( nBytes>=0 );
+  p = osHeapAlloc(hHeap, SQLITE_WIN32_HEAP_FLAGS, (SIZE_T)nBytes);
+  if( !p ){
+    sqlite3_log(SQLITE_NOMEM, "failed to HeapAlloc %u bytes (%lu), heap=%p",
+                nBytes, osGetLastError(), (void*)hHeap);
+  }
+  return p;
+}
+
+/*
+** Free memory.
+*/
+static void winMemFree(void *pPrior){
+  HANDLE hHeap;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
