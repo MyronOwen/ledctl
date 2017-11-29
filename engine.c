@@ -34542,3 +34542,226 @@ static LPWSTR winMbcsToUnicode(const char *zFilename){
                                 0)*sizeof(WCHAR);
   if( nByte==0 ){
     return 0;
+  }
+  zMbcsFilename = sqlite3MallocZero( nByte*sizeof(zMbcsFilename[0]) );
+  if( zMbcsFilename==0 ){
+    return 0;
+  }
+  nByte = osMultiByteToWideChar(codepage, 0, zFilename, -1, zMbcsFilename,
+                                nByte);
+  if( nByte==0 ){
+    sqlite3_free(zMbcsFilename);
+    zMbcsFilename = 0;
+  }
+  return zMbcsFilename;
+}
+
+/*
+** Convert Microsoft Unicode to multi-byte character string, based on the
+** user's ANSI codepage.
+**
+** Space to hold the returned string is obtained from
+** sqlite3_malloc().
+*/
+static char *winUnicodeToMbcs(LPCWSTR zWideFilename){
+  int nByte;
+  char *zFilename;
+  int codepage = osAreFileApisANSI() ? CP_ACP : CP_OEMCP;
+
+  nByte = osWideCharToMultiByte(codepage, 0, zWideFilename, -1, 0, 0, 0, 0);
+  if( nByte == 0 ){
+    return 0;
+  }
+  zFilename = sqlite3MallocZero( nByte );
+  if( zFilename==0 ){
+    return 0;
+  }
+  nByte = osWideCharToMultiByte(codepage, 0, zWideFilename, -1, zFilename,
+                                nByte, 0, 0);
+  if( nByte == 0 ){
+    sqlite3_free(zFilename);
+    zFilename = 0;
+  }
+  return zFilename;
+}
+
+/*
+** Convert multibyte character string to UTF-8.  Space to hold the
+** returned string is obtained from sqlite3_malloc().
+*/
+SQLITE_API char *sqlite3_win32_mbcs_to_utf8(const char *zFilename){
+  char *zFilenameUtf8;
+  LPWSTR zTmpWide;
+
+  zTmpWide = winMbcsToUnicode(zFilename);
+  if( zTmpWide==0 ){
+    return 0;
+  }
+  zFilenameUtf8 = winUnicodeToUtf8(zTmpWide);
+  sqlite3_free(zTmpWide);
+  return zFilenameUtf8;
+}
+
+/*
+** Convert UTF-8 to multibyte character string.  Space to hold the
+** returned string is obtained from sqlite3_malloc().
+*/
+SQLITE_API char *sqlite3_win32_utf8_to_mbcs(const char *zFilename){
+  char *zFilenameMbcs;
+  LPWSTR zTmpWide;
+
+  zTmpWide = winUtf8ToUnicode(zFilename);
+  if( zTmpWide==0 ){
+    return 0;
+  }
+  zFilenameMbcs = winUnicodeToMbcs(zTmpWide);
+  sqlite3_free(zTmpWide);
+  return zFilenameMbcs;
+}
+
+/*
+** This function sets the data directory or the temporary directory based on
+** the provided arguments.  The type argument must be 1 in order to set the
+** data directory or 2 in order to set the temporary directory.  The zValue
+** argument is the name of the directory to use.  The return value will be
+** SQLITE_OK if successful.
+*/
+SQLITE_API int sqlite3_win32_set_directory(DWORD type, LPCWSTR zValue){
+  char **ppDirectory = 0;
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return rc;
+#endif
+  if( type==SQLITE_WIN32_DATA_DIRECTORY_TYPE ){
+    ppDirectory = &sqlite3_data_directory;
+  }else if( type==SQLITE_WIN32_TEMP_DIRECTORY_TYPE ){
+    ppDirectory = &sqlite3_temp_directory;
+  }
+  assert( !ppDirectory || type==SQLITE_WIN32_DATA_DIRECTORY_TYPE
+          || type==SQLITE_WIN32_TEMP_DIRECTORY_TYPE
+  );
+  assert( !ppDirectory || sqlite3MemdebugHasType(*ppDirectory, MEMTYPE_HEAP) );
+  if( ppDirectory ){
+    char *zValueUtf8 = 0;
+    if( zValue && zValue[0] ){
+      zValueUtf8 = winUnicodeToUtf8(zValue);
+      if ( zValueUtf8==0 ){
+        return SQLITE_NOMEM;
+      }
+    }
+    sqlite3_free(*ppDirectory);
+    *ppDirectory = zValueUtf8;
+    return SQLITE_OK;
+  }
+  return SQLITE_ERROR;
+}
+
+/*
+** The return value of winGetLastErrorMsg
+** is zero if the error message fits in the buffer, or non-zero
+** otherwise (if the message was truncated).
+*/
+static int winGetLastErrorMsg(DWORD lastErrno, int nBuf, char *zBuf){
+  /* FormatMessage returns 0 on failure.  Otherwise it
+  ** returns the number of TCHARs written to the output
+  ** buffer, excluding the terminating null char.
+  */
+  DWORD dwLen = 0;
+  char *zOut = 0;
+
+  if( osIsNT() ){
+#if SQLITE_OS_WINRT
+    WCHAR zTempWide[SQLITE_WIN32_MAX_ERRMSG_CHARS+1];
+    dwLen = osFormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM |
+                             FORMAT_MESSAGE_IGNORE_INSERTS,
+                             NULL,
+                             lastErrno,
+                             0,
+                             zTempWide,
+                             SQLITE_WIN32_MAX_ERRMSG_CHARS,
+                             0);
+#else
+    LPWSTR zTempWide = NULL;
+    dwLen = osFormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                             FORMAT_MESSAGE_FROM_SYSTEM |
+                             FORMAT_MESSAGE_IGNORE_INSERTS,
+                             NULL,
+                             lastErrno,
+                             0,
+                             (LPWSTR) &zTempWide,
+                             0,
+                             0);
+#endif
+    if( dwLen > 0 ){
+      /* allocate a buffer and convert to UTF8 */
+      sqlite3BeginBenignMalloc();
+      zOut = winUnicodeToUtf8(zTempWide);
+      sqlite3EndBenignMalloc();
+#if !SQLITE_OS_WINRT
+      /* free the system buffer allocated by FormatMessage */
+      osLocalFree(zTempWide);
+#endif
+    }
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    char *zTemp = NULL;
+    dwLen = osFormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                             FORMAT_MESSAGE_FROM_SYSTEM |
+                             FORMAT_MESSAGE_IGNORE_INSERTS,
+                             NULL,
+                             lastErrno,
+                             0,
+                             (LPSTR) &zTemp,
+                             0,
+                             0);
+    if( dwLen > 0 ){
+      /* allocate a buffer and convert to UTF8 */
+      sqlite3BeginBenignMalloc();
+      zOut = sqlite3_win32_mbcs_to_utf8(zTemp);
+      sqlite3EndBenignMalloc();
+      /* free the system buffer allocated by FormatMessage */
+      osLocalFree(zTemp);
+    }
+  }
+#endif
+  if( 0 == dwLen ){
+    sqlite3_snprintf(nBuf, zBuf, "OsError 0x%lx (%lu)", lastErrno, lastErrno);
+  }else{
+    /* copy a maximum of nBuf chars to output buffer */
+    sqlite3_snprintf(nBuf, zBuf, "%s", zOut);
+    /* free the UTF8 buffer */
+    sqlite3_free(zOut);
+  }
+  return 0;
+}
+
+/*
+**
+** This function - winLogErrorAtLine() - is only ever called via the macro
+** winLogError().
+**
+** This routine is invoked after an error occurs in an OS function.
+** It logs a message using sqlite3_log() containing the current value of
+** error code and, if possible, the human-readable equivalent from
+** FormatMessage.
+**
+** The first argument passed to the macro should be the error code that
+** will be returned to SQLite (e.g. SQLITE_IOERR_DELETE, SQLITE_CANTOPEN).
+** The two subsequent arguments should be the name of the OS function that
+** failed and the associated file-system path, if any.
+*/
+#define winLogError(a,b,c,d)   winLogErrorAtLine(a,b,c,d,__LINE__)
+static int winLogErrorAtLine(
+  int errcode,                    /* SQLite error code */
+  DWORD lastErrno,                /* Win32 last error */
+  const char *zFunc,              /* Name of OS function that failed */
+  const char *zPath,              /* File path associated with error */
+  int iLine                       /* Source line number where error occurred */
+){
+  char zMsg[500];                 /* Human readable error text */
+  int i;                          /* Loop counter */
+
+  zMsg[0] = 0;
+  winGetLastErrorMsg(lastErrno, sizeof(zMsg), zMsg);
+  assert( errcode!=SQLITE_OK );
