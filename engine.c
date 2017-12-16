@@ -35241,3 +35241,229 @@ static BOOL winUnlockFile(
 ** by the sqlite3_io_methods object.
 ******************************************************************************/
 
+/*
+** Some Microsoft compilers lack this definition.
+*/
+#ifndef INVALID_SET_FILE_POINTER
+# define INVALID_SET_FILE_POINTER ((DWORD)-1)
+#endif
+
+/*
+** Move the current position of the file handle passed as the first
+** argument to offset iOffset within the file. If successful, return 0.
+** Otherwise, set pFile->lastErrno and return non-zero.
+*/
+static int winSeekFile(winFile *pFile, sqlite3_int64 iOffset){
+#if !SQLITE_OS_WINRT
+  LONG upperBits;                 /* Most sig. 32 bits of new offset */
+  LONG lowerBits;                 /* Least sig. 32 bits of new offset */
+  DWORD dwRet;                    /* Value returned by SetFilePointer() */
+  DWORD lastErrno;                /* Value returned by GetLastError() */
+
+  OSTRACE(("SEEK file=%p, offset=%lld\n", pFile->h, iOffset));
+
+  upperBits = (LONG)((iOffset>>32) & 0x7fffffff);
+  lowerBits = (LONG)(iOffset & 0xffffffff);
+
+  /* API oddity: If successful, SetFilePointer() returns a dword
+  ** containing the lower 32-bits of the new file-offset. Or, if it fails,
+  ** it returns INVALID_SET_FILE_POINTER. However according to MSDN,
+  ** INVALID_SET_FILE_POINTER may also be a valid new offset. So to determine
+  ** whether an error has actually occurred, it is also necessary to call
+  ** GetLastError().
+  */
+  dwRet = osSetFilePointer(pFile->h, lowerBits, &upperBits, FILE_BEGIN);
+
+  if( (dwRet==INVALID_SET_FILE_POINTER
+      && ((lastErrno = osGetLastError())!=NO_ERROR)) ){
+    pFile->lastErrno = lastErrno;
+    winLogError(SQLITE_IOERR_SEEK, pFile->lastErrno,
+                "winSeekFile", pFile->zPath);
+    OSTRACE(("SEEK file=%p, rc=SQLITE_IOERR_SEEK\n", pFile->h));
+    return 1;
+  }
+
+  OSTRACE(("SEEK file=%p, rc=SQLITE_OK\n", pFile->h));
+  return 0;
+#else
+  /*
+  ** Same as above, except that this implementation works for WinRT.
+  */
+
+  LARGE_INTEGER x;                /* The new offset */
+  BOOL bRet;                      /* Value returned by SetFilePointerEx() */
+
+  x.QuadPart = iOffset;
+  bRet = osSetFilePointerEx(pFile->h, x, 0, FILE_BEGIN);
+
+  if(!bRet){
+    pFile->lastErrno = osGetLastError();
+    winLogError(SQLITE_IOERR_SEEK, pFile->lastErrno,
+                "winSeekFile", pFile->zPath);
+    OSTRACE(("SEEK file=%p, rc=SQLITE_IOERR_SEEK\n", pFile->h));
+    return 1;
+  }
+
+  OSTRACE(("SEEK file=%p, rc=SQLITE_OK\n", pFile->h));
+  return 0;
+#endif
+}
+
+#if SQLITE_MAX_MMAP_SIZE>0
+/* Forward references to VFS helper methods used for memory mapped files */
+static int winMapfile(winFile*, sqlite3_int64);
+static int winUnmapfile(winFile*);
+#endif
+
+/*
+** Close a file.
+**
+** It is reported that an attempt to close a handle might sometimes
+** fail.  This is a very unreasonable result, but Windows is notorious
+** for being unreasonable so I do not doubt that it might happen.  If
+** the close fails, we pause for 100 milliseconds and try again.  As
+** many as MX_CLOSE_ATTEMPT attempts to close the handle are made before
+** giving up and returning an error.
+*/
+#define MX_CLOSE_ATTEMPT 3
+static int winClose(sqlite3_file *id){
+  int rc, cnt = 0;
+  winFile *pFile = (winFile*)id;
+
+  assert( id!=0 );
+#ifndef SQLITE_OMIT_WAL
+  assert( pFile->pShm==0 );
+#endif
+  assert( pFile->h!=NULL && pFile->h!=INVALID_HANDLE_VALUE );
+  OSTRACE(("CLOSE file=%p\n", pFile->h));
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  winUnmapfile(pFile);
+#endif
+
+  do{
+    rc = osCloseHandle(pFile->h);
+    /* SimulateIOError( rc=0; cnt=MX_CLOSE_ATTEMPT; ); */
+  }while( rc==0 && ++cnt < MX_CLOSE_ATTEMPT && (sqlite3_win32_sleep(100), 1) );
+#if SQLITE_OS_WINCE
+#define WINCE_DELETION_ATTEMPTS 3
+  winceDestroyLock(pFile);
+  if( pFile->zDeleteOnClose ){
+    int cnt = 0;
+    while(
+           osDeleteFileW(pFile->zDeleteOnClose)==0
+        && osGetFileAttributesW(pFile->zDeleteOnClose)!=0xffffffff
+        && cnt++ < WINCE_DELETION_ATTEMPTS
+    ){
+       sqlite3_win32_sleep(100);  /* Wait a little before trying again */
+    }
+    sqlite3_free(pFile->zDeleteOnClose);
+  }
+#endif
+  if( rc ){
+    pFile->h = NULL;
+  }
+  OpenCounter(-1);
+  OSTRACE(("CLOSE file=%p, rc=%s\n", pFile->h, rc ? "ok" : "failed"));
+  return rc ? SQLITE_OK
+            : winLogError(SQLITE_IOERR_CLOSE, osGetLastError(),
+                          "winClose", pFile->zPath);
+}
+
+/*
+** Read data from a file into a buffer.  Return SQLITE_OK if all
+** bytes were read successfully and SQLITE_IOERR if anything goes
+** wrong.
+*/
+static int winRead(
+  sqlite3_file *id,          /* File to read from */
+  void *pBuf,                /* Write content into this buffer */
+  int amt,                   /* Number of bytes to read */
+  sqlite3_int64 offset       /* Begin reading at this offset */
+){
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+  OVERLAPPED overlapped;          /* The offset for ReadFile. */
+#endif
+  winFile *pFile = (winFile*)id;  /* file handle */
+  DWORD nRead;                    /* Number of bytes actually read from file */
+  int nRetry = 0;                 /* Number of retrys */
+
+  assert( id!=0 );
+  assert( amt>0 );
+  assert( offset>=0 );
+  SimulateIOError(return SQLITE_IOERR_READ);
+  OSTRACE(("READ file=%p, buffer=%p, amount=%d, offset=%lld, lock=%d\n",
+           pFile->h, pBuf, amt, offset, pFile->locktype));
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  /* Deal with as much of this read request as possible by transfering
+  ** data from the memory mapping using memcpy().  */
+  if( offset<pFile->mmapSize ){
+    if( offset+amt <= pFile->mmapSize ){
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], amt);
+      OSTRACE(("READ-MMAP file=%p, rc=SQLITE_OK\n", pFile->h));
+      return SQLITE_OK;
+    }else{
+      int nCopy = (int)(pFile->mmapSize - offset);
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], nCopy);
+      pBuf = &((u8 *)pBuf)[nCopy];
+      amt -= nCopy;
+      offset += nCopy;
+    }
+  }
+#endif
+
+#if SQLITE_OS_WINCE || defined(SQLITE_WIN32_NO_OVERLAPPED)
+  if( winSeekFile(pFile, offset) ){
+    OSTRACE(("READ file=%p, rc=SQLITE_FULL\n", pFile->h));
+    return SQLITE_FULL;
+  }
+  while( !osReadFile(pFile->h, pBuf, amt, &nRead, 0) ){
+#else
+  memset(&overlapped, 0, sizeof(OVERLAPPED));
+  overlapped.Offset = (LONG)(offset & 0xffffffff);
+  overlapped.OffsetHigh = (LONG)((offset>>32) & 0x7fffffff);
+  while( !osReadFile(pFile->h, pBuf, amt, &nRead, &overlapped) &&
+         osGetLastError()!=ERROR_HANDLE_EOF ){
+#endif
+    DWORD lastErrno;
+    if( winRetryIoerr(&nRetry, &lastErrno) ) continue;
+    pFile->lastErrno = lastErrno;
+    OSTRACE(("READ file=%p, rc=SQLITE_IOERR_READ\n", pFile->h));
+    return winLogError(SQLITE_IOERR_READ, pFile->lastErrno,
+                       "winRead", pFile->zPath);
+  }
+  winLogIoerr(nRetry);
+  if( nRead<(DWORD)amt ){
+    /* Unread parts of the buffer must be zero-filled */
+    memset(&((char*)pBuf)[nRead], 0, amt-nRead);
+    OSTRACE(("READ file=%p, rc=SQLITE_IOERR_SHORT_READ\n", pFile->h));
+    return SQLITE_IOERR_SHORT_READ;
+  }
+
+  OSTRACE(("READ file=%p, rc=SQLITE_OK\n", pFile->h));
+  return SQLITE_OK;
+}
+
+/*
+** Write data from a buffer into a file.  Return SQLITE_OK on success
+** or some other error code on failure.
+*/
+static int winWrite(
+  sqlite3_file *id,               /* File to write into */
+  const void *pBuf,               /* The bytes to be written */
+  int amt,                        /* Number of bytes to write */
+  sqlite3_int64 offset            /* Offset into the file to begin writing at */
+){
+  int rc = 0;                     /* True if error has occurred, else false */
+  winFile *pFile = (winFile*)id;  /* File handle */
+  int nRetry = 0;                 /* Number of retries */
+
+  assert( amt>0 );
+  assert( pFile );
+  SimulateIOError(return SQLITE_IOERR_WRITE);
+  SimulateDiskfullError(return SQLITE_FULL);
+
+  OSTRACE(("WRITE file=%p, buffer=%p, amount=%d, offset=%lld, lock=%d\n",
+           pFile->h, pBuf, amt, offset, pFile->locktype));
+
