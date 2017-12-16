@@ -34997,3 +34997,247 @@ static int winceCreateLock(const char *zFilename, winFile *pFile){
 
   /* Initialize the shared memory if we're supposed to */
   if( bInit ){
+    memset(pFile->shared, 0, sizeof(winceLock));
+  }
+
+  winceMutexRelease(pFile->hMutex);
+  return SQLITE_OK;
+}
+
+/*
+** Destroy the part of winFile that deals with wince locks
+*/
+static void winceDestroyLock(winFile *pFile){
+  if (pFile->hMutex){
+    /* Acquire the mutex */
+    winceMutexAcquire(pFile->hMutex);
+
+    /* The following blocks should probably assert in debug mode, but they
+       are to cleanup in case any locks remained open */
+    if (pFile->local.nReaders){
+      pFile->shared->nReaders --;
+    }
+    if (pFile->local.bReserved){
+      pFile->shared->bReserved = FALSE;
+    }
+    if (pFile->local.bPending){
+      pFile->shared->bPending = FALSE;
+    }
+    if (pFile->local.bExclusive){
+      pFile->shared->bExclusive = FALSE;
+    }
+
+    /* De-reference and close our copy of the shared memory handle */
+    osUnmapViewOfFile(pFile->shared);
+    osCloseHandle(pFile->hShared);
+
+    /* Done with the mutex */
+    winceMutexRelease(pFile->hMutex);
+    osCloseHandle(pFile->hMutex);
+    pFile->hMutex = NULL;
+  }
+}
+
+/*
+** An implementation of the LockFile() API of Windows for CE
+*/
+static BOOL winceLockFile(
+  LPHANDLE phFile,
+  DWORD dwFileOffsetLow,
+  DWORD dwFileOffsetHigh,
+  DWORD nNumberOfBytesToLockLow,
+  DWORD nNumberOfBytesToLockHigh
+){
+  winFile *pFile = HANDLE_TO_WINFILE(phFile);
+  BOOL bReturn = FALSE;
+
+  UNUSED_PARAMETER(dwFileOffsetHigh);
+  UNUSED_PARAMETER(nNumberOfBytesToLockHigh);
+
+  if (!pFile->hMutex) return TRUE;
+  winceMutexAcquire(pFile->hMutex);
+
+  /* Wanting an exclusive lock? */
+  if (dwFileOffsetLow == (DWORD)SHARED_FIRST
+       && nNumberOfBytesToLockLow == (DWORD)SHARED_SIZE){
+    if (pFile->shared->nReaders == 0 && pFile->shared->bExclusive == 0){
+       pFile->shared->bExclusive = TRUE;
+       pFile->local.bExclusive = TRUE;
+       bReturn = TRUE;
+    }
+  }
+
+  /* Want a read-only lock? */
+  else if (dwFileOffsetLow == (DWORD)SHARED_FIRST &&
+           nNumberOfBytesToLockLow == 1){
+    if (pFile->shared->bExclusive == 0){
+      pFile->local.nReaders ++;
+      if (pFile->local.nReaders == 1){
+        pFile->shared->nReaders ++;
+      }
+      bReturn = TRUE;
+    }
+  }
+
+  /* Want a pending lock? */
+  else if (dwFileOffsetLow == (DWORD)PENDING_BYTE
+           && nNumberOfBytesToLockLow == 1){
+    /* If no pending lock has been acquired, then acquire it */
+    if (pFile->shared->bPending == 0) {
+      pFile->shared->bPending = TRUE;
+      pFile->local.bPending = TRUE;
+      bReturn = TRUE;
+    }
+  }
+
+  /* Want a reserved lock? */
+  else if (dwFileOffsetLow == (DWORD)RESERVED_BYTE
+           && nNumberOfBytesToLockLow == 1){
+    if (pFile->shared->bReserved == 0) {
+      pFile->shared->bReserved = TRUE;
+      pFile->local.bReserved = TRUE;
+      bReturn = TRUE;
+    }
+  }
+
+  winceMutexRelease(pFile->hMutex);
+  return bReturn;
+}
+
+/*
+** An implementation of the UnlockFile API of Windows for CE
+*/
+static BOOL winceUnlockFile(
+  LPHANDLE phFile,
+  DWORD dwFileOffsetLow,
+  DWORD dwFileOffsetHigh,
+  DWORD nNumberOfBytesToUnlockLow,
+  DWORD nNumberOfBytesToUnlockHigh
+){
+  winFile *pFile = HANDLE_TO_WINFILE(phFile);
+  BOOL bReturn = FALSE;
+
+  UNUSED_PARAMETER(dwFileOffsetHigh);
+  UNUSED_PARAMETER(nNumberOfBytesToUnlockHigh);
+
+  if (!pFile->hMutex) return TRUE;
+  winceMutexAcquire(pFile->hMutex);
+
+  /* Releasing a reader lock or an exclusive lock */
+  if (dwFileOffsetLow == (DWORD)SHARED_FIRST){
+    /* Did we have an exclusive lock? */
+    if (pFile->local.bExclusive){
+      assert(nNumberOfBytesToUnlockLow == (DWORD)SHARED_SIZE);
+      pFile->local.bExclusive = FALSE;
+      pFile->shared->bExclusive = FALSE;
+      bReturn = TRUE;
+    }
+
+    /* Did we just have a reader lock? */
+    else if (pFile->local.nReaders){
+      assert(nNumberOfBytesToUnlockLow == (DWORD)SHARED_SIZE
+             || nNumberOfBytesToUnlockLow == 1);
+      pFile->local.nReaders --;
+      if (pFile->local.nReaders == 0)
+      {
+        pFile->shared->nReaders --;
+      }
+      bReturn = TRUE;
+    }
+  }
+
+  /* Releasing a pending lock */
+  else if (dwFileOffsetLow == (DWORD)PENDING_BYTE
+           && nNumberOfBytesToUnlockLow == 1){
+    if (pFile->local.bPending){
+      pFile->local.bPending = FALSE;
+      pFile->shared->bPending = FALSE;
+      bReturn = TRUE;
+    }
+  }
+  /* Releasing a reserved lock */
+  else if (dwFileOffsetLow == (DWORD)RESERVED_BYTE
+           && nNumberOfBytesToUnlockLow == 1){
+    if (pFile->local.bReserved) {
+      pFile->local.bReserved = FALSE;
+      pFile->shared->bReserved = FALSE;
+      bReturn = TRUE;
+    }
+  }
+
+  winceMutexRelease(pFile->hMutex);
+  return bReturn;
+}
+/*
+** End of the special code for wince
+*****************************************************************************/
+#endif /* SQLITE_OS_WINCE */
+
+/*
+** Lock a file region.
+*/
+static BOOL winLockFile(
+  LPHANDLE phFile,
+  DWORD flags,
+  DWORD offsetLow,
+  DWORD offsetHigh,
+  DWORD numBytesLow,
+  DWORD numBytesHigh
+){
+#if SQLITE_OS_WINCE
+  /*
+  ** NOTE: Windows CE is handled differently here due its lack of the Win32
+  **       API LockFile.
+  */
+  return winceLockFile(phFile, offsetLow, offsetHigh,
+                       numBytesLow, numBytesHigh);
+#else
+  if( osIsNT() ){
+    OVERLAPPED ovlp;
+    memset(&ovlp, 0, sizeof(OVERLAPPED));
+    ovlp.Offset = offsetLow;
+    ovlp.OffsetHigh = offsetHigh;
+    return osLockFileEx(*phFile, flags, 0, numBytesLow, numBytesHigh, &ovlp);
+  }else{
+    return osLockFile(*phFile, offsetLow, offsetHigh, numBytesLow,
+                      numBytesHigh);
+  }
+#endif
+}
+
+/*
+** Unlock a file region.
+ */
+static BOOL winUnlockFile(
+  LPHANDLE phFile,
+  DWORD offsetLow,
+  DWORD offsetHigh,
+  DWORD numBytesLow,
+  DWORD numBytesHigh
+){
+#if SQLITE_OS_WINCE
+  /*
+  ** NOTE: Windows CE is handled differently here due its lack of the Win32
+  **       API UnlockFile.
+  */
+  return winceUnlockFile(phFile, offsetLow, offsetHigh,
+                         numBytesLow, numBytesHigh);
+#else
+  if( osIsNT() ){
+    OVERLAPPED ovlp;
+    memset(&ovlp, 0, sizeof(OVERLAPPED));
+    ovlp.Offset = offsetLow;
+    ovlp.OffsetHigh = offsetHigh;
+    return osUnlockFileEx(*phFile, 0, numBytesLow, numBytesHigh, &ovlp);
+  }else{
+    return osUnlockFile(*phFile, offsetLow, offsetHigh, numBytesLow,
+                        numBytesHigh);
+  }
+#endif
+}
+
+/*****************************************************************************
+** The next group of routines implement the I/O methods specified
+** by the sqlite3_io_methods object.
+******************************************************************************/
+
