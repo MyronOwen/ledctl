@@ -36336,3 +36336,229 @@ static int winShmSystemLock(
   OSTRACE(("SHM-LOCK file=%p, lock=%d, offset=%d, size=%d\n",
            pFile->hFile.h, lockType, ofst, nByte));
 
+  /* Release/Acquire the system-level lock */
+  if( lockType==_SHM_UNLCK ){
+    rc = winUnlockFile(&pFile->hFile.h, ofst, 0, nByte, 0);
+  }else{
+    /* Initialize the locking parameters */
+    DWORD dwFlags = LOCKFILE_FAIL_IMMEDIATELY;
+    if( lockType == _SHM_WRLCK ) dwFlags |= LOCKFILE_EXCLUSIVE_LOCK;
+    rc = winLockFile(&pFile->hFile.h, dwFlags, ofst, 0, nByte, 0);
+  }
+
+  if( rc!= 0 ){
+    rc = SQLITE_OK;
+  }else{
+    pFile->lastErrno =  osGetLastError();
+    rc = SQLITE_BUSY;
+  }
+
+  OSTRACE(("SHM-LOCK file=%p, func=%s, errno=%lu, rc=%s\n",
+           pFile->hFile.h, (lockType == _SHM_UNLCK) ? "winUnlockFile" :
+           "winLockFile", pFile->lastErrno, sqlite3ErrName(rc)));
+
+  return rc;
+}
+
+/* Forward references to VFS methods */
+static int winOpen(sqlite3_vfs*,const char*,sqlite3_file*,int,int*);
+static int winDelete(sqlite3_vfs *,const char*,int);
+
+/*
+** Purge the winShmNodeList list of all entries with winShmNode.nRef==0.
+**
+** This is not a VFS shared-memory method; it is a utility function called
+** by VFS shared-memory methods.
+*/
+static void winShmPurge(sqlite3_vfs *pVfs, int deleteFlag){
+  winShmNode **pp;
+  winShmNode *p;
+  assert( winShmMutexHeld() );
+  OSTRACE(("SHM-PURGE pid=%lu, deleteFlag=%d\n",
+           osGetCurrentProcessId(), deleteFlag));
+  pp = &winShmNodeList;
+  while( (p = *pp)!=0 ){
+    if( p->nRef==0 ){
+      int i;
+      if( p->mutex ){ sqlite3_mutex_free(p->mutex); }
+      for(i=0; i<p->nRegion; i++){
+        BOOL bRc = osUnmapViewOfFile(p->aRegion[i].pMap);
+        OSTRACE(("SHM-PURGE-UNMAP pid=%lu, region=%d, rc=%s\n",
+                 osGetCurrentProcessId(), i, bRc ? "ok" : "failed"));
+        UNUSED_VARIABLE_VALUE(bRc);
+        bRc = osCloseHandle(p->aRegion[i].hMap);
+        OSTRACE(("SHM-PURGE-CLOSE pid=%lu, region=%d, rc=%s\n",
+                 osGetCurrentProcessId(), i, bRc ? "ok" : "failed"));
+        UNUSED_VARIABLE_VALUE(bRc);
+      }
+      if( p->hFile.h!=NULL && p->hFile.h!=INVALID_HANDLE_VALUE ){
+        SimulateIOErrorBenign(1);
+        winClose((sqlite3_file *)&p->hFile);
+        SimulateIOErrorBenign(0);
+      }
+      if( deleteFlag ){
+        SimulateIOErrorBenign(1);
+        sqlite3BeginBenignMalloc();
+        winDelete(pVfs, p->zFilename, 0);
+        sqlite3EndBenignMalloc();
+        SimulateIOErrorBenign(0);
+      }
+      *pp = p->pNext;
+      sqlite3_free(p->aRegion);
+      sqlite3_free(p);
+    }else{
+      pp = &p->pNext;
+    }
+  }
+}
+
+/*
+** Open the shared-memory area associated with database file pDbFd.
+**
+** When opening a new shared-memory file, if no other instances of that
+** file are currently open, in this process or in other processes, then
+** the file must be truncated to zero length or have its header cleared.
+*/
+static int winOpenSharedMemory(winFile *pDbFd){
+  struct winShm *p;                  /* The connection to be opened */
+  struct winShmNode *pShmNode = 0;   /* The underlying mmapped file */
+  int rc;                            /* Result code */
+  struct winShmNode *pNew;           /* Newly allocated winShmNode */
+  int nName;                         /* Size of zName in bytes */
+
+  assert( pDbFd->pShm==0 );    /* Not previously opened */
+
+  /* Allocate space for the new sqlite3_shm object.  Also speculatively
+  ** allocate space for a new winShmNode and filename.
+  */
+  p = sqlite3MallocZero( sizeof(*p) );
+  if( p==0 ) return SQLITE_IOERR_NOMEM;
+  nName = sqlite3Strlen30(pDbFd->zPath);
+  pNew = sqlite3MallocZero( sizeof(*pShmNode) + nName + 17 );
+  if( pNew==0 ){
+    sqlite3_free(p);
+    return SQLITE_IOERR_NOMEM;
+  }
+  pNew->zFilename = (char*)&pNew[1];
+  sqlite3_snprintf(nName+15, pNew->zFilename, "%s-shm", pDbFd->zPath);
+  sqlite3FileSuffix3(pDbFd->zPath, pNew->zFilename);
+
+  /* Look to see if there is an existing winShmNode that can be used.
+  ** If no matching winShmNode currently exists, create a new one.
+  */
+  winShmEnterMutex();
+  for(pShmNode = winShmNodeList; pShmNode; pShmNode=pShmNode->pNext){
+    /* TBD need to come up with better match here.  Perhaps
+    ** use FILE_ID_BOTH_DIR_INFO Structure.
+    */
+    if( sqlite3StrICmp(pShmNode->zFilename, pNew->zFilename)==0 ) break;
+  }
+  if( pShmNode ){
+    sqlite3_free(pNew);
+  }else{
+    pShmNode = pNew;
+    pNew = 0;
+    ((winFile*)(&pShmNode->hFile))->h = INVALID_HANDLE_VALUE;
+    pShmNode->pNext = winShmNodeList;
+    winShmNodeList = pShmNode;
+
+    pShmNode->mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+    if( pShmNode->mutex==0 ){
+      rc = SQLITE_IOERR_NOMEM;
+      goto shm_open_err;
+    }
+
+    rc = winOpen(pDbFd->pVfs,
+                 pShmNode->zFilename,             /* Name of the file (UTF-8) */
+                 (sqlite3_file*)&pShmNode->hFile,  /* File handle here */
+                 SQLITE_OPEN_WAL | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                 0);
+    if( SQLITE_OK!=rc ){
+      goto shm_open_err;
+    }
+
+    /* Check to see if another process is holding the dead-man switch.
+    ** If not, truncate the file to zero length.
+    */
+    if( winShmSystemLock(pShmNode, _SHM_WRLCK, WIN_SHM_DMS, 1)==SQLITE_OK ){
+      rc = winTruncate((sqlite3_file *)&pShmNode->hFile, 0);
+      if( rc!=SQLITE_OK ){
+        rc = winLogError(SQLITE_IOERR_SHMOPEN, osGetLastError(),
+                         "winOpenShm", pDbFd->zPath);
+      }
+    }
+    if( rc==SQLITE_OK ){
+      winShmSystemLock(pShmNode, _SHM_UNLCK, WIN_SHM_DMS, 1);
+      rc = winShmSystemLock(pShmNode, _SHM_RDLCK, WIN_SHM_DMS, 1);
+    }
+    if( rc ) goto shm_open_err;
+  }
+
+  /* Make the new connection a child of the winShmNode */
+  p->pShmNode = pShmNode;
+#ifdef SQLITE_DEBUG
+  p->id = pShmNode->nextShmId++;
+#endif
+  pShmNode->nRef++;
+  pDbFd->pShm = p;
+  winShmLeaveMutex();
+
+  /* The reference count on pShmNode has already been incremented under
+  ** the cover of the winShmEnterMutex() mutex and the pointer from the
+  ** new (struct winShm) object to the pShmNode has been set. All that is
+  ** left to do is to link the new object into the linked list starting
+  ** at pShmNode->pFirst. This must be done while holding the pShmNode->mutex
+  ** mutex.
+  */
+  sqlite3_mutex_enter(pShmNode->mutex);
+  p->pNext = pShmNode->pFirst;
+  pShmNode->pFirst = p;
+  sqlite3_mutex_leave(pShmNode->mutex);
+  return SQLITE_OK;
+
+  /* Jump here on any error */
+shm_open_err:
+  winShmSystemLock(pShmNode, _SHM_UNLCK, WIN_SHM_DMS, 1);
+  winShmPurge(pDbFd->pVfs, 0);      /* This call frees pShmNode if required */
+  sqlite3_free(p);
+  sqlite3_free(pNew);
+  winShmLeaveMutex();
+  return rc;
+}
+
+/*
+** Close a connection to shared-memory.  Delete the underlying
+** storage if deleteFlag is true.
+*/
+static int winShmUnmap(
+  sqlite3_file *fd,          /* Database holding shared memory */
+  int deleteFlag             /* Delete after closing if true */
+){
+  winFile *pDbFd;       /* Database holding shared-memory */
+  winShm *p;            /* The connection to be closed */
+  winShmNode *pShmNode; /* The underlying shared-memory file */
+  winShm **pp;          /* For looping over sibling connections */
+
+  pDbFd = (winFile*)fd;
+  p = pDbFd->pShm;
+  if( p==0 ) return SQLITE_OK;
+  pShmNode = p->pShmNode;
+
+  /* Remove connection p from the set of connections associated
+  ** with pShmNode */
+  sqlite3_mutex_enter(pShmNode->mutex);
+  for(pp=&pShmNode->pFirst; (*pp)!=p; pp = &(*pp)->pNext){}
+  *pp = p->pNext;
+
+  /* Free the connection p */
+  sqlite3_free(p);
+  pDbFd->pShm = 0;
+  sqlite3_mutex_leave(pShmNode->mutex);
+
+  /* If pShmNode->nRef has reached 0, then close the underlying
+  ** shared-memory file, too */
+  winShmEnterMutex();
+  assert( pShmNode->nRef>0 );
+  pShmNode->nRef--;
+  if( pShmNode->nRef==0 ){
+    winShmPurge(pDbFd->pVfs, deleteFlag);
