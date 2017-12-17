@@ -35467,3 +35467,226 @@ static int winWrite(
   OSTRACE(("WRITE file=%p, buffer=%p, amount=%d, offset=%lld, lock=%d\n",
            pFile->h, pBuf, amt, offset, pFile->locktype));
 
+#if SQLITE_MAX_MMAP_SIZE>0
+  /* Deal with as much of this write request as possible by transfering
+  ** data from the memory mapping using memcpy().  */
+  if( offset<pFile->mmapSize ){
+    if( offset+amt <= pFile->mmapSize ){
+      memcpy(&((u8 *)(pFile->pMapRegion))[offset], pBuf, amt);
+      OSTRACE(("WRITE-MMAP file=%p, rc=SQLITE_OK\n", pFile->h));
+      return SQLITE_OK;
+    }else{
+      int nCopy = (int)(pFile->mmapSize - offset);
+      memcpy(&((u8 *)(pFile->pMapRegion))[offset], pBuf, nCopy);
+      pBuf = &((u8 *)pBuf)[nCopy];
+      amt -= nCopy;
+      offset += nCopy;
+    }
+  }
+#endif
+
+#if SQLITE_OS_WINCE || defined(SQLITE_WIN32_NO_OVERLAPPED)
+  rc = winSeekFile(pFile, offset);
+  if( rc==0 ){
+#else
+  {
+#endif
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+    OVERLAPPED overlapped;        /* The offset for WriteFile. */
+#endif
+    u8 *aRem = (u8 *)pBuf;        /* Data yet to be written */
+    int nRem = amt;               /* Number of bytes yet to be written */
+    DWORD nWrite;                 /* Bytes written by each WriteFile() call */
+    DWORD lastErrno = NO_ERROR;   /* Value returned by GetLastError() */
+
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+    memset(&overlapped, 0, sizeof(OVERLAPPED));
+    overlapped.Offset = (LONG)(offset & 0xffffffff);
+    overlapped.OffsetHigh = (LONG)((offset>>32) & 0x7fffffff);
+#endif
+
+    while( nRem>0 ){
+#if SQLITE_OS_WINCE || defined(SQLITE_WIN32_NO_OVERLAPPED)
+      if( !osWriteFile(pFile->h, aRem, nRem, &nWrite, 0) ){
+#else
+      if( !osWriteFile(pFile->h, aRem, nRem, &nWrite, &overlapped) ){
+#endif
+        if( winRetryIoerr(&nRetry, &lastErrno) ) continue;
+        break;
+      }
+      assert( nWrite==0 || nWrite<=(DWORD)nRem );
+      if( nWrite==0 || nWrite>(DWORD)nRem ){
+        lastErrno = osGetLastError();
+        break;
+      }
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+      offset += nWrite;
+      overlapped.Offset = (LONG)(offset & 0xffffffff);
+      overlapped.OffsetHigh = (LONG)((offset>>32) & 0x7fffffff);
+#endif
+      aRem += nWrite;
+      nRem -= nWrite;
+    }
+    if( nRem>0 ){
+      pFile->lastErrno = lastErrno;
+      rc = 1;
+    }
+  }
+
+  if( rc ){
+    if(   ( pFile->lastErrno==ERROR_HANDLE_DISK_FULL )
+       || ( pFile->lastErrno==ERROR_DISK_FULL )){
+      OSTRACE(("WRITE file=%p, rc=SQLITE_FULL\n", pFile->h));
+      return winLogError(SQLITE_FULL, pFile->lastErrno,
+                         "winWrite1", pFile->zPath);
+    }
+    OSTRACE(("WRITE file=%p, rc=SQLITE_IOERR_WRITE\n", pFile->h));
+    return winLogError(SQLITE_IOERR_WRITE, pFile->lastErrno,
+                       "winWrite2", pFile->zPath);
+  }else{
+    winLogIoerr(nRetry);
+  }
+  OSTRACE(("WRITE file=%p, rc=SQLITE_OK\n", pFile->h));
+  return SQLITE_OK;
+}
+
+/*
+** Truncate an open file to a specified size
+*/
+static int winTruncate(sqlite3_file *id, sqlite3_int64 nByte){
+  winFile *pFile = (winFile*)id;  /* File handle object */
+  int rc = SQLITE_OK;             /* Return code for this function */
+  DWORD lastErrno;
+
+  assert( pFile );
+  SimulateIOError(return SQLITE_IOERR_TRUNCATE);
+  OSTRACE(("TRUNCATE file=%p, size=%lld, lock=%d\n",
+           pFile->h, nByte, pFile->locktype));
+
+  /* If the user has configured a chunk-size for this file, truncate the
+  ** file so that it consists of an integer number of chunks (i.e. the
+  ** actual file size after the operation may be larger than the requested
+  ** size).
+  */
+  if( pFile->szChunk>0 ){
+    nByte = ((nByte + pFile->szChunk - 1)/pFile->szChunk) * pFile->szChunk;
+  }
+
+  /* SetEndOfFile() returns non-zero when successful, or zero when it fails. */
+  if( winSeekFile(pFile, nByte) ){
+    rc = winLogError(SQLITE_IOERR_TRUNCATE, pFile->lastErrno,
+                     "winTruncate1", pFile->zPath);
+  }else if( 0==osSetEndOfFile(pFile->h) &&
+            ((lastErrno = osGetLastError())!=ERROR_USER_MAPPED_FILE) ){
+    pFile->lastErrno = lastErrno;
+    rc = winLogError(SQLITE_IOERR_TRUNCATE, pFile->lastErrno,
+                     "winTruncate2", pFile->zPath);
+  }
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  /* If the file was truncated to a size smaller than the currently
+  ** mapped region, reduce the effective mapping size as well. SQLite will
+  ** use read() and write() to access data beyond this point from now on.
+  */
+  if( pFile->pMapRegion && nByte<pFile->mmapSize ){
+    pFile->mmapSize = nByte;
+  }
+#endif
+
+  OSTRACE(("TRUNCATE file=%p, rc=%s\n", pFile->h, sqlite3ErrName(rc)));
+  return rc;
+}
+
+#ifdef SQLITE_TEST
+/*
+** Count the number of fullsyncs and normal syncs.  This is used to test
+** that syncs and fullsyncs are occuring at the right times.
+*/
+SQLITE_API int sqlite3_sync_count = 0;
+SQLITE_API int sqlite3_fullsync_count = 0;
+#endif
+
+/*
+** Make sure all writes to a particular file are committed to disk.
+*/
+static int winSync(sqlite3_file *id, int flags){
+#ifndef SQLITE_NO_SYNC
+  /*
+  ** Used only when SQLITE_NO_SYNC is not defined.
+   */
+  BOOL rc;
+#endif
+#if !defined(NDEBUG) || !defined(SQLITE_NO_SYNC) || \
+    (defined(SQLITE_TEST) && defined(SQLITE_DEBUG))
+  /*
+  ** Used when SQLITE_NO_SYNC is not defined and by the assert() and/or
+  ** OSTRACE() macros.
+   */
+  winFile *pFile = (winFile*)id;
+#else
+  UNUSED_PARAMETER(id);
+#endif
+
+  assert( pFile );
+  /* Check that one of SQLITE_SYNC_NORMAL or FULL was passed */
+  assert((flags&0x0F)==SQLITE_SYNC_NORMAL
+      || (flags&0x0F)==SQLITE_SYNC_FULL
+  );
+
+  /* Unix cannot, but some systems may return SQLITE_FULL from here. This
+  ** line is to test that doing so does not cause any problems.
+  */
+  SimulateDiskfullError( return SQLITE_FULL );
+
+  OSTRACE(("SYNC file=%p, flags=%x, lock=%d\n",
+           pFile->h, flags, pFile->locktype));
+
+#ifndef SQLITE_TEST
+  UNUSED_PARAMETER(flags);
+#else
+  if( (flags&0x0F)==SQLITE_SYNC_FULL ){
+    sqlite3_fullsync_count++;
+  }
+  sqlite3_sync_count++;
+#endif
+
+  /* If we compiled with the SQLITE_NO_SYNC flag, then syncing is a
+  ** no-op
+  */
+#ifdef SQLITE_NO_SYNC
+  OSTRACE(("SYNC-NOP file=%p, rc=SQLITE_OK\n", pFile->h));
+  return SQLITE_OK;
+#else
+  rc = osFlushFileBuffers(pFile->h);
+  SimulateIOError( rc=FALSE );
+  if( rc ){
+    OSTRACE(("SYNC file=%p, rc=SQLITE_OK\n", pFile->h));
+    return SQLITE_OK;
+  }else{
+    pFile->lastErrno = osGetLastError();
+    OSTRACE(("SYNC file=%p, rc=SQLITE_IOERR_FSYNC\n", pFile->h));
+    return winLogError(SQLITE_IOERR_FSYNC, pFile->lastErrno,
+                       "winSync", pFile->zPath);
+  }
+#endif
+}
+
+/*
+** Determine the current size of a file in bytes
+*/
+static int winFileSize(sqlite3_file *id, sqlite3_int64 *pSize){
+  winFile *pFile = (winFile*)id;
+  int rc = SQLITE_OK;
+
+  assert( id!=0 );
+  assert( pSize!=0 );
+  SimulateIOError(return SQLITE_IOERR_FSTAT);
+  OSTRACE(("SIZE file=%p, pSize=%p\n", pFile->h, pSize));
+
+#if SQLITE_OS_WINRT
+  {
+    FILE_STANDARD_INFO info;
+    if( osGetFileInformationByHandleEx(pFile->h, FileStandardInfo,
+                                     &info, sizeof(info)) ){
+      *pSize = info.EndOfFile.QuadPart;
+    }else{
