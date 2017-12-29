@@ -37023,3 +37023,216 @@ static int winFetch(sqlite3_file *fd, i64 iOff, int nAmt, void **pp){
 
   OSTRACE(("FETCH pid=%lu, pFile=%p, pp=%p, *pp=%p, rc=SQLITE_OK\n",
            osGetCurrentProcessId(), fd, pp, *pp));
+  return SQLITE_OK;
+}
+
+/*
+** If the third argument is non-NULL, then this function releases a
+** reference obtained by an earlier call to winFetch(). The second
+** argument passed to this function must be the same as the corresponding
+** argument that was passed to the winFetch() invocation.
+**
+** Or, if the third argument is NULL, then this function is being called
+** to inform the VFS layer that, according to POSIX, any existing mapping
+** may now be invalid and should be unmapped.
+*/
+static int winUnfetch(sqlite3_file *fd, i64 iOff, void *p){
+#if SQLITE_MAX_MMAP_SIZE>0
+  winFile *pFd = (winFile*)fd;   /* The underlying database file */
+
+  /* If p==0 (unmap the entire file) then there must be no outstanding
+  ** xFetch references. Or, if p!=0 (meaning it is an xFetch reference),
+  ** then there must be at least one outstanding.  */
+  assert( (p==0)==(pFd->nFetchOut==0) );
+
+  /* If p!=0, it must match the iOff value. */
+  assert( p==0 || p==&((u8 *)pFd->pMapRegion)[iOff] );
+
+  OSTRACE(("UNFETCH pid=%lu, pFile=%p, offset=%lld, p=%p\n",
+           osGetCurrentProcessId(), pFd, iOff, p));
+
+  if( p ){
+    pFd->nFetchOut--;
+  }else{
+    /* FIXME:  If Windows truly always prevents truncating or deleting a
+    ** file while a mapping is held, then the following winUnmapfile() call
+    ** is unnecessary can be omitted - potentially improving
+    ** performance.  */
+    winUnmapfile(pFd);
+  }
+
+  assert( pFd->nFetchOut>=0 );
+#endif
+
+  OSTRACE(("UNFETCH pid=%lu, pFile=%p, rc=SQLITE_OK\n",
+           osGetCurrentProcessId(), fd));
+  return SQLITE_OK;
+}
+
+/*
+** Here ends the implementation of all sqlite3_file methods.
+**
+********************** End sqlite3_file Methods *******************************
+******************************************************************************/
+
+/*
+** This vector defines all the methods that can operate on an
+** sqlite3_file for win32.
+*/
+static const sqlite3_io_methods winIoMethod = {
+  3,                              /* iVersion */
+  winClose,                       /* xClose */
+  winRead,                        /* xRead */
+  winWrite,                       /* xWrite */
+  winTruncate,                    /* xTruncate */
+  winSync,                        /* xSync */
+  winFileSize,                    /* xFileSize */
+  winLock,                        /* xLock */
+  winUnlock,                      /* xUnlock */
+  winCheckReservedLock,           /* xCheckReservedLock */
+  winFileControl,                 /* xFileControl */
+  winSectorSize,                  /* xSectorSize */
+  winDeviceCharacteristics,       /* xDeviceCharacteristics */
+  winShmMap,                      /* xShmMap */
+  winShmLock,                     /* xShmLock */
+  winShmBarrier,                  /* xShmBarrier */
+  winShmUnmap,                    /* xShmUnmap */
+  winFetch,                       /* xFetch */
+  winUnfetch                      /* xUnfetch */
+};
+
+/****************************************************************************
+**************************** sqlite3_vfs methods ****************************
+**
+** This division contains the implementation of methods on the
+** sqlite3_vfs object.
+*/
+
+#if defined(__CYGWIN__)
+/*
+** Convert a filename from whatever the underlying operating system
+** supports for filenames into UTF-8.  Space to hold the result is
+** obtained from malloc and must be freed by the calling function.
+*/
+static char *winConvertToUtf8Filename(const void *zFilename){
+  char *zConverted = 0;
+  if( osIsNT() ){
+    zConverted = winUnicodeToUtf8(zFilename);
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    zConverted = sqlite3_win32_mbcs_to_utf8(zFilename);
+  }
+#endif
+  /* caller will handle out of memory */
+  return zConverted;
+}
+#endif
+
+/*
+** Convert a UTF-8 filename into whatever form the underlying
+** operating system wants filenames in.  Space to hold the result
+** is obtained from malloc and must be freed by the calling
+** function.
+*/
+static void *winConvertFromUtf8Filename(const char *zFilename){
+  void *zConverted = 0;
+  if( osIsNT() ){
+    zConverted = winUtf8ToUnicode(zFilename);
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    zConverted = sqlite3_win32_utf8_to_mbcs(zFilename);
+  }
+#endif
+  /* caller will handle out of memory */
+  return zConverted;
+}
+
+/*
+** This function returns non-zero if the specified UTF-8 string buffer
+** ends with a directory separator character or one was successfully
+** added to it.
+*/
+static int winMakeEndInDirSep(int nBuf, char *zBuf){
+  if( zBuf ){
+    int nLen = sqlite3Strlen30(zBuf);
+    if( nLen>0 ){
+      if( winIsDirSep(zBuf[nLen-1]) ){
+        return 1;
+      }else if( nLen+1<nBuf ){
+        zBuf[nLen] = winGetDirSep();
+        zBuf[nLen+1] = '\0';
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** Create a temporary file name and store the resulting pointer into pzBuf.
+** The pointer returned in pzBuf must be freed via sqlite3_free().
+*/
+static int winGetTempname(sqlite3_vfs *pVfs, char **pzBuf){
+  static char zChars[] =
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789";
+  size_t i, j;
+  int nPre = sqlite3Strlen30(SQLITE_TEMP_FILE_PREFIX);
+  int nMax, nBuf, nDir, nLen;
+  char *zBuf;
+
+  /* It's odd to simulate an io-error here, but really this is just
+  ** using the io-error infrastructure to test that SQLite handles this
+  ** function failing.
+  */
+  SimulateIOError( return SQLITE_IOERR );
+
+  /* Allocate a temporary buffer to store the fully qualified file
+  ** name for the temporary file.  If this fails, we cannot continue.
+  */
+  nMax = pVfs->mxPathname; nBuf = nMax + 2;
+  zBuf = sqlite3MallocZero( nBuf );
+  if( !zBuf ){
+    OSTRACE(("TEMP-FILENAME rc=SQLITE_IOERR_NOMEM\n"));
+    return SQLITE_IOERR_NOMEM;
+  }
+
+  /* Figure out the effective temporary directory.  First, check if one
+  ** has been explicitly set by the application; otherwise, use the one
+  ** configured by the operating system.
+  */
+  nDir = nMax - (nPre + 15);
+  assert( nDir>0 );
+  if( sqlite3_temp_directory ){
+    int nDirLen = sqlite3Strlen30(sqlite3_temp_directory);
+    if( nDirLen>0 ){
+      if( !winIsDirSep(sqlite3_temp_directory[nDirLen-1]) ){
+        nDirLen++;
+      }
+      if( nDirLen>nDir ){
+        sqlite3_free(zBuf);
+        OSTRACE(("TEMP-FILENAME rc=SQLITE_ERROR\n"));
+        return winLogError(SQLITE_ERROR, 0, "winGetTempname1", 0);
+      }
+      sqlite3_snprintf(nMax, zBuf, "%s", sqlite3_temp_directory);
+    }
+  }
+#if defined(__CYGWIN__)
+  else{
+    static const char *azDirs[] = {
+       0, /* getenv("SQLITE_TMPDIR") */
+       0, /* getenv("TMPDIR") */
+       0, /* getenv("TMP") */
+       0, /* getenv("TEMP") */
+       0, /* getenv("USERPROFILE") */
+       "/var/tmp",
+       "/usr/tmp",
+       "/tmp",
+       ".",
+       0        /* List terminator */
+    };
+    unsigned int i;
+    const char *zDir = 0;
