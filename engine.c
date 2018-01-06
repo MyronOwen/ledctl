@@ -37926,3 +37926,230 @@ static BOOL winIsVerbatimPathname(
 ){
   /*
   ** If the path name starts with a forward slash or a backslash, it is either
+  ** a legal UNC name, a volume relative path, or an absolute path name in the
+  ** "Unix" format on Windows.  There is no easy way to differentiate between
+  ** the final two cases; therefore, we return the safer return value of TRUE
+  ** so that callers of this function will simply use it verbatim.
+  */
+  if ( winIsDirSep(zPathname[0]) ){
+    return TRUE;
+  }
+
+  /*
+  ** If the path name starts with a letter and a colon it is either a volume
+  ** relative path or an absolute path.  Callers of this function must not
+  ** attempt to treat it as a relative path name (i.e. they should simply use
+  ** it verbatim).
+  */
+  if ( winIsDriveLetterAndColon(zPathname) ){
+    return TRUE;
+  }
+
+  /*
+  ** If we get to this point, the path name should almost certainly be a purely
+  ** relative one (i.e. not a UNC name, not absolute, and not volume relative).
+  */
+  return FALSE;
+}
+
+/*
+** Turn a relative pathname into a full pathname.  Write the full
+** pathname into zOut[].  zOut[] will be at least pVfs->mxPathname
+** bytes in size.
+*/
+static int winFullPathname(
+  sqlite3_vfs *pVfs,            /* Pointer to vfs object */
+  const char *zRelative,        /* Possibly relative input path */
+  int nFull,                    /* Size of output buffer in bytes */
+  char *zFull                   /* Output buffer */
+){
+
+#if defined(__CYGWIN__)
+  SimulateIOError( return SQLITE_ERROR );
+  UNUSED_PARAMETER(nFull);
+  assert( nFull>=pVfs->mxPathname );
+  if ( sqlite3_data_directory && !winIsVerbatimPathname(zRelative) ){
+    /*
+    ** NOTE: We are dealing with a relative path name and the data
+    **       directory has been set.  Therefore, use it as the basis
+    **       for converting the relative path name to an absolute
+    **       one by prepending the data directory and a slash.
+    */
+    char *zOut = sqlite3MallocZero( pVfs->mxPathname+1 );
+    if( !zOut ){
+      return SQLITE_IOERR_NOMEM;
+    }
+    if( cygwin_conv_path(
+            (osIsNT() ? CCP_POSIX_TO_WIN_W : CCP_POSIX_TO_WIN_A) |
+            CCP_RELATIVE, zRelative, zOut, pVfs->mxPathname+1)<0 ){
+      sqlite3_free(zOut);
+      return winLogError(SQLITE_CANTOPEN_CONVPATH, (DWORD)errno,
+                         "winFullPathname1", zRelative);
+    }else{
+      char *zUtf8 = winConvertToUtf8Filename(zOut);
+      if( !zUtf8 ){
+        sqlite3_free(zOut);
+        return SQLITE_IOERR_NOMEM;
+      }
+      sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s%c%s",
+                       sqlite3_data_directory, winGetDirSep(), zUtf8);
+      sqlite3_free(zUtf8);
+      sqlite3_free(zOut);
+    }
+  }else{
+    char *zOut = sqlite3MallocZero( pVfs->mxPathname+1 );
+    if( !zOut ){
+      return SQLITE_IOERR_NOMEM;
+    }
+    if( cygwin_conv_path(
+            (osIsNT() ? CCP_POSIX_TO_WIN_W : CCP_POSIX_TO_WIN_A),
+            zRelative, zOut, pVfs->mxPathname+1)<0 ){
+      sqlite3_free(zOut);
+      return winLogError(SQLITE_CANTOPEN_CONVPATH, (DWORD)errno,
+                         "winFullPathname2", zRelative);
+    }else{
+      char *zUtf8 = winConvertToUtf8Filename(zOut);
+      if( !zUtf8 ){
+        sqlite3_free(zOut);
+        return SQLITE_IOERR_NOMEM;
+      }
+      sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s", zUtf8);
+      sqlite3_free(zUtf8);
+      sqlite3_free(zOut);
+    }
+  }
+  return SQLITE_OK;
+#endif
+
+#if (SQLITE_OS_WINCE || SQLITE_OS_WINRT) && !defined(__CYGWIN__)
+  SimulateIOError( return SQLITE_ERROR );
+  /* WinCE has no concept of a relative pathname, or so I am told. */
+  /* WinRT has no way to convert a relative path to an absolute one. */
+  if ( sqlite3_data_directory && !winIsVerbatimPathname(zRelative) ){
+    /*
+    ** NOTE: We are dealing with a relative path name and the data
+    **       directory has been set.  Therefore, use it as the basis
+    **       for converting the relative path name to an absolute
+    **       one by prepending the data directory and a backslash.
+    */
+    sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s%c%s",
+                     sqlite3_data_directory, winGetDirSep(), zRelative);
+  }else{
+    sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s", zRelative);
+  }
+  return SQLITE_OK;
+#endif
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && !defined(__CYGWIN__)
+  DWORD nByte;
+  void *zConverted;
+  char *zOut;
+
+  /* If this path name begins with "/X:", where "X" is any alphabetic
+  ** character, discard the initial "/" from the pathname.
+  */
+  if( zRelative[0]=='/' && winIsDriveLetterAndColon(zRelative+1) ){
+    zRelative++;
+  }
+
+  /* It's odd to simulate an io-error here, but really this is just
+  ** using the io-error infrastructure to test that SQLite handles this
+  ** function failing. This function could fail if, for example, the
+  ** current working directory has been unlinked.
+  */
+  SimulateIOError( return SQLITE_ERROR );
+  if ( sqlite3_data_directory && !winIsVerbatimPathname(zRelative) ){
+    /*
+    ** NOTE: We are dealing with a relative path name and the data
+    **       directory has been set.  Therefore, use it as the basis
+    **       for converting the relative path name to an absolute
+    **       one by prepending the data directory and a backslash.
+    */
+    sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s%c%s",
+                     sqlite3_data_directory, winGetDirSep(), zRelative);
+    return SQLITE_OK;
+  }
+  zConverted = winConvertFromUtf8Filename(zRelative);
+  if( zConverted==0 ){
+    return SQLITE_IOERR_NOMEM;
+  }
+  if( osIsNT() ){
+    LPWSTR zTemp;
+    nByte = osGetFullPathNameW((LPCWSTR)zConverted, 0, 0, 0);
+    if( nByte==0 ){
+      sqlite3_free(zConverted);
+      return winLogError(SQLITE_CANTOPEN_FULLPATH, osGetLastError(),
+                         "winFullPathname1", zRelative);
+    }
+    nByte += 3;
+    zTemp = sqlite3MallocZero( nByte*sizeof(zTemp[0]) );
+    if( zTemp==0 ){
+      sqlite3_free(zConverted);
+      return SQLITE_IOERR_NOMEM;
+    }
+    nByte = osGetFullPathNameW((LPCWSTR)zConverted, nByte, zTemp, 0);
+    if( nByte==0 ){
+      sqlite3_free(zConverted);
+      sqlite3_free(zTemp);
+      return winLogError(SQLITE_CANTOPEN_FULLPATH, osGetLastError(),
+                         "winFullPathname2", zRelative);
+    }
+    sqlite3_free(zConverted);
+    zOut = winUnicodeToUtf8(zTemp);
+    sqlite3_free(zTemp);
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    char *zTemp;
+    nByte = osGetFullPathNameA((char*)zConverted, 0, 0, 0);
+    if( nByte==0 ){
+      sqlite3_free(zConverted);
+      return winLogError(SQLITE_CANTOPEN_FULLPATH, osGetLastError(),
+                         "winFullPathname3", zRelative);
+    }
+    nByte += 3;
+    zTemp = sqlite3MallocZero( nByte*sizeof(zTemp[0]) );
+    if( zTemp==0 ){
+      sqlite3_free(zConverted);
+      return SQLITE_IOERR_NOMEM;
+    }
+    nByte = osGetFullPathNameA((char*)zConverted, nByte, zTemp, 0);
+    if( nByte==0 ){
+      sqlite3_free(zConverted);
+      sqlite3_free(zTemp);
+      return winLogError(SQLITE_CANTOPEN_FULLPATH, osGetLastError(),
+                         "winFullPathname4", zRelative);
+    }
+    sqlite3_free(zConverted);
+    zOut = sqlite3_win32_mbcs_to_utf8(zTemp);
+    sqlite3_free(zTemp);
+  }
+#endif
+  if( zOut ){
+    sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s", zOut);
+    sqlite3_free(zOut);
+    return SQLITE_OK;
+  }else{
+    return SQLITE_IOERR_NOMEM;
+  }
+#endif
+}
+
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+/*
+** Interfaces for opening a shared library, finding entry points
+** within the shared library, and closing the shared library.
+*/
+static void *winDlOpen(sqlite3_vfs *pVfs, const char *zFilename){
+  HANDLE h;
+#if defined(__CYGWIN__)
+  int nFull = pVfs->mxPathname+1;
+  char *zFull = sqlite3MallocZero( nFull );
+  void *zConverted = 0;
+  if( zFull==0 ){
+    OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
+    return 0;
+  }
+  if( winFullPathname(pVfs, zFilename, nFull, zFull)!=SQLITE_OK ){
+    sqlite3_free(zFull);
+    OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
