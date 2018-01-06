@@ -37683,3 +37683,246 @@ static int winOpen(
     pFile->zDeleteOnClose = zConverted;
   }else
 #endif
+  {
+    sqlite3_free(zConverted);
+  }
+
+  sqlite3_free(zTmpname);
+  pFile->pMethod = &winIoMethod;
+  pFile->pVfs = pVfs;
+  pFile->h = h;
+  if( isReadonly ){
+    pFile->ctrlFlags |= WINFILE_RDONLY;
+  }
+  if( sqlite3_uri_boolean(zName, "psow", SQLITE_POWERSAFE_OVERWRITE) ){
+    pFile->ctrlFlags |= WINFILE_PSOW;
+  }
+  pFile->lastErrno = NO_ERROR;
+  pFile->zPath = zName;
+#if SQLITE_MAX_MMAP_SIZE>0
+  pFile->hMap = NULL;
+  pFile->pMapRegion = 0;
+  pFile->mmapSize = 0;
+  pFile->mmapSizeActual = 0;
+  pFile->mmapSizeMax = sqlite3GlobalConfig.szMmap;
+#endif
+
+  OpenCounter(+1);
+  return rc;
+}
+
+/*
+** Delete the named file.
+**
+** Note that Windows does not allow a file to be deleted if some other
+** process has it open.  Sometimes a virus scanner or indexing program
+** will open a journal file shortly after it is created in order to do
+** whatever it does.  While this other process is holding the
+** file open, we will be unable to delete it.  To work around this
+** problem, we delay 100 milliseconds and try to delete again.  Up
+** to MX_DELETION_ATTEMPTs deletion attempts are run before giving
+** up and returning an error.
+*/
+static int winDelete(
+  sqlite3_vfs *pVfs,          /* Not used on win32 */
+  const char *zFilename,      /* Name of file to delete */
+  int syncDir                 /* Not used on win32 */
+){
+  int cnt = 0;
+  int rc;
+  DWORD attr;
+  DWORD lastErrno = 0;
+  void *zConverted;
+  UNUSED_PARAMETER(pVfs);
+  UNUSED_PARAMETER(syncDir);
+
+  SimulateIOError(return SQLITE_IOERR_DELETE);
+  OSTRACE(("DELETE name=%s, syncDir=%d\n", zFilename, syncDir));
+
+  zConverted = winConvertFromUtf8Filename(zFilename);
+  if( zConverted==0 ){
+    OSTRACE(("DELETE name=%s, rc=SQLITE_IOERR_NOMEM\n", zFilename));
+    return SQLITE_IOERR_NOMEM;
+  }
+  if( osIsNT() ){
+    do {
+#if SQLITE_OS_WINRT
+      WIN32_FILE_ATTRIBUTE_DATA sAttrData;
+      memset(&sAttrData, 0, sizeof(sAttrData));
+      if ( osGetFileAttributesExW(zConverted, GetFileExInfoStandard,
+                                  &sAttrData) ){
+        attr = sAttrData.dwFileAttributes;
+      }else{
+        lastErrno = osGetLastError();
+        if( lastErrno==ERROR_FILE_NOT_FOUND
+         || lastErrno==ERROR_PATH_NOT_FOUND ){
+          rc = SQLITE_IOERR_DELETE_NOENT; /* Already gone? */
+        }else{
+          rc = SQLITE_ERROR;
+        }
+        break;
+      }
+#else
+      attr = osGetFileAttributesW(zConverted);
+#endif
+      if ( attr==INVALID_FILE_ATTRIBUTES ){
+        lastErrno = osGetLastError();
+        if( lastErrno==ERROR_FILE_NOT_FOUND
+         || lastErrno==ERROR_PATH_NOT_FOUND ){
+          rc = SQLITE_IOERR_DELETE_NOENT; /* Already gone? */
+        }else{
+          rc = SQLITE_ERROR;
+        }
+        break;
+      }
+      if ( attr&FILE_ATTRIBUTE_DIRECTORY ){
+        rc = SQLITE_ERROR; /* Files only. */
+        break;
+      }
+      if ( osDeleteFileW(zConverted) ){
+        rc = SQLITE_OK; /* Deleted OK. */
+        break;
+      }
+      if ( !winRetryIoerr(&cnt, &lastErrno) ){
+        rc = SQLITE_ERROR; /* No more retries. */
+        break;
+      }
+    } while(1);
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    do {
+      attr = osGetFileAttributesA(zConverted);
+      if ( attr==INVALID_FILE_ATTRIBUTES ){
+        lastErrno = osGetLastError();
+        if( lastErrno==ERROR_FILE_NOT_FOUND
+         || lastErrno==ERROR_PATH_NOT_FOUND ){
+          rc = SQLITE_IOERR_DELETE_NOENT; /* Already gone? */
+        }else{
+          rc = SQLITE_ERROR;
+        }
+        break;
+      }
+      if ( attr&FILE_ATTRIBUTE_DIRECTORY ){
+        rc = SQLITE_ERROR; /* Files only. */
+        break;
+      }
+      if ( osDeleteFileA(zConverted) ){
+        rc = SQLITE_OK; /* Deleted OK. */
+        break;
+      }
+      if ( !winRetryIoerr(&cnt, &lastErrno) ){
+        rc = SQLITE_ERROR; /* No more retries. */
+        break;
+      }
+    } while(1);
+  }
+#endif
+  if( rc && rc!=SQLITE_IOERR_DELETE_NOENT ){
+    rc = winLogError(SQLITE_IOERR_DELETE, lastErrno, "winDelete", zFilename);
+  }else{
+    winLogIoerr(cnt);
+  }
+  sqlite3_free(zConverted);
+  OSTRACE(("DELETE name=%s, rc=%s\n", zFilename, sqlite3ErrName(rc)));
+  return rc;
+}
+
+/*
+** Check the existence and status of a file.
+*/
+static int winAccess(
+  sqlite3_vfs *pVfs,         /* Not used on win32 */
+  const char *zFilename,     /* Name of file to check */
+  int flags,                 /* Type of test to make on this file */
+  int *pResOut               /* OUT: Result */
+){
+  DWORD attr;
+  int rc = 0;
+  DWORD lastErrno = 0;
+  void *zConverted;
+  UNUSED_PARAMETER(pVfs);
+
+  SimulateIOError( return SQLITE_IOERR_ACCESS; );
+  OSTRACE(("ACCESS name=%s, flags=%x, pResOut=%p\n",
+           zFilename, flags, pResOut));
+
+  zConverted = winConvertFromUtf8Filename(zFilename);
+  if( zConverted==0 ){
+    OSTRACE(("ACCESS name=%s, rc=SQLITE_IOERR_NOMEM\n", zFilename));
+    return SQLITE_IOERR_NOMEM;
+  }
+  if( osIsNT() ){
+    int cnt = 0;
+    WIN32_FILE_ATTRIBUTE_DATA sAttrData;
+    memset(&sAttrData, 0, sizeof(sAttrData));
+    while( !(rc = osGetFileAttributesExW((LPCWSTR)zConverted,
+                             GetFileExInfoStandard,
+                             &sAttrData)) && winRetryIoerr(&cnt, &lastErrno) ){}
+    if( rc ){
+      /* For an SQLITE_ACCESS_EXISTS query, treat a zero-length file
+      ** as if it does not exist.
+      */
+      if(    flags==SQLITE_ACCESS_EXISTS
+          && sAttrData.nFileSizeHigh==0
+          && sAttrData.nFileSizeLow==0 ){
+        attr = INVALID_FILE_ATTRIBUTES;
+      }else{
+        attr = sAttrData.dwFileAttributes;
+      }
+    }else{
+      winLogIoerr(cnt);
+      if( lastErrno!=ERROR_FILE_NOT_FOUND && lastErrno!=ERROR_PATH_NOT_FOUND ){
+        sqlite3_free(zConverted);
+        return winLogError(SQLITE_IOERR_ACCESS, lastErrno, "winAccess",
+                           zFilename);
+      }else{
+        attr = INVALID_FILE_ATTRIBUTES;
+      }
+    }
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    attr = osGetFileAttributesA((char*)zConverted);
+  }
+#endif
+  sqlite3_free(zConverted);
+  switch( flags ){
+    case SQLITE_ACCESS_READ:
+    case SQLITE_ACCESS_EXISTS:
+      rc = attr!=INVALID_FILE_ATTRIBUTES;
+      break;
+    case SQLITE_ACCESS_READWRITE:
+      rc = attr!=INVALID_FILE_ATTRIBUTES &&
+             (attr & FILE_ATTRIBUTE_READONLY)==0;
+      break;
+    default:
+      assert(!"Invalid flags argument");
+  }
+  *pResOut = rc;
+  OSTRACE(("ACCESS name=%s, pResOut=%p, *pResOut=%d, rc=SQLITE_OK\n",
+           zFilename, pResOut, *pResOut));
+  return SQLITE_OK;
+}
+
+/*
+** Returns non-zero if the specified path name starts with a drive letter
+** followed by a colon character.
+*/
+static BOOL winIsDriveLetterAndColon(
+  const char *zPathname
+){
+  return ( sqlite3Isalpha(zPathname[0]) && zPathname[1]==':' );
+}
+
+/*
+** Returns non-zero if the specified path name should be used verbatim.  If
+** non-zero is returned from this function, the calling function must simply
+** use the provided path name verbatim -OR- resolve it into a full path name
+** using the GetFullPathName Win32 API function (if available).
+*/
+static BOOL winIsVerbatimPathname(
+  const char *zPathname
+){
+  /*
+  ** If the path name starts with a forward slash or a backslash, it is either
