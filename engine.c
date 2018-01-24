@@ -38153,3 +38153,265 @@ static void *winDlOpen(sqlite3_vfs *pVfs, const char *zFilename){
   if( winFullPathname(pVfs, zFilename, nFull, zFull)!=SQLITE_OK ){
     sqlite3_free(zFull);
     OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
+    return 0;
+  }
+  zConverted = winConvertFromUtf8Filename(zFull);
+  sqlite3_free(zFull);
+#else
+  void *zConverted = winConvertFromUtf8Filename(zFilename);
+  UNUSED_PARAMETER(pVfs);
+#endif
+  if( zConverted==0 ){
+    OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
+    return 0;
+  }
+  if( osIsNT() ){
+#if SQLITE_OS_WINRT
+    h = osLoadPackagedLibrary((LPCWSTR)zConverted, 0);
+#else
+    h = osLoadLibraryW((LPCWSTR)zConverted);
+#endif
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    h = osLoadLibraryA((char*)zConverted);
+  }
+#endif
+  OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)h));
+  sqlite3_free(zConverted);
+  return (void*)h;
+}
+static void winDlError(sqlite3_vfs *pVfs, int nBuf, char *zBufOut){
+  UNUSED_PARAMETER(pVfs);
+  winGetLastErrorMsg(osGetLastError(), nBuf, zBufOut);
+}
+static void (*winDlSym(sqlite3_vfs *pVfs,void *pH,const char *zSym))(void){
+  FARPROC proc;
+  UNUSED_PARAMETER(pVfs);
+  proc = osGetProcAddressA((HANDLE)pH, zSym);
+  OSTRACE(("DLSYM handle=%p, symbol=%s, address=%p\n",
+           (void*)pH, zSym, (void*)proc));
+  return (void(*)(void))proc;
+}
+static void winDlClose(sqlite3_vfs *pVfs, void *pHandle){
+  UNUSED_PARAMETER(pVfs);
+  osFreeLibrary((HANDLE)pHandle);
+  OSTRACE(("DLCLOSE handle=%p\n", (void*)pHandle));
+}
+#else /* if SQLITE_OMIT_LOAD_EXTENSION is defined: */
+  #define winDlOpen  0
+  #define winDlError 0
+  #define winDlSym   0
+  #define winDlClose 0
+#endif
+
+
+/*
+** Write up to nBuf bytes of randomness into zBuf.
+*/
+static int winRandomness(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
+  int n = 0;
+  UNUSED_PARAMETER(pVfs);
+#if defined(SQLITE_TEST)
+  n = nBuf;
+  memset(zBuf, 0, nBuf);
+#else
+  if( sizeof(SYSTEMTIME)<=nBuf-n ){
+    SYSTEMTIME x;
+    osGetSystemTime(&x);
+    memcpy(&zBuf[n], &x, sizeof(x));
+    n += sizeof(x);
+  }
+  if( sizeof(DWORD)<=nBuf-n ){
+    DWORD pid = osGetCurrentProcessId();
+    memcpy(&zBuf[n], &pid, sizeof(pid));
+    n += sizeof(pid);
+  }
+#if SQLITE_OS_WINRT
+  if( sizeof(ULONGLONG)<=nBuf-n ){
+    ULONGLONG cnt = osGetTickCount64();
+    memcpy(&zBuf[n], &cnt, sizeof(cnt));
+    n += sizeof(cnt);
+  }
+#else
+  if( sizeof(DWORD)<=nBuf-n ){
+    DWORD cnt = osGetTickCount();
+    memcpy(&zBuf[n], &cnt, sizeof(cnt));
+    n += sizeof(cnt);
+  }
+#endif
+  if( sizeof(LARGE_INTEGER)<=nBuf-n ){
+    LARGE_INTEGER i;
+    osQueryPerformanceCounter(&i);
+    memcpy(&zBuf[n], &i, sizeof(i));
+    n += sizeof(i);
+  }
+#endif
+  return n;
+}
+
+
+/*
+** Sleep for a little while.  Return the amount of time slept.
+*/
+static int winSleep(sqlite3_vfs *pVfs, int microsec){
+  sqlite3_win32_sleep((microsec+999)/1000);
+  UNUSED_PARAMETER(pVfs);
+  return ((microsec+999)/1000)*1000;
+}
+
+/*
+** The following variable, if set to a non-zero value, is interpreted as
+** the number of seconds since 1970 and is used to set the result of
+** sqlite3OsCurrentTime() during testing.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_current_time = 0;  /* Fake system time in seconds since 1970. */
+#endif
+
+/*
+** Find the current time (in Universal Coordinated Time).  Write into *piNow
+** the current time and date as a Julian Day number times 86_400_000.  In
+** other words, write into *piNow the number of milliseconds since the Julian
+** epoch of noon in Greenwich on November 24, 4714 B.C according to the
+** proleptic Gregorian calendar.
+**
+** On success, return SQLITE_OK.  Return SQLITE_ERROR if the time and date
+** cannot be found.
+*/
+static int winCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *piNow){
+  /* FILETIME structure is a 64-bit value representing the number of
+     100-nanosecond intervals since January 1, 1601 (= JD 2305813.5).
+  */
+  FILETIME ft;
+  static const sqlite3_int64 winFiletimeEpoch = 23058135*(sqlite3_int64)8640000;
+#ifdef SQLITE_TEST
+  static const sqlite3_int64 unixEpoch = 24405875*(sqlite3_int64)8640000;
+#endif
+  /* 2^32 - to avoid use of LL and warnings in gcc */
+  static const sqlite3_int64 max32BitValue =
+      (sqlite3_int64)2000000000 + (sqlite3_int64)2000000000 +
+      (sqlite3_int64)294967296;
+
+#if SQLITE_OS_WINCE
+  SYSTEMTIME time;
+  osGetSystemTime(&time);
+  /* if SystemTimeToFileTime() fails, it returns zero. */
+  if (!osSystemTimeToFileTime(&time,&ft)){
+    return SQLITE_ERROR;
+  }
+#else
+  osGetSystemTimeAsFileTime( &ft );
+#endif
+
+  *piNow = winFiletimeEpoch +
+            ((((sqlite3_int64)ft.dwHighDateTime)*max32BitValue) +
+               (sqlite3_int64)ft.dwLowDateTime)/(sqlite3_int64)10000;
+
+#ifdef SQLITE_TEST
+  if( sqlite3_current_time ){
+    *piNow = 1000*(sqlite3_int64)sqlite3_current_time + unixEpoch;
+  }
+#endif
+  UNUSED_PARAMETER(pVfs);
+  return SQLITE_OK;
+}
+
+/*
+** Find the current time (in Universal Coordinated Time).  Write the
+** current time and date as a Julian Day number into *prNow and
+** return 0.  Return 1 if the time and date cannot be found.
+*/
+static int winCurrentTime(sqlite3_vfs *pVfs, double *prNow){
+  int rc;
+  sqlite3_int64 i;
+  rc = winCurrentTimeInt64(pVfs, &i);
+  if( !rc ){
+    *prNow = i/86400000.0;
+  }
+  return rc;
+}
+
+/*
+** The idea is that this function works like a combination of
+** GetLastError() and FormatMessage() on Windows (or errno and
+** strerror_r() on Unix). After an error is returned by an OS
+** function, SQLite calls this function with zBuf pointing to
+** a buffer of nBuf bytes. The OS layer should populate the
+** buffer with a nul-terminated UTF-8 encoded error message
+** describing the last IO error to have occurred within the calling
+** thread.
+**
+** If the error message is too large for the supplied buffer,
+** it should be truncated. The return value of xGetLastError
+** is zero if the error message fits in the buffer, or non-zero
+** otherwise (if the message was truncated). If non-zero is returned,
+** then it is not necessary to include the nul-terminator character
+** in the output buffer.
+**
+** Not supplying an error message will have no adverse effect
+** on SQLite. It is fine to have an implementation that never
+** returns an error message:
+**
+**   int xGetLastError(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
+**     assert(zBuf[0]=='\0');
+**     return 0;
+**   }
+**
+** However if an error message is supplied, it will be incorporated
+** by sqlite into the error message available to the user using
+** sqlite3_errmsg(), possibly making IO errors easier to debug.
+*/
+static int winGetLastError(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
+  UNUSED_PARAMETER(pVfs);
+  return winGetLastErrorMsg(osGetLastError(), nBuf, zBuf);
+}
+
+/*
+** Initialize and deinitialize the operating system interface.
+*/
+SQLITE_API int sqlite3_os_init(void){
+  static sqlite3_vfs winVfs = {
+    3,                   /* iVersion */
+    sizeof(winFile),     /* szOsFile */
+    SQLITE_WIN32_MAX_PATH_BYTES, /* mxPathname */
+    0,                   /* pNext */
+    "win32",             /* zName */
+    0,                   /* pAppData */
+    winOpen,             /* xOpen */
+    winDelete,           /* xDelete */
+    winAccess,           /* xAccess */
+    winFullPathname,     /* xFullPathname */
+    winDlOpen,           /* xDlOpen */
+    winDlError,          /* xDlError */
+    winDlSym,            /* xDlSym */
+    winDlClose,          /* xDlClose */
+    winRandomness,       /* xRandomness */
+    winSleep,            /* xSleep */
+    winCurrentTime,      /* xCurrentTime */
+    winGetLastError,     /* xGetLastError */
+    winCurrentTimeInt64, /* xCurrentTimeInt64 */
+    winSetSystemCall,    /* xSetSystemCall */
+    winGetSystemCall,    /* xGetSystemCall */
+    winNextSystemCall,   /* xNextSystemCall */
+  };
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  static sqlite3_vfs winLongPathVfs = {
+    3,                   /* iVersion */
+    sizeof(winFile),     /* szOsFile */
+    SQLITE_WINNT_MAX_PATH_BYTES, /* mxPathname */
+    0,                   /* pNext */
+    "win32-longpath",    /* zName */
+    0,                   /* pAppData */
+    winOpen,             /* xOpen */
+    winDelete,           /* xDelete */
+    winAccess,           /* xAccess */
+    winFullPathname,     /* xFullPathname */
+    winDlOpen,           /* xDlOpen */
+    winDlError,          /* xDlError */
+    winDlSym,            /* xDlSym */
+    winDlClose,          /* xDlClose */
+    winRandomness,       /* xRandomness */
+    winSleep,            /* xSleep */
+    winCurrentTime,      /* xCurrentTime */
+    winGetLastError,     /* xGetLastError */
