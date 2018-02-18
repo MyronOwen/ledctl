@@ -38415,3 +38415,226 @@ SQLITE_API int sqlite3_os_init(void){
     winSleep,            /* xSleep */
     winCurrentTime,      /* xCurrentTime */
     winGetLastError,     /* xGetLastError */
+    winCurrentTimeInt64, /* xCurrentTimeInt64 */
+    winSetSystemCall,    /* xSetSystemCall */
+    winGetSystemCall,    /* xGetSystemCall */
+    winNextSystemCall,   /* xNextSystemCall */
+  };
+#endif
+
+  /* Double-check that the aSyscall[] array has been constructed
+  ** correctly.  See ticket [bb3a86e890c8e96ab] */
+  assert( ArraySize(aSyscall)==77 );
+
+  /* get memory map allocation granularity */
+  memset(&winSysInfo, 0, sizeof(SYSTEM_INFO));
+#if SQLITE_OS_WINRT
+  osGetNativeSystemInfo(&winSysInfo);
+#else
+  osGetSystemInfo(&winSysInfo);
+#endif
+  assert( winSysInfo.dwAllocationGranularity>0 );
+  assert( winSysInfo.dwPageSize>0 );
+
+  sqlite3_vfs_register(&winVfs, 1);
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  sqlite3_vfs_register(&winLongPathVfs, 0);
+#endif
+
+  return SQLITE_OK;
+}
+
+SQLITE_API int sqlite3_os_end(void){
+#if SQLITE_OS_WINRT
+  if( sleepObj!=NULL ){
+    osCloseHandle(sleepObj);
+    sleepObj = NULL;
+  }
+#endif
+  return SQLITE_OK;
+}
+
+#endif /* SQLITE_OS_WIN */
+
+/************** End of os_win.c **********************************************/
+/************** Begin file bitvec.c ******************************************/
+/*
+** 2008 February 16
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file implements an object that represents a fixed-length
+** bitmap.  Bits are numbered starting with 1.
+**
+** A bitmap is used to record which pages of a database file have been
+** journalled during a transaction, or which pages have the "dont-write"
+** property.  Usually only a few pages are meet either condition.
+** So the bitmap is usually sparse and has low cardinality.
+** But sometimes (for example when during a DROP of a large table) most
+** or all of the pages in a database can get journalled.  In those cases, 
+** the bitmap becomes dense with high cardinality.  The algorithm needs 
+** to handle both cases well.
+**
+** The size of the bitmap is fixed when the object is created.
+**
+** All bits are clear when the bitmap is created.  Individual bits
+** may be set or cleared one at a time.
+**
+** Test operations are about 100 times more common that set operations.
+** Clear operations are exceedingly rare.  There are usually between
+** 5 and 500 set operations per Bitvec object, though the number of sets can
+** sometimes grow into tens of thousands or larger.  The size of the
+** Bitvec object is the number of pages in the database file at the
+** start of a transaction, and is thus usually less than a few thousand,
+** but can be as large as 2 billion for a really big database.
+*/
+
+/* Size of the Bitvec structure in bytes. */
+#define BITVEC_SZ        512
+
+/* Round the union size down to the nearest pointer boundary, since that's how 
+** it will be aligned within the Bitvec struct. */
+#define BITVEC_USIZE     (((BITVEC_SZ-(3*sizeof(u32)))/sizeof(Bitvec*))*sizeof(Bitvec*))
+
+/* Type of the array "element" for the bitmap representation. 
+** Should be a power of 2, and ideally, evenly divide into BITVEC_USIZE. 
+** Setting this to the "natural word" size of your CPU may improve
+** performance. */
+#define BITVEC_TELEM     u8
+/* Size, in bits, of the bitmap element. */
+#define BITVEC_SZELEM    8
+/* Number of elements in a bitmap array. */
+#define BITVEC_NELEM     (BITVEC_USIZE/sizeof(BITVEC_TELEM))
+/* Number of bits in the bitmap array. */
+#define BITVEC_NBIT      (BITVEC_NELEM*BITVEC_SZELEM)
+
+/* Number of u32 values in hash table. */
+#define BITVEC_NINT      (BITVEC_USIZE/sizeof(u32))
+/* Maximum number of entries in hash table before 
+** sub-dividing and re-hashing. */
+#define BITVEC_MXHASH    (BITVEC_NINT/2)
+/* Hashing function for the aHash representation.
+** Empirical testing showed that the *37 multiplier 
+** (an arbitrary prime)in the hash function provided 
+** no fewer collisions than the no-op *1. */
+#define BITVEC_HASH(X)   (((X)*1)%BITVEC_NINT)
+
+#define BITVEC_NPTR      (BITVEC_USIZE/sizeof(Bitvec *))
+
+
+/*
+** A bitmap is an instance of the following structure.
+**
+** This bitmap records the existence of zero or more bits
+** with values between 1 and iSize, inclusive.
+**
+** There are three possible representations of the bitmap.
+** If iSize<=BITVEC_NBIT, then Bitvec.u.aBitmap[] is a straight
+** bitmap.  The least significant bit is bit 1.
+**
+** If iSize>BITVEC_NBIT and iDivisor==0 then Bitvec.u.aHash[] is
+** a hash table that will hold up to BITVEC_MXHASH distinct values.
+**
+** Otherwise, the value i is redirected into one of BITVEC_NPTR
+** sub-bitmaps pointed to by Bitvec.u.apSub[].  Each subbitmap
+** handles up to iDivisor separate values of i.  apSub[0] holds
+** values between 1 and iDivisor.  apSub[1] holds values between
+** iDivisor+1 and 2*iDivisor.  apSub[N] holds values between
+** N*iDivisor+1 and (N+1)*iDivisor.  Each subbitmap is normalized
+** to hold deal with values between 1 and iDivisor.
+*/
+struct Bitvec {
+  u32 iSize;      /* Maximum bit index.  Max iSize is 4,294,967,296. */
+  u32 nSet;       /* Number of bits that are set - only valid for aHash
+                  ** element.  Max is BITVEC_NINT.  For BITVEC_SZ of 512,
+                  ** this would be 125. */
+  u32 iDivisor;   /* Number of bits handled by each apSub[] entry. */
+                  /* Should >=0 for apSub element. */
+                  /* Max iDivisor is max(u32) / BITVEC_NPTR + 1.  */
+                  /* For a BITVEC_SZ of 512, this would be 34,359,739. */
+  union {
+    BITVEC_TELEM aBitmap[BITVEC_NELEM];    /* Bitmap representation */
+    u32 aHash[BITVEC_NINT];      /* Hash table representation */
+    Bitvec *apSub[BITVEC_NPTR];  /* Recursive representation */
+  } u;
+};
+
+/*
+** Create a new bitmap object able to handle bits between 0 and iSize,
+** inclusive.  Return a pointer to the new object.  Return NULL if 
+** malloc fails.
+*/
+SQLITE_PRIVATE Bitvec *sqlite3BitvecCreate(u32 iSize){
+  Bitvec *p;
+  assert( sizeof(*p)==BITVEC_SZ );
+  p = sqlite3MallocZero( sizeof(*p) );
+  if( p ){
+    p->iSize = iSize;
+  }
+  return p;
+}
+
+/*
+** Check to see if the i-th bit is set.  Return true or false.
+** If p is NULL (if the bitmap has not been created) or if
+** i is out of range, then return false.
+*/
+SQLITE_PRIVATE int sqlite3BitvecTest(Bitvec *p, u32 i){
+  if( p==0 ) return 0;
+  if( i>p->iSize || i==0 ) return 0;
+  i--;
+  while( p->iDivisor ){
+    u32 bin = i/p->iDivisor;
+    i = i%p->iDivisor;
+    p = p->u.apSub[bin];
+    if (!p) {
+      return 0;
+    }
+  }
+  if( p->iSize<=BITVEC_NBIT ){
+    return (p->u.aBitmap[i/BITVEC_SZELEM] & (1<<(i&(BITVEC_SZELEM-1))))!=0;
+  } else{
+    u32 h = BITVEC_HASH(i++);
+    while( p->u.aHash[h] ){
+      if( p->u.aHash[h]==i ) return 1;
+      h = (h+1) % BITVEC_NINT;
+    }
+    return 0;
+  }
+}
+
+/*
+** Set the i-th bit.  Return 0 on success and an error code if
+** anything goes wrong.
+**
+** This routine might cause sub-bitmaps to be allocated.  Failing
+** to get the memory needed to hold the sub-bitmap is the only
+** that can go wrong with an insert, assuming p and i are valid.
+**
+** The calling function must ensure that p is a valid Bitvec object
+** and that the value for "i" is within range of the Bitvec object.
+** Otherwise the behavior is undefined.
+*/
+SQLITE_PRIVATE int sqlite3BitvecSet(Bitvec *p, u32 i){
+  u32 h;
+  if( p==0 ) return SQLITE_OK;
+  assert( i>0 );
+  assert( i<=p->iSize );
+  i--;
+  while((p->iSize > BITVEC_NBIT) && p->iDivisor) {
+    u32 bin = i/p->iDivisor;
+    i = i%p->iDivisor;
+    if( p->u.apSub[bin]==0 ){
+      p->u.apSub[bin] = sqlite3BitvecCreate( p->iDivisor );
+      if( p->u.apSub[bin]==0 ) return SQLITE_NOMEM;
+    }
+    p = p->u.apSub[bin];
+  }
+  if( p->iSize<=BITVEC_NBIT ){
