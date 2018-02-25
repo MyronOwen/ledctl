@@ -38890,3 +38890,241 @@ struct PCache {
   PgHdr *pSynced;                     /* Last synced page in dirty page list */
   int nRef;                           /* Number of referenced pages */
   int szCache;                        /* Configured cache size */
+  int szPage;                         /* Size of every page in this cache */
+  int szExtra;                        /* Size of extra space for each page */
+  u8 bPurgeable;                      /* True if pages are on backing store */
+  u8 eCreate;                         /* eCreate value for for xFetch() */
+  int (*xStress)(void*,PgHdr*);       /* Call to try make a page clean */
+  void *pStress;                      /* Argument to xStress */
+  sqlite3_pcache *pCache;             /* Pluggable cache module */
+  PgHdr *pPage1;                      /* Reference to page 1 */
+};
+
+/********************************** Linked List Management ********************/
+
+/* Allowed values for second argument to pcacheManageDirtyList() */
+#define PCACHE_DIRTYLIST_REMOVE   1    /* Remove pPage from dirty list */
+#define PCACHE_DIRTYLIST_ADD      2    /* Add pPage to the dirty list */
+#define PCACHE_DIRTYLIST_FRONT    3    /* Move pPage to the front of the list */
+
+/*
+** Manage pPage's participation on the dirty list.  Bits of the addRemove
+** argument determines what operation to do.  The 0x01 bit means first
+** remove pPage from the dirty list.  The 0x02 means add pPage back to
+** the dirty list.  Doing both moves pPage to the front of the dirty list.
+*/
+static void pcacheManageDirtyList(PgHdr *pPage, u8 addRemove){
+  PCache *p = pPage->pCache;
+
+  if( addRemove & PCACHE_DIRTYLIST_REMOVE ){
+    assert( pPage->pDirtyNext || pPage==p->pDirtyTail );
+    assert( pPage->pDirtyPrev || pPage==p->pDirty );
+  
+    /* Update the PCache1.pSynced variable if necessary. */
+    if( p->pSynced==pPage ){
+      PgHdr *pSynced = pPage->pDirtyPrev;
+      while( pSynced && (pSynced->flags&PGHDR_NEED_SYNC) ){
+        pSynced = pSynced->pDirtyPrev;
+      }
+      p->pSynced = pSynced;
+    }
+  
+    if( pPage->pDirtyNext ){
+      pPage->pDirtyNext->pDirtyPrev = pPage->pDirtyPrev;
+    }else{
+      assert( pPage==p->pDirtyTail );
+      p->pDirtyTail = pPage->pDirtyPrev;
+    }
+    if( pPage->pDirtyPrev ){
+      pPage->pDirtyPrev->pDirtyNext = pPage->pDirtyNext;
+    }else{
+      assert( pPage==p->pDirty );
+      p->pDirty = pPage->pDirtyNext;
+      if( p->pDirty==0 && p->bPurgeable ){
+        assert( p->eCreate==1 );
+        p->eCreate = 2;
+      }
+    }
+    pPage->pDirtyNext = 0;
+    pPage->pDirtyPrev = 0;
+  }
+  if( addRemove & PCACHE_DIRTYLIST_ADD ){
+    assert( pPage->pDirtyNext==0 && pPage->pDirtyPrev==0 && p->pDirty!=pPage );
+  
+    pPage->pDirtyNext = p->pDirty;
+    if( pPage->pDirtyNext ){
+      assert( pPage->pDirtyNext->pDirtyPrev==0 );
+      pPage->pDirtyNext->pDirtyPrev = pPage;
+    }else{
+      p->pDirtyTail = pPage;
+      if( p->bPurgeable ){
+        assert( p->eCreate==2 );
+        p->eCreate = 1;
+      }
+    }
+    p->pDirty = pPage;
+    if( !p->pSynced && 0==(pPage->flags&PGHDR_NEED_SYNC) ){
+      p->pSynced = pPage;
+    }
+  }
+}
+
+/*
+** Wrapper around the pluggable caches xUnpin method. If the cache is
+** being used for an in-memory database, this function is a no-op.
+*/
+static void pcacheUnpin(PgHdr *p){
+  if( p->pCache->bPurgeable ){
+    if( p->pgno==1 ){
+      p->pCache->pPage1 = 0;
+    }
+    sqlite3GlobalConfig.pcache2.xUnpin(p->pCache->pCache, p->pPage, 0);
+  }
+}
+
+/*
+** Compute the number of pages of cache requested.
+*/
+static int numberOfCachePages(PCache *p){
+  if( p->szCache>=0 ){
+    return p->szCache;
+  }else{
+    return (int)((-1024*(i64)p->szCache)/(p->szPage+p->szExtra));
+  }
+}
+
+/*************************************************** General Interfaces ******
+**
+** Initialize and shutdown the page cache subsystem. Neither of these 
+** functions are threadsafe.
+*/
+SQLITE_PRIVATE int sqlite3PcacheInitialize(void){
+  if( sqlite3GlobalConfig.pcache2.xInit==0 ){
+    /* IMPLEMENTATION-OF: R-26801-64137 If the xInit() method is NULL, then the
+    ** built-in default page cache is used instead of the application defined
+    ** page cache. */
+    sqlite3PCacheSetDefault();
+  }
+  return sqlite3GlobalConfig.pcache2.xInit(sqlite3GlobalConfig.pcache2.pArg);
+}
+SQLITE_PRIVATE void sqlite3PcacheShutdown(void){
+  if( sqlite3GlobalConfig.pcache2.xShutdown ){
+    /* IMPLEMENTATION-OF: R-26000-56589 The xShutdown() method may be NULL. */
+    sqlite3GlobalConfig.pcache2.xShutdown(sqlite3GlobalConfig.pcache2.pArg);
+  }
+}
+
+/*
+** Return the size in bytes of a PCache object.
+*/
+SQLITE_PRIVATE int sqlite3PcacheSize(void){ return sizeof(PCache); }
+
+/*
+** Create a new PCache object. Storage space to hold the object
+** has already been allocated and is passed in as the p pointer. 
+** The caller discovers how much space needs to be allocated by 
+** calling sqlite3PcacheSize().
+*/
+SQLITE_PRIVATE int sqlite3PcacheOpen(
+  int szPage,                  /* Size of every page */
+  int szExtra,                 /* Extra space associated with each page */
+  int bPurgeable,              /* True if pages are on backing store */
+  int (*xStress)(void*,PgHdr*),/* Call to try to make pages clean */
+  void *pStress,               /* Argument to xStress */
+  PCache *p                    /* Preallocated space for the PCache */
+){
+  memset(p, 0, sizeof(PCache));
+  p->szPage = 1;
+  p->szExtra = szExtra;
+  p->bPurgeable = bPurgeable;
+  p->eCreate = 2;
+  p->xStress = xStress;
+  p->pStress = pStress;
+  p->szCache = 100;
+  return sqlite3PcacheSetPageSize(p, szPage);
+}
+
+/*
+** Change the page size for PCache object. The caller must ensure that there
+** are no outstanding page references when this function is called.
+*/
+SQLITE_PRIVATE int sqlite3PcacheSetPageSize(PCache *pCache, int szPage){
+  assert( pCache->nRef==0 && pCache->pDirty==0 );
+  if( pCache->szPage ){
+    sqlite3_pcache *pNew;
+    pNew = sqlite3GlobalConfig.pcache2.xCreate(
+                szPage, pCache->szExtra + ROUND8(sizeof(PgHdr)),
+                pCache->bPurgeable
+    );
+    if( pNew==0 ) return SQLITE_NOMEM;
+    sqlite3GlobalConfig.pcache2.xCachesize(pNew, numberOfCachePages(pCache));
+    if( pCache->pCache ){
+      sqlite3GlobalConfig.pcache2.xDestroy(pCache->pCache);
+    }
+    pCache->pCache = pNew;
+    pCache->pPage1 = 0;
+    pCache->szPage = szPage;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Try to obtain a page from the cache.
+**
+** This routine returns a pointer to an sqlite3_pcache_page object if
+** such an object is already in cache, or if a new one is created.
+** This routine returns a NULL pointer if the object was not in cache
+** and could not be created.
+**
+** The createFlags should be 0 to check for existing pages and should
+** be 3 (not 1, but 3) to try to create a new page.
+**
+** If the createFlag is 0, then NULL is always returned if the page
+** is not already in the cache.  If createFlag is 1, then a new page
+** is created only if that can be done without spilling dirty pages
+** and without exceeding the cache size limit.
+**
+** The caller needs to invoke sqlite3PcacheFetchFinish() to properly
+** initialize the sqlite3_pcache_page object and convert it into a
+** PgHdr object.  The sqlite3PcacheFetch() and sqlite3PcacheFetchFinish()
+** routines are split this way for performance reasons. When separated
+** they can both (usually) operate without having to push values to
+** the stack on entry and pop them back off on exit, which saves a
+** lot of pushing and popping.
+*/
+SQLITE_PRIVATE sqlite3_pcache_page *sqlite3PcacheFetch(
+  PCache *pCache,       /* Obtain the page from this cache */
+  Pgno pgno,            /* Page number to obtain */
+  int createFlag        /* If true, create page if it does not exist already */
+){
+  int eCreate;
+
+  assert( pCache!=0 );
+  assert( pCache->pCache!=0 );
+  assert( createFlag==3 || createFlag==0 );
+  assert( pgno>0 );
+
+  /* eCreate defines what to do if the page does not exist.
+  **    0     Do not allocate a new page.  (createFlag==0)
+  **    1     Allocate a new page if doing so is inexpensive.
+  **          (createFlag==1 AND bPurgeable AND pDirty)
+  **    2     Allocate a new page even it doing so is difficult.
+  **          (createFlag==1 AND !(bPurgeable AND pDirty)
+  */
+  eCreate = createFlag & pCache->eCreate;
+  assert( eCreate==0 || eCreate==1 || eCreate==2 );
+  assert( createFlag==0 || pCache->eCreate==eCreate );
+  assert( createFlag==0 || eCreate==1+(!pCache->bPurgeable||!pCache->pDirty) );
+  return sqlite3GlobalConfig.pcache2.xFetch(pCache->pCache, pgno, eCreate);
+}
+
+/*
+** If the sqlite3PcacheFetch() routine is unable to allocate a new
+** page because new clean pages are available for reuse and the cache
+** size limit has been reached, then this routine can be invoked to 
+** try harder to allocate a page.  This routine might invoke the stress
+** callback to spill dirty pages to the journal.  It will then try to
+** allocate the new page and will only fail to allocate a new page on
+** an OOM error.
+**
+** This routine should be invoked only after sqlite3PcacheFetch() fails.
