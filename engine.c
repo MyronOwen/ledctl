@@ -40248,3 +40248,221 @@ static SQLITE_NOINLINE PgHdr1 *pcache1FetchStage2(
     assert( pCache->szExtra<512 );
     assert( (pOther->szPage & (pOther->szPage-1))==0 && pOther->szPage>=512 );
     assert( pOther->szExtra<512 );
+
+    if( pOther->szPage+pOther->szExtra != pCache->szPage+pCache->szExtra ){
+      pcache1FreePage(pPage);
+      pPage = 0;
+    }else{
+      pGroup->nCurrentPage -= (pOther->bPurgeable - pCache->bPurgeable);
+    }
+  }
+
+  /* Step 5. If a usable page buffer has still not been found, 
+  ** attempt to allocate a new one. 
+  */
+  if( !pPage ){
+    if( createFlag==1 ) sqlite3BeginBenignMalloc();
+    pPage = pcache1AllocPage(pCache);
+    if( createFlag==1 ) sqlite3EndBenignMalloc();
+  }
+
+  if( pPage ){
+    unsigned int h = iKey % pCache->nHash;
+    pCache->nPage++;
+    pPage->iKey = iKey;
+    pPage->pNext = pCache->apHash[h];
+    pPage->pCache = pCache;
+    pPage->pLruPrev = 0;
+    pPage->pLruNext = 0;
+    pPage->isPinned = 1;
+    *(void **)pPage->page.pExtra = 0;
+    pCache->apHash[h] = pPage;
+    if( iKey>pCache->iMaxKey ){
+      pCache->iMaxKey = iKey;
+    }
+  }
+  return pPage;
+}
+
+/*
+** Implementation of the sqlite3_pcache.xFetch method. 
+**
+** Fetch a page by key value.
+**
+** Whether or not a new page may be allocated by this function depends on
+** the value of the createFlag argument.  0 means do not allocate a new
+** page.  1 means allocate a new page if space is easily available.  2 
+** means to try really hard to allocate a new page.
+**
+** For a non-purgeable cache (a cache used as the storage for an in-memory
+** database) there is really no difference between createFlag 1 and 2.  So
+** the calling function (pcache.c) will never have a createFlag of 1 on
+** a non-purgeable cache.
+**
+** There are three different approaches to obtaining space for a page,
+** depending on the value of parameter createFlag (which may be 0, 1 or 2).
+**
+**   1. Regardless of the value of createFlag, the cache is searched for a 
+**      copy of the requested page. If one is found, it is returned.
+**
+**   2. If createFlag==0 and the page is not already in the cache, NULL is
+**      returned.
+**
+**   3. If createFlag is 1, and the page is not already in the cache, then
+**      return NULL (do not allocate a new page) if any of the following
+**      conditions are true:
+**
+**       (a) the number of pages pinned by the cache is greater than
+**           PCache1.nMax, or
+**
+**       (b) the number of pages pinned by the cache is greater than
+**           the sum of nMax for all purgeable caches, less the sum of 
+**           nMin for all other purgeable caches, or
+**
+**   4. If none of the first three conditions apply and the cache is marked
+**      as purgeable, and if one of the following is true:
+**
+**       (a) The number of pages allocated for the cache is already 
+**           PCache1.nMax, or
+**
+**       (b) The number of pages allocated for all purgeable caches is
+**           already equal to or greater than the sum of nMax for all
+**           purgeable caches,
+**
+**       (c) The system is under memory pressure and wants to avoid
+**           unnecessary pages cache entry allocations
+**
+**      then attempt to recycle a page from the LRU list. If it is the right
+**      size, return the recycled buffer. Otherwise, free the buffer and
+**      proceed to step 5. 
+**
+**   5. Otherwise, allocate and return a new page buffer.
+*/
+static sqlite3_pcache_page *pcache1Fetch(
+  sqlite3_pcache *p, 
+  unsigned int iKey, 
+  int createFlag
+){
+  PCache1 *pCache = (PCache1 *)p;
+  PgHdr1 *pPage = 0;
+
+  assert( offsetof(PgHdr1,page)==0 );
+  assert( pCache->bPurgeable || createFlag!=1 );
+  assert( pCache->bPurgeable || pCache->nMin==0 );
+  assert( pCache->bPurgeable==0 || pCache->nMin==10 );
+  assert( pCache->nMin==0 || pCache->bPurgeable );
+  assert( pCache->nHash>0 );
+  pcache1EnterMutex(pCache->pGroup);
+
+  /* Step 1: Search the hash table for an existing entry. */
+  pPage = pCache->apHash[iKey % pCache->nHash];
+  while( pPage && pPage->iKey!=iKey ){ pPage = pPage->pNext; }
+
+  /* Step 2: Abort if no existing page is found and createFlag is 0 */
+  if( pPage ){
+    if( !pPage->isPinned ) pcache1PinPage(pPage);
+  }else if( createFlag ){
+    /* Steps 3, 4, and 5 implemented by this subroutine */
+    pPage = pcache1FetchStage2(pCache, iKey, createFlag);
+  }
+  assert( pPage==0 || pCache->iMaxKey>=iKey );
+  pcache1LeaveMutex(pCache->pGroup);
+  return (sqlite3_pcache_page*)pPage;
+}
+
+
+/*
+** Implementation of the sqlite3_pcache.xUnpin method.
+**
+** Mark a page as unpinned (eligible for asynchronous recycling).
+*/
+static void pcache1Unpin(
+  sqlite3_pcache *p, 
+  sqlite3_pcache_page *pPg, 
+  int reuseUnlikely
+){
+  PCache1 *pCache = (PCache1 *)p;
+  PgHdr1 *pPage = (PgHdr1 *)pPg;
+  PGroup *pGroup = pCache->pGroup;
+ 
+  assert( pPage->pCache==pCache );
+  pcache1EnterMutex(pGroup);
+
+  /* It is an error to call this function if the page is already 
+  ** part of the PGroup LRU list.
+  */
+  assert( pPage->pLruPrev==0 && pPage->pLruNext==0 );
+  assert( pGroup->pLruHead!=pPage && pGroup->pLruTail!=pPage );
+  assert( pPage->isPinned==1 );
+
+  if( reuseUnlikely || pGroup->nCurrentPage>pGroup->nMaxPage ){
+    pcache1RemoveFromHash(pPage);
+    pcache1FreePage(pPage);
+  }else{
+    /* Add the page to the PGroup LRU list. */
+    if( pGroup->pLruHead ){
+      pGroup->pLruHead->pLruPrev = pPage;
+      pPage->pLruNext = pGroup->pLruHead;
+      pGroup->pLruHead = pPage;
+    }else{
+      pGroup->pLruTail = pPage;
+      pGroup->pLruHead = pPage;
+    }
+    pCache->nRecyclable++;
+    pPage->isPinned = 0;
+  }
+
+  pcache1LeaveMutex(pCache->pGroup);
+}
+
+/*
+** Implementation of the sqlite3_pcache.xRekey method. 
+*/
+static void pcache1Rekey(
+  sqlite3_pcache *p,
+  sqlite3_pcache_page *pPg,
+  unsigned int iOld,
+  unsigned int iNew
+){
+  PCache1 *pCache = (PCache1 *)p;
+  PgHdr1 *pPage = (PgHdr1 *)pPg;
+  PgHdr1 **pp;
+  unsigned int h; 
+  assert( pPage->iKey==iOld );
+  assert( pPage->pCache==pCache );
+
+  pcache1EnterMutex(pCache->pGroup);
+
+  h = iOld%pCache->nHash;
+  pp = &pCache->apHash[h];
+  while( (*pp)!=pPage ){
+    pp = &(*pp)->pNext;
+  }
+  *pp = pPage->pNext;
+
+  h = iNew%pCache->nHash;
+  pPage->iKey = iNew;
+  pPage->pNext = pCache->apHash[h];
+  pCache->apHash[h] = pPage;
+  if( iNew>pCache->iMaxKey ){
+    pCache->iMaxKey = iNew;
+  }
+
+  pcache1LeaveMutex(pCache->pGroup);
+}
+
+/*
+** Implementation of the sqlite3_pcache.xTruncate method. 
+**
+** Discard all unpinned pages in the cache with a page number equal to
+** or greater than parameter iLimit. Any pinned pages with a page number
+** equal to or greater than iLimit are implicitly unpinned.
+*/
+static void pcache1Truncate(sqlite3_pcache *p, unsigned int iLimit){
+  PCache1 *pCache = (PCache1 *)p;
+  pcache1EnterMutex(pCache->pGroup);
+  if( iLimit<=pCache->iMaxKey ){
+    pcache1TruncateUnsafe(pCache, iLimit);
+    pCache->iMaxKey = iLimit-1;
+  }
+  pcache1LeaveMutex(pCache->pGroup);
