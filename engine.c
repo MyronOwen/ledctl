@@ -40685,3 +40685,211 @@ struct RowSetChunk {
 */
 struct RowSet {
   struct RowSetChunk *pChunk;    /* List of all chunk allocations */
+  sqlite3 *db;                   /* The database connection */
+  struct RowSetEntry *pEntry;    /* List of entries using pRight */
+  struct RowSetEntry *pLast;     /* Last entry on the pEntry list */
+  struct RowSetEntry *pFresh;    /* Source of new entry objects */
+  struct RowSetEntry *pForest;   /* List of binary trees of entries */
+  u16 nFresh;                    /* Number of objects on pFresh */
+  u16 rsFlags;                   /* Various flags */
+  int iBatch;                    /* Current insert batch */
+};
+
+/*
+** Allowed values for RowSet.rsFlags
+*/
+#define ROWSET_SORTED  0x01   /* True if RowSet.pEntry is sorted */
+#define ROWSET_NEXT    0x02   /* True if sqlite3RowSetNext() has been called */
+
+/*
+** Turn bulk memory into a RowSet object.  N bytes of memory
+** are available at pSpace.  The db pointer is used as a memory context
+** for any subsequent allocations that need to occur.
+** Return a pointer to the new RowSet object.
+**
+** It must be the case that N is sufficient to make a Rowset.  If not
+** an assertion fault occurs.
+** 
+** If N is larger than the minimum, use the surplus as an initial
+** allocation of entries available to be filled.
+*/
+SQLITE_PRIVATE RowSet *sqlite3RowSetInit(sqlite3 *db, void *pSpace, unsigned int N){
+  RowSet *p;
+  assert( N >= ROUND8(sizeof(*p)) );
+  p = pSpace;
+  p->pChunk = 0;
+  p->db = db;
+  p->pEntry = 0;
+  p->pLast = 0;
+  p->pForest = 0;
+  p->pFresh = (struct RowSetEntry*)(ROUND8(sizeof(*p)) + (char*)p);
+  p->nFresh = (u16)((N - ROUND8(sizeof(*p)))/sizeof(struct RowSetEntry));
+  p->rsFlags = ROWSET_SORTED;
+  p->iBatch = 0;
+  return p;
+}
+
+/*
+** Deallocate all chunks from a RowSet.  This frees all memory that
+** the RowSet has allocated over its lifetime.  This routine is
+** the destructor for the RowSet.
+*/
+SQLITE_PRIVATE void sqlite3RowSetClear(RowSet *p){
+  struct RowSetChunk *pChunk, *pNextChunk;
+  for(pChunk=p->pChunk; pChunk; pChunk = pNextChunk){
+    pNextChunk = pChunk->pNextChunk;
+    sqlite3DbFree(p->db, pChunk);
+  }
+  p->pChunk = 0;
+  p->nFresh = 0;
+  p->pEntry = 0;
+  p->pLast = 0;
+  p->pForest = 0;
+  p->rsFlags = ROWSET_SORTED;
+}
+
+/*
+** Allocate a new RowSetEntry object that is associated with the
+** given RowSet.  Return a pointer to the new and completely uninitialized
+** objected.
+**
+** In an OOM situation, the RowSet.db->mallocFailed flag is set and this
+** routine returns NULL.
+*/
+static struct RowSetEntry *rowSetEntryAlloc(RowSet *p){
+  assert( p!=0 );
+  if( p->nFresh==0 ){
+    struct RowSetChunk *pNew;
+    pNew = sqlite3DbMallocRaw(p->db, sizeof(*pNew));
+    if( pNew==0 ){
+      return 0;
+    }
+    pNew->pNextChunk = p->pChunk;
+    p->pChunk = pNew;
+    p->pFresh = pNew->aEntry;
+    p->nFresh = ROWSET_ENTRY_PER_CHUNK;
+  }
+  p->nFresh--;
+  return p->pFresh++;
+}
+
+/*
+** Insert a new value into a RowSet.
+**
+** The mallocFailed flag of the database connection is set if a
+** memory allocation fails.
+*/
+SQLITE_PRIVATE void sqlite3RowSetInsert(RowSet *p, i64 rowid){
+  struct RowSetEntry *pEntry;  /* The new entry */
+  struct RowSetEntry *pLast;   /* The last prior entry */
+
+  /* This routine is never called after sqlite3RowSetNext() */
+  assert( p!=0 && (p->rsFlags & ROWSET_NEXT)==0 );
+
+  pEntry = rowSetEntryAlloc(p);
+  if( pEntry==0 ) return;
+  pEntry->v = rowid;
+  pEntry->pRight = 0;
+  pLast = p->pLast;
+  if( pLast ){
+    if( (p->rsFlags & ROWSET_SORTED)!=0 && rowid<=pLast->v ){
+      p->rsFlags &= ~ROWSET_SORTED;
+    }
+    pLast->pRight = pEntry;
+  }else{
+    p->pEntry = pEntry;
+  }
+  p->pLast = pEntry;
+}
+
+/*
+** Merge two lists of RowSetEntry objects.  Remove duplicates.
+**
+** The input lists are connected via pRight pointers and are 
+** assumed to each already be in sorted order.
+*/
+static struct RowSetEntry *rowSetEntryMerge(
+  struct RowSetEntry *pA,    /* First sorted list to be merged */
+  struct RowSetEntry *pB     /* Second sorted list to be merged */
+){
+  struct RowSetEntry head;
+  struct RowSetEntry *pTail;
+
+  pTail = &head;
+  while( pA && pB ){
+    assert( pA->pRight==0 || pA->v<=pA->pRight->v );
+    assert( pB->pRight==0 || pB->v<=pB->pRight->v );
+    if( pA->v<pB->v ){
+      pTail->pRight = pA;
+      pA = pA->pRight;
+      pTail = pTail->pRight;
+    }else if( pB->v<pA->v ){
+      pTail->pRight = pB;
+      pB = pB->pRight;
+      pTail = pTail->pRight;
+    }else{
+      pA = pA->pRight;
+    }
+  }
+  if( pA ){
+    assert( pA->pRight==0 || pA->v<=pA->pRight->v );
+    pTail->pRight = pA;
+  }else{
+    assert( pB==0 || pB->pRight==0 || pB->v<=pB->pRight->v );
+    pTail->pRight = pB;
+  }
+  return head.pRight;
+}
+
+/*
+** Sort all elements on the list of RowSetEntry objects into order of
+** increasing v.
+*/ 
+static struct RowSetEntry *rowSetEntrySort(struct RowSetEntry *pIn){
+  unsigned int i;
+  struct RowSetEntry *pNext, *aBucket[40];
+
+  memset(aBucket, 0, sizeof(aBucket));
+  while( pIn ){
+    pNext = pIn->pRight;
+    pIn->pRight = 0;
+    for(i=0; aBucket[i]; i++){
+      pIn = rowSetEntryMerge(aBucket[i], pIn);
+      aBucket[i] = 0;
+    }
+    aBucket[i] = pIn;
+    pIn = pNext;
+  }
+  pIn = 0;
+  for(i=0; i<sizeof(aBucket)/sizeof(aBucket[0]); i++){
+    pIn = rowSetEntryMerge(pIn, aBucket[i]);
+  }
+  return pIn;
+}
+
+
+/*
+** The input, pIn, is a binary tree (or subtree) of RowSetEntry objects.
+** Convert this tree into a linked list connected by the pRight pointers
+** and return pointers to the first and last elements of the new list.
+*/
+static void rowSetTreeToList(
+  struct RowSetEntry *pIn,         /* Root of the input tree */
+  struct RowSetEntry **ppFirst,    /* Write head of the output list here */
+  struct RowSetEntry **ppLast      /* Write tail of the output list here */
+){
+  assert( pIn!=0 );
+  if( pIn->pLeft ){
+    struct RowSetEntry *p;
+    rowSetTreeToList(pIn->pLeft, ppFirst, &p);
+    p->pRight = pIn;
+  }else{
+    *ppFirst = pIn;
+  }
+  if( pIn->pRight ){
+    rowSetTreeToList(pIn->pRight, &pIn->pRight, ppLast);
+  }else{
+    *ppLast = pIn;
+  }
+  assert( (*ppLast)->pRight==0 );
+}
