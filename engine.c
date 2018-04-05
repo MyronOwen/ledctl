@@ -41811,3 +41811,220 @@ struct PagerSavepoint {
 **   being modified.
 **
 **   Throughout a write-transaction, dbFileSize contains the size of
+**   the file on disk in pages. It is set to a copy of dbSize when the
+**   write-transaction is first opened, and updated when VFS calls are made
+**   to write or truncate the database file on disk. 
+**
+**   The only reason the dbFileSize variable is required is to suppress 
+**   unnecessary calls to xTruncate() after committing a transaction. If, 
+**   when a transaction is committed, the dbFileSize variable indicates 
+**   that the database file is larger than the database image (Pager.dbSize), 
+**   pager_truncate() is called. The pager_truncate() call uses xFilesize()
+**   to measure the database file on disk, and then truncates it if required.
+**   dbFileSize is not used when rolling back a transaction. In this case
+**   pager_truncate() is called unconditionally (which means there may be
+**   a call to xFilesize() that is not strictly required). In either case,
+**   pager_truncate() may cause the file to become smaller or larger.
+**
+** dbHintSize
+**
+**   The dbHintSize variable is used to limit the number of calls made to
+**   the VFS xFileControl(FCNTL_SIZE_HINT) method. 
+**
+**   dbHintSize is set to a copy of the dbSize variable when a
+**   write-transaction is opened (at the same time as dbFileSize and
+**   dbOrigSize). If the xFileControl(FCNTL_SIZE_HINT) method is called,
+**   dbHintSize is increased to the number of pages that correspond to the
+**   size-hint passed to the method call. See pager_write_pagelist() for 
+**   details.
+**
+** errCode
+**
+**   The Pager.errCode variable is only ever used in PAGER_ERROR state. It
+**   is set to zero in all other states. In PAGER_ERROR state, Pager.errCode 
+**   is always set to SQLITE_FULL, SQLITE_IOERR or one of the SQLITE_IOERR_XXX 
+**   sub-codes.
+*/
+struct Pager {
+  sqlite3_vfs *pVfs;          /* OS functions to use for IO */
+  u8 exclusiveMode;           /* Boolean. True if locking_mode==EXCLUSIVE */
+  u8 journalMode;             /* One of the PAGER_JOURNALMODE_* values */
+  u8 useJournal;              /* Use a rollback journal on this file */
+  u8 noSync;                  /* Do not sync the journal if true */
+  u8 fullSync;                /* Do extra syncs of the journal for robustness */
+  u8 ckptSyncFlags;           /* SYNC_NORMAL or SYNC_FULL for checkpoint */
+  u8 walSyncFlags;            /* SYNC_NORMAL or SYNC_FULL for wal writes */
+  u8 syncFlags;               /* SYNC_NORMAL or SYNC_FULL otherwise */
+  u8 tempFile;                /* zFilename is a temporary or immutable file */
+  u8 noLock;                  /* Do not lock (except in WAL mode) */
+  u8 readOnly;                /* True for a read-only database */
+  u8 memDb;                   /* True to inhibit all file I/O */
+
+  /**************************************************************************
+  ** The following block contains those class members that change during
+  ** routine operation.  Class members not in this block are either fixed
+  ** when the pager is first created or else only change when there is a
+  ** significant mode change (such as changing the page_size, locking_mode,
+  ** or the journal_mode).  From another view, these class members describe
+  ** the "state" of the pager, while other class members describe the
+  ** "configuration" of the pager.
+  */
+  u8 eState;                  /* Pager state (OPEN, READER, WRITER_LOCKED..) */
+  u8 eLock;                   /* Current lock held on database file */
+  u8 changeCountDone;         /* Set after incrementing the change-counter */
+  u8 setMaster;               /* True if a m-j name has been written to jrnl */
+  u8 doNotSpill;              /* Do not spill the cache when non-zero */
+  u8 subjInMemory;            /* True to use in-memory sub-journals */
+  u8 bUseFetch;               /* True to use xFetch() */
+  u8 hasBeenUsed;             /* True if any content previously read from this pager*/
+  Pgno dbSize;                /* Number of pages in the database */
+  Pgno dbOrigSize;            /* dbSize before the current transaction */
+  Pgno dbFileSize;            /* Number of pages in the database file */
+  Pgno dbHintSize;            /* Value passed to FCNTL_SIZE_HINT call */
+  int errCode;                /* One of several kinds of errors */
+  int nRec;                   /* Pages journalled since last j-header written */
+  u32 cksumInit;              /* Quasi-random value added to every checksum */
+  u32 nSubRec;                /* Number of records written to sub-journal */
+  Bitvec *pInJournal;         /* One bit for each page in the database file */
+  sqlite3_file *fd;           /* File descriptor for database */
+  sqlite3_file *jfd;          /* File descriptor for main journal */
+  sqlite3_file *sjfd;         /* File descriptor for sub-journal */
+  i64 journalOff;             /* Current write offset in the journal file */
+  i64 journalHdr;             /* Byte offset to previous journal header */
+  sqlite3_backup *pBackup;    /* Pointer to list of ongoing backup processes */
+  PagerSavepoint *aSavepoint; /* Array of active savepoints */
+  int nSavepoint;             /* Number of elements in aSavepoint[] */
+  u32 iDataVersion;           /* Changes whenever database content changes */
+  char dbFileVers[16];        /* Changes whenever database file changes */
+
+  int nMmapOut;               /* Number of mmap pages currently outstanding */
+  sqlite3_int64 szMmap;       /* Desired maximum mmap size */
+  PgHdr *pMmapFreelist;       /* List of free mmap page headers (pDirty) */
+  /*
+  ** End of the routinely-changing class members
+  ***************************************************************************/
+
+  u16 nExtra;                 /* Add this many bytes to each in-memory page */
+  i16 nReserve;               /* Number of unused bytes at end of each page */
+  u32 vfsFlags;               /* Flags for sqlite3_vfs.xOpen() */
+  u32 sectorSize;             /* Assumed sector size during rollback */
+  int pageSize;               /* Number of bytes in a page */
+  Pgno mxPgno;                /* Maximum allowed size of the database */
+  i64 journalSizeLimit;       /* Size limit for persistent journal files */
+  char *zFilename;            /* Name of the database file */
+  char *zJournal;             /* Name of the journal file */
+  int (*xBusyHandler)(void*); /* Function to call when busy */
+  void *pBusyHandlerArg;      /* Context argument for xBusyHandler */
+  int aStat[3];               /* Total cache hits, misses and writes */
+#ifdef SQLITE_TEST
+  int nRead;                  /* Database pages read */
+#endif
+  void (*xReiniter)(DbPage*); /* Call this routine when reloading pages */
+#ifdef SQLITE_HAS_CODEC
+  void *(*xCodec)(void*,void*,Pgno,int); /* Routine for en/decoding data */
+  void (*xCodecSizeChng)(void*,int,int); /* Notify of page size changes */
+  void (*xCodecFree)(void*);             /* Destructor for the codec */
+  void *pCodec;               /* First argument to xCodec... methods */
+#endif
+  char *pTmpSpace;            /* Pager.pageSize bytes of space for tmp use */
+  PCache *pPCache;            /* Pointer to page cache object */
+#ifndef SQLITE_OMIT_WAL
+  Wal *pWal;                  /* Write-ahead log used by "journal_mode=wal" */
+  char *zWal;                 /* File name for write-ahead log */
+#endif
+};
+
+/*
+** Indexes for use with Pager.aStat[]. The Pager.aStat[] array contains
+** the values accessed by passing SQLITE_DBSTATUS_CACHE_HIT, CACHE_MISS 
+** or CACHE_WRITE to sqlite3_db_status().
+*/
+#define PAGER_STAT_HIT   0
+#define PAGER_STAT_MISS  1
+#define PAGER_STAT_WRITE 2
+
+/*
+** The following global variables hold counters used for
+** testing purposes only.  These variables do not exist in
+** a non-testing build.  These variables are not thread-safe.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_pager_readdb_count = 0;    /* Number of full pages read from DB */
+SQLITE_API int sqlite3_pager_writedb_count = 0;   /* Number of full pages written to DB */
+SQLITE_API int sqlite3_pager_writej_count = 0;    /* Number of pages written to journal */
+# define PAGER_INCR(v)  v++
+#else
+# define PAGER_INCR(v)
+#endif
+
+
+
+/*
+** Journal files begin with the following magic string.  The data
+** was obtained from /dev/random.  It is used only as a sanity check.
+**
+** Since version 2.8.0, the journal format contains additional sanity
+** checking information.  If the power fails while the journal is being
+** written, semi-random garbage data might appear in the journal
+** file after power is restored.  If an attempt is then made
+** to roll the journal back, the database could be corrupted.  The additional
+** sanity checking data is an attempt to discover the garbage in the
+** journal and ignore it.
+**
+** The sanity checking information for the new journal format consists
+** of a 32-bit checksum on each page of data.  The checksum covers both
+** the page number and the pPager->pageSize bytes of data for the page.
+** This cksum is initialized to a 32-bit random value that appears in the
+** journal file right after the header.  The random initializer is important,
+** because garbage data that appears at the end of a journal is likely
+** data that was once in other files that have now been deleted.  If the
+** garbage data came from an obsolete journal file, the checksums might
+** be correct.  But by initializing the checksum to random value which
+** is different for every journal, we minimize that risk.
+*/
+static const unsigned char aJournalMagic[] = {
+  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7,
+};
+
+/*
+** The size of the of each page record in the journal is given by
+** the following macro.
+*/
+#define JOURNAL_PG_SZ(pPager)  ((pPager->pageSize) + 8)
+
+/*
+** The journal header size for this pager. This is usually the same 
+** size as a single disk sector. See also setSectorSize().
+*/
+#define JOURNAL_HDR_SZ(pPager) (pPager->sectorSize)
+
+/*
+** The macro MEMDB is true if we are dealing with an in-memory database.
+** We do this as a macro so that if the SQLITE_OMIT_MEMORYDB macro is set,
+** the value of MEMDB will be a constant and the compiler will optimize
+** out code that would never execute.
+*/
+#ifdef SQLITE_OMIT_MEMORYDB
+# define MEMDB 0
+#else
+# define MEMDB pPager->memDb
+#endif
+
+/*
+** The macro USEFETCH is true if we are allowed to use the xFetch and xUnfetch
+** interfaces to access the database using memory-mapped I/O.
+*/
+#if SQLITE_MAX_MMAP_SIZE>0
+# define USEFETCH(x) ((x)->bUseFetch)
+#else
+# define USEFETCH(x) 0
+#endif
+
+/*
+** The maximum legal page number is (2^31 - 1).
+*/
+#define PAGER_MAX_PGNO 2147483647
+
+/*
+** The argument to this macro is a file descriptor (type sqlite3_file*).
+** Return 0 if it is not open, or non-zero (but not 1) if it is.
