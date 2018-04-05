@@ -41124,3 +41124,223 @@ SQLITE_PRIVATE int sqlite3RowSetTest(RowSet *pRowSet, int iBatch, sqlite3_int64 
 *************************************************************************
 ** This header file defines the interface to the write-ahead logging 
 ** system. Refer to the comments below and the header comment attached to 
+** the implementation of each function in log.c for further details.
+*/
+
+#ifndef _WAL_H_
+#define _WAL_H_
+
+
+/* Additional values that can be added to the sync_flags argument of
+** sqlite3WalFrames():
+*/
+#define WAL_SYNC_TRANSACTIONS  0x20   /* Sync at the end of each transaction */
+#define SQLITE_SYNC_MASK       0x13   /* Mask off the SQLITE_SYNC_* values */
+
+#ifdef SQLITE_OMIT_WAL
+# define sqlite3WalOpen(x,y,z)                   0
+# define sqlite3WalLimit(x,y)
+# define sqlite3WalClose(w,x,y,z)                0
+# define sqlite3WalBeginReadTransaction(y,z)     0
+# define sqlite3WalEndReadTransaction(z)
+# define sqlite3WalDbsize(y)                     0
+# define sqlite3WalBeginWriteTransaction(y)      0
+# define sqlite3WalEndWriteTransaction(x)        0
+# define sqlite3WalUndo(x,y,z)                   0
+# define sqlite3WalSavepoint(y,z)
+# define sqlite3WalSavepointUndo(y,z)            0
+# define sqlite3WalFrames(u,v,w,x,y,z)           0
+# define sqlite3WalCheckpoint(r,s,t,u,v,w,x,y,z) 0
+# define sqlite3WalCallback(z)                   0
+# define sqlite3WalExclusiveMode(y,z)            0
+# define sqlite3WalHeapMemory(z)                 0
+# define sqlite3WalFramesize(z)                  0
+# define sqlite3WalFindFrame(x,y,z)              0
+#else
+
+#define WAL_SAVEPOINT_NDATA 4
+
+/* Connection to a write-ahead log (WAL) file. 
+** There is one object of this type for each pager. 
+*/
+typedef struct Wal Wal;
+
+/* Open and close a connection to a write-ahead log. */
+SQLITE_PRIVATE int sqlite3WalOpen(sqlite3_vfs*, sqlite3_file*, const char *, int, i64, Wal**);
+SQLITE_PRIVATE int sqlite3WalClose(Wal *pWal, int sync_flags, int, u8 *);
+
+/* Set the limiting size of a WAL file. */
+SQLITE_PRIVATE void sqlite3WalLimit(Wal*, i64);
+
+/* Used by readers to open (lock) and close (unlock) a snapshot.  A 
+** snapshot is like a read-transaction.  It is the state of the database
+** at an instant in time.  sqlite3WalOpenSnapshot gets a read lock and
+** preserves the current state even if the other threads or processes
+** write to or checkpoint the WAL.  sqlite3WalCloseSnapshot() closes the
+** transaction and releases the lock.
+*/
+SQLITE_PRIVATE int sqlite3WalBeginReadTransaction(Wal *pWal, int *);
+SQLITE_PRIVATE void sqlite3WalEndReadTransaction(Wal *pWal);
+
+/* Read a page from the write-ahead log, if it is present. */
+SQLITE_PRIVATE int sqlite3WalFindFrame(Wal *, Pgno, u32 *);
+SQLITE_PRIVATE int sqlite3WalReadFrame(Wal *, u32, int, u8 *);
+
+/* If the WAL is not empty, return the size of the database. */
+SQLITE_PRIVATE Pgno sqlite3WalDbsize(Wal *pWal);
+
+/* Obtain or release the WRITER lock. */
+SQLITE_PRIVATE int sqlite3WalBeginWriteTransaction(Wal *pWal);
+SQLITE_PRIVATE int sqlite3WalEndWriteTransaction(Wal *pWal);
+
+/* Undo any frames written (but not committed) to the log */
+SQLITE_PRIVATE int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx);
+
+/* Return an integer that records the current (uncommitted) write
+** position in the WAL */
+SQLITE_PRIVATE void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData);
+
+/* Move the write position of the WAL back to iFrame.  Called in
+** response to a ROLLBACK TO command. */
+SQLITE_PRIVATE int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData);
+
+/* Write a frame or frames to the log. */
+SQLITE_PRIVATE int sqlite3WalFrames(Wal *pWal, int, PgHdr *, Pgno, int, int);
+
+/* Copy pages from the log to the database file */ 
+SQLITE_PRIVATE int sqlite3WalCheckpoint(
+  Wal *pWal,                      /* Write-ahead log connection */
+  int eMode,                      /* One of PASSIVE, FULL and RESTART */
+  int (*xBusy)(void*),            /* Function to call when busy */
+  void *pBusyArg,                 /* Context argument for xBusyHandler */
+  int sync_flags,                 /* Flags to sync db file with (or 0) */
+  int nBuf,                       /* Size of buffer nBuf */
+  u8 *zBuf,                       /* Temporary buffer to use */
+  int *pnLog,                     /* OUT: Number of frames in WAL */
+  int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+);
+
+/* Return the value to pass to a sqlite3_wal_hook callback, the
+** number of frames in the WAL at the point of the last commit since
+** sqlite3WalCallback() was called.  If no commits have occurred since
+** the last call, then return 0.
+*/
+SQLITE_PRIVATE int sqlite3WalCallback(Wal *pWal);
+
+/* Tell the wal layer that an EXCLUSIVE lock has been obtained (or released)
+** by the pager layer on the database file.
+*/
+SQLITE_PRIVATE int sqlite3WalExclusiveMode(Wal *pWal, int op);
+
+/* Return true if the argument is non-NULL and the WAL module is using
+** heap-memory for the wal-index. Otherwise, if the argument is NULL or the
+** WAL module is using shared-memory, return false. 
+*/
+SQLITE_PRIVATE int sqlite3WalHeapMemory(Wal *pWal);
+
+#ifdef SQLITE_ENABLE_ZIPVFS
+/* If the WAL file is not empty, return the number of bytes of content
+** stored in each frame (i.e. the db page-size when the WAL was created).
+*/
+SQLITE_PRIVATE int sqlite3WalFramesize(Wal *pWal);
+#endif
+
+#endif /* ifndef SQLITE_OMIT_WAL */
+#endif /* _WAL_H_ */
+
+/************** End of wal.h *************************************************/
+/************** Continuing where we left off in pager.c **********************/
+
+
+/******************* NOTES ON THE DESIGN OF THE PAGER ************************
+**
+** This comment block describes invariants that hold when using a rollback
+** journal.  These invariants do not apply for journal_mode=WAL,
+** journal_mode=MEMORY, or journal_mode=OFF.
+**
+** Within this comment block, a page is deemed to have been synced
+** automatically as soon as it is written when PRAGMA synchronous=OFF.
+** Otherwise, the page is not synced until the xSync method of the VFS
+** is called successfully on the file containing the page.
+**
+** Definition:  A page of the database file is said to be "overwriteable" if
+** one or more of the following are true about the page:
+** 
+**     (a)  The original content of the page as it was at the beginning of
+**          the transaction has been written into the rollback journal and
+**          synced.
+** 
+**     (b)  The page was a freelist leaf page at the start of the transaction.
+** 
+**     (c)  The page number is greater than the largest page that existed in
+**          the database file at the start of the transaction.
+** 
+** (1) A page of the database file is never overwritten unless one of the
+**     following are true:
+** 
+**     (a) The page and all other pages on the same sector are overwriteable.
+** 
+**     (b) The atomic page write optimization is enabled, and the entire
+**         transaction other than the update of the transaction sequence
+**         number consists of a single page change.
+** 
+** (2) The content of a page written into the rollback journal exactly matches
+**     both the content in the database when the rollback journal was written
+**     and the content in the database at the beginning of the current
+**     transaction.
+** 
+** (3) Writes to the database file are an integer multiple of the page size
+**     in length and are aligned on a page boundary.
+** 
+** (4) Reads from the database file are either aligned on a page boundary and
+**     an integer multiple of the page size in length or are taken from the
+**     first 100 bytes of the database file.
+** 
+** (5) All writes to the database file are synced prior to the rollback journal
+**     being deleted, truncated, or zeroed.
+** 
+** (6) If a master journal file is used, then all writes to the database file
+**     are synced prior to the master journal being deleted.
+** 
+** Definition: Two databases (or the same database at two points it time)
+** are said to be "logically equivalent" if they give the same answer to
+** all queries.  Note in particular the content of freelist leaf
+** pages can be changed arbitrarily without affecting the logical equivalence
+** of the database.
+** 
+** (7) At any time, if any subset, including the empty set and the total set,
+**     of the unsynced changes to a rollback journal are removed and the 
+**     journal is rolled back, the resulting database file will be logically
+**     equivalent to the database file at the beginning of the transaction.
+** 
+** (8) When a transaction is rolled back, the xTruncate method of the VFS
+**     is called to restore the database file to the same size it was at
+**     the beginning of the transaction.  (In some VFSes, the xTruncate
+**     method is a no-op, but that does not change the fact the SQLite will
+**     invoke it.)
+** 
+** (9) Whenever the database file is modified, at least one bit in the range
+**     of bytes from 24 through 39 inclusive will be changed prior to releasing
+**     the EXCLUSIVE lock, thus signaling other connections on the same
+**     database to flush their caches.
+**
+** (10) The pattern of bits in bytes 24 through 39 shall not repeat in less
+**      than one billion transactions.
+**
+** (11) A database file is well-formed at the beginning and at the conclusion
+**      of every transaction.
+**
+** (12) An EXCLUSIVE lock is held on the database file when writing to
+**      the database file.
+**
+** (13) A SHARED lock is held on the database file while reading any
+**      content out of the database file.
+**
+******************************************************************************/
+
+/*
+** Macros for troubleshooting.  Normally turned off
+*/
+#if 0
+int sqlite3PagerTrace=1;  /* True to enable tracing */
+#define sqlite3DebugPrintf printf
