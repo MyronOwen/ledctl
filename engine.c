@@ -41569,3 +41569,245 @@ int sqlite3PagerTrace=1;  /* True to enable tracing */
 **   * A pager is never in WRITER_DBMOD or WRITER_FINISHED state if the
 **     connection is open in WAL mode. A WAL connection is always in one
 **     of the first four states.
+**
+**   * Normally, a connection open in exclusive mode is never in PAGER_OPEN
+**     state. There are two exceptions: immediately after exclusive-mode has
+**     been turned on (and before any read or write transactions are 
+**     executed), and when the pager is leaving the "error state".
+**
+**   * See also: assert_pager_state().
+*/
+#define PAGER_OPEN                  0
+#define PAGER_READER                1
+#define PAGER_WRITER_LOCKED         2
+#define PAGER_WRITER_CACHEMOD       3
+#define PAGER_WRITER_DBMOD          4
+#define PAGER_WRITER_FINISHED       5
+#define PAGER_ERROR                 6
+
+/*
+** The Pager.eLock variable is almost always set to one of the 
+** following locking-states, according to the lock currently held on
+** the database file: NO_LOCK, SHARED_LOCK, RESERVED_LOCK or EXCLUSIVE_LOCK.
+** This variable is kept up to date as locks are taken and released by
+** the pagerLockDb() and pagerUnlockDb() wrappers.
+**
+** If the VFS xLock() or xUnlock() returns an error other than SQLITE_BUSY
+** (i.e. one of the SQLITE_IOERR subtypes), it is not clear whether or not
+** the operation was successful. In these circumstances pagerLockDb() and
+** pagerUnlockDb() take a conservative approach - eLock is always updated
+** when unlocking the file, and only updated when locking the file if the
+** VFS call is successful. This way, the Pager.eLock variable may be set
+** to a less exclusive (lower) value than the lock that is actually held
+** at the system level, but it is never set to a more exclusive value.
+**
+** This is usually safe. If an xUnlock fails or appears to fail, there may 
+** be a few redundant xLock() calls or a lock may be held for longer than
+** required, but nothing really goes wrong.
+**
+** The exception is when the database file is unlocked as the pager moves
+** from ERROR to OPEN state. At this point there may be a hot-journal file 
+** in the file-system that needs to be rolled back (as part of an OPEN->SHARED
+** transition, by the same pager or any other). If the call to xUnlock()
+** fails at this point and the pager is left holding an EXCLUSIVE lock, this
+** can confuse the call to xCheckReservedLock() call made later as part
+** of hot-journal detection.
+**
+** xCheckReservedLock() is defined as returning true "if there is a RESERVED 
+** lock held by this process or any others". So xCheckReservedLock may 
+** return true because the caller itself is holding an EXCLUSIVE lock (but
+** doesn't know it because of a previous error in xUnlock). If this happens
+** a hot-journal may be mistaken for a journal being created by an active
+** transaction in another process, causing SQLite to read from the database
+** without rolling it back.
+**
+** To work around this, if a call to xUnlock() fails when unlocking the
+** database in the ERROR state, Pager.eLock is set to UNKNOWN_LOCK. It
+** is only changed back to a real locking state after a successful call
+** to xLock(EXCLUSIVE). Also, the code to do the OPEN->SHARED state transition
+** omits the check for a hot-journal if Pager.eLock is set to UNKNOWN_LOCK 
+** lock. Instead, it assumes a hot-journal exists and obtains an EXCLUSIVE
+** lock on the database file before attempting to roll it back. See function
+** PagerSharedLock() for more detail.
+**
+** Pager.eLock may only be set to UNKNOWN_LOCK when the pager is in 
+** PAGER_OPEN state.
+*/
+#define UNKNOWN_LOCK                (EXCLUSIVE_LOCK+1)
+
+/*
+** A macro used for invoking the codec if there is one
+*/
+#ifdef SQLITE_HAS_CODEC
+# define CODEC1(P,D,N,X,E) \
+    if( P->xCodec && P->xCodec(P->pCodec,D,N,X)==0 ){ E; }
+# define CODEC2(P,D,N,X,E,O) \
+    if( P->xCodec==0 ){ O=(char*)D; }else \
+    if( (O=(char*)(P->xCodec(P->pCodec,D,N,X)))==0 ){ E; }
+#else
+# define CODEC1(P,D,N,X,E)   /* NO-OP */
+# define CODEC2(P,D,N,X,E,O) O=(char*)D
+#endif
+
+/*
+** The maximum allowed sector size. 64KiB. If the xSectorsize() method 
+** returns a value larger than this, then MAX_SECTOR_SIZE is used instead.
+** This could conceivably cause corruption following a power failure on
+** such a system. This is currently an undocumented limit.
+*/
+#define MAX_SECTOR_SIZE 0x10000
+
+/*
+** An instance of the following structure is allocated for each active
+** savepoint and statement transaction in the system. All such structures
+** are stored in the Pager.aSavepoint[] array, which is allocated and
+** resized using sqlite3Realloc().
+**
+** When a savepoint is created, the PagerSavepoint.iHdrOffset field is
+** set to 0. If a journal-header is written into the main journal while
+** the savepoint is active, then iHdrOffset is set to the byte offset 
+** immediately following the last journal record written into the main
+** journal before the journal-header. This is required during savepoint
+** rollback (see pagerPlaybackSavepoint()).
+*/
+typedef struct PagerSavepoint PagerSavepoint;
+struct PagerSavepoint {
+  i64 iOffset;                 /* Starting offset in main journal */
+  i64 iHdrOffset;              /* See above */
+  Bitvec *pInSavepoint;        /* Set of pages in this savepoint */
+  Pgno nOrig;                  /* Original number of pages in file */
+  Pgno iSubRec;                /* Index of first record in sub-journal */
+#ifndef SQLITE_OMIT_WAL
+  u32 aWalData[WAL_SAVEPOINT_NDATA];        /* WAL savepoint context */
+#endif
+};
+
+/*
+** Bits of the Pager.doNotSpill flag.  See further description below.
+*/
+#define SPILLFLAG_OFF         0x01      /* Never spill cache.  Set via pragma */
+#define SPILLFLAG_ROLLBACK    0x02      /* Current rolling back, so do not spill */
+#define SPILLFLAG_NOSYNC      0x04      /* Spill is ok, but do not sync */
+
+/*
+** An open page cache is an instance of struct Pager. A description of
+** some of the more important member variables follows:
+**
+** eState
+**
+**   The current 'state' of the pager object. See the comment and state
+**   diagram above for a description of the pager state.
+**
+** eLock
+**
+**   For a real on-disk database, the current lock held on the database file -
+**   NO_LOCK, SHARED_LOCK, RESERVED_LOCK or EXCLUSIVE_LOCK.
+**
+**   For a temporary or in-memory database (neither of which require any
+**   locks), this variable is always set to EXCLUSIVE_LOCK. Since such
+**   databases always have Pager.exclusiveMode==1, this tricks the pager
+**   logic into thinking that it already has all the locks it will ever
+**   need (and no reason to release them).
+**
+**   In some (obscure) circumstances, this variable may also be set to
+**   UNKNOWN_LOCK. See the comment above the #define of UNKNOWN_LOCK for
+**   details.
+**
+** changeCountDone
+**
+**   This boolean variable is used to make sure that the change-counter 
+**   (the 4-byte header field at byte offset 24 of the database file) is 
+**   not updated more often than necessary. 
+**
+**   It is set to true when the change-counter field is updated, which 
+**   can only happen if an exclusive lock is held on the database file.
+**   It is cleared (set to false) whenever an exclusive lock is 
+**   relinquished on the database file. Each time a transaction is committed,
+**   The changeCountDone flag is inspected. If it is true, the work of
+**   updating the change-counter is omitted for the current transaction.
+**
+**   This mechanism means that when running in exclusive mode, a connection 
+**   need only update the change-counter once, for the first transaction
+**   committed.
+**
+** setMaster
+**
+**   When PagerCommitPhaseOne() is called to commit a transaction, it may
+**   (or may not) specify a master-journal name to be written into the 
+**   journal file before it is synced to disk.
+**
+**   Whether or not a journal file contains a master-journal pointer affects 
+**   the way in which the journal file is finalized after the transaction is 
+**   committed or rolled back when running in "journal_mode=PERSIST" mode.
+**   If a journal file does not contain a master-journal pointer, it is
+**   finalized by overwriting the first journal header with zeroes. If
+**   it does contain a master-journal pointer the journal file is finalized 
+**   by truncating it to zero bytes, just as if the connection were 
+**   running in "journal_mode=truncate" mode.
+**
+**   Journal files that contain master journal pointers cannot be finalized
+**   simply by overwriting the first journal-header with zeroes, as the
+**   master journal pointer could interfere with hot-journal rollback of any
+**   subsequently interrupted transaction that reuses the journal file.
+**
+**   The flag is cleared as soon as the journal file is finalized (either
+**   by PagerCommitPhaseTwo or PagerRollback). If an IO error prevents the
+**   journal file from being successfully finalized, the setMaster flag
+**   is cleared anyway (and the pager will move to ERROR state).
+**
+** doNotSpill
+**
+**   This variables control the behavior of cache-spills  (calls made by
+**   the pcache module to the pagerStress() routine to write cached data
+**   to the file-system in order to free up memory).
+**
+**   When bits SPILLFLAG_OFF or SPILLFLAG_ROLLBACK of doNotSpill are set,
+**   writing to the database from pagerStress() is disabled altogether.
+**   The SPILLFLAG_ROLLBACK case is done in a very obscure case that
+**   comes up during savepoint rollback that requires the pcache module
+**   to allocate a new page to prevent the journal file from being written
+**   while it is being traversed by code in pager_playback().  The SPILLFLAG_OFF
+**   case is a user preference.
+** 
+**   If the SPILLFLAG_NOSYNC bit is set, writing to the database from pagerStress()
+**   is permitted, but syncing the journal file is not. This flag is set
+**   by sqlite3PagerWrite() when the file-system sector-size is larger than
+**   the database page-size in order to prevent a journal sync from happening 
+**   in between the journalling of two pages on the same sector. 
+**
+** subjInMemory
+**
+**   This is a boolean variable. If true, then any required sub-journal
+**   is opened as an in-memory journal file. If false, then in-memory
+**   sub-journals are only used for in-memory pager files.
+**
+**   This variable is updated by the upper layer each time a new 
+**   write-transaction is opened.
+**
+** dbSize, dbOrigSize, dbFileSize
+**
+**   Variable dbSize is set to the number of pages in the database file.
+**   It is valid in PAGER_READER and higher states (all states except for
+**   OPEN and ERROR). 
+**
+**   dbSize is set based on the size of the database file, which may be 
+**   larger than the size of the database (the value stored at offset
+**   28 of the database header by the btree). If the size of the file
+**   is not an integer multiple of the page-size, the value stored in
+**   dbSize is rounded down (i.e. a 5KB file with 2K page-size has dbSize==2).
+**   Except, any file that is greater than 0 bytes in size is considered
+**   to have at least one page. (i.e. a 1KB file with 2K page-size leads
+**   to dbSize==1).
+**
+**   During a write-transaction, if pages with page-numbers greater than
+**   dbSize are modified in the cache, dbSize is updated accordingly.
+**   Similarly, if the database is truncated using PagerTruncateImage(), 
+**   dbSize is updated.
+**
+**   Variables dbOrigSize and dbFileSize are valid in states 
+**   PAGER_WRITER_LOCKED and higher. dbOrigSize is a copy of the dbSize
+**   variable at the start of the transaction. It is used during rollback,
+**   and to determine whether or not pages need to be journalled before
+**   being modified.
+**
+**   Throughout a write-transaction, dbFileSize contains the size of
