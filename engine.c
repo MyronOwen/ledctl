@@ -42473,3 +42473,228 @@ static int readMasterJournal(sqlite3_file *pJrnl, char *zMaster, u32 nMaster){
   u32 u;                     /* Unsigned loop counter */
   unsigned char aMagic[8];   /* A buffer to hold the magic header */
   zMaster[0] = '\0';
+
+  if( SQLITE_OK!=(rc = sqlite3OsFileSize(pJrnl, &szJ))
+   || szJ<16
+   || SQLITE_OK!=(rc = read32bits(pJrnl, szJ-16, &len))
+   || len>=nMaster 
+   || len==0 
+   || SQLITE_OK!=(rc = read32bits(pJrnl, szJ-12, &cksum))
+   || SQLITE_OK!=(rc = sqlite3OsRead(pJrnl, aMagic, 8, szJ-8))
+   || memcmp(aMagic, aJournalMagic, 8)
+   || SQLITE_OK!=(rc = sqlite3OsRead(pJrnl, zMaster, len, szJ-16-len))
+  ){
+    return rc;
+  }
+
+  /* See if the checksum matches the master journal name */
+  for(u=0; u<len; u++){
+    cksum -= zMaster[u];
+  }
+  if( cksum ){
+    /* If the checksum doesn't add up, then one or more of the disk sectors
+    ** containing the master journal filename is corrupted. This means
+    ** definitely roll back, so just return SQLITE_OK and report a (nul)
+    ** master-journal filename.
+    */
+    len = 0;
+  }
+  zMaster[len] = '\0';
+   
+  return SQLITE_OK;
+}
+
+/*
+** Return the offset of the sector boundary at or immediately 
+** following the value in pPager->journalOff, assuming a sector 
+** size of pPager->sectorSize bytes.
+**
+** i.e for a sector size of 512:
+**
+**   Pager.journalOff          Return value
+**   ---------------------------------------
+**   0                         0
+**   512                       512
+**   100                       512
+**   2000                      2048
+** 
+*/
+static i64 journalHdrOffset(Pager *pPager){
+  i64 offset = 0;
+  i64 c = pPager->journalOff;
+  if( c ){
+    offset = ((c-1)/JOURNAL_HDR_SZ(pPager) + 1) * JOURNAL_HDR_SZ(pPager);
+  }
+  assert( offset%JOURNAL_HDR_SZ(pPager)==0 );
+  assert( offset>=c );
+  assert( (offset-c)<JOURNAL_HDR_SZ(pPager) );
+  return offset;
+}
+
+/*
+** The journal file must be open when this function is called.
+**
+** This function is a no-op if the journal file has not been written to
+** within the current transaction (i.e. if Pager.journalOff==0).
+**
+** If doTruncate is non-zero or the Pager.journalSizeLimit variable is
+** set to 0, then truncate the journal file to zero bytes in size. Otherwise,
+** zero the 28-byte header at the start of the journal file. In either case, 
+** if the pager is not in no-sync mode, sync the journal file immediately 
+** after writing or truncating it.
+**
+** If Pager.journalSizeLimit is set to a positive, non-zero value, and
+** following the truncation or zeroing described above the size of the 
+** journal file in bytes is larger than this value, then truncate the
+** journal file to Pager.journalSizeLimit bytes. The journal file does
+** not need to be synced following this operation.
+**
+** If an IO error occurs, abandon processing and return the IO error code.
+** Otherwise, return SQLITE_OK.
+*/
+static int zeroJournalHdr(Pager *pPager, int doTruncate){
+  int rc = SQLITE_OK;                               /* Return code */
+  assert( isOpen(pPager->jfd) );
+  if( pPager->journalOff ){
+    const i64 iLimit = pPager->journalSizeLimit;    /* Local cache of jsl */
+
+    IOTRACE(("JZEROHDR %p\n", pPager))
+    if( doTruncate || iLimit==0 ){
+      rc = sqlite3OsTruncate(pPager->jfd, 0);
+    }else{
+      static const char zeroHdr[28] = {0};
+      rc = sqlite3OsWrite(pPager->jfd, zeroHdr, sizeof(zeroHdr), 0);
+    }
+    if( rc==SQLITE_OK && !pPager->noSync ){
+      rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_DATAONLY|pPager->syncFlags);
+    }
+
+    /* At this point the transaction is committed but the write lock 
+    ** is still held on the file. If there is a size limit configured for 
+    ** the persistent journal and the journal file currently consumes more
+    ** space than that limit allows for, truncate it now. There is no need
+    ** to sync the file following this operation.
+    */
+    if( rc==SQLITE_OK && iLimit>0 ){
+      i64 sz;
+      rc = sqlite3OsFileSize(pPager->jfd, &sz);
+      if( rc==SQLITE_OK && sz>iLimit ){
+        rc = sqlite3OsTruncate(pPager->jfd, iLimit);
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** The journal file must be open when this routine is called. A journal
+** header (JOURNAL_HDR_SZ bytes) is written into the journal file at the
+** current location.
+**
+** The format for the journal header is as follows:
+** - 8 bytes: Magic identifying journal format.
+** - 4 bytes: Number of records in journal, or -1 no-sync mode is on.
+** - 4 bytes: Random number used for page hash.
+** - 4 bytes: Initial database page count.
+** - 4 bytes: Sector size used by the process that wrote this journal.
+** - 4 bytes: Database page size.
+** 
+** Followed by (JOURNAL_HDR_SZ - 28) bytes of unused space.
+*/
+static int writeJournalHdr(Pager *pPager){
+  int rc = SQLITE_OK;                 /* Return code */
+  char *zHeader = pPager->pTmpSpace;  /* Temporary space used to build header */
+  u32 nHeader = (u32)pPager->pageSize;/* Size of buffer pointed to by zHeader */
+  u32 nWrite;                         /* Bytes of header sector written */
+  int ii;                             /* Loop counter */
+
+  assert( isOpen(pPager->jfd) );      /* Journal file must be open. */
+
+  if( nHeader>JOURNAL_HDR_SZ(pPager) ){
+    nHeader = JOURNAL_HDR_SZ(pPager);
+  }
+
+  /* If there are active savepoints and any of them were created 
+  ** since the most recent journal header was written, update the 
+  ** PagerSavepoint.iHdrOffset fields now.
+  */
+  for(ii=0; ii<pPager->nSavepoint; ii++){
+    if( pPager->aSavepoint[ii].iHdrOffset==0 ){
+      pPager->aSavepoint[ii].iHdrOffset = pPager->journalOff;
+    }
+  }
+
+  pPager->journalHdr = pPager->journalOff = journalHdrOffset(pPager);
+
+  /* 
+  ** Write the nRec Field - the number of page records that follow this
+  ** journal header. Normally, zero is written to this value at this time.
+  ** After the records are added to the journal (and the journal synced, 
+  ** if in full-sync mode), the zero is overwritten with the true number
+  ** of records (see syncJournal()).
+  **
+  ** A faster alternative is to write 0xFFFFFFFF to the nRec field. When
+  ** reading the journal this value tells SQLite to assume that the
+  ** rest of the journal file contains valid page records. This assumption
+  ** is dangerous, as if a failure occurred whilst writing to the journal
+  ** file it may contain some garbage data. There are two scenarios
+  ** where this risk can be ignored:
+  **
+  **   * When the pager is in no-sync mode. Corruption can follow a
+  **     power failure in this case anyway.
+  **
+  **   * When the SQLITE_IOCAP_SAFE_APPEND flag is set. This guarantees
+  **     that garbage data is never appended to the journal file.
+  */
+  assert( isOpen(pPager->fd) || pPager->noSync );
+  if( pPager->noSync || (pPager->journalMode==PAGER_JOURNALMODE_MEMORY)
+   || (sqlite3OsDeviceCharacteristics(pPager->fd)&SQLITE_IOCAP_SAFE_APPEND) 
+  ){
+    memcpy(zHeader, aJournalMagic, sizeof(aJournalMagic));
+    put32bits(&zHeader[sizeof(aJournalMagic)], 0xffffffff);
+  }else{
+    memset(zHeader, 0, sizeof(aJournalMagic)+4);
+  }
+
+  /* The random check-hash initializer */ 
+  sqlite3_randomness(sizeof(pPager->cksumInit), &pPager->cksumInit);
+  put32bits(&zHeader[sizeof(aJournalMagic)+4], pPager->cksumInit);
+  /* The initial database size */
+  put32bits(&zHeader[sizeof(aJournalMagic)+8], pPager->dbOrigSize);
+  /* The assumed sector size for this process */
+  put32bits(&zHeader[sizeof(aJournalMagic)+12], pPager->sectorSize);
+
+  /* The page size */
+  put32bits(&zHeader[sizeof(aJournalMagic)+16], pPager->pageSize);
+
+  /* Initializing the tail of the buffer is not necessary.  Everything
+  ** works find if the following memset() is omitted.  But initializing
+  ** the memory prevents valgrind from complaining, so we are willing to
+  ** take the performance hit.
+  */
+  memset(&zHeader[sizeof(aJournalMagic)+20], 0,
+         nHeader-(sizeof(aJournalMagic)+20));
+
+  /* In theory, it is only necessary to write the 28 bytes that the 
+  ** journal header consumes to the journal file here. Then increment the 
+  ** Pager.journalOff variable by JOURNAL_HDR_SZ so that the next 
+  ** record is written to the following sector (leaving a gap in the file
+  ** that will be implicitly filled in by the OS).
+  **
+  ** However it has been discovered that on some systems this pattern can 
+  ** be significantly slower than contiguously writing data to the file,
+  ** even if that means explicitly writing data to the block of 
+  ** (JOURNAL_HDR_SZ - 28) bytes that will not be used. So that is what
+  ** is done. 
+  **
+  ** The loop is required here in case the sector-size is larger than the 
+  ** database page size. Since the zHeader buffer is only Pager.pageSize
+  ** bytes in size, more than one call to sqlite3OsWrite() may be required
+  ** to populate the entire journal header sector.
+  */ 
+  for(nWrite=0; rc==SQLITE_OK&&nWrite<JOURNAL_HDR_SZ(pPager); nWrite+=nHeader){
+    IOTRACE(("JHDR %p %lld %d\n", pPager, pPager->journalHdr, nHeader))
+    rc = sqlite3OsWrite(pPager->jfd, zHeader, nHeader, pPager->journalOff);
+    assert( pPager->journalHdr <= pPager->journalOff );
+    pPager->journalOff += nHeader;
+  }
