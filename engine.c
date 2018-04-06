@@ -42918,3 +42918,252 @@ static void pager_reset(Pager *pPager){
 }
 
 /*
+** Return the pPager->iDataVersion value
+*/
+SQLITE_PRIVATE u32 sqlite3PagerDataVersion(Pager *pPager){
+  assert( pPager->eState>PAGER_OPEN );
+  return pPager->iDataVersion;
+}
+
+/*
+** Free all structures in the Pager.aSavepoint[] array and set both
+** Pager.aSavepoint and Pager.nSavepoint to zero. Close the sub-journal
+** if it is open and the pager is not in exclusive mode.
+*/
+static void releaseAllSavepoints(Pager *pPager){
+  int ii;               /* Iterator for looping through Pager.aSavepoint */
+  for(ii=0; ii<pPager->nSavepoint; ii++){
+    sqlite3BitvecDestroy(pPager->aSavepoint[ii].pInSavepoint);
+  }
+  if( !pPager->exclusiveMode || sqlite3IsMemJournal(pPager->sjfd) ){
+    sqlite3OsClose(pPager->sjfd);
+  }
+  sqlite3_free(pPager->aSavepoint);
+  pPager->aSavepoint = 0;
+  pPager->nSavepoint = 0;
+  pPager->nSubRec = 0;
+}
+
+/*
+** Set the bit number pgno in the PagerSavepoint.pInSavepoint 
+** bitvecs of all open savepoints. Return SQLITE_OK if successful
+** or SQLITE_NOMEM if a malloc failure occurs.
+*/
+static int addToSavepointBitvecs(Pager *pPager, Pgno pgno){
+  int ii;                   /* Loop counter */
+  int rc = SQLITE_OK;       /* Result code */
+
+  for(ii=0; ii<pPager->nSavepoint; ii++){
+    PagerSavepoint *p = &pPager->aSavepoint[ii];
+    if( pgno<=p->nOrig ){
+      rc |= sqlite3BitvecSet(p->pInSavepoint, pgno);
+      testcase( rc==SQLITE_NOMEM );
+      assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
+    }
+  }
+  return rc;
+}
+
+/*
+** This function is a no-op if the pager is in exclusive mode and not
+** in the ERROR state. Otherwise, it switches the pager to PAGER_OPEN
+** state.
+**
+** If the pager is not in exclusive-access mode, the database file is
+** completely unlocked. If the file is unlocked and the file-system does
+** not exhibit the UNDELETABLE_WHEN_OPEN property, the journal file is
+** closed (if it is open).
+**
+** If the pager is in ERROR state when this function is called, the 
+** contents of the pager cache are discarded before switching back to 
+** the OPEN state. Regardless of whether the pager is in exclusive-mode
+** or not, any journal file left in the file-system will be treated
+** as a hot-journal and rolled back the next time a read-transaction
+** is opened (by this or by any other connection).
+*/
+static void pager_unlock(Pager *pPager){
+
+  assert( pPager->eState==PAGER_READER 
+       || pPager->eState==PAGER_OPEN 
+       || pPager->eState==PAGER_ERROR 
+  );
+
+  sqlite3BitvecDestroy(pPager->pInJournal);
+  pPager->pInJournal = 0;
+  releaseAllSavepoints(pPager);
+
+  if( pagerUseWal(pPager) ){
+    assert( !isOpen(pPager->jfd) );
+    sqlite3WalEndReadTransaction(pPager->pWal);
+    pPager->eState = PAGER_OPEN;
+  }else if( !pPager->exclusiveMode ){
+    int rc;                       /* Error code returned by pagerUnlockDb() */
+    int iDc = isOpen(pPager->fd)?sqlite3OsDeviceCharacteristics(pPager->fd):0;
+
+    /* If the operating system support deletion of open files, then
+    ** close the journal file when dropping the database lock.  Otherwise
+    ** another connection with journal_mode=delete might delete the file
+    ** out from under us.
+    */
+    assert( (PAGER_JOURNALMODE_MEMORY   & 5)!=1 );
+    assert( (PAGER_JOURNALMODE_OFF      & 5)!=1 );
+    assert( (PAGER_JOURNALMODE_WAL      & 5)!=1 );
+    assert( (PAGER_JOURNALMODE_DELETE   & 5)!=1 );
+    assert( (PAGER_JOURNALMODE_TRUNCATE & 5)==1 );
+    assert( (PAGER_JOURNALMODE_PERSIST  & 5)==1 );
+    if( 0==(iDc & SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN)
+     || 1!=(pPager->journalMode & 5)
+    ){
+      sqlite3OsClose(pPager->jfd);
+    }
+
+    /* If the pager is in the ERROR state and the call to unlock the database
+    ** file fails, set the current lock to UNKNOWN_LOCK. See the comment
+    ** above the #define for UNKNOWN_LOCK for an explanation of why this
+    ** is necessary.
+    */
+    rc = pagerUnlockDb(pPager, NO_LOCK);
+    if( rc!=SQLITE_OK && pPager->eState==PAGER_ERROR ){
+      pPager->eLock = UNKNOWN_LOCK;
+    }
+
+    /* The pager state may be changed from PAGER_ERROR to PAGER_OPEN here
+    ** without clearing the error code. This is intentional - the error
+    ** code is cleared and the cache reset in the block below.
+    */
+    assert( pPager->errCode || pPager->eState!=PAGER_ERROR );
+    pPager->changeCountDone = 0;
+    pPager->eState = PAGER_OPEN;
+  }
+
+  /* If Pager.errCode is set, the contents of the pager cache cannot be
+  ** trusted. Now that there are no outstanding references to the pager,
+  ** it can safely move back to PAGER_OPEN state. This happens in both
+  ** normal and exclusive-locking mode.
+  */
+  if( pPager->errCode ){
+    assert( !MEMDB );
+    pager_reset(pPager);
+    pPager->changeCountDone = pPager->tempFile;
+    pPager->eState = PAGER_OPEN;
+    pPager->errCode = SQLITE_OK;
+    if( USEFETCH(pPager) ) sqlite3OsUnfetch(pPager->fd, 0, 0);
+  }
+
+  pPager->journalOff = 0;
+  pPager->journalHdr = 0;
+  pPager->setMaster = 0;
+}
+
+/*
+** This function is called whenever an IOERR or FULL error that requires
+** the pager to transition into the ERROR state may ahve occurred.
+** The first argument is a pointer to the pager structure, the second 
+** the error-code about to be returned by a pager API function. The 
+** value returned is a copy of the second argument to this function. 
+**
+** If the second argument is SQLITE_FULL, SQLITE_IOERR or one of the
+** IOERR sub-codes, the pager enters the ERROR state and the error code
+** is stored in Pager.errCode. While the pager remains in the ERROR state,
+** all major API calls on the Pager will immediately return Pager.errCode.
+**
+** The ERROR state indicates that the contents of the pager-cache 
+** cannot be trusted. This state can be cleared by completely discarding 
+** the contents of the pager-cache. If a transaction was active when
+** the persistent error occurred, then the rollback journal may need
+** to be replayed to restore the contents of the database file (as if
+** it were a hot-journal).
+*/
+static int pager_error(Pager *pPager, int rc){
+  int rc2 = rc & 0xff;
+  assert( rc==SQLITE_OK || !MEMDB );
+  assert(
+       pPager->errCode==SQLITE_FULL ||
+       pPager->errCode==SQLITE_OK ||
+       (pPager->errCode & 0xff)==SQLITE_IOERR
+  );
+  if( rc2==SQLITE_FULL || rc2==SQLITE_IOERR ){
+    pPager->errCode = rc;
+    pPager->eState = PAGER_ERROR;
+  }
+  return rc;
+}
+
+static int pager_truncate(Pager *pPager, Pgno nPage);
+
+/*
+** This routine ends a transaction. A transaction is usually ended by 
+** either a COMMIT or a ROLLBACK operation. This routine may be called 
+** after rollback of a hot-journal, or if an error occurs while opening
+** the journal file or writing the very first journal-header of a
+** database transaction.
+** 
+** This routine is never called in PAGER_ERROR state. If it is called
+** in PAGER_NONE or PAGER_SHARED state and the lock held is less
+** exclusive than a RESERVED lock, it is a no-op.
+**
+** Otherwise, any active savepoints are released.
+**
+** If the journal file is open, then it is "finalized". Once a journal 
+** file has been finalized it is not possible to use it to roll back a 
+** transaction. Nor will it be considered to be a hot-journal by this
+** or any other database connection. Exactly how a journal is finalized
+** depends on whether or not the pager is running in exclusive mode and
+** the current journal-mode (Pager.journalMode value), as follows:
+**
+**   journalMode==MEMORY
+**     Journal file descriptor is simply closed. This destroys an 
+**     in-memory journal.
+**
+**   journalMode==TRUNCATE
+**     Journal file is truncated to zero bytes in size.
+**
+**   journalMode==PERSIST
+**     The first 28 bytes of the journal file are zeroed. This invalidates
+**     the first journal header in the file, and hence the entire journal
+**     file. An invalid journal file cannot be rolled back.
+**
+**   journalMode==DELETE
+**     The journal file is closed and deleted using sqlite3OsDelete().
+**
+**     If the pager is running in exclusive mode, this method of finalizing
+**     the journal file is never used. Instead, if the journalMode is
+**     DELETE and the pager is in exclusive mode, the method described under
+**     journalMode==PERSIST is used instead.
+**
+** After the journal is finalized, the pager moves to PAGER_READER state.
+** If running in non-exclusive rollback mode, the lock on the file is 
+** downgraded to a SHARED_LOCK.
+**
+** SQLITE_OK is returned if no error occurs. If an error occurs during
+** any of the IO operations to finalize the journal file or unlock the
+** database then the IO error code is returned to the user. If the 
+** operation to finalize the journal file fails, then the code still
+** tries to unlock the database file if not in exclusive mode. If the
+** unlock operation fails as well, then the first error code related
+** to the first error encountered (the journal finalization one) is
+** returned.
+*/
+static int pager_end_transaction(Pager *pPager, int hasMaster, int bCommit){
+  int rc = SQLITE_OK;      /* Error code from journal finalization operation */
+  int rc2 = SQLITE_OK;     /* Error code from db file unlock operation */
+
+  /* Do nothing if the pager does not have an open write transaction
+  ** or at least a RESERVED lock. This function may be called when there
+  ** is no write-transaction active but a RESERVED or greater lock is
+  ** held under two circumstances:
+  **
+  **   1. After a successful hot-journal rollback, it is called with
+  **      eState==PAGER_NONE and eLock==EXCLUSIVE_LOCK.
+  **
+  **   2. If a connection with locking_mode=exclusive holding an EXCLUSIVE 
+  **      lock switches back to locking_mode=normal and then executes a
+  **      read-transaction, this function is called with eState==PAGER_READER 
+  **      and eLock==EXCLUSIVE_LOCK when the read-transaction is closed.
+  */
+  assert( assert_pager_state(pPager) );
+  assert( pPager->eState!=PAGER_ERROR );
+  if( pPager->eState<PAGER_WRITER_LOCKED && pPager->eLock<RESERVED_LOCK ){
+    return SQLITE_OK;
+  }
+
