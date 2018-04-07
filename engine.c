@@ -43167,3 +43167,244 @@ static int pager_end_transaction(Pager *pPager, int hasMaster, int bCommit){
     return SQLITE_OK;
   }
 
+  releaseAllSavepoints(pPager);
+  assert( isOpen(pPager->jfd) || pPager->pInJournal==0 );
+  if( isOpen(pPager->jfd) ){
+    assert( !pagerUseWal(pPager) );
+
+    /* Finalize the journal file. */
+    if( sqlite3IsMemJournal(pPager->jfd) ){
+      assert( pPager->journalMode==PAGER_JOURNALMODE_MEMORY );
+      sqlite3OsClose(pPager->jfd);
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_TRUNCATE ){
+      if( pPager->journalOff==0 ){
+        rc = SQLITE_OK;
+      }else{
+        rc = sqlite3OsTruncate(pPager->jfd, 0);
+        if( rc==SQLITE_OK && pPager->fullSync ){
+          /* Make sure the new file size is written into the inode right away.
+          ** Otherwise the journal might resurrect following a power loss and
+          ** cause the last transaction to roll back.  See
+          ** https://bugzilla.mozilla.org/show_bug.cgi?id=1072773
+          */
+          rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags);
+        }
+      }
+      pPager->journalOff = 0;
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_PERSIST
+      || (pPager->exclusiveMode && pPager->journalMode!=PAGER_JOURNALMODE_WAL)
+    ){
+      rc = zeroJournalHdr(pPager, hasMaster);
+      pPager->journalOff = 0;
+    }else{
+      /* This branch may be executed with Pager.journalMode==MEMORY if
+      ** a hot-journal was just rolled back. In this case the journal
+      ** file should be closed and deleted. If this connection writes to
+      ** the database file, it will do so using an in-memory journal. 
+      */
+      int bDelete = (!pPager->tempFile && sqlite3JournalExists(pPager->jfd));
+      assert( pPager->journalMode==PAGER_JOURNALMODE_DELETE 
+           || pPager->journalMode==PAGER_JOURNALMODE_MEMORY 
+           || pPager->journalMode==PAGER_JOURNALMODE_WAL 
+      );
+      sqlite3OsClose(pPager->jfd);
+      if( bDelete ){
+        rc = sqlite3OsDelete(pPager->pVfs, pPager->zJournal, 0);
+      }
+    }
+  }
+
+#ifdef SQLITE_CHECK_PAGES
+  sqlite3PcacheIterateDirty(pPager->pPCache, pager_set_pagehash);
+  if( pPager->dbSize==0 && sqlite3PcacheRefCount(pPager->pPCache)>0 ){
+    PgHdr *p = sqlite3PagerLookup(pPager, 1);
+    if( p ){
+      p->pageHash = 0;
+      sqlite3PagerUnrefNotNull(p);
+    }
+  }
+#endif
+
+  sqlite3BitvecDestroy(pPager->pInJournal);
+  pPager->pInJournal = 0;
+  pPager->nRec = 0;
+  sqlite3PcacheCleanAll(pPager->pPCache);
+  sqlite3PcacheTruncate(pPager->pPCache, pPager->dbSize);
+
+  if( pagerUseWal(pPager) ){
+    /* Drop the WAL write-lock, if any. Also, if the connection was in 
+    ** locking_mode=exclusive mode but is no longer, drop the EXCLUSIVE 
+    ** lock held on the database file.
+    */
+    rc2 = sqlite3WalEndWriteTransaction(pPager->pWal);
+    assert( rc2==SQLITE_OK );
+  }else if( rc==SQLITE_OK && bCommit && pPager->dbFileSize>pPager->dbSize ){
+    /* This branch is taken when committing a transaction in rollback-journal
+    ** mode if the database file on disk is larger than the database image.
+    ** At this point the journal has been finalized and the transaction 
+    ** successfully committed, but the EXCLUSIVE lock is still held on the
+    ** file. So it is safe to truncate the database file to its minimum
+    ** required size.  */
+    assert( pPager->eLock==EXCLUSIVE_LOCK );
+    rc = pager_truncate(pPager, pPager->dbSize);
+  }
+
+  if( rc==SQLITE_OK && bCommit && isOpen(pPager->fd) ){
+    rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_COMMIT_PHASETWO, 0);
+    if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
+  }
+
+  if( !pPager->exclusiveMode 
+   && (!pagerUseWal(pPager) || sqlite3WalExclusiveMode(pPager->pWal, 0))
+  ){
+    rc2 = pagerUnlockDb(pPager, SHARED_LOCK);
+    pPager->changeCountDone = 0;
+  }
+  pPager->eState = PAGER_READER;
+  pPager->setMaster = 0;
+
+  return (rc==SQLITE_OK?rc2:rc);
+}
+
+/*
+** Execute a rollback if a transaction is active and unlock the 
+** database file. 
+**
+** If the pager has already entered the ERROR state, do not attempt 
+** the rollback at this time. Instead, pager_unlock() is called. The
+** call to pager_unlock() will discard all in-memory pages, unlock
+** the database file and move the pager back to OPEN state. If this 
+** means that there is a hot-journal left in the file-system, the next 
+** connection to obtain a shared lock on the pager (which may be this one) 
+** will roll it back.
+**
+** If the pager has not already entered the ERROR state, but an IO or
+** malloc error occurs during a rollback, then this will itself cause 
+** the pager to enter the ERROR state. Which will be cleared by the
+** call to pager_unlock(), as described above.
+*/
+static void pagerUnlockAndRollback(Pager *pPager){
+  if( pPager->eState!=PAGER_ERROR && pPager->eState!=PAGER_OPEN ){
+    assert( assert_pager_state(pPager) );
+    if( pPager->eState>=PAGER_WRITER_LOCKED ){
+      sqlite3BeginBenignMalloc();
+      sqlite3PagerRollback(pPager);
+      sqlite3EndBenignMalloc();
+    }else if( !pPager->exclusiveMode ){
+      assert( pPager->eState==PAGER_READER );
+      pager_end_transaction(pPager, 0, 0);
+    }
+  }
+  pager_unlock(pPager);
+}
+
+/*
+** Parameter aData must point to a buffer of pPager->pageSize bytes
+** of data. Compute and return a checksum based ont the contents of the 
+** page of data and the current value of pPager->cksumInit.
+**
+** This is not a real checksum. It is really just the sum of the 
+** random initial value (pPager->cksumInit) and every 200th byte
+** of the page data, starting with byte offset (pPager->pageSize%200).
+** Each byte is interpreted as an 8-bit unsigned integer.
+**
+** Changing the formula used to compute this checksum results in an
+** incompatible journal file format.
+**
+** If journal corruption occurs due to a power failure, the most likely 
+** scenario is that one end or the other of the record will be changed. 
+** It is much less likely that the two ends of the journal record will be
+** correct and the middle be corrupt.  Thus, this "checksum" scheme,
+** though fast and simple, catches the mostly likely kind of corruption.
+*/
+static u32 pager_cksum(Pager *pPager, const u8 *aData){
+  u32 cksum = pPager->cksumInit;         /* Checksum value to return */
+  int i = pPager->pageSize-200;          /* Loop counter */
+  while( i>0 ){
+    cksum += aData[i];
+    i -= 200;
+  }
+  return cksum;
+}
+
+/*
+** Report the current page size and number of reserved bytes back
+** to the codec.
+*/
+#ifdef SQLITE_HAS_CODEC
+static void pagerReportSize(Pager *pPager){
+  if( pPager->xCodecSizeChng ){
+    pPager->xCodecSizeChng(pPager->pCodec, pPager->pageSize,
+                           (int)pPager->nReserve);
+  }
+}
+#else
+# define pagerReportSize(X)     /* No-op if we do not support a codec */
+#endif
+
+/*
+** Read a single page from either the journal file (if isMainJrnl==1) or
+** from the sub-journal (if isMainJrnl==0) and playback that page.
+** The page begins at offset *pOffset into the file. The *pOffset
+** value is increased to the start of the next page in the journal.
+**
+** The main rollback journal uses checksums - the statement journal does 
+** not.
+**
+** If the page number of the page record read from the (sub-)journal file
+** is greater than the current value of Pager.dbSize, then playback is
+** skipped and SQLITE_OK is returned.
+**
+** If pDone is not NULL, then it is a record of pages that have already
+** been played back.  If the page at *pOffset has already been played back
+** (if the corresponding pDone bit is set) then skip the playback.
+** Make sure the pDone bit corresponding to the *pOffset page is set
+** prior to returning.
+**
+** If the page record is successfully read from the (sub-)journal file
+** and played back, then SQLITE_OK is returned. If an IO error occurs
+** while reading the record from the (sub-)journal file or while writing
+** to the database file, then the IO error code is returned. If data
+** is successfully read from the (sub-)journal file but appears to be
+** corrupted, SQLITE_DONE is returned. Data is considered corrupted in
+** two circumstances:
+** 
+**   * If the record page-number is illegal (0 or PAGER_MJ_PGNO), or
+**   * If the record is being rolled back from the main journal file
+**     and the checksum field does not match the record content.
+**
+** Neither of these two scenarios are possible during a savepoint rollback.
+**
+** If this is a savepoint rollback, then memory may have to be dynamically
+** allocated by this function. If this is the case and an allocation fails,
+** SQLITE_NOMEM is returned.
+*/
+static int pager_playback_one_page(
+  Pager *pPager,                /* The pager being played back */
+  i64 *pOffset,                 /* Offset of record to playback */
+  Bitvec *pDone,                /* Bitvec of pages already played back */
+  int isMainJrnl,               /* 1 -> main journal. 0 -> sub-journal. */
+  int isSavepnt                 /* True for a savepoint rollback */
+){
+  int rc;
+  PgHdr *pPg;                   /* An existing page in the cache */
+  Pgno pgno;                    /* The page number of a page in journal */
+  u32 cksum;                    /* Checksum used for sanity checking */
+  char *aData;                  /* Temporary storage for the page */
+  sqlite3_file *jfd;            /* The file descriptor for the journal file */
+  int isSynced;                 /* True if journal page is synced */
+
+  assert( (isMainJrnl&~1)==0 );      /* isMainJrnl is 0 or 1 */
+  assert( (isSavepnt&~1)==0 );       /* isSavepnt is 0 or 1 */
+  assert( isMainJrnl || pDone );     /* pDone always used on sub-journals */
+  assert( isSavepnt || pDone==0 );   /* pDone never used on non-savepoint */
+
+  aData = pPager->pTmpSpace;
+  assert( aData );         /* Temp storage must have already been allocated */
+  assert( pagerUseWal(pPager)==0 || (!isMainJrnl && isSavepnt) );
+
+  /* Either the state is greater than PAGER_WRITER_CACHEMOD (a transaction 
+  ** or savepoint rollback done at the request of the caller) or this is
+  ** a hot-journal rollback. If it is a hot-journal rollback, the pager
+  ** is in state OPEN and holds an EXCLUSIVE lock. Hot-journal rollback
+  ** only reads from the main journal, not the sub-journal.
