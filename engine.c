@@ -43408,3 +43408,214 @@ static int pager_playback_one_page(
   ** a hot-journal rollback. If it is a hot-journal rollback, the pager
   ** is in state OPEN and holds an EXCLUSIVE lock. Hot-journal rollback
   ** only reads from the main journal, not the sub-journal.
+  */
+  assert( pPager->eState>=PAGER_WRITER_CACHEMOD
+       || (pPager->eState==PAGER_OPEN && pPager->eLock==EXCLUSIVE_LOCK)
+  );
+  assert( pPager->eState>=PAGER_WRITER_CACHEMOD || isMainJrnl );
+
+  /* Read the page number and page data from the journal or sub-journal
+  ** file. Return an error code to the caller if an IO error occurs.
+  */
+  jfd = isMainJrnl ? pPager->jfd : pPager->sjfd;
+  rc = read32bits(jfd, *pOffset, &pgno);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = sqlite3OsRead(jfd, (u8*)aData, pPager->pageSize, (*pOffset)+4);
+  if( rc!=SQLITE_OK ) return rc;
+  *pOffset += pPager->pageSize + 4 + isMainJrnl*4;
+
+  /* Sanity checking on the page.  This is more important that I originally
+  ** thought.  If a power failure occurs while the journal is being written,
+  ** it could cause invalid data to be written into the journal.  We need to
+  ** detect this invalid data (with high probability) and ignore it.
+  */
+  if( pgno==0 || pgno==PAGER_MJ_PGNO(pPager) ){
+    assert( !isSavepnt );
+    return SQLITE_DONE;
+  }
+  if( pgno>(Pgno)pPager->dbSize || sqlite3BitvecTest(pDone, pgno) ){
+    return SQLITE_OK;
+  }
+  if( isMainJrnl ){
+    rc = read32bits(jfd, (*pOffset)-4, &cksum);
+    if( rc ) return rc;
+    if( !isSavepnt && pager_cksum(pPager, (u8*)aData)!=cksum ){
+      return SQLITE_DONE;
+    }
+  }
+
+  /* If this page has already been played by before during the current
+  ** rollback, then don't bother to play it back again.
+  */
+  if( pDone && (rc = sqlite3BitvecSet(pDone, pgno))!=SQLITE_OK ){
+    return rc;
+  }
+
+  /* When playing back page 1, restore the nReserve setting
+  */
+  if( pgno==1 && pPager->nReserve!=((u8*)aData)[20] ){
+    pPager->nReserve = ((u8*)aData)[20];
+    pagerReportSize(pPager);
+  }
+
+  /* If the pager is in CACHEMOD state, then there must be a copy of this
+  ** page in the pager cache. In this case just update the pager cache,
+  ** not the database file. The page is left marked dirty in this case.
+  **
+  ** An exception to the above rule: If the database is in no-sync mode
+  ** and a page is moved during an incremental vacuum then the page may
+  ** not be in the pager cache. Later: if a malloc() or IO error occurs
+  ** during a Movepage() call, then the page may not be in the cache
+  ** either. So the condition described in the above paragraph is not
+  ** assert()able.
+  **
+  ** If in WRITER_DBMOD, WRITER_FINISHED or OPEN state, then we update the
+  ** pager cache if it exists and the main file. The page is then marked 
+  ** not dirty. Since this code is only executed in PAGER_OPEN state for
+  ** a hot-journal rollback, it is guaranteed that the page-cache is empty
+  ** if the pager is in OPEN state.
+  **
+  ** Ticket #1171:  The statement journal might contain page content that is
+  ** different from the page content at the start of the transaction.
+  ** This occurs when a page is changed prior to the start of a statement
+  ** then changed again within the statement.  When rolling back such a
+  ** statement we must not write to the original database unless we know
+  ** for certain that original page contents are synced into the main rollback
+  ** journal.  Otherwise, a power loss might leave modified data in the
+  ** database file without an entry in the rollback journal that can
+  ** restore the database to its original form.  Two conditions must be
+  ** met before writing to the database files. (1) the database must be
+  ** locked.  (2) we know that the original page content is fully synced
+  ** in the main journal either because the page is not in cache or else
+  ** the page is marked as needSync==0.
+  **
+  ** 2008-04-14:  When attempting to vacuum a corrupt database file, it
+  ** is possible to fail a statement on a database that does not yet exist.
+  ** Do not attempt to write if database file has never been opened.
+  */
+  if( pagerUseWal(pPager) ){
+    pPg = 0;
+  }else{
+    pPg = sqlite3PagerLookup(pPager, pgno);
+  }
+  assert( pPg || !MEMDB );
+  assert( pPager->eState!=PAGER_OPEN || pPg==0 );
+  PAGERTRACE(("PLAYBACK %d page %d hash(%08x) %s\n",
+           PAGERID(pPager), pgno, pager_datahash(pPager->pageSize, (u8*)aData),
+           (isMainJrnl?"main-journal":"sub-journal")
+  ));
+  if( isMainJrnl ){
+    isSynced = pPager->noSync || (*pOffset <= pPager->journalHdr);
+  }else{
+    isSynced = (pPg==0 || 0==(pPg->flags & PGHDR_NEED_SYNC));
+  }
+  if( isOpen(pPager->fd)
+   && (pPager->eState>=PAGER_WRITER_DBMOD || pPager->eState==PAGER_OPEN)
+   && isSynced
+  ){
+    i64 ofst = (pgno-1)*(i64)pPager->pageSize;
+    testcase( !isSavepnt && pPg!=0 && (pPg->flags&PGHDR_NEED_SYNC)!=0 );
+    assert( !pagerUseWal(pPager) );
+    rc = sqlite3OsWrite(pPager->fd, (u8 *)aData, pPager->pageSize, ofst);
+    if( pgno>pPager->dbFileSize ){
+      pPager->dbFileSize = pgno;
+    }
+    if( pPager->pBackup ){
+      CODEC1(pPager, aData, pgno, 3, rc=SQLITE_NOMEM);
+      sqlite3BackupUpdate(pPager->pBackup, pgno, (u8*)aData);
+      CODEC2(pPager, aData, pgno, 7, rc=SQLITE_NOMEM, aData);
+    }
+  }else if( !isMainJrnl && pPg==0 ){
+    /* If this is a rollback of a savepoint and data was not written to
+    ** the database and the page is not in-memory, there is a potential
+    ** problem. When the page is next fetched by the b-tree layer, it 
+    ** will be read from the database file, which may or may not be 
+    ** current. 
+    **
+    ** There are a couple of different ways this can happen. All are quite
+    ** obscure. When running in synchronous mode, this can only happen 
+    ** if the page is on the free-list at the start of the transaction, then
+    ** populated, then moved using sqlite3PagerMovepage().
+    **
+    ** The solution is to add an in-memory page to the cache containing
+    ** the data just read from the sub-journal. Mark the page as dirty 
+    ** and if the pager requires a journal-sync, then mark the page as 
+    ** requiring a journal-sync before it is written.
+    */
+    assert( isSavepnt );
+    assert( (pPager->doNotSpill & SPILLFLAG_ROLLBACK)==0 );
+    pPager->doNotSpill |= SPILLFLAG_ROLLBACK;
+    rc = sqlite3PagerAcquire(pPager, pgno, &pPg, 1);
+    assert( (pPager->doNotSpill & SPILLFLAG_ROLLBACK)!=0 );
+    pPager->doNotSpill &= ~SPILLFLAG_ROLLBACK;
+    if( rc!=SQLITE_OK ) return rc;
+    pPg->flags &= ~PGHDR_NEED_READ;
+    sqlite3PcacheMakeDirty(pPg);
+  }
+  if( pPg ){
+    /* No page should ever be explicitly rolled back that is in use, except
+    ** for page 1 which is held in use in order to keep the lock on the
+    ** database active. However such a page may be rolled back as a result
+    ** of an internal error resulting in an automatic call to
+    ** sqlite3PagerRollback().
+    */
+    void *pData;
+    pData = pPg->pData;
+    memcpy(pData, (u8*)aData, pPager->pageSize);
+    pPager->xReiniter(pPg);
+    if( isMainJrnl && (!isSavepnt || *pOffset<=pPager->journalHdr) ){
+      /* If the contents of this page were just restored from the main 
+      ** journal file, then its content must be as they were when the 
+      ** transaction was first opened. In this case we can mark the page
+      ** as clean, since there will be no need to write it out to the
+      ** database.
+      **
+      ** There is one exception to this rule. If the page is being rolled
+      ** back as part of a savepoint (or statement) rollback from an 
+      ** unsynced portion of the main journal file, then it is not safe
+      ** to mark the page as clean. This is because marking the page as
+      ** clean will clear the PGHDR_NEED_SYNC flag. Since the page is
+      ** already in the journal file (recorded in Pager.pInJournal) and
+      ** the PGHDR_NEED_SYNC flag is cleared, if the page is written to
+      ** again within this transaction, it will be marked as dirty but
+      ** the PGHDR_NEED_SYNC flag will not be set. It could then potentially
+      ** be written out into the database file before its journal file
+      ** segment is synced. If a crash occurs during or following this,
+      ** database corruption may ensue.
+      */
+      assert( !pagerUseWal(pPager) );
+      sqlite3PcacheMakeClean(pPg);
+    }
+    pager_set_pagehash(pPg);
+
+    /* If this was page 1, then restore the value of Pager.dbFileVers.
+    ** Do this before any decoding. */
+    if( pgno==1 ){
+      memcpy(&pPager->dbFileVers, &((u8*)pData)[24],sizeof(pPager->dbFileVers));
+    }
+
+    /* Decode the page just read from disk */
+    CODEC1(pPager, pData, pPg->pgno, 3, rc=SQLITE_NOMEM);
+    sqlite3PcacheRelease(pPg);
+  }
+  return rc;
+}
+
+/*
+** Parameter zMaster is the name of a master journal file. A single journal
+** file that referred to the master journal file has just been rolled back.
+** This routine checks if it is possible to delete the master journal file,
+** and does so if it is.
+**
+** Argument zMaster may point to Pager.pTmpSpace. So that buffer is not 
+** available for use within this function.
+**
+** When a master journal file is created, it is populated with the names 
+** of all of its child journals, one after another, formatted as utf-8 
+** encoded text. The end of each child journal file is marked with a 
+** nul-terminator byte (0x00). i.e. the entire contents of a master journal
+** file for a transaction involving two databases might be:
+**
+**   "/home/bill/a.db-journal\x00/home/bill/b.db-journal\x00"
+**
+** A master journal file may only be deleted once all of its child 
