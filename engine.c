@@ -43860,3 +43860,273 @@ static void setSectorSize(Pager *pPager){
 **  (7)  zero padding out to the next sector size.
 **  (8)  Zero or more pages instances, each as follows:
 **        +  4 byte page number.
+**        +  pPager->pageSize bytes of data.
+**        +  4 byte checksum
+**
+** When we speak of the journal header, we mean the first 7 items above.
+** Each entry in the journal is an instance of the 8th item.
+**
+** Call the value from the second bullet "nRec".  nRec is the number of
+** valid page entries in the journal.  In most cases, you can compute the
+** value of nRec from the size of the journal file.  But if a power
+** failure occurred while the journal was being written, it could be the
+** case that the size of the journal file had already been increased but
+** the extra entries had not yet made it safely to disk.  In such a case,
+** the value of nRec computed from the file size would be too large.  For
+** that reason, we always use the nRec value in the header.
+**
+** If the nRec value is 0xffffffff it means that nRec should be computed
+** from the file size.  This value is used when the user selects the
+** no-sync option for the journal.  A power failure could lead to corruption
+** in this case.  But for things like temporary table (which will be
+** deleted when the power is restored) we don't care.  
+**
+** If the file opened as the journal file is not a well-formed
+** journal file then all pages up to the first corrupted page are rolled
+** back (or no pages if the journal header is corrupted). The journal file
+** is then deleted and SQLITE_OK returned, just as if no corruption had
+** been encountered.
+**
+** If an I/O or malloc() error occurs, the journal-file is not deleted
+** and an error code is returned.
+**
+** The isHot parameter indicates that we are trying to rollback a journal
+** that might be a hot journal.  Or, it could be that the journal is 
+** preserved because of JOURNALMODE_PERSIST or JOURNALMODE_TRUNCATE.
+** If the journal really is hot, reset the pager cache prior rolling
+** back any content.  If the journal is merely persistent, no reset is
+** needed.
+*/
+static int pager_playback(Pager *pPager, int isHot){
+  sqlite3_vfs *pVfs = pPager->pVfs;
+  i64 szJ;                 /* Size of the journal file in bytes */
+  u32 nRec;                /* Number of Records in the journal */
+  u32 u;                   /* Unsigned loop counter */
+  Pgno mxPg = 0;           /* Size of the original file in pages */
+  int rc;                  /* Result code of a subroutine */
+  int res = 1;             /* Value returned by sqlite3OsAccess() */
+  char *zMaster = 0;       /* Name of master journal file if any */
+  int needPagerReset;      /* True to reset page prior to first page rollback */
+  int nPlayback = 0;       /* Total number of pages restored from journal */
+
+  /* Figure out how many records are in the journal.  Abort early if
+  ** the journal is empty.
+  */
+  assert( isOpen(pPager->jfd) );
+  rc = sqlite3OsFileSize(pPager->jfd, &szJ);
+  if( rc!=SQLITE_OK ){
+    goto end_playback;
+  }
+
+  /* Read the master journal name from the journal, if it is present.
+  ** If a master journal file name is specified, but the file is not
+  ** present on disk, then the journal is not hot and does not need to be
+  ** played back.
+  **
+  ** TODO: Technically the following is an error because it assumes that
+  ** buffer Pager.pTmpSpace is (mxPathname+1) bytes or larger. i.e. that
+  ** (pPager->pageSize >= pPager->pVfs->mxPathname+1). Using os_unix.c,
+  **  mxPathname is 512, which is the same as the minimum allowable value
+  ** for pageSize.
+  */
+  zMaster = pPager->pTmpSpace;
+  rc = readMasterJournal(pPager->jfd, zMaster, pPager->pVfs->mxPathname+1);
+  if( rc==SQLITE_OK && zMaster[0] ){
+    rc = sqlite3OsAccess(pVfs, zMaster, SQLITE_ACCESS_EXISTS, &res);
+  }
+  zMaster = 0;
+  if( rc!=SQLITE_OK || !res ){
+    goto end_playback;
+  }
+  pPager->journalOff = 0;
+  needPagerReset = isHot;
+
+  /* This loop terminates either when a readJournalHdr() or 
+  ** pager_playback_one_page() call returns SQLITE_DONE or an IO error 
+  ** occurs. 
+  */
+  while( 1 ){
+    /* Read the next journal header from the journal file.  If there are
+    ** not enough bytes left in the journal file for a complete header, or
+    ** it is corrupted, then a process must have failed while writing it.
+    ** This indicates nothing more needs to be rolled back.
+    */
+    rc = readJournalHdr(pPager, isHot, szJ, &nRec, &mxPg);
+    if( rc!=SQLITE_OK ){ 
+      if( rc==SQLITE_DONE ){
+        rc = SQLITE_OK;
+      }
+      goto end_playback;
+    }
+
+    /* If nRec is 0xffffffff, then this journal was created by a process
+    ** working in no-sync mode. This means that the rest of the journal
+    ** file consists of pages, there are no more journal headers. Compute
+    ** the value of nRec based on this assumption.
+    */
+    if( nRec==0xffffffff ){
+      assert( pPager->journalOff==JOURNAL_HDR_SZ(pPager) );
+      nRec = (int)((szJ - JOURNAL_HDR_SZ(pPager))/JOURNAL_PG_SZ(pPager));
+    }
+
+    /* If nRec is 0 and this rollback is of a transaction created by this
+    ** process and if this is the final header in the journal, then it means
+    ** that this part of the journal was being filled but has not yet been
+    ** synced to disk.  Compute the number of pages based on the remaining
+    ** size of the file.
+    **
+    ** The third term of the test was added to fix ticket #2565.
+    ** When rolling back a hot journal, nRec==0 always means that the next
+    ** chunk of the journal contains zero pages to be rolled back.  But
+    ** when doing a ROLLBACK and the nRec==0 chunk is the last chunk in
+    ** the journal, it means that the journal might contain additional
+    ** pages that need to be rolled back and that the number of pages 
+    ** should be computed based on the journal file size.
+    */
+    if( nRec==0 && !isHot &&
+        pPager->journalHdr+JOURNAL_HDR_SZ(pPager)==pPager->journalOff ){
+      nRec = (int)((szJ - pPager->journalOff) / JOURNAL_PG_SZ(pPager));
+    }
+
+    /* If this is the first header read from the journal, truncate the
+    ** database file back to its original size.
+    */
+    if( pPager->journalOff==JOURNAL_HDR_SZ(pPager) ){
+      rc = pager_truncate(pPager, mxPg);
+      if( rc!=SQLITE_OK ){
+        goto end_playback;
+      }
+      pPager->dbSize = mxPg;
+    }
+
+    /* Copy original pages out of the journal and back into the 
+    ** database file and/or page cache.
+    */
+    for(u=0; u<nRec; u++){
+      if( needPagerReset ){
+        pager_reset(pPager);
+        needPagerReset = 0;
+      }
+      rc = pager_playback_one_page(pPager,&pPager->journalOff,0,1,0);
+      if( rc==SQLITE_OK ){
+        nPlayback++;
+      }else{
+        if( rc==SQLITE_DONE ){
+          pPager->journalOff = szJ;
+          break;
+        }else if( rc==SQLITE_IOERR_SHORT_READ ){
+          /* If the journal has been truncated, simply stop reading and
+          ** processing the journal. This might happen if the journal was
+          ** not completely written and synced prior to a crash.  In that
+          ** case, the database should have never been written in the
+          ** first place so it is OK to simply abandon the rollback. */
+          rc = SQLITE_OK;
+          goto end_playback;
+        }else{
+          /* If we are unable to rollback, quit and return the error
+          ** code.  This will cause the pager to enter the error state
+          ** so that no further harm will be done.  Perhaps the next
+          ** process to come along will be able to rollback the database.
+          */
+          goto end_playback;
+        }
+      }
+    }
+  }
+  /*NOTREACHED*/
+  assert( 0 );
+
+end_playback:
+  /* Following a rollback, the database file should be back in its original
+  ** state prior to the start of the transaction, so invoke the
+  ** SQLITE_FCNTL_DB_UNCHANGED file-control method to disable the
+  ** assertion that the transaction counter was modified.
+  */
+#ifdef SQLITE_DEBUG
+  if( pPager->fd->pMethods ){
+    sqlite3OsFileControlHint(pPager->fd,SQLITE_FCNTL_DB_UNCHANGED,0);
+  }
+#endif
+
+  /* If this playback is happening automatically as a result of an IO or 
+  ** malloc error that occurred after the change-counter was updated but 
+  ** before the transaction was committed, then the change-counter 
+  ** modification may just have been reverted. If this happens in exclusive 
+  ** mode, then subsequent transactions performed by the connection will not
+  ** update the change-counter at all. This may lead to cache inconsistency
+  ** problems for other processes at some point in the future. So, just
+  ** in case this has happened, clear the changeCountDone flag now.
+  */
+  pPager->changeCountDone = pPager->tempFile;
+
+  if( rc==SQLITE_OK ){
+    zMaster = pPager->pTmpSpace;
+    rc = readMasterJournal(pPager->jfd, zMaster, pPager->pVfs->mxPathname+1);
+    testcase( rc!=SQLITE_OK );
+  }
+  if( rc==SQLITE_OK
+   && (pPager->eState>=PAGER_WRITER_DBMOD || pPager->eState==PAGER_OPEN)
+  ){
+    rc = sqlite3PagerSync(pPager, 0);
+  }
+  if( rc==SQLITE_OK ){
+    rc = pager_end_transaction(pPager, zMaster[0]!='\0', 0);
+    testcase( rc!=SQLITE_OK );
+  }
+  if( rc==SQLITE_OK && zMaster[0] && res ){
+    /* If there was a master journal and this routine will return success,
+    ** see if it is possible to delete the master journal.
+    */
+    rc = pager_delmaster(pPager, zMaster);
+    testcase( rc!=SQLITE_OK );
+  }
+  if( isHot && nPlayback ){
+    sqlite3_log(SQLITE_NOTICE_RECOVER_ROLLBACK, "recovered %d pages from %s",
+                nPlayback, pPager->zJournal);
+  }
+
+  /* The Pager.sectorSize variable may have been updated while rolling
+  ** back a journal created by a process with a different sector size
+  ** value. Reset it to the correct value for this process.
+  */
+  setSectorSize(pPager);
+  return rc;
+}
+
+
+/*
+** Read the content for page pPg out of the database file and into 
+** pPg->pData. A shared lock or greater must be held on the database
+** file before this function is called.
+**
+** If page 1 is read, then the value of Pager.dbFileVers[] is set to
+** the value read from the database file.
+**
+** If an IO error occurs, then the IO error is returned to the caller.
+** Otherwise, SQLITE_OK is returned.
+*/
+static int readDbPage(PgHdr *pPg, u32 iFrame){
+  Pager *pPager = pPg->pPager; /* Pager object associated with page pPg */
+  Pgno pgno = pPg->pgno;       /* Page number to read */
+  int rc = SQLITE_OK;          /* Return code */
+  int pgsz = pPager->pageSize; /* Number of bytes to read */
+
+  assert( pPager->eState>=PAGER_READER && !MEMDB );
+  assert( isOpen(pPager->fd) );
+
+#ifndef SQLITE_OMIT_WAL
+  if( iFrame ){
+    /* Try to pull the page from the write-ahead log. */
+    rc = sqlite3WalReadFrame(pPager->pWal, iFrame, pgsz, pPg->pData);
+  }else
+#endif
+  {
+    i64 iOffset = (pgno-1)*(i64)pPager->pageSize;
+    rc = sqlite3OsRead(pPager->fd, pPg->pData, pgsz, iOffset);
+    if( rc==SQLITE_IOERR_SHORT_READ ){
+      rc = SQLITE_OK;
+    }
+  }
+
+  if( pgno==1 ){
+    if( rc ){
