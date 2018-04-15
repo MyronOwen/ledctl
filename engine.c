@@ -43619,3 +43619,244 @@ static int pager_playback_one_page(
 **   "/home/bill/a.db-journal\x00/home/bill/b.db-journal\x00"
 **
 ** A master journal file may only be deleted once all of its child 
+** journals have been rolled back.
+**
+** This function reads the contents of the master-journal file into 
+** memory and loops through each of the child journal names. For
+** each child journal, it checks if:
+**
+**   * if the child journal exists, and if so
+**   * if the child journal contains a reference to master journal 
+**     file zMaster
+**
+** If a child journal can be found that matches both of the criteria
+** above, this function returns without doing anything. Otherwise, if
+** no such child journal can be found, file zMaster is deleted from
+** the file-system using sqlite3OsDelete().
+**
+** If an IO error within this function, an error code is returned. This
+** function allocates memory by calling sqlite3Malloc(). If an allocation
+** fails, SQLITE_NOMEM is returned. Otherwise, if no IO or malloc errors 
+** occur, SQLITE_OK is returned.
+**
+** TODO: This function allocates a single block of memory to load
+** the entire contents of the master journal file. This could be
+** a couple of kilobytes or so - potentially larger than the page 
+** size.
+*/
+static int pager_delmaster(Pager *pPager, const char *zMaster){
+  sqlite3_vfs *pVfs = pPager->pVfs;
+  int rc;                   /* Return code */
+  sqlite3_file *pMaster;    /* Malloc'd master-journal file descriptor */
+  sqlite3_file *pJournal;   /* Malloc'd child-journal file descriptor */
+  char *zMasterJournal = 0; /* Contents of master journal file */
+  i64 nMasterJournal;       /* Size of master journal file */
+  char *zJournal;           /* Pointer to one journal within MJ file */
+  char *zMasterPtr;         /* Space to hold MJ filename from a journal file */
+  int nMasterPtr;           /* Amount of space allocated to zMasterPtr[] */
+
+  /* Allocate space for both the pJournal and pMaster file descriptors.
+  ** If successful, open the master journal file for reading.
+  */
+  pMaster = (sqlite3_file *)sqlite3MallocZero(pVfs->szOsFile * 2);
+  pJournal = (sqlite3_file *)(((u8 *)pMaster) + pVfs->szOsFile);
+  if( !pMaster ){
+    rc = SQLITE_NOMEM;
+  }else{
+    const int flags = (SQLITE_OPEN_READONLY|SQLITE_OPEN_MASTER_JOURNAL);
+    rc = sqlite3OsOpen(pVfs, zMaster, pMaster, flags, 0);
+  }
+  if( rc!=SQLITE_OK ) goto delmaster_out;
+
+  /* Load the entire master journal file into space obtained from
+  ** sqlite3_malloc() and pointed to by zMasterJournal.   Also obtain
+  ** sufficient space (in zMasterPtr) to hold the names of master
+  ** journal files extracted from regular rollback-journals.
+  */
+  rc = sqlite3OsFileSize(pMaster, &nMasterJournal);
+  if( rc!=SQLITE_OK ) goto delmaster_out;
+  nMasterPtr = pVfs->mxPathname+1;
+  zMasterJournal = sqlite3Malloc(nMasterJournal + nMasterPtr + 1);
+  if( !zMasterJournal ){
+    rc = SQLITE_NOMEM;
+    goto delmaster_out;
+  }
+  zMasterPtr = &zMasterJournal[nMasterJournal+1];
+  rc = sqlite3OsRead(pMaster, zMasterJournal, (int)nMasterJournal, 0);
+  if( rc!=SQLITE_OK ) goto delmaster_out;
+  zMasterJournal[nMasterJournal] = 0;
+
+  zJournal = zMasterJournal;
+  while( (zJournal-zMasterJournal)<nMasterJournal ){
+    int exists;
+    rc = sqlite3OsAccess(pVfs, zJournal, SQLITE_ACCESS_EXISTS, &exists);
+    if( rc!=SQLITE_OK ){
+      goto delmaster_out;
+    }
+    if( exists ){
+      /* One of the journals pointed to by the master journal exists.
+      ** Open it and check if it points at the master journal. If
+      ** so, return without deleting the master journal file.
+      */
+      int c;
+      int flags = (SQLITE_OPEN_READONLY|SQLITE_OPEN_MAIN_JOURNAL);
+      rc = sqlite3OsOpen(pVfs, zJournal, pJournal, flags, 0);
+      if( rc!=SQLITE_OK ){
+        goto delmaster_out;
+      }
+
+      rc = readMasterJournal(pJournal, zMasterPtr, nMasterPtr);
+      sqlite3OsClose(pJournal);
+      if( rc!=SQLITE_OK ){
+        goto delmaster_out;
+      }
+
+      c = zMasterPtr[0]!=0 && strcmp(zMasterPtr, zMaster)==0;
+      if( c ){
+        /* We have a match. Do not delete the master journal file. */
+        goto delmaster_out;
+      }
+    }
+    zJournal += (sqlite3Strlen30(zJournal)+1);
+  }
+ 
+  sqlite3OsClose(pMaster);
+  rc = sqlite3OsDelete(pVfs, zMaster, 0);
+
+delmaster_out:
+  sqlite3_free(zMasterJournal);
+  if( pMaster ){
+    sqlite3OsClose(pMaster);
+    assert( !isOpen(pJournal) );
+    sqlite3_free(pMaster);
+  }
+  return rc;
+}
+
+
+/*
+** This function is used to change the actual size of the database 
+** file in the file-system. This only happens when committing a transaction,
+** or rolling back a transaction (including rolling back a hot-journal).
+**
+** If the main database file is not open, or the pager is not in either
+** DBMOD or OPEN state, this function is a no-op. Otherwise, the size 
+** of the file is changed to nPage pages (nPage*pPager->pageSize bytes). 
+** If the file on disk is currently larger than nPage pages, then use the VFS
+** xTruncate() method to truncate it.
+**
+** Or, it might be the case that the file on disk is smaller than 
+** nPage pages. Some operating system implementations can get confused if 
+** you try to truncate a file to some size that is larger than it 
+** currently is, so detect this case and write a single zero byte to 
+** the end of the new file instead.
+**
+** If successful, return SQLITE_OK. If an IO error occurs while modifying
+** the database file, return the error code to the caller.
+*/
+static int pager_truncate(Pager *pPager, Pgno nPage){
+  int rc = SQLITE_OK;
+  assert( pPager->eState!=PAGER_ERROR );
+  assert( pPager->eState!=PAGER_READER );
+  
+  if( isOpen(pPager->fd) 
+   && (pPager->eState>=PAGER_WRITER_DBMOD || pPager->eState==PAGER_OPEN) 
+  ){
+    i64 currentSize, newSize;
+    int szPage = pPager->pageSize;
+    assert( pPager->eLock==EXCLUSIVE_LOCK );
+    /* TODO: Is it safe to use Pager.dbFileSize here? */
+    rc = sqlite3OsFileSize(pPager->fd, &currentSize);
+    newSize = szPage*(i64)nPage;
+    if( rc==SQLITE_OK && currentSize!=newSize ){
+      if( currentSize>newSize ){
+        rc = sqlite3OsTruncate(pPager->fd, newSize);
+      }else if( (currentSize+szPage)<=newSize ){
+        char *pTmp = pPager->pTmpSpace;
+        memset(pTmp, 0, szPage);
+        testcase( (newSize-szPage) == currentSize );
+        testcase( (newSize-szPage) >  currentSize );
+        rc = sqlite3OsWrite(pPager->fd, pTmp, szPage, newSize-szPage);
+      }
+      if( rc==SQLITE_OK ){
+        pPager->dbFileSize = nPage;
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** Return a sanitized version of the sector-size of OS file pFile. The
+** return value is guaranteed to lie between 32 and MAX_SECTOR_SIZE.
+*/
+SQLITE_PRIVATE int sqlite3SectorSize(sqlite3_file *pFile){
+  int iRet = sqlite3OsSectorSize(pFile);
+  if( iRet<32 ){
+    iRet = 512;
+  }else if( iRet>MAX_SECTOR_SIZE ){
+    assert( MAX_SECTOR_SIZE>=512 );
+    iRet = MAX_SECTOR_SIZE;
+  }
+  return iRet;
+}
+
+/*
+** Set the value of the Pager.sectorSize variable for the given
+** pager based on the value returned by the xSectorSize method
+** of the open database file. The sector size will be used 
+** to determine the size and alignment of journal header and 
+** master journal pointers within created journal files.
+**
+** For temporary files the effective sector size is always 512 bytes.
+**
+** Otherwise, for non-temporary files, the effective sector size is
+** the value returned by the xSectorSize() method rounded up to 32 if
+** it is less than 32, or rounded down to MAX_SECTOR_SIZE if it
+** is greater than MAX_SECTOR_SIZE.
+**
+** If the file has the SQLITE_IOCAP_POWERSAFE_OVERWRITE property, then set
+** the effective sector size to its minimum value (512).  The purpose of
+** pPager->sectorSize is to define the "blast radius" of bytes that
+** might change if a crash occurs while writing to a single byte in
+** that range.  But with POWERSAFE_OVERWRITE, the blast radius is zero
+** (that is what POWERSAFE_OVERWRITE means), so we minimize the sector
+** size.  For backwards compatibility of the rollback journal file format,
+** we cannot reduce the effective sector size below 512.
+*/
+static void setSectorSize(Pager *pPager){
+  assert( isOpen(pPager->fd) || pPager->tempFile );
+
+  if( pPager->tempFile
+   || (sqlite3OsDeviceCharacteristics(pPager->fd) & 
+              SQLITE_IOCAP_POWERSAFE_OVERWRITE)!=0
+  ){
+    /* Sector size doesn't matter for temporary files. Also, the file
+    ** may not have been opened yet, in which case the OsSectorSize()
+    ** call will segfault. */
+    pPager->sectorSize = 512;
+  }else{
+    pPager->sectorSize = sqlite3SectorSize(pPager->fd);
+  }
+}
+
+/*
+** Playback the journal and thus restore the database file to
+** the state it was in before we started making changes.  
+**
+** The journal file format is as follows: 
+**
+**  (1)  8 byte prefix.  A copy of aJournalMagic[].
+**  (2)  4 byte big-endian integer which is the number of valid page records
+**       in the journal.  If this value is 0xffffffff, then compute the
+**       number of page records from the journal size.
+**  (3)  4 byte big-endian integer which is the initial value for the 
+**       sanity checksum.
+**  (4)  4 byte integer which is the number of pages to truncate the
+**       database to during a rollback.
+**  (5)  4 byte big-endian integer which is the sector size.  The header
+**       is this many bytes in size.
+**  (6)  4 byte big-endian integer which is the page size.
+**  (7)  zero padding out to the next sector size.
+**  (8)  Zero or more pages instances, each as follows:
+**        +  4 byte page number.
