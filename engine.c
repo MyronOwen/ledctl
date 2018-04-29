@@ -44351,3 +44351,264 @@ static int pagerBeginReadTransaction(Pager *pPager){
   sqlite3WalEndReadTransaction(pPager->pWal);
 
   rc = sqlite3WalBeginReadTransaction(pPager->pWal, &changed);
+  if( rc!=SQLITE_OK || changed ){
+    pager_reset(pPager);
+    if( USEFETCH(pPager) ) sqlite3OsUnfetch(pPager->fd, 0, 0);
+  }
+
+  return rc;
+}
+#endif
+
+/*
+** This function is called as part of the transition from PAGER_OPEN
+** to PAGER_READER state to determine the size of the database file
+** in pages (assuming the page size currently stored in Pager.pageSize).
+**
+** If no error occurs, SQLITE_OK is returned and the size of the database
+** in pages is stored in *pnPage. Otherwise, an error code (perhaps
+** SQLITE_IOERR_FSTAT) is returned and *pnPage is left unmodified.
+*/
+static int pagerPagecount(Pager *pPager, Pgno *pnPage){
+  Pgno nPage;                     /* Value to return via *pnPage */
+
+  /* Query the WAL sub-system for the database size. The WalDbsize()
+  ** function returns zero if the WAL is not open (i.e. Pager.pWal==0), or
+  ** if the database size is not available. The database size is not
+  ** available from the WAL sub-system if the log file is empty or
+  ** contains no valid committed transactions.
+  */
+  assert( pPager->eState==PAGER_OPEN );
+  assert( pPager->eLock>=SHARED_LOCK );
+  nPage = sqlite3WalDbsize(pPager->pWal);
+
+  /* If the database size was not available from the WAL sub-system,
+  ** determine it based on the size of the database file. If the size
+  ** of the database file is not an integer multiple of the page-size,
+  ** round down to the nearest page. Except, any file larger than 0
+  ** bytes in size is considered to contain at least one page.
+  */
+  if( nPage==0 ){
+    i64 n = 0;                    /* Size of db file in bytes */
+    assert( isOpen(pPager->fd) || pPager->tempFile );
+    if( isOpen(pPager->fd) ){
+      int rc = sqlite3OsFileSize(pPager->fd, &n);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+    }
+    nPage = (Pgno)((n+pPager->pageSize-1) / pPager->pageSize);
+  }
+
+  /* If the current number of pages in the file is greater than the
+  ** configured maximum pager number, increase the allowed limit so
+  ** that the file can be read.
+  */
+  if( nPage>pPager->mxPgno ){
+    pPager->mxPgno = (Pgno)nPage;
+  }
+
+  *pnPage = nPage;
+  return SQLITE_OK;
+}
+
+#ifndef SQLITE_OMIT_WAL
+/*
+** Check if the *-wal file that corresponds to the database opened by pPager
+** exists if the database is not empy, or verify that the *-wal file does
+** not exist (by deleting it) if the database file is empty.
+**
+** If the database is not empty and the *-wal file exists, open the pager
+** in WAL mode.  If the database is empty or if no *-wal file exists and
+** if no error occurs, make sure Pager.journalMode is not set to
+** PAGER_JOURNALMODE_WAL.
+**
+** Return SQLITE_OK or an error code.
+**
+** The caller must hold a SHARED lock on the database file to call this
+** function. Because an EXCLUSIVE lock on the db file is required to delete 
+** a WAL on a none-empty database, this ensures there is no race condition 
+** between the xAccess() below and an xDelete() being executed by some 
+** other connection.
+*/
+static int pagerOpenWalIfPresent(Pager *pPager){
+  int rc = SQLITE_OK;
+  assert( pPager->eState==PAGER_OPEN );
+  assert( pPager->eLock>=SHARED_LOCK );
+
+  if( !pPager->tempFile ){
+    int isWal;                    /* True if WAL file exists */
+    Pgno nPage;                   /* Size of the database file */
+
+    rc = pagerPagecount(pPager, &nPage);
+    if( rc ) return rc;
+    if( nPage==0 ){
+      rc = sqlite3OsDelete(pPager->pVfs, pPager->zWal, 0);
+      if( rc==SQLITE_IOERR_DELETE_NOENT ) rc = SQLITE_OK;
+      isWal = 0;
+    }else{
+      rc = sqlite3OsAccess(
+          pPager->pVfs, pPager->zWal, SQLITE_ACCESS_EXISTS, &isWal
+      );
+    }
+    if( rc==SQLITE_OK ){
+      if( isWal ){
+        testcase( sqlite3PcachePagecount(pPager->pPCache)==0 );
+        rc = sqlite3PagerOpenWal(pPager, 0);
+      }else if( pPager->journalMode==PAGER_JOURNALMODE_WAL ){
+        pPager->journalMode = PAGER_JOURNALMODE_DELETE;
+      }
+    }
+  }
+  return rc;
+}
+#endif
+
+/*
+** Playback savepoint pSavepoint. Or, if pSavepoint==NULL, then playback
+** the entire master journal file. The case pSavepoint==NULL occurs when 
+** a ROLLBACK TO command is invoked on a SAVEPOINT that is a transaction 
+** savepoint.
+**
+** When pSavepoint is not NULL (meaning a non-transaction savepoint is 
+** being rolled back), then the rollback consists of up to three stages,
+** performed in the order specified:
+**
+**   * Pages are played back from the main journal starting at byte
+**     offset PagerSavepoint.iOffset and continuing to 
+**     PagerSavepoint.iHdrOffset, or to the end of the main journal
+**     file if PagerSavepoint.iHdrOffset is zero.
+**
+**   * If PagerSavepoint.iHdrOffset is not zero, then pages are played
+**     back starting from the journal header immediately following 
+**     PagerSavepoint.iHdrOffset to the end of the main journal file.
+**
+**   * Pages are then played back from the sub-journal file, starting
+**     with the PagerSavepoint.iSubRec and continuing to the end of
+**     the journal file.
+**
+** Throughout the rollback process, each time a page is rolled back, the
+** corresponding bit is set in a bitvec structure (variable pDone in the
+** implementation below). This is used to ensure that a page is only
+** rolled back the first time it is encountered in either journal.
+**
+** If pSavepoint is NULL, then pages are only played back from the main
+** journal file. There is no need for a bitvec in this case.
+**
+** In either case, before playback commences the Pager.dbSize variable
+** is reset to the value that it held at the start of the savepoint 
+** (or transaction). No page with a page-number greater than this value
+** is played back. If one is encountered it is simply skipped.
+*/
+static int pagerPlaybackSavepoint(Pager *pPager, PagerSavepoint *pSavepoint){
+  i64 szJ;                 /* Effective size of the main journal */
+  i64 iHdrOff;             /* End of first segment of main-journal records */
+  int rc = SQLITE_OK;      /* Return code */
+  Bitvec *pDone = 0;       /* Bitvec to ensure pages played back only once */
+
+  assert( pPager->eState!=PAGER_ERROR );
+  assert( pPager->eState>=PAGER_WRITER_LOCKED );
+
+  /* Allocate a bitvec to use to store the set of pages rolled back */
+  if( pSavepoint ){
+    pDone = sqlite3BitvecCreate(pSavepoint->nOrig);
+    if( !pDone ){
+      return SQLITE_NOMEM;
+    }
+  }
+
+  /* Set the database size back to the value it was before the savepoint 
+  ** being reverted was opened.
+  */
+  pPager->dbSize = pSavepoint ? pSavepoint->nOrig : pPager->dbOrigSize;
+  pPager->changeCountDone = pPager->tempFile;
+
+  if( !pSavepoint && pagerUseWal(pPager) ){
+    return pagerRollbackWal(pPager);
+  }
+
+  /* Use pPager->journalOff as the effective size of the main rollback
+  ** journal.  The actual file might be larger than this in
+  ** PAGER_JOURNALMODE_TRUNCATE or PAGER_JOURNALMODE_PERSIST.  But anything
+  ** past pPager->journalOff is off-limits to us.
+  */
+  szJ = pPager->journalOff;
+  assert( pagerUseWal(pPager)==0 || szJ==0 );
+
+  /* Begin by rolling back records from the main journal starting at
+  ** PagerSavepoint.iOffset and continuing to the next journal header.
+  ** There might be records in the main journal that have a page number
+  ** greater than the current database size (pPager->dbSize) but those
+  ** will be skipped automatically.  Pages are added to pDone as they
+  ** are played back.
+  */
+  if( pSavepoint && !pagerUseWal(pPager) ){
+    iHdrOff = pSavepoint->iHdrOffset ? pSavepoint->iHdrOffset : szJ;
+    pPager->journalOff = pSavepoint->iOffset;
+    while( rc==SQLITE_OK && pPager->journalOff<iHdrOff ){
+      rc = pager_playback_one_page(pPager, &pPager->journalOff, pDone, 1, 1);
+    }
+    assert( rc!=SQLITE_DONE );
+  }else{
+    pPager->journalOff = 0;
+  }
+
+  /* Continue rolling back records out of the main journal starting at
+  ** the first journal header seen and continuing until the effective end
+  ** of the main journal file.  Continue to skip out-of-range pages and
+  ** continue adding pages rolled back to pDone.
+  */
+  while( rc==SQLITE_OK && pPager->journalOff<szJ ){
+    u32 ii;            /* Loop counter */
+    u32 nJRec = 0;     /* Number of Journal Records */
+    u32 dummy;
+    rc = readJournalHdr(pPager, 0, szJ, &nJRec, &dummy);
+    assert( rc!=SQLITE_DONE );
+
+    /*
+    ** The "pPager->journalHdr+JOURNAL_HDR_SZ(pPager)==pPager->journalOff"
+    ** test is related to ticket #2565.  See the discussion in the
+    ** pager_playback() function for additional information.
+    */
+    if( nJRec==0 
+     && pPager->journalHdr+JOURNAL_HDR_SZ(pPager)==pPager->journalOff
+    ){
+      nJRec = (u32)((szJ - pPager->journalOff)/JOURNAL_PG_SZ(pPager));
+    }
+    for(ii=0; rc==SQLITE_OK && ii<nJRec && pPager->journalOff<szJ; ii++){
+      rc = pager_playback_one_page(pPager, &pPager->journalOff, pDone, 1, 1);
+    }
+    assert( rc!=SQLITE_DONE );
+  }
+  assert( rc!=SQLITE_OK || pPager->journalOff>=szJ );
+
+  /* Finally,  rollback pages from the sub-journal.  Page that were
+  ** previously rolled back out of the main journal (and are hence in pDone)
+  ** will be skipped.  Out-of-range pages are also skipped.
+  */
+  if( pSavepoint ){
+    u32 ii;            /* Loop counter */
+    i64 offset = (i64)pSavepoint->iSubRec*(4+pPager->pageSize);
+
+    if( pagerUseWal(pPager) ){
+      rc = sqlite3WalSavepointUndo(pPager->pWal, pSavepoint->aWalData);
+    }
+    for(ii=pSavepoint->iSubRec; rc==SQLITE_OK && ii<pPager->nSubRec; ii++){
+      assert( offset==(i64)ii*(4+pPager->pageSize) );
+      rc = pager_playback_one_page(pPager, &offset, pDone, 0, 1);
+    }
+    assert( rc!=SQLITE_DONE );
+  }
+
+  sqlite3BitvecDestroy(pDone);
+  if( rc==SQLITE_OK ){
+    pPager->journalOff = szJ;
+  }
+
+  return rc;
+}
+
+/*
+** Change the maximum number of in-memory pages that are allowed.
+*/
+SQLITE_PRIVATE void sqlite3PagerSetCachesize(Pager *pPager, int mxPage){
