@@ -45084,3 +45084,241 @@ SQLITE_PRIVATE void sqlite3PagerTruncateImage(Pager *pPager, Pgno nPage){
   ** is no longer correct. */
 }
 
+
+/*
+** This function is called before attempting a hot-journal rollback. It
+** syncs the journal file to disk, then sets pPager->journalHdr to the
+** size of the journal file so that the pager_playback() routine knows
+** that the entire journal file has been synced.
+**
+** Syncing a hot-journal to disk before attempting to roll it back ensures 
+** that if a power-failure occurs during the rollback, the process that
+** attempts rollback following system recovery sees the same journal
+** content as this process.
+**
+** If everything goes as planned, SQLITE_OK is returned. Otherwise, 
+** an SQLite error code.
+*/
+static int pagerSyncHotJournal(Pager *pPager){
+  int rc = SQLITE_OK;
+  if( !pPager->noSync ){
+    rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_NORMAL);
+  }
+  if( rc==SQLITE_OK ){
+    rc = sqlite3OsFileSize(pPager->jfd, &pPager->journalHdr);
+  }
+  return rc;
+}
+
+/*
+** Obtain a reference to a memory mapped page object for page number pgno. 
+** The new object will use the pointer pData, obtained from xFetch().
+** If successful, set *ppPage to point to the new page reference
+** and return SQLITE_OK. Otherwise, return an SQLite error code and set
+** *ppPage to zero.
+**
+** Page references obtained by calling this function should be released
+** by calling pagerReleaseMapPage().
+*/
+static int pagerAcquireMapPage(
+  Pager *pPager,                  /* Pager object */
+  Pgno pgno,                      /* Page number */
+  void *pData,                    /* xFetch()'d data for this page */
+  PgHdr **ppPage                  /* OUT: Acquired page object */
+){
+  PgHdr *p;                       /* Memory mapped page to return */
+  
+  if( pPager->pMmapFreelist ){
+    *ppPage = p = pPager->pMmapFreelist;
+    pPager->pMmapFreelist = p->pDirty;
+    p->pDirty = 0;
+    memset(p->pExtra, 0, pPager->nExtra);
+  }else{
+    *ppPage = p = (PgHdr *)sqlite3MallocZero(sizeof(PgHdr) + pPager->nExtra);
+    if( p==0 ){
+      sqlite3OsUnfetch(pPager->fd, (i64)(pgno-1) * pPager->pageSize, pData);
+      return SQLITE_NOMEM;
+    }
+    p->pExtra = (void *)&p[1];
+    p->flags = PGHDR_MMAP;
+    p->nRef = 1;
+    p->pPager = pPager;
+  }
+
+  assert( p->pExtra==(void *)&p[1] );
+  assert( p->pPage==0 );
+  assert( p->flags==PGHDR_MMAP );
+  assert( p->pPager==pPager );
+  assert( p->nRef==1 );
+
+  p->pgno = pgno;
+  p->pData = pData;
+  pPager->nMmapOut++;
+
+  return SQLITE_OK;
+}
+
+/*
+** Release a reference to page pPg. pPg must have been returned by an 
+** earlier call to pagerAcquireMapPage().
+*/
+static void pagerReleaseMapPage(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  pPager->nMmapOut--;
+  pPg->pDirty = pPager->pMmapFreelist;
+  pPager->pMmapFreelist = pPg;
+
+  assert( pPager->fd->pMethods->iVersion>=3 );
+  sqlite3OsUnfetch(pPager->fd, (i64)(pPg->pgno-1)*pPager->pageSize, pPg->pData);
+}
+
+/*
+** Free all PgHdr objects stored in the Pager.pMmapFreelist list.
+*/
+static void pagerFreeMapHdrs(Pager *pPager){
+  PgHdr *p;
+  PgHdr *pNext;
+  for(p=pPager->pMmapFreelist; p; p=pNext){
+    pNext = p->pDirty;
+    sqlite3_free(p);
+  }
+}
+
+
+/*
+** Shutdown the page cache.  Free all memory and close all files.
+**
+** If a transaction was in progress when this routine is called, that
+** transaction is rolled back.  All outstanding pages are invalidated
+** and their memory is freed.  Any attempt to use a page associated
+** with this page cache after this function returns will likely
+** result in a coredump.
+**
+** This function always succeeds. If a transaction is active an attempt
+** is made to roll it back. If an error occurs during the rollback 
+** a hot journal may be left in the filesystem but no error is returned
+** to the caller.
+*/
+SQLITE_PRIVATE int sqlite3PagerClose(Pager *pPager){
+  u8 *pTmp = (u8 *)pPager->pTmpSpace;
+
+  assert( assert_pager_state(pPager) );
+  disable_simulated_io_errors();
+  sqlite3BeginBenignMalloc();
+  pagerFreeMapHdrs(pPager);
+  /* pPager->errCode = 0; */
+  pPager->exclusiveMode = 0;
+#ifndef SQLITE_OMIT_WAL
+  sqlite3WalClose(pPager->pWal, pPager->ckptSyncFlags, pPager->pageSize, pTmp);
+  pPager->pWal = 0;
+#endif
+  pager_reset(pPager);
+  if( MEMDB ){
+    pager_unlock(pPager);
+  }else{
+    /* If it is open, sync the journal file before calling UnlockAndRollback.
+    ** If this is not done, then an unsynced portion of the open journal 
+    ** file may be played back into the database. If a power failure occurs 
+    ** while this is happening, the database could become corrupt.
+    **
+    ** If an error occurs while trying to sync the journal, shift the pager
+    ** into the ERROR state. This causes UnlockAndRollback to unlock the
+    ** database and close the journal file without attempting to roll it
+    ** back or finalize it. The next database user will have to do hot-journal
+    ** rollback before accessing the database file.
+    */
+    if( isOpen(pPager->jfd) ){
+      pager_error(pPager, pagerSyncHotJournal(pPager));
+    }
+    pagerUnlockAndRollback(pPager);
+  }
+  sqlite3EndBenignMalloc();
+  enable_simulated_io_errors();
+  PAGERTRACE(("CLOSE %d\n", PAGERID(pPager)));
+  IOTRACE(("CLOSE %p\n", pPager))
+  sqlite3OsClose(pPager->jfd);
+  sqlite3OsClose(pPager->fd);
+  sqlite3PageFree(pTmp);
+  sqlite3PcacheClose(pPager->pPCache);
+
+#ifdef SQLITE_HAS_CODEC
+  if( pPager->xCodecFree ) pPager->xCodecFree(pPager->pCodec);
+#endif
+
+  assert( !pPager->aSavepoint && !pPager->pInJournal );
+  assert( !isOpen(pPager->jfd) && !isOpen(pPager->sjfd) );
+
+  sqlite3_free(pPager);
+  return SQLITE_OK;
+}
+
+#if !defined(NDEBUG) || defined(SQLITE_TEST)
+/*
+** Return the page number for page pPg.
+*/
+SQLITE_PRIVATE Pgno sqlite3PagerPagenumber(DbPage *pPg){
+  return pPg->pgno;
+}
+#endif
+
+/*
+** Increment the reference count for page pPg.
+*/
+SQLITE_PRIVATE void sqlite3PagerRef(DbPage *pPg){
+  sqlite3PcacheRef(pPg);
+}
+
+/*
+** Sync the journal. In other words, make sure all the pages that have
+** been written to the journal have actually reached the surface of the
+** disk and can be restored in the event of a hot-journal rollback.
+**
+** If the Pager.noSync flag is set, then this function is a no-op.
+** Otherwise, the actions required depend on the journal-mode and the 
+** device characteristics of the file-system, as follows:
+**
+**   * If the journal file is an in-memory journal file, no action need
+**     be taken.
+**
+**   * Otherwise, if the device does not support the SAFE_APPEND property,
+**     then the nRec field of the most recently written journal header
+**     is updated to contain the number of journal records that have
+**     been written following it. If the pager is operating in full-sync
+**     mode, then the journal file is synced before this field is updated.
+**
+**   * If the device does not support the SEQUENTIAL property, then 
+**     journal file is synced.
+**
+** Or, in pseudo-code:
+**
+**   if( NOT <in-memory journal> ){
+**     if( NOT SAFE_APPEND ){
+**       if( <full-sync mode> ) xSync(<journal file>);
+**       <update nRec field>
+**     } 
+**     if( NOT SEQUENTIAL ) xSync(<journal file>);
+**   }
+**
+** If successful, this routine clears the PGHDR_NEED_SYNC flag of every 
+** page currently held in memory before returning SQLITE_OK. If an IO
+** error is encountered, then the IO error code is returned to the caller.
+*/
+static int syncJournal(Pager *pPager, int newHdr){
+  int rc;                         /* Return code */
+
+  assert( pPager->eState==PAGER_WRITER_CACHEMOD
+       || pPager->eState==PAGER_WRITER_DBMOD
+  );
+  assert( assert_pager_state(pPager) );
+  assert( !pagerUseWal(pPager) );
+
+  rc = sqlite3PagerExclusiveLock(pPager);
+  if( rc!=SQLITE_OK ) return rc;
+
+  if( !pPager->noSync ){
+    assert( !pPager->tempFile );
+    if( isOpen(pPager->jfd) && pPager->journalMode!=PAGER_JOURNALMODE_MEMORY ){
+      const int iDc = sqlite3OsDeviceCharacteristics(pPager->fd);
+      assert( isOpen(pPager->jfd) );
+
+      if( 0==(iDc&SQLITE_IOCAP_SAFE_APPEND) ){
