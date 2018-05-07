@@ -45750,3 +45750,215 @@ static int pagerStress(void *p, PgHdr *pPg){
 ** and error code returned. This function may return SQLITE_NOMEM
 ** (sqlite3Malloc() is used to allocate memory), SQLITE_CANTOPEN or 
 ** various SQLITE_IO_XXX errors.
+*/
+SQLITE_PRIVATE int sqlite3PagerOpen(
+  sqlite3_vfs *pVfs,       /* The virtual file system to use */
+  Pager **ppPager,         /* OUT: Return the Pager structure here */
+  const char *zFilename,   /* Name of the database file to open */
+  int nExtra,              /* Extra bytes append to each in-memory page */
+  int flags,               /* flags controlling this file */
+  int vfsFlags,            /* flags passed through to sqlite3_vfs.xOpen() */
+  void (*xReinit)(DbPage*) /* Function to reinitialize pages */
+){
+  u8 *pPtr;
+  Pager *pPager = 0;       /* Pager object to allocate and return */
+  int rc = SQLITE_OK;      /* Return code */
+  int tempFile = 0;        /* True for temp files (incl. in-memory files) */
+  int memDb = 0;           /* True if this is an in-memory file */
+  int readOnly = 0;        /* True if this is a read-only file */
+  int journalFileSize;     /* Bytes to allocate for each journal fd */
+  char *zPathname = 0;     /* Full path to database file */
+  int nPathname = 0;       /* Number of bytes in zPathname */
+  int useJournal = (flags & PAGER_OMIT_JOURNAL)==0; /* False to omit journal */
+  int pcacheSize = sqlite3PcacheSize();       /* Bytes to allocate for PCache */
+  u32 szPageDflt = SQLITE_DEFAULT_PAGE_SIZE;  /* Default page size */
+  const char *zUri = 0;    /* URI args to copy */
+  int nUri = 0;            /* Number of bytes of URI args at *zUri */
+
+  /* Figure out how much space is required for each journal file-handle
+  ** (there are two of them, the main journal and the sub-journal). This
+  ** is the maximum space required for an in-memory journal file handle 
+  ** and a regular journal file-handle. Note that a "regular journal-handle"
+  ** may be a wrapper capable of caching the first portion of the journal
+  ** file in memory to implement the atomic-write optimization (see 
+  ** source file journal.c).
+  */
+  if( sqlite3JournalSize(pVfs)>sqlite3MemJournalSize() ){
+    journalFileSize = ROUND8(sqlite3JournalSize(pVfs));
+  }else{
+    journalFileSize = ROUND8(sqlite3MemJournalSize());
+  }
+
+  /* Set the output variable to NULL in case an error occurs. */
+  *ppPager = 0;
+
+#ifndef SQLITE_OMIT_MEMORYDB
+  if( flags & PAGER_MEMORY ){
+    memDb = 1;
+    if( zFilename && zFilename[0] ){
+      zPathname = sqlite3DbStrDup(0, zFilename);
+      if( zPathname==0  ) return SQLITE_NOMEM;
+      nPathname = sqlite3Strlen30(zPathname);
+      zFilename = 0;
+    }
+  }
+#endif
+
+  /* Compute and store the full pathname in an allocated buffer pointed
+  ** to by zPathname, length nPathname. Or, if this is a temporary file,
+  ** leave both nPathname and zPathname set to 0.
+  */
+  if( zFilename && zFilename[0] ){
+    const char *z;
+    nPathname = pVfs->mxPathname+1;
+    zPathname = sqlite3DbMallocRaw(0, nPathname*2);
+    if( zPathname==0 ){
+      return SQLITE_NOMEM;
+    }
+    zPathname[0] = 0; /* Make sure initialized even if FullPathname() fails */
+    rc = sqlite3OsFullPathname(pVfs, zFilename, nPathname, zPathname);
+    nPathname = sqlite3Strlen30(zPathname);
+    z = zUri = &zFilename[sqlite3Strlen30(zFilename)+1];
+    while( *z ){
+      z += sqlite3Strlen30(z)+1;
+      z += sqlite3Strlen30(z)+1;
+    }
+    nUri = (int)(&z[1] - zUri);
+    assert( nUri>=0 );
+    if( rc==SQLITE_OK && nPathname+8>pVfs->mxPathname ){
+      /* This branch is taken when the journal path required by
+      ** the database being opened will be more than pVfs->mxPathname
+      ** bytes in length. This means the database cannot be opened,
+      ** as it will not be possible to open the journal file or even
+      ** check for a hot-journal before reading.
+      */
+      rc = SQLITE_CANTOPEN_BKPT;
+    }
+    if( rc!=SQLITE_OK ){
+      sqlite3DbFree(0, zPathname);
+      return rc;
+    }
+  }
+
+  /* Allocate memory for the Pager structure, PCache object, the
+  ** three file descriptors, the database file name and the journal 
+  ** file name. The layout in memory is as follows:
+  **
+  **     Pager object                    (sizeof(Pager) bytes)
+  **     PCache object                   (sqlite3PcacheSize() bytes)
+  **     Database file handle            (pVfs->szOsFile bytes)
+  **     Sub-journal file handle         (journalFileSize bytes)
+  **     Main journal file handle        (journalFileSize bytes)
+  **     Database file name              (nPathname+1 bytes)
+  **     Journal file name               (nPathname+8+1 bytes)
+  */
+  pPtr = (u8 *)sqlite3MallocZero(
+    ROUND8(sizeof(*pPager)) +      /* Pager structure */
+    ROUND8(pcacheSize) +           /* PCache object */
+    ROUND8(pVfs->szOsFile) +       /* The main db file */
+    journalFileSize * 2 +          /* The two journal files */ 
+    nPathname + 1 + nUri +         /* zFilename */
+    nPathname + 8 + 2              /* zJournal */
+#ifndef SQLITE_OMIT_WAL
+    + nPathname + 4 + 2            /* zWal */
+#endif
+  );
+  assert( EIGHT_BYTE_ALIGNMENT(SQLITE_INT_TO_PTR(journalFileSize)) );
+  if( !pPtr ){
+    sqlite3DbFree(0, zPathname);
+    return SQLITE_NOMEM;
+  }
+  pPager =              (Pager*)(pPtr);
+  pPager->pPCache =    (PCache*)(pPtr += ROUND8(sizeof(*pPager)));
+  pPager->fd =   (sqlite3_file*)(pPtr += ROUND8(pcacheSize));
+  pPager->sjfd = (sqlite3_file*)(pPtr += ROUND8(pVfs->szOsFile));
+  pPager->jfd =  (sqlite3_file*)(pPtr += journalFileSize);
+  pPager->zFilename =    (char*)(pPtr += journalFileSize);
+  assert( EIGHT_BYTE_ALIGNMENT(pPager->jfd) );
+
+  /* Fill in the Pager.zFilename and Pager.zJournal buffers, if required. */
+  if( zPathname ){
+    assert( nPathname>0 );
+    pPager->zJournal =   (char*)(pPtr += nPathname + 1 + nUri);
+    memcpy(pPager->zFilename, zPathname, nPathname);
+    if( nUri ) memcpy(&pPager->zFilename[nPathname+1], zUri, nUri);
+    memcpy(pPager->zJournal, zPathname, nPathname);
+    memcpy(&pPager->zJournal[nPathname], "-journal\000", 8+2);
+    sqlite3FileSuffix3(pPager->zFilename, pPager->zJournal);
+#ifndef SQLITE_OMIT_WAL
+    pPager->zWal = &pPager->zJournal[nPathname+8+1];
+    memcpy(pPager->zWal, zPathname, nPathname);
+    memcpy(&pPager->zWal[nPathname], "-wal\000", 4+1);
+    sqlite3FileSuffix3(pPager->zFilename, pPager->zWal);
+#endif
+    sqlite3DbFree(0, zPathname);
+  }
+  pPager->pVfs = pVfs;
+  pPager->vfsFlags = vfsFlags;
+
+  /* Open the pager file.
+  */
+  if( zFilename && zFilename[0] ){
+    int fout = 0;                    /* VFS flags returned by xOpen() */
+    rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);
+    assert( !memDb );
+    readOnly = (fout&SQLITE_OPEN_READONLY);
+
+    /* If the file was successfully opened for read/write access,
+    ** choose a default page size in case we have to create the
+    ** database file. The default page size is the maximum of:
+    **
+    **    + SQLITE_DEFAULT_PAGE_SIZE,
+    **    + The value returned by sqlite3OsSectorSize()
+    **    + The largest page size that can be written atomically.
+    */
+    if( rc==SQLITE_OK ){
+      int iDc = sqlite3OsDeviceCharacteristics(pPager->fd);
+      if( !readOnly ){
+        setSectorSize(pPager);
+        assert(SQLITE_DEFAULT_PAGE_SIZE<=SQLITE_MAX_DEFAULT_PAGE_SIZE);
+        if( szPageDflt<pPager->sectorSize ){
+          if( pPager->sectorSize>SQLITE_MAX_DEFAULT_PAGE_SIZE ){
+            szPageDflt = SQLITE_MAX_DEFAULT_PAGE_SIZE;
+          }else{
+            szPageDflt = (u32)pPager->sectorSize;
+          }
+        }
+#ifdef SQLITE_ENABLE_ATOMIC_WRITE
+        {
+          int ii;
+          assert(SQLITE_IOCAP_ATOMIC512==(512>>8));
+          assert(SQLITE_IOCAP_ATOMIC64K==(65536>>8));
+          assert(SQLITE_MAX_DEFAULT_PAGE_SIZE<=65536);
+          for(ii=szPageDflt; ii<=SQLITE_MAX_DEFAULT_PAGE_SIZE; ii=ii*2){
+            if( iDc&(SQLITE_IOCAP_ATOMIC|(ii>>8)) ){
+              szPageDflt = ii;
+            }
+          }
+        }
+#endif
+      }
+      pPager->noLock = sqlite3_uri_boolean(zFilename, "nolock", 0);
+      if( (iDc & SQLITE_IOCAP_IMMUTABLE)!=0
+       || sqlite3_uri_boolean(zFilename, "immutable", 0) ){
+          vfsFlags |= SQLITE_OPEN_READONLY;
+          goto act_like_temp_file;
+      }
+    }
+  }else{
+    /* If a temporary file is requested, it is not opened immediately.
+    ** In this case we accept the default page size and delay actually
+    ** opening the file until the first call to OsWrite().
+    **
+    ** This branch is also run for an in-memory database. An in-memory
+    ** database is the same as a temp-file that is never written out to
+    ** disk and uses an in-memory rollback journal.
+    **
+    ** This branch also runs for files marked as immutable.
+    */ 
+act_like_temp_file:
+    tempFile = 1;
+    pPager->eState = PAGER_READER;     /* Pretend we already have a lock */
+    pPager->eLock = EXCLUSIVE_LOCK;    /* Pretend we are in EXCLUSIVE locking mode */
+    pPager->noLock = 1;                /* Do no locking */
+    readOnly = (vfsFlags&SQLITE_OPEN_READONLY);
