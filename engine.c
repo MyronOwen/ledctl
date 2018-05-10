@@ -46420,3 +46420,223 @@ SQLITE_PRIVATE int sqlite3PagerSharedLock(Pager *pPager){
     rc = pagerBeginReadTransaction(pPager);
   }
 
+  if( pPager->eState==PAGER_OPEN && rc==SQLITE_OK ){
+    rc = pagerPagecount(pPager, &pPager->dbSize);
+  }
+
+ failed:
+  if( rc!=SQLITE_OK ){
+    assert( !MEMDB );
+    pager_unlock(pPager);
+    assert( pPager->eState==PAGER_OPEN );
+  }else{
+    pPager->eState = PAGER_READER;
+  }
+  return rc;
+}
+
+/*
+** If the reference count has reached zero, rollback any active
+** transaction and unlock the pager.
+**
+** Except, in locking_mode=EXCLUSIVE when there is nothing to in
+** the rollback journal, the unlock is not performed and there is
+** nothing to rollback, so this routine is a no-op.
+*/ 
+static void pagerUnlockIfUnused(Pager *pPager){
+  if( pPager->nMmapOut==0 && (sqlite3PcacheRefCount(pPager->pPCache)==0) ){
+    pagerUnlockAndRollback(pPager);
+  }
+}
+
+/*
+** Acquire a reference to page number pgno in pager pPager (a page
+** reference has type DbPage*). If the requested reference is 
+** successfully obtained, it is copied to *ppPage and SQLITE_OK returned.
+**
+** If the requested page is already in the cache, it is returned. 
+** Otherwise, a new page object is allocated and populated with data
+** read from the database file. In some cases, the pcache module may
+** choose not to allocate a new page object and may reuse an existing
+** object with no outstanding references.
+**
+** The extra data appended to a page is always initialized to zeros the 
+** first time a page is loaded into memory. If the page requested is 
+** already in the cache when this function is called, then the extra
+** data is left as it was when the page object was last used.
+**
+** If the database image is smaller than the requested page or if a 
+** non-zero value is passed as the noContent parameter and the 
+** requested page is not already stored in the cache, then no 
+** actual disk read occurs. In this case the memory image of the 
+** page is initialized to all zeros. 
+**
+** If noContent is true, it means that we do not care about the contents
+** of the page. This occurs in two scenarios:
+**
+**   a) When reading a free-list leaf page from the database, and
+**
+**   b) When a savepoint is being rolled back and we need to load
+**      a new page into the cache to be filled with the data read
+**      from the savepoint journal.
+**
+** If noContent is true, then the data returned is zeroed instead of
+** being read from the database. Additionally, the bits corresponding
+** to pgno in Pager.pInJournal (bitvec of pages already written to the
+** journal file) and the PagerSavepoint.pInSavepoint bitvecs of any open
+** savepoints are set. This means if the page is made writable at any
+** point in the future, using a call to sqlite3PagerWrite(), its contents
+** will not be journaled. This saves IO.
+**
+** The acquisition might fail for several reasons.  In all cases,
+** an appropriate error code is returned and *ppPage is set to NULL.
+**
+** See also sqlite3PagerLookup().  Both this routine and Lookup() attempt
+** to find a page in the in-memory cache first.  If the page is not already
+** in memory, this routine goes to disk to read it in whereas Lookup()
+** just returns 0.  This routine acquires a read-lock the first time it
+** has to go to disk, and could also playback an old journal if necessary.
+** Since Lookup() never goes to disk, it never has to deal with locks
+** or journal files.
+*/
+SQLITE_PRIVATE int sqlite3PagerAcquire(
+  Pager *pPager,      /* The pager open on the database file */
+  Pgno pgno,          /* Page number to fetch */
+  DbPage **ppPage,    /* Write a pointer to the page here */
+  int flags           /* PAGER_GET_XXX flags */
+){
+  int rc = SQLITE_OK;
+  PgHdr *pPg = 0;
+  u32 iFrame = 0;                 /* Frame to read from WAL file */
+  const int noContent = (flags & PAGER_GET_NOCONTENT);
+
+  /* It is acceptable to use a read-only (mmap) page for any page except
+  ** page 1 if there is no write-transaction open or the ACQUIRE_READONLY
+  ** flag was specified by the caller. And so long as the db is not a 
+  ** temporary or in-memory database.  */
+  const int bMmapOk = (pgno!=1 && USEFETCH(pPager)
+   && (pPager->eState==PAGER_READER || (flags & PAGER_GET_READONLY))
+#ifdef SQLITE_HAS_CODEC
+   && pPager->xCodec==0
+#endif
+  );
+
+  assert( pPager->eState>=PAGER_READER );
+  assert( assert_pager_state(pPager) );
+  assert( noContent==0 || bMmapOk==0 );
+
+  if( pgno==0 ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  pPager->hasBeenUsed = 1;
+
+  /* If the pager is in the error state, return an error immediately. 
+  ** Otherwise, request the page from the PCache layer. */
+  if( pPager->errCode!=SQLITE_OK ){
+    rc = pPager->errCode;
+  }else{
+    if( bMmapOk && pagerUseWal(pPager) ){
+      rc = sqlite3WalFindFrame(pPager->pWal, pgno, &iFrame);
+      if( rc!=SQLITE_OK ) goto pager_acquire_err;
+    }
+
+    if( bMmapOk && iFrame==0 ){
+      void *pData = 0;
+
+      rc = sqlite3OsFetch(pPager->fd, 
+          (i64)(pgno-1) * pPager->pageSize, pPager->pageSize, &pData
+      );
+
+      if( rc==SQLITE_OK && pData ){
+        if( pPager->eState>PAGER_READER ){
+          pPg = sqlite3PagerLookup(pPager, pgno);
+        }
+        if( pPg==0 ){
+          rc = pagerAcquireMapPage(pPager, pgno, pData, &pPg);
+        }else{
+          sqlite3OsUnfetch(pPager->fd, (i64)(pgno-1)*pPager->pageSize, pData);
+        }
+        if( pPg ){
+          assert( rc==SQLITE_OK );
+          *ppPage = pPg;
+          return SQLITE_OK;
+        }
+      }
+      if( rc!=SQLITE_OK ){
+        goto pager_acquire_err;
+      }
+    }
+
+    {
+      sqlite3_pcache_page *pBase;
+      pBase = sqlite3PcacheFetch(pPager->pPCache, pgno, 3);
+      if( pBase==0 ){
+        rc = sqlite3PcacheFetchStress(pPager->pPCache, pgno, &pBase);
+        if( rc!=SQLITE_OK ) goto pager_acquire_err;
+      }
+      pPg = *ppPage = sqlite3PcacheFetchFinish(pPager->pPCache, pgno, pBase);
+      if( pPg==0 ) rc = SQLITE_NOMEM;
+    }
+  }
+
+  if( rc!=SQLITE_OK ){
+    /* Either the call to sqlite3PcacheFetch() returned an error or the
+    ** pager was already in the error-state when this function was called.
+    ** Set pPg to 0 and jump to the exception handler.  */
+    pPg = 0;
+    goto pager_acquire_err;
+  }
+  assert( (*ppPage)->pgno==pgno );
+  assert( (*ppPage)->pPager==pPager || (*ppPage)->pPager==0 );
+
+  if( (*ppPage)->pPager && !noContent ){
+    /* In this case the pcache already contains an initialized copy of
+    ** the page. Return without further ado.  */
+    assert( pgno<=PAGER_MAX_PGNO && pgno!=PAGER_MJ_PGNO(pPager) );
+    pPager->aStat[PAGER_STAT_HIT]++;
+    return SQLITE_OK;
+
+  }else{
+    /* The pager cache has created a new page. Its content needs to 
+    ** be initialized.  */
+
+    pPg = *ppPage;
+    pPg->pPager = pPager;
+
+    /* The maximum page number is 2^31. Return SQLITE_CORRUPT if a page
+    ** number greater than this, or the unused locking-page, is requested. */
+    if( pgno>PAGER_MAX_PGNO || pgno==PAGER_MJ_PGNO(pPager) ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto pager_acquire_err;
+    }
+
+    if( MEMDB || pPager->dbSize<pgno || noContent || !isOpen(pPager->fd) ){
+      if( pgno>pPager->mxPgno ){
+        rc = SQLITE_FULL;
+        goto pager_acquire_err;
+      }
+      if( noContent ){
+        /* Failure to set the bits in the InJournal bit-vectors is benign.
+        ** It merely means that we might do some extra work to journal a 
+        ** page that does not need to be journaled.  Nevertheless, be sure 
+        ** to test the case where a malloc error occurs while trying to set 
+        ** a bit in a bit vector.
+        */
+        sqlite3BeginBenignMalloc();
+        if( pgno<=pPager->dbOrigSize ){
+          TESTONLY( rc = ) sqlite3BitvecSet(pPager->pInJournal, pgno);
+          testcase( rc==SQLITE_NOMEM );
+        }
+        TESTONLY( rc = ) addToSavepointBitvecs(pPager, pgno);
+        testcase( rc==SQLITE_NOMEM );
+        sqlite3EndBenignMalloc();
+      }
+      memset(pPg->pData, 0, pPager->pageSize);
+      IOTRACE(("ZERO %p %d\n", pPager, pgno));
+    }else{
+      if( pagerUseWal(pPager) && bMmapOk==0 ){
+        rc = sqlite3WalFindFrame(pPager->pWal, pgno, &iFrame);
+        if( rc!=SQLITE_OK ) goto pager_acquire_err;
+      }
+      assert( pPg->pPager==pPager );
+      pPager->aStat[PAGER_STAT_MISS]++;
