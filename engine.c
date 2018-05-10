@@ -47610,3 +47610,218 @@ SQLITE_PRIVATE int sqlite3PagerRollback(Pager *pPager){
   }
 
   assert( pPager->eState==PAGER_READER || rc!=SQLITE_OK );
+  assert( rc==SQLITE_OK || rc==SQLITE_FULL || rc==SQLITE_CORRUPT
+          || rc==SQLITE_NOMEM || (rc&0xFF)==SQLITE_IOERR 
+          || rc==SQLITE_CANTOPEN
+  );
+
+  /* If an error occurs during a ROLLBACK, we can no longer trust the pager
+  ** cache. So call pager_error() on the way out to make any error persistent.
+  */
+  return pager_error(pPager, rc);
+}
+
+/*
+** Return TRUE if the database file is opened read-only.  Return FALSE
+** if the database is (in theory) writable.
+*/
+SQLITE_PRIVATE u8 sqlite3PagerIsreadonly(Pager *pPager){
+  return pPager->readOnly;
+}
+
+/*
+** Return the number of references to the pager.
+*/
+SQLITE_PRIVATE int sqlite3PagerRefcount(Pager *pPager){
+  return sqlite3PcacheRefCount(pPager->pPCache);
+}
+
+/*
+** Return the approximate number of bytes of memory currently
+** used by the pager and its associated cache.
+*/
+SQLITE_PRIVATE int sqlite3PagerMemUsed(Pager *pPager){
+  int perPageSize = pPager->pageSize + pPager->nExtra + sizeof(PgHdr)
+                                     + 5*sizeof(void*);
+  return perPageSize*sqlite3PcachePagecount(pPager->pPCache)
+           + sqlite3MallocSize(pPager)
+           + pPager->pageSize;
+}
+
+/*
+** Return the number of references to the specified page.
+*/
+SQLITE_PRIVATE int sqlite3PagerPageRefcount(DbPage *pPage){
+  return sqlite3PcachePageRefcount(pPage);
+}
+
+#ifdef SQLITE_TEST
+/*
+** This routine is used for testing and analysis only.
+*/
+SQLITE_PRIVATE int *sqlite3PagerStats(Pager *pPager){
+  static int a[11];
+  a[0] = sqlite3PcacheRefCount(pPager->pPCache);
+  a[1] = sqlite3PcachePagecount(pPager->pPCache);
+  a[2] = sqlite3PcacheGetCachesize(pPager->pPCache);
+  a[3] = pPager->eState==PAGER_OPEN ? -1 : (int) pPager->dbSize;
+  a[4] = pPager->eState;
+  a[5] = pPager->errCode;
+  a[6] = pPager->aStat[PAGER_STAT_HIT];
+  a[7] = pPager->aStat[PAGER_STAT_MISS];
+  a[8] = 0;  /* Used to be pPager->nOvfl */
+  a[9] = pPager->nRead;
+  a[10] = pPager->aStat[PAGER_STAT_WRITE];
+  return a;
+}
+#endif
+
+/*
+** Parameter eStat must be either SQLITE_DBSTATUS_CACHE_HIT or
+** SQLITE_DBSTATUS_CACHE_MISS. Before returning, *pnVal is incremented by the
+** current cache hit or miss count, according to the value of eStat. If the 
+** reset parameter is non-zero, the cache hit or miss count is zeroed before 
+** returning.
+*/
+SQLITE_PRIVATE void sqlite3PagerCacheStat(Pager *pPager, int eStat, int reset, int *pnVal){
+
+  assert( eStat==SQLITE_DBSTATUS_CACHE_HIT
+       || eStat==SQLITE_DBSTATUS_CACHE_MISS
+       || eStat==SQLITE_DBSTATUS_CACHE_WRITE
+  );
+
+  assert( SQLITE_DBSTATUS_CACHE_HIT+1==SQLITE_DBSTATUS_CACHE_MISS );
+  assert( SQLITE_DBSTATUS_CACHE_HIT+2==SQLITE_DBSTATUS_CACHE_WRITE );
+  assert( PAGER_STAT_HIT==0 && PAGER_STAT_MISS==1 && PAGER_STAT_WRITE==2 );
+
+  *pnVal += pPager->aStat[eStat - SQLITE_DBSTATUS_CACHE_HIT];
+  if( reset ){
+    pPager->aStat[eStat - SQLITE_DBSTATUS_CACHE_HIT] = 0;
+  }
+}
+
+/*
+** Return true if this is an in-memory pager.
+*/
+SQLITE_PRIVATE int sqlite3PagerIsMemdb(Pager *pPager){
+  return MEMDB;
+}
+
+/*
+** Check that there are at least nSavepoint savepoints open. If there are
+** currently less than nSavepoints open, then open one or more savepoints
+** to make up the difference. If the number of savepoints is already
+** equal to nSavepoint, then this function is a no-op.
+**
+** If a memory allocation fails, SQLITE_NOMEM is returned. If an error 
+** occurs while opening the sub-journal file, then an IO error code is
+** returned. Otherwise, SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3PagerOpenSavepoint(Pager *pPager, int nSavepoint){
+  int rc = SQLITE_OK;                       /* Return code */
+  int nCurrent = pPager->nSavepoint;        /* Current number of savepoints */
+
+  assert( pPager->eState>=PAGER_WRITER_LOCKED );
+  assert( assert_pager_state(pPager) );
+
+  if( nSavepoint>nCurrent && pPager->useJournal ){
+    int ii;                                 /* Iterator variable */
+    PagerSavepoint *aNew;                   /* New Pager.aSavepoint array */
+
+    /* Grow the Pager.aSavepoint array using realloc(). Return SQLITE_NOMEM
+    ** if the allocation fails. Otherwise, zero the new portion in case a 
+    ** malloc failure occurs while populating it in the for(...) loop below.
+    */
+    aNew = (PagerSavepoint *)sqlite3Realloc(
+        pPager->aSavepoint, sizeof(PagerSavepoint)*nSavepoint
+    );
+    if( !aNew ){
+      return SQLITE_NOMEM;
+    }
+    memset(&aNew[nCurrent], 0, (nSavepoint-nCurrent) * sizeof(PagerSavepoint));
+    pPager->aSavepoint = aNew;
+
+    /* Populate the PagerSavepoint structures just allocated. */
+    for(ii=nCurrent; ii<nSavepoint; ii++){
+      aNew[ii].nOrig = pPager->dbSize;
+      if( isOpen(pPager->jfd) && pPager->journalOff>0 ){
+        aNew[ii].iOffset = pPager->journalOff;
+      }else{
+        aNew[ii].iOffset = JOURNAL_HDR_SZ(pPager);
+      }
+      aNew[ii].iSubRec = pPager->nSubRec;
+      aNew[ii].pInSavepoint = sqlite3BitvecCreate(pPager->dbSize);
+      if( !aNew[ii].pInSavepoint ){
+        return SQLITE_NOMEM;
+      }
+      if( pagerUseWal(pPager) ){
+        sqlite3WalSavepoint(pPager->pWal, aNew[ii].aWalData);
+      }
+      pPager->nSavepoint = ii+1;
+    }
+    assert( pPager->nSavepoint==nSavepoint );
+    assertTruncateConstraint(pPager);
+  }
+
+  return rc;
+}
+
+/*
+** This function is called to rollback or release (commit) a savepoint.
+** The savepoint to release or rollback need not be the most recently 
+** created savepoint.
+**
+** Parameter op is always either SAVEPOINT_ROLLBACK or SAVEPOINT_RELEASE.
+** If it is SAVEPOINT_RELEASE, then release and destroy the savepoint with
+** index iSavepoint. If it is SAVEPOINT_ROLLBACK, then rollback all changes
+** that have occurred since the specified savepoint was created.
+**
+** The savepoint to rollback or release is identified by parameter 
+** iSavepoint. A value of 0 means to operate on the outermost savepoint
+** (the first created). A value of (Pager.nSavepoint-1) means operate
+** on the most recently created savepoint. If iSavepoint is greater than
+** (Pager.nSavepoint-1), then this function is a no-op.
+**
+** If a negative value is passed to this function, then the current
+** transaction is rolled back. This is different to calling 
+** sqlite3PagerRollback() because this function does not terminate
+** the transaction or unlock the database, it just restores the 
+** contents of the database to its original state. 
+**
+** In any case, all savepoints with an index greater than iSavepoint 
+** are destroyed. If this is a release operation (op==SAVEPOINT_RELEASE),
+** then savepoint iSavepoint is also destroyed.
+**
+** This function may return SQLITE_NOMEM if a memory allocation fails,
+** or an IO error code if an IO error occurs while rolling back a 
+** savepoint. If no errors occur, SQLITE_OK is returned.
+*/ 
+SQLITE_PRIVATE int sqlite3PagerSavepoint(Pager *pPager, int op, int iSavepoint){
+  int rc = pPager->errCode;       /* Return code */
+
+  assert( op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
+  assert( iSavepoint>=0 || op==SAVEPOINT_ROLLBACK );
+
+  if( rc==SQLITE_OK && iSavepoint<pPager->nSavepoint ){
+    int ii;            /* Iterator variable */
+    int nNew;          /* Number of remaining savepoints after this op. */
+
+    /* Figure out how many savepoints will still be active after this
+    ** operation. Store this value in nNew. Then free resources associated 
+    ** with any savepoints that are destroyed by this operation.
+    */
+    nNew = iSavepoint + (( op==SAVEPOINT_RELEASE ) ? 0 : 1);
+    for(ii=nNew; ii<pPager->nSavepoint; ii++){
+      sqlite3BitvecDestroy(pPager->aSavepoint[ii].pInSavepoint);
+    }
+    pPager->nSavepoint = nNew;
+
+    /* If this is a release of the outermost savepoint, truncate 
+    ** the sub-journal to zero bytes in size. */
+    if( op==SAVEPOINT_RELEASE ){
+      if( nNew==0 && isOpen(pPager->sjfd) ){
+        /* Only truncate if it is an in-memory sub-journal. */
+        if( sqlite3IsMemJournal(pPager->sjfd) ){
+          rc = sqlite3OsTruncate(pPager->sjfd, 0);
+          assert( rc==SQLITE_OK );
+        }
