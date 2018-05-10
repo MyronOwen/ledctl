@@ -47359,3 +47359,254 @@ SQLITE_PRIVATE int sqlite3PagerCommitPhaseOne(
 
   /* If no database changes have been made, return early. */
   if( pPager->eState<PAGER_WRITER_CACHEMOD ) return SQLITE_OK;
+
+  if( MEMDB ){
+    /* If this is an in-memory db, or no pages have been written to, or this
+    ** function has already been called, it is mostly a no-op.  However, any
+    ** backup in progress needs to be restarted.
+    */
+    sqlite3BackupRestart(pPager->pBackup);
+  }else{
+    if( pagerUseWal(pPager) ){
+      PgHdr *pList = sqlite3PcacheDirtyList(pPager->pPCache);
+      PgHdr *pPageOne = 0;
+      if( pList==0 ){
+        /* Must have at least one page for the WAL commit flag.
+        ** Ticket [2d1a5c67dfc2363e44f29d9bbd57f] 2011-05-18 */
+        rc = sqlite3PagerGet(pPager, 1, &pPageOne);
+        pList = pPageOne;
+        pList->pDirty = 0;
+      }
+      assert( rc==SQLITE_OK );
+      if( ALWAYS(pList) ){
+        rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);
+      }
+      sqlite3PagerUnref(pPageOne);
+      if( rc==SQLITE_OK ){
+        sqlite3PcacheCleanAll(pPager->pPCache);
+      }
+    }else{
+      /* The following block updates the change-counter. Exactly how it
+      ** does this depends on whether or not the atomic-update optimization
+      ** was enabled at compile time, and if this transaction meets the 
+      ** runtime criteria to use the operation: 
+      **
+      **    * The file-system supports the atomic-write property for
+      **      blocks of size page-size, and 
+      **    * This commit is not part of a multi-file transaction, and
+      **    * Exactly one page has been modified and store in the journal file.
+      **
+      ** If the optimization was not enabled at compile time, then the
+      ** pager_incr_changecounter() function is called to update the change
+      ** counter in 'indirect-mode'. If the optimization is compiled in but
+      ** is not applicable to this transaction, call sqlite3JournalCreate()
+      ** to make sure the journal file has actually been created, then call
+      ** pager_incr_changecounter() to update the change-counter in indirect
+      ** mode. 
+      **
+      ** Otherwise, if the optimization is both enabled and applicable,
+      ** then call pager_incr_changecounter() to update the change-counter
+      ** in 'direct' mode. In this case the journal file will never be
+      ** created for this transaction.
+      */
+  #ifdef SQLITE_ENABLE_ATOMIC_WRITE
+      PgHdr *pPg;
+      assert( isOpen(pPager->jfd) 
+           || pPager->journalMode==PAGER_JOURNALMODE_OFF 
+           || pPager->journalMode==PAGER_JOURNALMODE_WAL 
+      );
+      if( !zMaster && isOpen(pPager->jfd) 
+       && pPager->journalOff==jrnlBufferSize(pPager) 
+       && pPager->dbSize>=pPager->dbOrigSize
+       && (0==(pPg = sqlite3PcacheDirtyList(pPager->pPCache)) || 0==pPg->pDirty)
+      ){
+        /* Update the db file change counter via the direct-write method. The 
+        ** following call will modify the in-memory representation of page 1 
+        ** to include the updated change counter and then write page 1 
+        ** directly to the database file. Because of the atomic-write 
+        ** property of the host file-system, this is safe.
+        */
+        rc = pager_incr_changecounter(pPager, 1);
+      }else{
+        rc = sqlite3JournalCreate(pPager->jfd);
+        if( rc==SQLITE_OK ){
+          rc = pager_incr_changecounter(pPager, 0);
+        }
+      }
+  #else
+      rc = pager_incr_changecounter(pPager, 0);
+  #endif
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+  
+      /* Write the master journal name into the journal file. If a master 
+      ** journal file name has already been written to the journal file, 
+      ** or if zMaster is NULL (no master journal), then this call is a no-op.
+      */
+      rc = writeMasterJournal(pPager, zMaster);
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+  
+      /* Sync the journal file and write all dirty pages to the database.
+      ** If the atomic-update optimization is being used, this sync will not 
+      ** create the journal file or perform any real IO.
+      **
+      ** Because the change-counter page was just modified, unless the
+      ** atomic-update optimization is used it is almost certain that the
+      ** journal requires a sync here. However, in locking_mode=exclusive
+      ** on a system under memory pressure it is just possible that this is 
+      ** not the case. In this case it is likely enough that the redundant
+      ** xSync() call will be changed to a no-op by the OS anyhow. 
+      */
+      rc = syncJournal(pPager, 0);
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+  
+      rc = pager_write_pagelist(pPager,sqlite3PcacheDirtyList(pPager->pPCache));
+      if( rc!=SQLITE_OK ){
+        assert( rc!=SQLITE_IOERR_BLOCKED );
+        goto commit_phase_one_exit;
+      }
+      sqlite3PcacheCleanAll(pPager->pPCache);
+
+      /* If the file on disk is smaller than the database image, use 
+      ** pager_truncate to grow the file here. This can happen if the database
+      ** image was extended as part of the current transaction and then the
+      ** last page in the db image moved to the free-list. In this case the
+      ** last page is never written out to disk, leaving the database file
+      ** undersized. Fix this now if it is the case.  */
+      if( pPager->dbSize>pPager->dbFileSize ){
+        Pgno nNew = pPager->dbSize - (pPager->dbSize==PAGER_MJ_PGNO(pPager));
+        assert( pPager->eState==PAGER_WRITER_DBMOD );
+        rc = pager_truncate(pPager, nNew);
+        if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+      }
+  
+      /* Finally, sync the database file. */
+      if( !noSync ){
+        rc = sqlite3PagerSync(pPager, zMaster);
+      }
+      IOTRACE(("DBSYNC %p\n", pPager))
+    }
+  }
+
+commit_phase_one_exit:
+  if( rc==SQLITE_OK && !pagerUseWal(pPager) ){
+    pPager->eState = PAGER_WRITER_FINISHED;
+  }
+  return rc;
+}
+
+
+/*
+** When this function is called, the database file has been completely
+** updated to reflect the changes made by the current transaction and
+** synced to disk. The journal file still exists in the file-system 
+** though, and if a failure occurs at this point it will eventually
+** be used as a hot-journal and the current transaction rolled back.
+**
+** This function finalizes the journal file, either by deleting, 
+** truncating or partially zeroing it, so that it cannot be used 
+** for hot-journal rollback. Once this is done the transaction is
+** irrevocably committed.
+**
+** If an error occurs, an IO error code is returned and the pager
+** moves into the error state. Otherwise, SQLITE_OK is returned.
+*/
+SQLITE_PRIVATE int sqlite3PagerCommitPhaseTwo(Pager *pPager){
+  int rc = SQLITE_OK;                  /* Return code */
+
+  /* This routine should not be called if a prior error has occurred.
+  ** But if (due to a coding error elsewhere in the system) it does get
+  ** called, just return the same error code without doing anything. */
+  if( NEVER(pPager->errCode) ) return pPager->errCode;
+
+  assert( pPager->eState==PAGER_WRITER_LOCKED
+       || pPager->eState==PAGER_WRITER_FINISHED
+       || (pagerUseWal(pPager) && pPager->eState==PAGER_WRITER_CACHEMOD)
+  );
+  assert( assert_pager_state(pPager) );
+
+  /* An optimization. If the database was not actually modified during
+  ** this transaction, the pager is running in exclusive-mode and is
+  ** using persistent journals, then this function is a no-op.
+  **
+  ** The start of the journal file currently contains a single journal 
+  ** header with the nRec field set to 0. If such a journal is used as
+  ** a hot-journal during hot-journal rollback, 0 changes will be made
+  ** to the database file. So there is no need to zero the journal 
+  ** header. Since the pager is in exclusive mode, there is no need
+  ** to drop any locks either.
+  */
+  if( pPager->eState==PAGER_WRITER_LOCKED 
+   && pPager->exclusiveMode 
+   && pPager->journalMode==PAGER_JOURNALMODE_PERSIST
+  ){
+    assert( pPager->journalOff==JOURNAL_HDR_SZ(pPager) || !pPager->journalOff );
+    pPager->eState = PAGER_READER;
+    return SQLITE_OK;
+  }
+
+  PAGERTRACE(("COMMIT %d\n", PAGERID(pPager)));
+  pPager->iDataVersion++;
+  rc = pager_end_transaction(pPager, pPager->setMaster, 1);
+  return pager_error(pPager, rc);
+}
+
+/*
+** If a write transaction is open, then all changes made within the 
+** transaction are reverted and the current write-transaction is closed.
+** The pager falls back to PAGER_READER state if successful, or PAGER_ERROR
+** state if an error occurs.
+**
+** If the pager is already in PAGER_ERROR state when this function is called,
+** it returns Pager.errCode immediately. No work is performed in this case.
+**
+** Otherwise, in rollback mode, this function performs two functions:
+**
+**   1) It rolls back the journal file, restoring all database file and 
+**      in-memory cache pages to the state they were in when the transaction
+**      was opened, and
+**
+**   2) It finalizes the journal file, so that it is not used for hot
+**      rollback at any point in the future.
+**
+** Finalization of the journal file (task 2) is only performed if the 
+** rollback is successful.
+**
+** In WAL mode, all cache-entries containing data modified within the
+** current transaction are either expelled from the cache or reverted to
+** their pre-transaction state by re-reading data from the database or
+** WAL files. The WAL transaction is then closed.
+*/
+SQLITE_PRIVATE int sqlite3PagerRollback(Pager *pPager){
+  int rc = SQLITE_OK;                  /* Return code */
+  PAGERTRACE(("ROLLBACK %d\n", PAGERID(pPager)));
+
+  /* PagerRollback() is a no-op if called in READER or OPEN state. If
+  ** the pager is already in the ERROR state, the rollback is not 
+  ** attempted here. Instead, the error code is returned to the caller.
+  */
+  assert( assert_pager_state(pPager) );
+  if( pPager->eState==PAGER_ERROR ) return pPager->errCode;
+  if( pPager->eState<=PAGER_READER ) return SQLITE_OK;
+
+  if( pagerUseWal(pPager) ){
+    int rc2;
+    rc = sqlite3PagerSavepoint(pPager, SAVEPOINT_ROLLBACK, -1);
+    rc2 = pager_end_transaction(pPager, pPager->setMaster, 0);
+    if( rc==SQLITE_OK ) rc = rc2;
+  }else if( !isOpen(pPager->jfd) || pPager->eState==PAGER_WRITER_LOCKED ){
+    int eState = pPager->eState;
+    rc = pager_end_transaction(pPager, 0, 0);
+    if( !MEMDB && eState>PAGER_WRITER_LOCKED ){
+      /* This can happen using journal_mode=off. Move the pager to the error 
+      ** state to indicate that the contents of the cache may not be trusted.
+      ** Any active readers will get SQLITE_ABORT.
+      */
+      pPager->errCode = SQLITE_ABORT;
+      pPager->eState = PAGER_ERROR;
+      return rc;
+    }
+  }else{
+    rc = pager_playback(pPager, 0);
+  }
+
+  assert( pPager->eState==PAGER_READER || rc!=SQLITE_OK );
