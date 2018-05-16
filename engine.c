@@ -48287,3 +48287,225 @@ SQLITE_PRIVATE i64 sqlite3PagerJournalSizeLimit(Pager *pPager, i64 iLimit){
 ** Return a pointer to the pPager->pBackup variable. The backup module
 ** in backup.c maintains the content of this variable. This module
 ** uses it opaquely as an argument to sqlite3BackupRestart() and
+** sqlite3BackupUpdate() only.
+*/
+SQLITE_PRIVATE sqlite3_backup **sqlite3PagerBackupPtr(Pager *pPager){
+  return &pPager->pBackup;
+}
+
+#ifndef SQLITE_OMIT_VACUUM
+/*
+** Unless this is an in-memory or temporary database, clear the pager cache.
+*/
+SQLITE_PRIVATE void sqlite3PagerClearCache(Pager *pPager){
+  if( !MEMDB && pPager->tempFile==0 ) pager_reset(pPager);
+}
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+/*
+** This function is called when the user invokes "PRAGMA wal_checkpoint",
+** "PRAGMA wal_blocking_checkpoint" or calls the sqlite3_wal_checkpoint()
+** or wal_blocking_checkpoint() API functions.
+**
+** Parameter eMode is one of SQLITE_CHECKPOINT_PASSIVE, FULL or RESTART.
+*/
+SQLITE_PRIVATE int sqlite3PagerCheckpoint(Pager *pPager, int eMode, int *pnLog, int *pnCkpt){
+  int rc = SQLITE_OK;
+  if( pPager->pWal ){
+    rc = sqlite3WalCheckpoint(pPager->pWal, eMode,
+        (eMode==SQLITE_CHECKPOINT_PASSIVE ? 0 : pPager->xBusyHandler),
+        pPager->pBusyHandlerArg,
+        pPager->ckptSyncFlags, pPager->pageSize, (u8 *)pPager->pTmpSpace,
+        pnLog, pnCkpt
+    );
+  }
+  return rc;
+}
+
+SQLITE_PRIVATE int sqlite3PagerWalCallback(Pager *pPager){
+  return sqlite3WalCallback(pPager->pWal);
+}
+
+/*
+** Return true if the underlying VFS for the given pager supports the
+** primitives necessary for write-ahead logging.
+*/
+SQLITE_PRIVATE int sqlite3PagerWalSupported(Pager *pPager){
+  const sqlite3_io_methods *pMethods = pPager->fd->pMethods;
+  return pPager->exclusiveMode || (pMethods->iVersion>=2 && pMethods->xShmMap);
+}
+
+/*
+** Attempt to take an exclusive lock on the database file. If a PENDING lock
+** is obtained instead, immediately release it.
+*/
+static int pagerExclusiveLock(Pager *pPager){
+  int rc;                         /* Return code */
+
+  assert( pPager->eLock==SHARED_LOCK || pPager->eLock==EXCLUSIVE_LOCK );
+  rc = pagerLockDb(pPager, EXCLUSIVE_LOCK);
+  if( rc!=SQLITE_OK ){
+    /* If the attempt to grab the exclusive lock failed, release the 
+    ** pending lock that may have been obtained instead.  */
+    pagerUnlockDb(pPager, SHARED_LOCK);
+  }
+
+  return rc;
+}
+
+/*
+** Call sqlite3WalOpen() to open the WAL handle. If the pager is in 
+** exclusive-locking mode when this function is called, take an EXCLUSIVE
+** lock on the database file and use heap-memory to store the wal-index
+** in. Otherwise, use the normal shared-memory.
+*/
+static int pagerOpenWal(Pager *pPager){
+  int rc = SQLITE_OK;
+
+  assert( pPager->pWal==0 && pPager->tempFile==0 );
+  assert( pPager->eLock==SHARED_LOCK || pPager->eLock==EXCLUSIVE_LOCK );
+
+  /* If the pager is already in exclusive-mode, the WAL module will use 
+  ** heap-memory for the wal-index instead of the VFS shared-memory 
+  ** implementation. Take the exclusive lock now, before opening the WAL
+  ** file, to make sure this is safe.
+  */
+  if( pPager->exclusiveMode ){
+    rc = pagerExclusiveLock(pPager);
+  }
+
+  /* Open the connection to the log file. If this operation fails, 
+  ** (e.g. due to malloc() failure), return an error code.
+  */
+  if( rc==SQLITE_OK ){
+    rc = sqlite3WalOpen(pPager->pVfs,
+        pPager->fd, pPager->zWal, pPager->exclusiveMode,
+        pPager->journalSizeLimit, &pPager->pWal
+    );
+  }
+  pagerFixMaplimit(pPager);
+
+  return rc;
+}
+
+
+/*
+** The caller must be holding a SHARED lock on the database file to call
+** this function.
+**
+** If the pager passed as the first argument is open on a real database
+** file (not a temp file or an in-memory database), and the WAL file
+** is not already open, make an attempt to open it now. If successful,
+** return SQLITE_OK. If an error occurs or the VFS used by the pager does 
+** not support the xShmXXX() methods, return an error code. *pbOpen is
+** not modified in either case.
+**
+** If the pager is open on a temp-file (or in-memory database), or if
+** the WAL file is already open, set *pbOpen to 1 and return SQLITE_OK
+** without doing anything.
+*/
+SQLITE_PRIVATE int sqlite3PagerOpenWal(
+  Pager *pPager,                  /* Pager object */
+  int *pbOpen                     /* OUT: Set to true if call is a no-op */
+){
+  int rc = SQLITE_OK;             /* Return code */
+
+  assert( assert_pager_state(pPager) );
+  assert( pPager->eState==PAGER_OPEN   || pbOpen );
+  assert( pPager->eState==PAGER_READER || !pbOpen );
+  assert( pbOpen==0 || *pbOpen==0 );
+  assert( pbOpen!=0 || (!pPager->tempFile && !pPager->pWal) );
+
+  if( !pPager->tempFile && !pPager->pWal ){
+    if( !sqlite3PagerWalSupported(pPager) ) return SQLITE_CANTOPEN;
+
+    /* Close any rollback journal previously open */
+    sqlite3OsClose(pPager->jfd);
+
+    rc = pagerOpenWal(pPager);
+    if( rc==SQLITE_OK ){
+      pPager->journalMode = PAGER_JOURNALMODE_WAL;
+      pPager->eState = PAGER_OPEN;
+    }
+  }else{
+    *pbOpen = 1;
+  }
+
+  return rc;
+}
+
+/*
+** This function is called to close the connection to the log file prior
+** to switching from WAL to rollback mode.
+**
+** Before closing the log file, this function attempts to take an 
+** EXCLUSIVE lock on the database file. If this cannot be obtained, an
+** error (SQLITE_BUSY) is returned and the log connection is not closed.
+** If successful, the EXCLUSIVE lock is not released before returning.
+*/
+SQLITE_PRIVATE int sqlite3PagerCloseWal(Pager *pPager){
+  int rc = SQLITE_OK;
+
+  assert( pPager->journalMode==PAGER_JOURNALMODE_WAL );
+
+  /* If the log file is not already open, but does exist in the file-system,
+  ** it may need to be checkpointed before the connection can switch to
+  ** rollback mode. Open it now so this can happen.
+  */
+  if( !pPager->pWal ){
+    int logexists = 0;
+    rc = pagerLockDb(pPager, SHARED_LOCK);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3OsAccess(
+          pPager->pVfs, pPager->zWal, SQLITE_ACCESS_EXISTS, &logexists
+      );
+    }
+    if( rc==SQLITE_OK && logexists ){
+      rc = pagerOpenWal(pPager);
+    }
+  }
+    
+  /* Checkpoint and close the log. Because an EXCLUSIVE lock is held on
+  ** the database file, the log and log-summary files will be deleted.
+  */
+  if( rc==SQLITE_OK && pPager->pWal ){
+    rc = pagerExclusiveLock(pPager);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3WalClose(pPager->pWal, pPager->ckptSyncFlags,
+                           pPager->pageSize, (u8*)pPager->pTmpSpace);
+      pPager->pWal = 0;
+      pagerFixMaplimit(pPager);
+    }
+  }
+  return rc;
+}
+
+#endif /* !SQLITE_OMIT_WAL */
+
+#ifdef SQLITE_ENABLE_ZIPVFS
+/*
+** A read-lock must be held on the pager when this function is called. If
+** the pager is in WAL mode and the WAL file currently contains one or more
+** frames, return the size in bytes of the page images stored within the
+** WAL frames. Otherwise, if this is not a WAL database or the WAL file
+** is empty, return 0.
+*/
+SQLITE_PRIVATE int sqlite3PagerWalFramesize(Pager *pPager){
+  assert( pPager->eState>=PAGER_READER );
+  return sqlite3WalFramesize(pPager->pWal);
+}
+#endif
+
+
+#endif /* SQLITE_OMIT_DISKIO */
+
+/************** End of pager.c ***********************************************/
+/************** Begin file wal.c *********************************************/
+/*
+** 2010 February 1
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
