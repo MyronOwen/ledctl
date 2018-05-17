@@ -48746,3 +48746,232 @@ SQLITE_PRIVATE int sqlite3PagerWalFramesize(Pager *pPager){
 */
 #ifndef SQLITE_OMIT_WAL
 
+
+/*
+** Trace output macros
+*/
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+SQLITE_PRIVATE int sqlite3WalTrace = 0;
+# define WALTRACE(X)  if(sqlite3WalTrace) sqlite3DebugPrintf X
+#else
+# define WALTRACE(X)
+#endif
+
+/*
+** The maximum (and only) versions of the wal and wal-index formats
+** that may be interpreted by this version of SQLite.
+**
+** If a client begins recovering a WAL file and finds that (a) the checksum
+** values in the wal-header are correct and (b) the version field is not
+** WAL_MAX_VERSION, recovery fails and SQLite returns SQLITE_CANTOPEN.
+**
+** Similarly, if a client successfully reads a wal-index header (i.e. the 
+** checksum test is successful) and finds that the version field is not
+** WALINDEX_MAX_VERSION, then no read-transaction is opened and SQLite
+** returns SQLITE_CANTOPEN.
+*/
+#define WAL_MAX_VERSION      3007000
+#define WALINDEX_MAX_VERSION 3007000
+
+/*
+** Indices of various locking bytes.   WAL_NREADER is the number
+** of available reader locks and should be at least 3.
+*/
+#define WAL_WRITE_LOCK         0
+#define WAL_ALL_BUT_WRITE      1
+#define WAL_CKPT_LOCK          1
+#define WAL_RECOVER_LOCK       2
+#define WAL_READ_LOCK(I)       (3+(I))
+#define WAL_NREADER            (SQLITE_SHM_NLOCK-3)
+
+
+/* Object declarations */
+typedef struct WalIndexHdr WalIndexHdr;
+typedef struct WalIterator WalIterator;
+typedef struct WalCkptInfo WalCkptInfo;
+
+
+/*
+** The following object holds a copy of the wal-index header content.
+**
+** The actual header in the wal-index consists of two copies of this
+** object.
+**
+** The szPage value can be any power of 2 between 512 and 32768, inclusive.
+** Or it can be 1 to represent a 65536-byte page.  The latter case was
+** added in 3.7.1 when support for 64K pages was added.  
+*/
+struct WalIndexHdr {
+  u32 iVersion;                   /* Wal-index version */
+  u32 unused;                     /* Unused (padding) field */
+  u32 iChange;                    /* Counter incremented each transaction */
+  u8 isInit;                      /* 1 when initialized */
+  u8 bigEndCksum;                 /* True if checksums in WAL are big-endian */
+  u16 szPage;                     /* Database page size in bytes. 1==64K */
+  u32 mxFrame;                    /* Index of last valid frame in the WAL */
+  u32 nPage;                      /* Size of database in pages */
+  u32 aFrameCksum[2];             /* Checksum of last frame in log */
+  u32 aSalt[2];                   /* Two salt values copied from WAL header */
+  u32 aCksum[2];                  /* Checksum over all prior fields */
+};
+
+/*
+** A copy of the following object occurs in the wal-index immediately
+** following the second copy of the WalIndexHdr.  This object stores
+** information used by checkpoint.
+**
+** nBackfill is the number of frames in the WAL that have been written
+** back into the database. (We call the act of moving content from WAL to
+** database "backfilling".)  The nBackfill number is never greater than
+** WalIndexHdr.mxFrame.  nBackfill can only be increased by threads
+** holding the WAL_CKPT_LOCK lock (which includes a recovery thread).
+** However, a WAL_WRITE_LOCK thread can move the value of nBackfill from
+** mxFrame back to zero when the WAL is reset.
+**
+** There is one entry in aReadMark[] for each reader lock.  If a reader
+** holds read-lock K, then the value in aReadMark[K] is no greater than
+** the mxFrame for that reader.  The value READMARK_NOT_USED (0xffffffff)
+** for any aReadMark[] means that entry is unused.  aReadMark[0] is 
+** a special case; its value is never used and it exists as a place-holder
+** to avoid having to offset aReadMark[] indexs by one.  Readers holding
+** WAL_READ_LOCK(0) always ignore the entire WAL and read all content
+** directly from the database.
+**
+** The value of aReadMark[K] may only be changed by a thread that
+** is holding an exclusive lock on WAL_READ_LOCK(K).  Thus, the value of
+** aReadMark[K] cannot changed while there is a reader is using that mark
+** since the reader will be holding a shared lock on WAL_READ_LOCK(K).
+**
+** The checkpointer may only transfer frames from WAL to database where
+** the frame numbers are less than or equal to every aReadMark[] that is
+** in use (that is, every aReadMark[j] for which there is a corresponding
+** WAL_READ_LOCK(j)).  New readers (usually) pick the aReadMark[] with the
+** largest value and will increase an unused aReadMark[] to mxFrame if there
+** is not already an aReadMark[] equal to mxFrame.  The exception to the
+** previous sentence is when nBackfill equals mxFrame (meaning that everything
+** in the WAL has been backfilled into the database) then new readers
+** will choose aReadMark[0] which has value 0 and hence such reader will
+** get all their all content directly from the database file and ignore 
+** the WAL.
+**
+** Writers normally append new frames to the end of the WAL.  However,
+** if nBackfill equals mxFrame (meaning that all WAL content has been
+** written back into the database) and if no readers are using the WAL
+** (in other words, if there are no WAL_READ_LOCK(i) where i>0) then
+** the writer will first "reset" the WAL back to the beginning and start
+** writing new content beginning at frame 1.
+**
+** We assume that 32-bit loads are atomic and so no locks are needed in
+** order to read from any aReadMark[] entries.
+*/
+struct WalCkptInfo {
+  u32 nBackfill;                  /* Number of WAL frames backfilled into DB */
+  u32 aReadMark[WAL_NREADER];     /* Reader marks */
+};
+#define READMARK_NOT_USED  0xffffffff
+
+
+/* A block of WALINDEX_LOCK_RESERVED bytes beginning at
+** WALINDEX_LOCK_OFFSET is reserved for locks. Since some systems
+** only support mandatory file-locks, we do not read or write data
+** from the region of the file on which locks are applied.
+*/
+#define WALINDEX_LOCK_OFFSET   (sizeof(WalIndexHdr)*2 + sizeof(WalCkptInfo))
+#define WALINDEX_LOCK_RESERVED 16
+#define WALINDEX_HDR_SIZE      (WALINDEX_LOCK_OFFSET+WALINDEX_LOCK_RESERVED)
+
+/* Size of header before each frame in wal */
+#define WAL_FRAME_HDRSIZE 24
+
+/* Size of write ahead log header, including checksum. */
+/* #define WAL_HDRSIZE 24 */
+#define WAL_HDRSIZE 32
+
+/* WAL magic value. Either this value, or the same value with the least
+** significant bit also set (WAL_MAGIC | 0x00000001) is stored in 32-bit
+** big-endian format in the first 4 bytes of a WAL file.
+**
+** If the LSB is set, then the checksums for each frame within the WAL
+** file are calculated by treating all data as an array of 32-bit 
+** big-endian words. Otherwise, they are calculated by interpreting 
+** all data as 32-bit little-endian words.
+*/
+#define WAL_MAGIC 0x377f0682
+
+/*
+** Return the offset of frame iFrame in the write-ahead log file, 
+** assuming a database page size of szPage bytes. The offset returned
+** is to the start of the write-ahead log frame-header.
+*/
+#define walFrameOffset(iFrame, szPage) (                               \
+  WAL_HDRSIZE + ((iFrame)-1)*(i64)((szPage)+WAL_FRAME_HDRSIZE)         \
+)
+
+/*
+** An open write-ahead log file is represented by an instance of the
+** following object.
+*/
+struct Wal {
+  sqlite3_vfs *pVfs;         /* The VFS used to create pDbFd */
+  sqlite3_file *pDbFd;       /* File handle for the database file */
+  sqlite3_file *pWalFd;      /* File handle for WAL file */
+  u32 iCallback;             /* Value to pass to log callback (or 0) */
+  i64 mxWalSize;             /* Truncate WAL to this size upon reset */
+  int nWiData;               /* Size of array apWiData */
+  int szFirstBlock;          /* Size of first block written to WAL file */
+  volatile u32 **apWiData;   /* Pointer to wal-index content in memory */
+  u32 szPage;                /* Database page size */
+  i16 readLock;              /* Which read lock is being held.  -1 for none */
+  u8 syncFlags;              /* Flags to use to sync header writes */
+  u8 exclusiveMode;          /* Non-zero if connection is in exclusive mode */
+  u8 writeLock;              /* True if in a write transaction */
+  u8 ckptLock;               /* True if holding a checkpoint lock */
+  u8 readOnly;               /* WAL_RDWR, WAL_RDONLY, or WAL_SHM_RDONLY */
+  u8 truncateOnCommit;       /* True to truncate WAL file on commit */
+  u8 syncHeader;             /* Fsync the WAL header if true */
+  u8 padToSectorBoundary;    /* Pad transactions out to the next sector */
+  WalIndexHdr hdr;           /* Wal-index header for current transaction */
+  const char *zWalName;      /* Name of WAL file */
+  u32 nCkpt;                 /* Checkpoint sequence counter in the wal-header */
+#ifdef SQLITE_DEBUG
+  u8 lockError;              /* True if a locking error has occurred */
+#endif
+};
+
+/*
+** Candidate values for Wal.exclusiveMode.
+*/
+#define WAL_NORMAL_MODE     0
+#define WAL_EXCLUSIVE_MODE  1     
+#define WAL_HEAPMEMORY_MODE 2
+
+/*
+** Possible values for WAL.readOnly
+*/
+#define WAL_RDWR        0    /* Normal read/write connection */
+#define WAL_RDONLY      1    /* The WAL file is readonly */
+#define WAL_SHM_RDONLY  2    /* The SHM file is readonly */
+
+/*
+** Each page of the wal-index mapping contains a hash-table made up of
+** an array of HASHTABLE_NSLOT elements of the following type.
+*/
+typedef u16 ht_slot;
+
+/*
+** This structure is used to implement an iterator that loops through
+** all frames in the WAL in database page order. Where two or more frames
+** correspond to the same database page, the iterator visits only the 
+** frame most recently written to the WAL (in other words, the frame with
+** the largest index).
+**
+** The internals of this structure are only accessed by:
+**
+**   walIteratorInit() - Create a new iterator,
+**   walIteratorNext() - Step an iterator,
+**   walIteratorFree() - Free an iterator.
+**
+** This functionality is used by the checkpoint code (see walCheckpoint()).
+*/
+struct WalIterator {
+  int iPrior;                     /* Last result returned from the iterator */
