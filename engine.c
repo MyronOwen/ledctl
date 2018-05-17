@@ -48975,3 +48975,241 @@ typedef u16 ht_slot;
 */
 struct WalIterator {
   int iPrior;                     /* Last result returned from the iterator */
+  int nSegment;                   /* Number of entries in aSegment[] */
+  struct WalSegment {
+    int iNext;                    /* Next slot in aIndex[] not yet returned */
+    ht_slot *aIndex;              /* i0, i1, i2... such that aPgno[iN] ascend */
+    u32 *aPgno;                   /* Array of page numbers. */
+    int nEntry;                   /* Nr. of entries in aPgno[] and aIndex[] */
+    int iZero;                    /* Frame number associated with aPgno[0] */
+  } aSegment[1];                  /* One for every 32KB page in the wal-index */
+};
+
+/*
+** Define the parameters of the hash tables in the wal-index file. There
+** is a hash-table following every HASHTABLE_NPAGE page numbers in the
+** wal-index.
+**
+** Changing any of these constants will alter the wal-index format and
+** create incompatibilities.
+*/
+#define HASHTABLE_NPAGE      4096                 /* Must be power of 2 */
+#define HASHTABLE_HASH_1     383                  /* Should be prime */
+#define HASHTABLE_NSLOT      (HASHTABLE_NPAGE*2)  /* Must be a power of 2 */
+
+/* 
+** The block of page numbers associated with the first hash-table in a
+** wal-index is smaller than usual. This is so that there is a complete
+** hash-table on each aligned 32KB page of the wal-index.
+*/
+#define HASHTABLE_NPAGE_ONE  (HASHTABLE_NPAGE - (WALINDEX_HDR_SIZE/sizeof(u32)))
+
+/* The wal-index is divided into pages of WALINDEX_PGSZ bytes each. */
+#define WALINDEX_PGSZ   (                                         \
+    sizeof(ht_slot)*HASHTABLE_NSLOT + HASHTABLE_NPAGE*sizeof(u32) \
+)
+
+/*
+** Obtain a pointer to the iPage'th page of the wal-index. The wal-index
+** is broken into pages of WALINDEX_PGSZ bytes. Wal-index pages are
+** numbered from zero.
+**
+** If this call is successful, *ppPage is set to point to the wal-index
+** page and SQLITE_OK is returned. If an error (an OOM or VFS error) occurs,
+** then an SQLite error code is returned and *ppPage is set to 0.
+*/
+static int walIndexPage(Wal *pWal, int iPage, volatile u32 **ppPage){
+  int rc = SQLITE_OK;
+
+  /* Enlarge the pWal->apWiData[] array if required */
+  if( pWal->nWiData<=iPage ){
+    int nByte = sizeof(u32*)*(iPage+1);
+    volatile u32 **apNew;
+    apNew = (volatile u32 **)sqlite3_realloc((void *)pWal->apWiData, nByte);
+    if( !apNew ){
+      *ppPage = 0;
+      return SQLITE_NOMEM;
+    }
+    memset((void*)&apNew[pWal->nWiData], 0,
+           sizeof(u32*)*(iPage+1-pWal->nWiData));
+    pWal->apWiData = apNew;
+    pWal->nWiData = iPage+1;
+  }
+
+  /* Request a pointer to the required page from the VFS */
+  if( pWal->apWiData[iPage]==0 ){
+    if( pWal->exclusiveMode==WAL_HEAPMEMORY_MODE ){
+      pWal->apWiData[iPage] = (u32 volatile *)sqlite3MallocZero(WALINDEX_PGSZ);
+      if( !pWal->apWiData[iPage] ) rc = SQLITE_NOMEM;
+    }else{
+      rc = sqlite3OsShmMap(pWal->pDbFd, iPage, WALINDEX_PGSZ, 
+          pWal->writeLock, (void volatile **)&pWal->apWiData[iPage]
+      );
+      if( rc==SQLITE_READONLY ){
+        pWal->readOnly |= WAL_SHM_RDONLY;
+        rc = SQLITE_OK;
+      }
+    }
+  }
+
+  *ppPage = pWal->apWiData[iPage];
+  assert( iPage==0 || *ppPage || rc!=SQLITE_OK );
+  return rc;
+}
+
+/*
+** Return a pointer to the WalCkptInfo structure in the wal-index.
+*/
+static volatile WalCkptInfo *walCkptInfo(Wal *pWal){
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+  return (volatile WalCkptInfo*)&(pWal->apWiData[0][sizeof(WalIndexHdr)/2]);
+}
+
+/*
+** Return a pointer to the WalIndexHdr structure in the wal-index.
+*/
+static volatile WalIndexHdr *walIndexHdr(Wal *pWal){
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+  return (volatile WalIndexHdr*)pWal->apWiData[0];
+}
+
+/*
+** The argument to this macro must be of type u32. On a little-endian
+** architecture, it returns the u32 value that results from interpreting
+** the 4 bytes as a big-endian value. On a big-endian architecture, it
+** returns the value that would be produced by interpreting the 4 bytes
+** of the input value as a little-endian integer.
+*/
+#define BYTESWAP32(x) ( \
+    (((x)&0x000000FF)<<24) + (((x)&0x0000FF00)<<8)  \
+  + (((x)&0x00FF0000)>>8)  + (((x)&0xFF000000)>>24) \
+)
+
+/*
+** Generate or extend an 8 byte checksum based on the data in 
+** array aByte[] and the initial values of aIn[0] and aIn[1] (or
+** initial values of 0 and 0 if aIn==NULL).
+**
+** The checksum is written back into aOut[] before returning.
+**
+** nByte must be a positive multiple of 8.
+*/
+static void walChecksumBytes(
+  int nativeCksum, /* True for native byte-order, false for non-native */
+  u8 *a,           /* Content to be checksummed */
+  int nByte,       /* Bytes of content in a[].  Must be a multiple of 8. */
+  const u32 *aIn,  /* Initial checksum value input */
+  u32 *aOut        /* OUT: Final checksum value output */
+){
+  u32 s1, s2;
+  u32 *aData = (u32 *)a;
+  u32 *aEnd = (u32 *)&a[nByte];
+
+  if( aIn ){
+    s1 = aIn[0];
+    s2 = aIn[1];
+  }else{
+    s1 = s2 = 0;
+  }
+
+  assert( nByte>=8 );
+  assert( (nByte&0x00000007)==0 );
+
+  if( nativeCksum ){
+    do {
+      s1 += *aData++ + s2;
+      s2 += *aData++ + s1;
+    }while( aData<aEnd );
+  }else{
+    do {
+      s1 += BYTESWAP32(aData[0]) + s2;
+      s2 += BYTESWAP32(aData[1]) + s1;
+      aData += 2;
+    }while( aData<aEnd );
+  }
+
+  aOut[0] = s1;
+  aOut[1] = s2;
+}
+
+static void walShmBarrier(Wal *pWal){
+  if( pWal->exclusiveMode!=WAL_HEAPMEMORY_MODE ){
+    sqlite3OsShmBarrier(pWal->pDbFd);
+  }
+}
+
+/*
+** Write the header information in pWal->hdr into the wal-index.
+**
+** The checksum on pWal->hdr is updated before it is written.
+*/
+static void walIndexWriteHdr(Wal *pWal){
+  volatile WalIndexHdr *aHdr = walIndexHdr(pWal);
+  const int nCksum = offsetof(WalIndexHdr, aCksum);
+
+  assert( pWal->writeLock );
+  pWal->hdr.isInit = 1;
+  pWal->hdr.iVersion = WALINDEX_MAX_VERSION;
+  walChecksumBytes(1, (u8*)&pWal->hdr, nCksum, 0, pWal->hdr.aCksum);
+  memcpy((void *)&aHdr[1], (void *)&pWal->hdr, sizeof(WalIndexHdr));
+  walShmBarrier(pWal);
+  memcpy((void *)&aHdr[0], (void *)&pWal->hdr, sizeof(WalIndexHdr));
+}
+
+/*
+** This function encodes a single frame header and writes it to a buffer
+** supplied by the caller. A frame-header is made up of a series of 
+** 4-byte big-endian integers, as follows:
+**
+**     0: Page number.
+**     4: For commit records, the size of the database image in pages 
+**        after the commit. For all other records, zero.
+**     8: Salt-1 (copied from the wal-header)
+**    12: Salt-2 (copied from the wal-header)
+**    16: Checksum-1.
+**    20: Checksum-2.
+*/
+static void walEncodeFrame(
+  Wal *pWal,                      /* The write-ahead log */
+  u32 iPage,                      /* Database page number for frame */
+  u32 nTruncate,                  /* New db size (or 0 for non-commit frames) */
+  u8 *aData,                      /* Pointer to page data */
+  u8 *aFrame                      /* OUT: Write encoded frame here */
+){
+  int nativeCksum;                /* True for native byte-order checksums */
+  u32 *aCksum = pWal->hdr.aFrameCksum;
+  assert( WAL_FRAME_HDRSIZE==24 );
+  sqlite3Put4byte(&aFrame[0], iPage);
+  sqlite3Put4byte(&aFrame[4], nTruncate);
+  memcpy(&aFrame[8], pWal->hdr.aSalt, 8);
+
+  nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
+  walChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
+  walChecksumBytes(nativeCksum, aData, pWal->szPage, aCksum, aCksum);
+
+  sqlite3Put4byte(&aFrame[16], aCksum[0]);
+  sqlite3Put4byte(&aFrame[20], aCksum[1]);
+}
+
+/*
+** Check to see if the frame with header in aFrame[] and content
+** in aData[] is valid.  If it is a valid frame, fill *piPage and
+** *pnTruncate and return true.  Return if the frame is not valid.
+*/
+static int walDecodeFrame(
+  Wal *pWal,                      /* The write-ahead log */
+  u32 *piPage,                    /* OUT: Database page number for frame */
+  u32 *pnTruncate,                /* OUT: New db size (or 0 if not commit) */
+  u8 *aData,                      /* Pointer to page data (for checksum) */
+  u8 *aFrame                      /* Frame data */
+){
+  int nativeCksum;                /* True for native byte-order checksums */
+  u32 *aCksum = pWal->hdr.aFrameCksum;
+  u32 pgno;                       /* Page number of the frame */
+  assert( WAL_FRAME_HDRSIZE==24 );
+
+  /* A frame is only valid if the salt values in the frame-header
+  ** match the salt values in the wal-header. 
+  */
+  if( memcmp(&pWal->hdr.aSalt, &aFrame[8], 8)!=0 ){
+    return 0;
