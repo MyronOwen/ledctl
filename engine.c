@@ -49213,3 +49213,258 @@ static int walDecodeFrame(
   */
   if( memcmp(&pWal->hdr.aSalt, &aFrame[8], 8)!=0 ){
     return 0;
+  }
+
+  /* A frame is only valid if the page number is creater than zero.
+  */
+  pgno = sqlite3Get4byte(&aFrame[0]);
+  if( pgno==0 ){
+    return 0;
+  }
+
+  /* A frame is only valid if a checksum of the WAL header,
+  ** all prior frams, the first 16 bytes of this frame-header, 
+  ** and the frame-data matches the checksum in the last 8 
+  ** bytes of this frame-header.
+  */
+  nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
+  walChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
+  walChecksumBytes(nativeCksum, aData, pWal->szPage, aCksum, aCksum);
+  if( aCksum[0]!=sqlite3Get4byte(&aFrame[16]) 
+   || aCksum[1]!=sqlite3Get4byte(&aFrame[20]) 
+  ){
+    /* Checksum failed. */
+    return 0;
+  }
+
+  /* If we reach this point, the frame is valid.  Return the page number
+  ** and the new database size.
+  */
+  *piPage = pgno;
+  *pnTruncate = sqlite3Get4byte(&aFrame[4]);
+  return 1;
+}
+
+
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+/*
+** Names of locks.  This routine is used to provide debugging output and is not
+** a part of an ordinary build.
+*/
+static const char *walLockName(int lockIdx){
+  if( lockIdx==WAL_WRITE_LOCK ){
+    return "WRITE-LOCK";
+  }else if( lockIdx==WAL_CKPT_LOCK ){
+    return "CKPT-LOCK";
+  }else if( lockIdx==WAL_RECOVER_LOCK ){
+    return "RECOVER-LOCK";
+  }else{
+    static char zName[15];
+    sqlite3_snprintf(sizeof(zName), zName, "READ-LOCK[%d]",
+                     lockIdx-WAL_READ_LOCK(0));
+    return zName;
+  }
+}
+#endif /*defined(SQLITE_TEST) || defined(SQLITE_DEBUG) */
+    
+
+/*
+** Set or release locks on the WAL.  Locks are either shared or exclusive.
+** A lock cannot be moved directly between shared and exclusive - it must go
+** through the unlocked state first.
+**
+** In locking_mode=EXCLUSIVE, all of these routines become no-ops.
+*/
+static int walLockShared(Wal *pWal, int lockIdx){
+  int rc;
+  if( pWal->exclusiveMode ) return SQLITE_OK;
+  rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, 1,
+                        SQLITE_SHM_LOCK | SQLITE_SHM_SHARED);
+  WALTRACE(("WAL%p: acquire SHARED-%s %s\n", pWal,
+            walLockName(lockIdx), rc ? "failed" : "ok"));
+  VVA_ONLY( pWal->lockError = (u8)(rc!=SQLITE_OK && rc!=SQLITE_BUSY); )
+  return rc;
+}
+static void walUnlockShared(Wal *pWal, int lockIdx){
+  if( pWal->exclusiveMode ) return;
+  (void)sqlite3OsShmLock(pWal->pDbFd, lockIdx, 1,
+                         SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED);
+  WALTRACE(("WAL%p: release SHARED-%s\n", pWal, walLockName(lockIdx)));
+}
+static int walLockExclusive(Wal *pWal, int lockIdx, int n){
+  int rc;
+  if( pWal->exclusiveMode ) return SQLITE_OK;
+  rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
+                        SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+  WALTRACE(("WAL%p: acquire EXCLUSIVE-%s cnt=%d %s\n", pWal,
+            walLockName(lockIdx), n, rc ? "failed" : "ok"));
+  VVA_ONLY( pWal->lockError = (u8)(rc!=SQLITE_OK && rc!=SQLITE_BUSY); )
+  return rc;
+}
+static void walUnlockExclusive(Wal *pWal, int lockIdx, int n){
+  if( pWal->exclusiveMode ) return;
+  (void)sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
+                         SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE);
+  WALTRACE(("WAL%p: release EXCLUSIVE-%s cnt=%d\n", pWal,
+             walLockName(lockIdx), n));
+}
+
+/*
+** Compute a hash on a page number.  The resulting hash value must land
+** between 0 and (HASHTABLE_NSLOT-1).  The walHashNext() function advances
+** the hash to the next value in the event of a collision.
+*/
+static int walHash(u32 iPage){
+  assert( iPage>0 );
+  assert( (HASHTABLE_NSLOT & (HASHTABLE_NSLOT-1))==0 );
+  return (iPage*HASHTABLE_HASH_1) & (HASHTABLE_NSLOT-1);
+}
+static int walNextHash(int iPriorHash){
+  return (iPriorHash+1)&(HASHTABLE_NSLOT-1);
+}
+
+/* 
+** Return pointers to the hash table and page number array stored on
+** page iHash of the wal-index. The wal-index is broken into 32KB pages
+** numbered starting from 0.
+**
+** Set output variable *paHash to point to the start of the hash table
+** in the wal-index file. Set *piZero to one less than the frame 
+** number of the first frame indexed by this hash table. If a
+** slot in the hash table is set to N, it refers to frame number 
+** (*piZero+N) in the log.
+**
+** Finally, set *paPgno so that *paPgno[1] is the page number of the
+** first frame indexed by the hash table, frame (*piZero+1).
+*/
+static int walHashGet(
+  Wal *pWal,                      /* WAL handle */
+  int iHash,                      /* Find the iHash'th table */
+  volatile ht_slot **paHash,      /* OUT: Pointer to hash index */
+  volatile u32 **paPgno,          /* OUT: Pointer to page number array */
+  u32 *piZero                     /* OUT: Frame associated with *paPgno[0] */
+){
+  int rc;                         /* Return code */
+  volatile u32 *aPgno;
+
+  rc = walIndexPage(pWal, iHash, &aPgno);
+  assert( rc==SQLITE_OK || iHash>0 );
+
+  if( rc==SQLITE_OK ){
+    u32 iZero;
+    volatile ht_slot *aHash;
+
+    aHash = (volatile ht_slot *)&aPgno[HASHTABLE_NPAGE];
+    if( iHash==0 ){
+      aPgno = &aPgno[WALINDEX_HDR_SIZE/sizeof(u32)];
+      iZero = 0;
+    }else{
+      iZero = HASHTABLE_NPAGE_ONE + (iHash-1)*HASHTABLE_NPAGE;
+    }
+  
+    *paPgno = &aPgno[-1];
+    *paHash = aHash;
+    *piZero = iZero;
+  }
+  return rc;
+}
+
+/*
+** Return the number of the wal-index page that contains the hash-table
+** and page-number array that contain entries corresponding to WAL frame
+** iFrame. The wal-index is broken up into 32KB pages. Wal-index pages 
+** are numbered starting from 0.
+*/
+static int walFramePage(u32 iFrame){
+  int iHash = (iFrame+HASHTABLE_NPAGE-HASHTABLE_NPAGE_ONE-1) / HASHTABLE_NPAGE;
+  assert( (iHash==0 || iFrame>HASHTABLE_NPAGE_ONE)
+       && (iHash>=1 || iFrame<=HASHTABLE_NPAGE_ONE)
+       && (iHash<=1 || iFrame>(HASHTABLE_NPAGE_ONE+HASHTABLE_NPAGE))
+       && (iHash>=2 || iFrame<=HASHTABLE_NPAGE_ONE+HASHTABLE_NPAGE)
+       && (iHash<=2 || iFrame>(HASHTABLE_NPAGE_ONE+2*HASHTABLE_NPAGE))
+  );
+  return iHash;
+}
+
+/*
+** Return the page number associated with frame iFrame in this WAL.
+*/
+static u32 walFramePgno(Wal *pWal, u32 iFrame){
+  int iHash = walFramePage(iFrame);
+  if( iHash==0 ){
+    return pWal->apWiData[0][WALINDEX_HDR_SIZE/sizeof(u32) + iFrame - 1];
+  }
+  return pWal->apWiData[iHash][(iFrame-1-HASHTABLE_NPAGE_ONE)%HASHTABLE_NPAGE];
+}
+
+/*
+** Remove entries from the hash table that point to WAL slots greater
+** than pWal->hdr.mxFrame.
+**
+** This function is called whenever pWal->hdr.mxFrame is decreased due
+** to a rollback or savepoint.
+**
+** At most only the hash table containing pWal->hdr.mxFrame needs to be
+** updated.  Any later hash tables will be automatically cleared when
+** pWal->hdr.mxFrame advances to the point where those hash tables are
+** actually needed.
+*/
+static void walCleanupHash(Wal *pWal){
+  volatile ht_slot *aHash = 0;    /* Pointer to hash table to clear */
+  volatile u32 *aPgno = 0;        /* Page number array for hash table */
+  u32 iZero = 0;                  /* frame == (aHash[x]+iZero) */
+  int iLimit = 0;                 /* Zero values greater than this */
+  int nByte;                      /* Number of bytes to zero in aPgno[] */
+  int i;                          /* Used to iterate through aHash[] */
+
+  assert( pWal->writeLock );
+  testcase( pWal->hdr.mxFrame==HASHTABLE_NPAGE_ONE-1 );
+  testcase( pWal->hdr.mxFrame==HASHTABLE_NPAGE_ONE );
+  testcase( pWal->hdr.mxFrame==HASHTABLE_NPAGE_ONE+1 );
+
+  if( pWal->hdr.mxFrame==0 ) return;
+
+  /* Obtain pointers to the hash-table and page-number array containing 
+  ** the entry that corresponds to frame pWal->hdr.mxFrame. It is guaranteed
+  ** that the page said hash-table and array reside on is already mapped.
+  */
+  assert( pWal->nWiData>walFramePage(pWal->hdr.mxFrame) );
+  assert( pWal->apWiData[walFramePage(pWal->hdr.mxFrame)] );
+  walHashGet(pWal, walFramePage(pWal->hdr.mxFrame), &aHash, &aPgno, &iZero);
+
+  /* Zero all hash-table entries that correspond to frame numbers greater
+  ** than pWal->hdr.mxFrame.
+  */
+  iLimit = pWal->hdr.mxFrame - iZero;
+  assert( iLimit>0 );
+  for(i=0; i<HASHTABLE_NSLOT; i++){
+    if( aHash[i]>iLimit ){
+      aHash[i] = 0;
+    }
+  }
+  
+  /* Zero the entries in the aPgno array that correspond to frames with
+  ** frame numbers greater than pWal->hdr.mxFrame. 
+  */
+  nByte = (int)((char *)aHash - (char *)&aPgno[iLimit+1]);
+  memset((void *)&aPgno[iLimit+1], 0, nByte);
+
+#ifdef SQLITE_ENABLE_EXPENSIVE_ASSERT
+  /* Verify that the every entry in the mapping region is still reachable
+  ** via the hash table even after the cleanup.
+  */
+  if( iLimit ){
+    int i;           /* Loop counter */
+    int iKey;        /* Hash key */
+    for(i=1; i<=iLimit; i++){
+      for(iKey=walHash(aPgno[i]); aHash[iKey]; iKey=walNextHash(iKey)){
+        if( aHash[iKey]==i ) break;
+      }
+      assert( aHash[iKey]==i );
+    }
+  }
+#endif /* SQLITE_ENABLE_EXPENSIVE_ASSERT */
+}
+
+
+/*
