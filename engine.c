@@ -49953,3 +49953,253 @@ static void walMergesort(
   ht_slot *aList,                 /* IN/OUT: List to sort */
   int *pnList                     /* IN/OUT: Number of elements in aList[] */
 ){
+  struct Sublist {
+    int nList;                    /* Number of elements in aList */
+    ht_slot *aList;               /* Pointer to sub-list content */
+  };
+
+  const int nList = *pnList;      /* Size of input list */
+  int nMerge = 0;                 /* Number of elements in list aMerge */
+  ht_slot *aMerge = 0;            /* List to be merged */
+  int iList;                      /* Index into input list */
+  int iSub = 0;                   /* Index into aSub array */
+  struct Sublist aSub[13];        /* Array of sub-lists */
+
+  memset(aSub, 0, sizeof(aSub));
+  assert( nList<=HASHTABLE_NPAGE && nList>0 );
+  assert( HASHTABLE_NPAGE==(1<<(ArraySize(aSub)-1)) );
+
+  for(iList=0; iList<nList; iList++){
+    nMerge = 1;
+    aMerge = &aList[iList];
+    for(iSub=0; iList & (1<<iSub); iSub++){
+      struct Sublist *p = &aSub[iSub];
+      assert( p->aList && p->nList<=(1<<iSub) );
+      assert( p->aList==&aList[iList&~((2<<iSub)-1)] );
+      walMerge(aContent, p->aList, p->nList, &aMerge, &nMerge, aBuffer);
+    }
+    aSub[iSub].aList = aMerge;
+    aSub[iSub].nList = nMerge;
+  }
+
+  for(iSub++; iSub<ArraySize(aSub); iSub++){
+    if( nList & (1<<iSub) ){
+      struct Sublist *p = &aSub[iSub];
+      assert( p->nList<=(1<<iSub) );
+      assert( p->aList==&aList[nList&~((2<<iSub)-1)] );
+      walMerge(aContent, p->aList, p->nList, &aMerge, &nMerge, aBuffer);
+    }
+  }
+  assert( aMerge==aList );
+  *pnList = nMerge;
+
+#ifdef SQLITE_DEBUG
+  {
+    int i;
+    for(i=1; i<*pnList; i++){
+      assert( aContent[aList[i]] > aContent[aList[i-1]] );
+    }
+  }
+#endif
+}
+
+/* 
+** Free an iterator allocated by walIteratorInit().
+*/
+static void walIteratorFree(WalIterator *p){
+  sqlite3_free(p);
+}
+
+/*
+** Construct a WalInterator object that can be used to loop over all 
+** pages in the WAL in ascending order. The caller must hold the checkpoint
+** lock.
+**
+** On success, make *pp point to the newly allocated WalInterator object
+** return SQLITE_OK. Otherwise, return an error code. If this routine
+** returns an error, the value of *pp is undefined.
+**
+** The calling routine should invoke walIteratorFree() to destroy the
+** WalIterator object when it has finished with it.
+*/
+static int walIteratorInit(Wal *pWal, WalIterator **pp){
+  WalIterator *p;                 /* Return value */
+  int nSegment;                   /* Number of segments to merge */
+  u32 iLast;                      /* Last frame in log */
+  int nByte;                      /* Number of bytes to allocate */
+  int i;                          /* Iterator variable */
+  ht_slot *aTmp;                  /* Temp space used by merge-sort */
+  int rc = SQLITE_OK;             /* Return Code */
+
+  /* This routine only runs while holding the checkpoint lock. And
+  ** it only runs if there is actually content in the log (mxFrame>0).
+  */
+  assert( pWal->ckptLock && pWal->hdr.mxFrame>0 );
+  iLast = pWal->hdr.mxFrame;
+
+  /* Allocate space for the WalIterator object. */
+  nSegment = walFramePage(iLast) + 1;
+  nByte = sizeof(WalIterator) 
+        + (nSegment-1)*sizeof(struct WalSegment)
+        + iLast*sizeof(ht_slot);
+  p = (WalIterator *)sqlite3_malloc(nByte);
+  if( !p ){
+    return SQLITE_NOMEM;
+  }
+  memset(p, 0, nByte);
+  p->nSegment = nSegment;
+
+  /* Allocate temporary space used by the merge-sort routine. This block
+  ** of memory will be freed before this function returns.
+  */
+  aTmp = (ht_slot *)sqlite3_malloc(
+      sizeof(ht_slot) * (iLast>HASHTABLE_NPAGE?HASHTABLE_NPAGE:iLast)
+  );
+  if( !aTmp ){
+    rc = SQLITE_NOMEM;
+  }
+
+  for(i=0; rc==SQLITE_OK && i<nSegment; i++){
+    volatile ht_slot *aHash;
+    u32 iZero;
+    volatile u32 *aPgno;
+
+    rc = walHashGet(pWal, i, &aHash, &aPgno, &iZero);
+    if( rc==SQLITE_OK ){
+      int j;                      /* Counter variable */
+      int nEntry;                 /* Number of entries in this segment */
+      ht_slot *aIndex;            /* Sorted index for this segment */
+
+      aPgno++;
+      if( (i+1)==nSegment ){
+        nEntry = (int)(iLast - iZero);
+      }else{
+        nEntry = (int)((u32*)aHash - (u32*)aPgno);
+      }
+      aIndex = &((ht_slot *)&p->aSegment[p->nSegment])[iZero];
+      iZero++;
+  
+      for(j=0; j<nEntry; j++){
+        aIndex[j] = (ht_slot)j;
+      }
+      walMergesort((u32 *)aPgno, aTmp, aIndex, &nEntry);
+      p->aSegment[i].iZero = iZero;
+      p->aSegment[i].nEntry = nEntry;
+      p->aSegment[i].aIndex = aIndex;
+      p->aSegment[i].aPgno = (u32 *)aPgno;
+    }
+  }
+  sqlite3_free(aTmp);
+
+  if( rc!=SQLITE_OK ){
+    walIteratorFree(p);
+  }
+  *pp = p;
+  return rc;
+}
+
+/*
+** Attempt to obtain the exclusive WAL lock defined by parameters lockIdx and
+** n. If the attempt fails and parameter xBusy is not NULL, then it is a
+** busy-handler function. Invoke it and retry the lock until either the
+** lock is successfully obtained or the busy-handler returns 0.
+*/
+static int walBusyLock(
+  Wal *pWal,                      /* WAL connection */
+  int (*xBusy)(void*),            /* Function to call when busy */
+  void *pBusyArg,                 /* Context argument for xBusyHandler */
+  int lockIdx,                    /* Offset of first byte to lock */
+  int n                           /* Number of bytes to lock */
+){
+  int rc;
+  do {
+    rc = walLockExclusive(pWal, lockIdx, n);
+  }while( xBusy && rc==SQLITE_BUSY && xBusy(pBusyArg) );
+  return rc;
+}
+
+/*
+** The cache of the wal-index header must be valid to call this function.
+** Return the page-size in bytes used by the database.
+*/
+static int walPagesize(Wal *pWal){
+  return (pWal->hdr.szPage&0xfe00) + ((pWal->hdr.szPage&0x0001)<<16);
+}
+
+/*
+** The following is guaranteed when this function is called:
+**
+**   a) the WRITER lock is held,
+**   b) the entire log file has been checkpointed, and
+**   c) any existing readers are reading exclusively from the database
+**      file - there are no readers that may attempt to read a frame from
+**      the log file.
+**
+** This function updates the shared-memory structures so that the next
+** client to write to the database (which may be this one) does so by
+** writing frames into the start of the log file.
+**
+** The value of parameter salt1 is used as the aSalt[1] value in the 
+** new wal-index header. It should be passed a pseudo-random value (i.e. 
+** one obtained from sqlite3_randomness()).
+*/
+static void walRestartHdr(Wal *pWal, u32 salt1){
+  volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+  int i;                          /* Loop counter */
+  u32 *aSalt = pWal->hdr.aSalt;   /* Big-endian salt values */
+  pWal->nCkpt++;
+  pWal->hdr.mxFrame = 0;
+  sqlite3Put4byte((u8*)&aSalt[0], 1 + sqlite3Get4byte((u8*)&aSalt[0]));
+  memcpy(&pWal->hdr.aSalt[1], &salt1, 4);
+  walIndexWriteHdr(pWal);
+  pInfo->nBackfill = 0;
+  pInfo->aReadMark[1] = 0;
+  for(i=2; i<WAL_NREADER; i++) pInfo->aReadMark[i] = READMARK_NOT_USED;
+  assert( pInfo->aReadMark[0]==0 );
+}
+
+/*
+** Copy as much content as we can from the WAL back into the database file
+** in response to an sqlite3_wal_checkpoint() request or the equivalent.
+**
+** The amount of information copies from WAL to database might be limited
+** by active readers.  This routine will never overwrite a database page
+** that a concurrent reader might be using.
+**
+** All I/O barrier operations (a.k.a fsyncs) occur in this routine when
+** SQLite is in WAL-mode in synchronous=NORMAL.  That means that if 
+** checkpoints are always run by a background thread or background 
+** process, foreground threads will never block on a lengthy fsync call.
+**
+** Fsync is called on the WAL before writing content out of the WAL and
+** into the database.  This ensures that if the new content is persistent
+** in the WAL and can be recovered following a power-loss or hard reset.
+**
+** Fsync is also called on the database file if (and only if) the entire
+** WAL content is copied into the database file.  This second fsync makes
+** it safe to delete the WAL since the new content will persist in the
+** database file.
+**
+** This routine uses and updates the nBackfill field of the wal-index header.
+** This is the only routine that will increase the value of nBackfill.  
+** (A WAL reset or recovery will revert nBackfill to zero, but not increase
+** its value.)
+**
+** The caller must be holding sufficient locks to ensure that no other
+** checkpoint is running (in any other thread or process) at the same
+** time.
+*/
+static int walCheckpoint(
+  Wal *pWal,                      /* Wal connection */
+  int eMode,                      /* One of PASSIVE, FULL or RESTART */
+  int (*xBusy)(void*),            /* Function to call when busy */
+  void *pBusyArg,                 /* Context argument for xBusyHandler */
+  int sync_flags,                 /* Flags for OsSync() (or 0) */
+  u8 *zBuf                        /* Temporary buffer to use */
+){
+  int rc;                         /* Return code */
+  int szPage;                     /* Database page-size */
+  WalIterator *pIter = 0;         /* Wal iterator context */
+  u32 iDbpage = 0;                /* Next database page to write */
+  u32 iFrame = 0;                 /* Wal frame containing data for iDbpage */
+  u32 mxSafeFrame;                /* Max frame that can be backfilled */
