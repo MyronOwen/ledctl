@@ -50446,3 +50446,229 @@ SQLITE_PRIVATE int sqlite3WalClose(
 ** by verifying that both copies of the header are the same and also by
 ** a checksum on the header.
 **
+** If and only if the read is consistent and the header is different from
+** pWal->hdr, then pWal->hdr is updated to the content of the new header
+** and *pChanged is set to 1.
+**
+** If the checksum cannot be verified return non-zero. If the header
+** is read successfully and the checksum verified, return zero.
+*/
+static int walIndexTryHdr(Wal *pWal, int *pChanged){
+  u32 aCksum[2];                  /* Checksum on the header content */
+  WalIndexHdr h1, h2;             /* Two copies of the header content */
+  WalIndexHdr volatile *aHdr;     /* Header in shared memory */
+
+  /* The first page of the wal-index must be mapped at this point. */
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+
+  /* Read the header. This might happen concurrently with a write to the
+  ** same area of shared memory on a different CPU in a SMP,
+  ** meaning it is possible that an inconsistent snapshot is read
+  ** from the file. If this happens, return non-zero.
+  **
+  ** There are two copies of the header at the beginning of the wal-index.
+  ** When reading, read [0] first then [1].  Writes are in the reverse order.
+  ** Memory barriers are used to prevent the compiler or the hardware from
+  ** reordering the reads and writes.
+  */
+  aHdr = walIndexHdr(pWal);
+  memcpy(&h1, (void *)&aHdr[0], sizeof(h1));
+  walShmBarrier(pWal);
+  memcpy(&h2, (void *)&aHdr[1], sizeof(h2));
+
+  if( memcmp(&h1, &h2, sizeof(h1))!=0 ){
+    return 1;   /* Dirty read */
+  }  
+  if( h1.isInit==0 ){
+    return 1;   /* Malformed header - probably all zeros */
+  }
+  walChecksumBytes(1, (u8*)&h1, sizeof(h1)-sizeof(h1.aCksum), 0, aCksum);
+  if( aCksum[0]!=h1.aCksum[0] || aCksum[1]!=h1.aCksum[1] ){
+    return 1;   /* Checksum does not match */
+  }
+
+  if( memcmp(&pWal->hdr, &h1, sizeof(WalIndexHdr)) ){
+    *pChanged = 1;
+    memcpy(&pWal->hdr, &h1, sizeof(WalIndexHdr));
+    pWal->szPage = (pWal->hdr.szPage&0xfe00) + ((pWal->hdr.szPage&0x0001)<<16);
+    testcase( pWal->szPage<=32768 );
+    testcase( pWal->szPage>=65536 );
+  }
+
+  /* The header was successfully read. Return zero. */
+  return 0;
+}
+
+/*
+** Read the wal-index header from the wal-index and into pWal->hdr.
+** If the wal-header appears to be corrupt, try to reconstruct the
+** wal-index from the WAL before returning.
+**
+** Set *pChanged to 1 if the wal-index header value in pWal->hdr is
+** changed by this operation.  If pWal->hdr is unchanged, set *pChanged
+** to 0.
+**
+** If the wal-index header is successfully read, return SQLITE_OK. 
+** Otherwise an SQLite error code.
+*/
+static int walIndexReadHdr(Wal *pWal, int *pChanged){
+  int rc;                         /* Return code */
+  int badHdr;                     /* True if a header read failed */
+  volatile u32 *page0;            /* Chunk of wal-index containing header */
+
+  /* Ensure that page 0 of the wal-index (the page that contains the 
+  ** wal-index header) is mapped. Return early if an error occurs here.
+  */
+  assert( pChanged );
+  rc = walIndexPage(pWal, 0, &page0);
+  if( rc!=SQLITE_OK ){
+    return rc;
+  };
+  assert( page0 || pWal->writeLock==0 );
+
+  /* If the first page of the wal-index has been mapped, try to read the
+  ** wal-index header immediately, without holding any lock. This usually
+  ** works, but may fail if the wal-index header is corrupt or currently 
+  ** being modified by another thread or process.
+  */
+  badHdr = (page0 ? walIndexTryHdr(pWal, pChanged) : 1);
+
+  /* If the first attempt failed, it might have been due to a race
+  ** with a writer.  So get a WRITE lock and try again.
+  */
+  assert( badHdr==0 || pWal->writeLock==0 );
+  if( badHdr ){
+    if( pWal->readOnly & WAL_SHM_RDONLY ){
+      if( SQLITE_OK==(rc = walLockShared(pWal, WAL_WRITE_LOCK)) ){
+        walUnlockShared(pWal, WAL_WRITE_LOCK);
+        rc = SQLITE_READONLY_RECOVERY;
+      }
+    }else if( SQLITE_OK==(rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1)) ){
+      pWal->writeLock = 1;
+      if( SQLITE_OK==(rc = walIndexPage(pWal, 0, &page0)) ){
+        badHdr = walIndexTryHdr(pWal, pChanged);
+        if( badHdr ){
+          /* If the wal-index header is still malformed even while holding
+          ** a WRITE lock, it can only mean that the header is corrupted and
+          ** needs to be reconstructed.  So run recovery to do exactly that.
+          */
+          rc = walIndexRecover(pWal);
+          *pChanged = 1;
+        }
+      }
+      pWal->writeLock = 0;
+      walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    }
+  }
+
+  /* If the header is read successfully, check the version number to make
+  ** sure the wal-index was not constructed with some future format that
+  ** this version of SQLite cannot understand.
+  */
+  if( badHdr==0 && pWal->hdr.iVersion!=WALINDEX_MAX_VERSION ){
+    rc = SQLITE_CANTOPEN_BKPT;
+  }
+
+  return rc;
+}
+
+/*
+** This is the value that walTryBeginRead returns when it needs to
+** be retried.
+*/
+#define WAL_RETRY  (-1)
+
+/*
+** Attempt to start a read transaction.  This might fail due to a race or
+** other transient condition.  When that happens, it returns WAL_RETRY to
+** indicate to the caller that it is safe to retry immediately.
+**
+** On success return SQLITE_OK.  On a permanent failure (such an
+** I/O error or an SQLITE_BUSY because another process is running
+** recovery) return a positive error code.
+**
+** The useWal parameter is true to force the use of the WAL and disable
+** the case where the WAL is bypassed because it has been completely
+** checkpointed.  If useWal==0 then this routine calls walIndexReadHdr() 
+** to make a copy of the wal-index header into pWal->hdr.  If the 
+** wal-index header has changed, *pChanged is set to 1 (as an indication 
+** to the caller that the local paget cache is obsolete and needs to be 
+** flushed.)  When useWal==1, the wal-index header is assumed to already
+** be loaded and the pChanged parameter is unused.
+**
+** The caller must set the cnt parameter to the number of prior calls to
+** this routine during the current read attempt that returned WAL_RETRY.
+** This routine will start taking more aggressive measures to clear the
+** race conditions after multiple WAL_RETRY returns, and after an excessive
+** number of errors will ultimately return SQLITE_PROTOCOL.  The
+** SQLITE_PROTOCOL return indicates that some other process has gone rogue
+** and is not honoring the locking protocol.  There is a vanishingly small
+** chance that SQLITE_PROTOCOL could be returned because of a run of really
+** bad luck when there is lots of contention for the wal-index, but that
+** possibility is so small that it can be safely neglected, we believe.
+**
+** On success, this routine obtains a read lock on 
+** WAL_READ_LOCK(pWal->readLock).  The pWal->readLock integer is
+** in the range 0 <= pWal->readLock < WAL_NREADER.  If pWal->readLock==(-1)
+** that means the Wal does not hold any read lock.  The reader must not
+** access any database page that is modified by a WAL frame up to and
+** including frame number aReadMark[pWal->readLock].  The reader will
+** use WAL frames up to and including pWal->hdr.mxFrame if pWal->readLock>0
+** Or if pWal->readLock==0, then the reader will ignore the WAL
+** completely and get all content directly from the database file.
+** If the useWal parameter is 1 then the WAL will never be ignored and
+** this routine will always set pWal->readLock>0 on success.
+** When the read transaction is completed, the caller must release the
+** lock on WAL_READ_LOCK(pWal->readLock) and set pWal->readLock to -1.
+**
+** This routine uses the nBackfill and aReadMark[] fields of the header
+** to select a particular WAL_READ_LOCK() that strives to let the
+** checkpoint process do as much work as possible.  This routine might
+** update values of the aReadMark[] array in the header, but if it does
+** so it takes care to hold an exclusive lock on the corresponding
+** WAL_READ_LOCK() while changing values.
+*/
+static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int cnt){
+  volatile WalCkptInfo *pInfo;    /* Checkpoint information in wal-index */
+  u32 mxReadMark;                 /* Largest aReadMark[] value */
+  int mxI;                        /* Index of largest aReadMark[] value */
+  int i;                          /* Loop counter */
+  int rc = SQLITE_OK;             /* Return code  */
+
+  assert( pWal->readLock<0 );     /* Not currently locked */
+
+  /* Take steps to avoid spinning forever if there is a protocol error.
+  **
+  ** Circumstances that cause a RETRY should only last for the briefest
+  ** instances of time.  No I/O or other system calls are done while the
+  ** locks are held, so the locks should not be held for very long. But 
+  ** if we are unlucky, another process that is holding a lock might get
+  ** paged out or take a page-fault that is time-consuming to resolve, 
+  ** during the few nanoseconds that it is holding the lock.  In that case,
+  ** it might take longer than normal for the lock to free.
+  **
+  ** After 5 RETRYs, we begin calling sqlite3OsSleep().  The first few
+  ** calls to sqlite3OsSleep() have a delay of 1 microsecond.  Really this
+  ** is more of a scheduler yield than an actual delay.  But on the 10th
+  ** an subsequent retries, the delays start becoming longer and longer, 
+  ** so that on the 100th (and last) RETRY we delay for 323 milliseconds.
+  ** The total delay time before giving up is less than 10 seconds.
+  */
+  if( cnt>5 ){
+    int nDelay = 1;                      /* Pause time in microseconds */
+    if( cnt>100 ){
+      VVA_ONLY( pWal->lockError = 1; )
+      return SQLITE_PROTOCOL;
+    }
+    if( cnt>=10 ) nDelay = (cnt-9)*(cnt-9)*39;
+    sqlite3OsSleep(pWal->pVfs, nDelay);
+  }
+
+  if( !useWal ){
+    rc = walIndexReadHdr(pWal, pChanged);
+    if( rc==SQLITE_BUSY ){
+      /* If there is not a recovery running in another thread or process
+      ** then convert BUSY errors to WAL_RETRY.  If recovery is known to
+      ** be running, convert BUSY to BUSY_RECOVERY.  There is a race here
+      ** which might cause WAL_RETRY to be returned even if BUSY_RECOVERY
+      ** would be technically correct.  But the race is benign since with
