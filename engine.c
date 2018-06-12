@@ -50888,3 +50888,209 @@ SQLITE_PRIVATE int sqlite3WalFindFrame(
   ** that any slots written before the current read transaction was
   ** opened remain unmodified.
   **
+  ** For the reasons above, the if(...) condition featured in the inner
+  ** loop of the following block is more stringent that would be required 
+  ** if we had exclusive access to the hash-table:
+  **
+  **   (aPgno[iFrame]==pgno): 
+  **     This condition filters out normal hash-table collisions.
+  **
+  **   (iFrame<=iLast): 
+  **     This condition filters out entries that were added to the hash
+  **     table after the current read-transaction had started.
+  */
+  for(iHash=walFramePage(iLast); iHash>=0 && iRead==0; iHash--){
+    volatile ht_slot *aHash;      /* Pointer to hash table */
+    volatile u32 *aPgno;          /* Pointer to array of page numbers */
+    u32 iZero;                    /* Frame number corresponding to aPgno[0] */
+    int iKey;                     /* Hash slot index */
+    int nCollide;                 /* Number of hash collisions remaining */
+    int rc;                       /* Error code */
+
+    rc = walHashGet(pWal, iHash, &aHash, &aPgno, &iZero);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    nCollide = HASHTABLE_NSLOT;
+    for(iKey=walHash(pgno); aHash[iKey]; iKey=walNextHash(iKey)){
+      u32 iFrame = aHash[iKey] + iZero;
+      if( iFrame<=iLast && aPgno[aHash[iKey]]==pgno ){
+        assert( iFrame>iRead || CORRUPT_DB );
+        iRead = iFrame;
+      }
+      if( (nCollide--)==0 ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+    }
+  }
+
+#ifdef SQLITE_ENABLE_EXPENSIVE_ASSERT
+  /* If expensive assert() statements are available, do a linear search
+  ** of the wal-index file content. Make sure the results agree with the
+  ** result obtained using the hash indexes above.  */
+  {
+    u32 iRead2 = 0;
+    u32 iTest;
+    for(iTest=iLast; iTest>0; iTest--){
+      if( walFramePgno(pWal, iTest)==pgno ){
+        iRead2 = iTest;
+        break;
+      }
+    }
+    assert( iRead==iRead2 );
+  }
+#endif
+
+  *piRead = iRead;
+  return SQLITE_OK;
+}
+
+/*
+** Read the contents of frame iRead from the wal file into buffer pOut
+** (which is nOut bytes in size). Return SQLITE_OK if successful, or an
+** error code otherwise.
+*/
+SQLITE_PRIVATE int sqlite3WalReadFrame(
+  Wal *pWal,                      /* WAL handle */
+  u32 iRead,                      /* Frame to read */
+  int nOut,                       /* Size of buffer pOut in bytes */
+  u8 *pOut                        /* Buffer to write page data to */
+){
+  int sz;
+  i64 iOffset;
+  sz = pWal->hdr.szPage;
+  sz = (sz&0xfe00) + ((sz&0x0001)<<16);
+  testcase( sz<=32768 );
+  testcase( sz>=65536 );
+  iOffset = walFrameOffset(iRead, sz) + WAL_FRAME_HDRSIZE;
+  /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL */
+  return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);
+}
+
+/* 
+** Return the size of the database in pages (or zero, if unknown).
+*/
+SQLITE_PRIVATE Pgno sqlite3WalDbsize(Wal *pWal){
+  if( pWal && ALWAYS(pWal->readLock>=0) ){
+    return pWal->hdr.nPage;
+  }
+  return 0;
+}
+
+
+/* 
+** This function starts a write transaction on the WAL.
+**
+** A read transaction must have already been started by a prior call
+** to sqlite3WalBeginReadTransaction().
+**
+** If another thread or process has written into the database since
+** the read transaction was started, then it is not possible for this
+** thread to write as doing so would cause a fork.  So this routine
+** returns SQLITE_BUSY in that case and no write transaction is started.
+**
+** There can only be a single writer active at a time.
+*/
+SQLITE_PRIVATE int sqlite3WalBeginWriteTransaction(Wal *pWal){
+  int rc;
+
+  /* Cannot start a write transaction without first holding a read
+  ** transaction. */
+  assert( pWal->readLock>=0 );
+
+  if( pWal->readOnly ){
+    return SQLITE_READONLY;
+  }
+
+  /* Only one writer allowed at a time.  Get the write lock.  Return
+  ** SQLITE_BUSY if unable.
+  */
+  rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
+  if( rc ){
+    return rc;
+  }
+  pWal->writeLock = 1;
+
+  /* If another connection has written to the database file since the
+  ** time the read transaction on this connection was started, then
+  ** the write is disallowed.
+  */
+  if( memcmp(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr))!=0 ){
+    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    pWal->writeLock = 0;
+    rc = SQLITE_BUSY_SNAPSHOT;
+  }
+
+  return rc;
+}
+
+/*
+** End a write transaction.  The commit has already been done.  This
+** routine merely releases the lock.
+*/
+SQLITE_PRIVATE int sqlite3WalEndWriteTransaction(Wal *pWal){
+  if( pWal->writeLock ){
+    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    pWal->writeLock = 0;
+    pWal->truncateOnCommit = 0;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** If any data has been written (but not committed) to the log file, this
+** function moves the write-pointer back to the start of the transaction.
+**
+** Additionally, the callback function is invoked for each frame written
+** to the WAL since the start of the transaction. If the callback returns
+** other than SQLITE_OK, it is not invoked again and the error code is
+** returned to the caller.
+**
+** Otherwise, if the callback function does not return an error, this
+** function returns SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
+  int rc = SQLITE_OK;
+  if( ALWAYS(pWal->writeLock) ){
+    Pgno iMax = pWal->hdr.mxFrame;
+    Pgno iFrame;
+  
+    /* Restore the clients cache of the wal-index header to the state it
+    ** was in before the client began writing to the database. 
+    */
+    memcpy(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr));
+
+    for(iFrame=pWal->hdr.mxFrame+1; 
+        ALWAYS(rc==SQLITE_OK) && iFrame<=iMax; 
+        iFrame++
+    ){
+      /* This call cannot fail. Unless the page for which the page number
+      ** is passed as the second argument is (a) in the cache and 
+      ** (b) has an outstanding reference, then xUndo is either a no-op
+      ** (if (a) is false) or simply expels the page from the cache (if (b)
+      ** is false).
+      **
+      ** If the upper layer is doing a rollback, it is guaranteed that there
+      ** are no outstanding references to any page other than page 1. And
+      ** page 1 is never written to the log until the transaction is
+      ** committed. As a result, the call to xUndo may not fail.
+      */
+      assert( walFramePgno(pWal, iFrame)!=1 );
+      rc = xUndo(pUndoCtx, walFramePgno(pWal, iFrame));
+    }
+    if( iMax!=pWal->hdr.mxFrame ) walCleanupHash(pWal);
+  }
+  return rc;
+}
+
+/* 
+** Argument aWalData must point to an array of WAL_SAVEPOINT_NDATA u32 
+** values. This function populates the array with values required to 
+** "rollback" the write position of the WAL handle back to the current 
+** point in the event of a savepoint rollback (via WalSavepointUndo()).
+*/
+SQLITE_PRIVATE void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
+  assert( pWal->writeLock );
+  aWalData[0] = pWal->hdr.mxFrame;
+  aWalData[1] = pWal->hdr.aFrameCksum[0];
+  aWalData[2] = pWal->hdr.aFrameCksum[1];
