@@ -51094,3 +51094,255 @@ SQLITE_PRIVATE void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
   aWalData[0] = pWal->hdr.mxFrame;
   aWalData[1] = pWal->hdr.aFrameCksum[0];
   aWalData[2] = pWal->hdr.aFrameCksum[1];
+  aWalData[3] = pWal->nCkpt;
+}
+
+/* 
+** Move the write position of the WAL back to the point identified by
+** the values in the aWalData[] array. aWalData must point to an array
+** of WAL_SAVEPOINT_NDATA u32 values that has been previously populated
+** by a call to WalSavepoint().
+*/
+SQLITE_PRIVATE int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
+  int rc = SQLITE_OK;
+
+  assert( pWal->writeLock );
+  assert( aWalData[3]!=pWal->nCkpt || aWalData[0]<=pWal->hdr.mxFrame );
+
+  if( aWalData[3]!=pWal->nCkpt ){
+    /* This savepoint was opened immediately after the write-transaction
+    ** was started. Right after that, the writer decided to wrap around
+    ** to the start of the log. Update the savepoint values to match.
+    */
+    aWalData[0] = 0;
+    aWalData[3] = pWal->nCkpt;
+  }
+
+  if( aWalData[0]<pWal->hdr.mxFrame ){
+    pWal->hdr.mxFrame = aWalData[0];
+    pWal->hdr.aFrameCksum[0] = aWalData[1];
+    pWal->hdr.aFrameCksum[1] = aWalData[2];
+    walCleanupHash(pWal);
+  }
+
+  return rc;
+}
+
+/*
+** This function is called just before writing a set of frames to the log
+** file (see sqlite3WalFrames()). It checks to see if, instead of appending
+** to the current log file, it is possible to overwrite the start of the
+** existing log file with the new frames (i.e. "reset" the log). If so,
+** it sets pWal->hdr.mxFrame to 0. Otherwise, pWal->hdr.mxFrame is left
+** unchanged.
+**
+** SQLITE_OK is returned if no error is encountered (regardless of whether
+** or not pWal->hdr.mxFrame is modified). An SQLite error code is returned
+** if an error occurs.
+*/
+static int walRestartLog(Wal *pWal){
+  int rc = SQLITE_OK;
+  int cnt;
+
+  if( pWal->readLock==0 ){
+    volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+    assert( pInfo->nBackfill==pWal->hdr.mxFrame );
+    if( pInfo->nBackfill>0 ){
+      u32 salt1;
+      sqlite3_randomness(4, &salt1);
+      rc = walLockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+      if( rc==SQLITE_OK ){
+        /* If all readers are using WAL_READ_LOCK(0) (in other words if no
+        ** readers are currently using the WAL), then the transactions
+        ** frames will overwrite the start of the existing log. Update the
+        ** wal-index header to reflect this.
+        **
+        ** In theory it would be Ok to update the cache of the header only
+        ** at this point. But updating the actual wal-index header is also
+        ** safe and means there is no special case for sqlite3WalUndo()
+        ** to handle if this transaction is rolled back.  */
+        walRestartHdr(pWal, salt1);
+        walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+      }else if( rc!=SQLITE_BUSY ){
+        return rc;
+      }
+    }
+    walUnlockShared(pWal, WAL_READ_LOCK(0));
+    pWal->readLock = -1;
+    cnt = 0;
+    do{
+      int notUsed;
+      rc = walTryBeginRead(pWal, &notUsed, 1, ++cnt);
+    }while( rc==WAL_RETRY );
+    assert( (rc&0xff)!=SQLITE_BUSY ); /* BUSY not possible when useWal==1 */
+    testcase( (rc&0xff)==SQLITE_IOERR );
+    testcase( rc==SQLITE_PROTOCOL );
+    testcase( rc==SQLITE_OK );
+  }
+  return rc;
+}
+
+/*
+** Information about the current state of the WAL file and where
+** the next fsync should occur - passed from sqlite3WalFrames() into
+** walWriteToLog().
+*/
+typedef struct WalWriter {
+  Wal *pWal;                   /* The complete WAL information */
+  sqlite3_file *pFd;           /* The WAL file to which we write */
+  sqlite3_int64 iSyncPoint;    /* Fsync at this offset */
+  int syncFlags;               /* Flags for the fsync */
+  int szPage;                  /* Size of one page */
+} WalWriter;
+
+/*
+** Write iAmt bytes of content into the WAL file beginning at iOffset.
+** Do a sync when crossing the p->iSyncPoint boundary.
+**
+** In other words, if iSyncPoint is in between iOffset and iOffset+iAmt,
+** first write the part before iSyncPoint, then sync, then write the
+** rest.
+*/
+static int walWriteToLog(
+  WalWriter *p,              /* WAL to write to */
+  void *pContent,            /* Content to be written */
+  int iAmt,                  /* Number of bytes to write */
+  sqlite3_int64 iOffset      /* Start writing at this offset */
+){
+  int rc;
+  if( iOffset<p->iSyncPoint && iOffset+iAmt>=p->iSyncPoint ){
+    int iFirstAmt = (int)(p->iSyncPoint - iOffset);
+    rc = sqlite3OsWrite(p->pFd, pContent, iFirstAmt, iOffset);
+    if( rc ) return rc;
+    iOffset += iFirstAmt;
+    iAmt -= iFirstAmt;
+    pContent = (void*)(iFirstAmt + (char*)pContent);
+    assert( p->syncFlags & (SQLITE_SYNC_NORMAL|SQLITE_SYNC_FULL) );
+    rc = sqlite3OsSync(p->pFd, p->syncFlags & SQLITE_SYNC_MASK);
+    if( iAmt==0 || rc ) return rc;
+  }
+  rc = sqlite3OsWrite(p->pFd, pContent, iAmt, iOffset);
+  return rc;
+}
+
+/*
+** Write out a single frame of the WAL
+*/
+static int walWriteOneFrame(
+  WalWriter *p,               /* Where to write the frame */
+  PgHdr *pPage,               /* The page of the frame to be written */
+  int nTruncate,              /* The commit flag.  Usually 0.  >0 for commit */
+  sqlite3_int64 iOffset       /* Byte offset at which to write */
+){
+  int rc;                         /* Result code from subfunctions */
+  void *pData;                    /* Data actually written */
+  u8 aFrame[WAL_FRAME_HDRSIZE];   /* Buffer to assemble frame-header in */
+#if defined(SQLITE_HAS_CODEC)
+  if( (pData = sqlite3PagerCodec(pPage))==0 ) return SQLITE_NOMEM;
+#else
+  pData = pPage->pData;
+#endif
+  walEncodeFrame(p->pWal, pPage->pgno, nTruncate, pData, aFrame);
+  rc = walWriteToLog(p, aFrame, sizeof(aFrame), iOffset);
+  if( rc ) return rc;
+  /* Write the page data */
+  rc = walWriteToLog(p, pData, p->szPage, iOffset+sizeof(aFrame));
+  return rc;
+}
+
+/* 
+** Write a set of frames to the log. The caller must hold the write-lock
+** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
+*/
+SQLITE_PRIVATE int sqlite3WalFrames(
+  Wal *pWal,                      /* Wal handle to write to */
+  int szPage,                     /* Database page-size in bytes */
+  PgHdr *pList,                   /* List of dirty pages to write */
+  Pgno nTruncate,                 /* Database size after this commit */
+  int isCommit,                   /* True if this is a commit */
+  int sync_flags                  /* Flags to pass to OsSync() (or 0) */
+){
+  int rc;                         /* Used to catch return codes */
+  u32 iFrame;                     /* Next frame address */
+  PgHdr *p;                       /* Iterator to run through pList with. */
+  PgHdr *pLast = 0;               /* Last frame in list */
+  int nExtra = 0;                 /* Number of extra copies of last page */
+  int szFrame;                    /* The size of a single frame */
+  i64 iOffset;                    /* Next byte to write in WAL file */
+  WalWriter w;                    /* The writer */
+
+  assert( pList );
+  assert( pWal->writeLock );
+
+  /* If this frame set completes a transaction, then nTruncate>0.  If
+  ** nTruncate==0 then this frame set does not complete the transaction. */
+  assert( (isCommit!=0)==(nTruncate!=0) );
+
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+  { int cnt; for(cnt=0, p=pList; p; p=p->pDirty, cnt++){}
+    WALTRACE(("WAL%p: frame write begin. %d frames. mxFrame=%d. %s\n",
+              pWal, cnt, pWal->hdr.mxFrame, isCommit ? "Commit" : "Spill"));
+  }
+#endif
+
+  /* See if it is possible to write these frames into the start of the
+  ** log file, instead of appending to it at pWal->hdr.mxFrame.
+  */
+  if( SQLITE_OK!=(rc = walRestartLog(pWal)) ){
+    return rc;
+  }
+
+  /* If this is the first frame written into the log, write the WAL
+  ** header to the start of the WAL file. See comments at the top of
+  ** this source file for a description of the WAL header format.
+  */
+  iFrame = pWal->hdr.mxFrame;
+  if( iFrame==0 ){
+    u8 aWalHdr[WAL_HDRSIZE];      /* Buffer to assemble wal-header in */
+    u32 aCksum[2];                /* Checksum for wal-header */
+
+    sqlite3Put4byte(&aWalHdr[0], (WAL_MAGIC | SQLITE_BIGENDIAN));
+    sqlite3Put4byte(&aWalHdr[4], WAL_MAX_VERSION);
+    sqlite3Put4byte(&aWalHdr[8], szPage);
+    sqlite3Put4byte(&aWalHdr[12], pWal->nCkpt);
+    if( pWal->nCkpt==0 ) sqlite3_randomness(8, pWal->hdr.aSalt);
+    memcpy(&aWalHdr[16], pWal->hdr.aSalt, 8);
+    walChecksumBytes(1, aWalHdr, WAL_HDRSIZE-2*4, 0, aCksum);
+    sqlite3Put4byte(&aWalHdr[24], aCksum[0]);
+    sqlite3Put4byte(&aWalHdr[28], aCksum[1]);
+    
+    pWal->szPage = szPage;
+    pWal->hdr.bigEndCksum = SQLITE_BIGENDIAN;
+    pWal->hdr.aFrameCksum[0] = aCksum[0];
+    pWal->hdr.aFrameCksum[1] = aCksum[1];
+    pWal->truncateOnCommit = 1;
+
+    rc = sqlite3OsWrite(pWal->pWalFd, aWalHdr, sizeof(aWalHdr), 0);
+    WALTRACE(("WAL%p: wal-header write %s\n", pWal, rc ? "failed" : "ok"));
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+
+    /* Sync the header (unless SQLITE_IOCAP_SEQUENTIAL is true or unless
+    ** all syncing is turned off by PRAGMA synchronous=OFF).  Otherwise
+    ** an out-of-order write following a WAL restart could result in
+    ** database corruption.  See the ticket:
+    **
+    **     http://localhost:591/sqlite/info/ff5be73dee
+    */
+    if( pWal->syncHeader && sync_flags ){
+      rc = sqlite3OsSync(pWal->pWalFd, sync_flags & SQLITE_SYNC_MASK);
+      if( rc ) return rc;
+    }
+  }
+  assert( (int)pWal->szPage==szPage );
+
+  /* Setup information needed to write frames into the WAL */
+  w.pWal = pWal;
+  w.pFd = pWal->pWalFd;
+  w.iSyncPoint = 0;
+  w.syncFlags = sync_flags;
+  w.szPage = szPage;
+  iOffset = walFrameOffset(iFrame+1, szPage);
+  szFrame = szPage + WAL_FRAME_HDRSIZE;
+
