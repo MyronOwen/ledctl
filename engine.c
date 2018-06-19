@@ -51791,3 +51791,236 @@ SQLITE_PRIVATE int sqlite3WalFramesize(Wal *pWal){
 **      | space          |
 **      |----------------|   ^  Grows upwards
 **      | cell content   |   |  Arbitrary order interspersed with freeblocks.
+**      | area           |   |  and free space fragments.
+**      |----------------|
+**
+** The page headers looks like this:
+**
+**   OFFSET   SIZE     DESCRIPTION
+**      0       1      Flags. 1: intkey, 2: zerodata, 4: leafdata, 8: leaf
+**      1       2      byte offset to the first freeblock
+**      3       2      number of cells on this page
+**      5       2      first byte of the cell content area
+**      7       1      number of fragmented free bytes
+**      8       4      Right child (the Ptr(N) value).  Omitted on leaves.
+**
+** The flags define the format of this btree page.  The leaf flag means that
+** this page has no children.  The zerodata flag means that this page carries
+** only keys and no data.  The intkey flag means that the key is an integer
+** which is stored in the key size entry of the cell header rather than in
+** the payload area.
+**
+** The cell pointer array begins on the first byte after the page header.
+** The cell pointer array contains zero or more 2-byte numbers which are
+** offsets from the beginning of the page to the cell content in the cell
+** content area.  The cell pointers occur in sorted order.  The system strives
+** to keep free space after the last cell pointer so that new cells can
+** be easily added without having to defragment the page.
+**
+** Cell content is stored at the very end of the page and grows toward the
+** beginning of the page.
+**
+** Unused space within the cell content area is collected into a linked list of
+** freeblocks.  Each freeblock is at least 4 bytes in size.  The byte offset
+** to the first freeblock is given in the header.  Freeblocks occur in
+** increasing order.  Because a freeblock must be at least 4 bytes in size,
+** any group of 3 or fewer unused bytes in the cell content area cannot
+** exist on the freeblock chain.  A group of 3 or fewer free bytes is called
+** a fragment.  The total number of bytes in all fragments is recorded.
+** in the page header at offset 7.
+**
+**    SIZE    DESCRIPTION
+**      2     Byte offset of the next freeblock
+**      2     Bytes in this freeblock
+**
+** Cells are of variable length.  Cells are stored in the cell content area at
+** the end of the page.  Pointers to the cells are in the cell pointer array
+** that immediately follows the page header.  Cells is not necessarily
+** contiguous or in order, but cell pointers are contiguous and in order.
+**
+** Cell content makes use of variable length integers.  A variable
+** length integer is 1 to 9 bytes where the lower 7 bits of each 
+** byte are used.  The integer consists of all bytes that have bit 8 set and
+** the first byte with bit 8 clear.  The most significant byte of the integer
+** appears first.  A variable-length integer may not be more than 9 bytes long.
+** As a special case, all 8 bytes of the 9th byte are used as data.  This
+** allows a 64-bit integer to be encoded in 9 bytes.
+**
+**    0x00                      becomes  0x00000000
+**    0x7f                      becomes  0x0000007f
+**    0x81 0x00                 becomes  0x00000080
+**    0x82 0x00                 becomes  0x00000100
+**    0x80 0x7f                 becomes  0x0000007f
+**    0x8a 0x91 0xd1 0xac 0x78  becomes  0x12345678
+**    0x81 0x81 0x81 0x81 0x01  becomes  0x10204081
+**
+** Variable length integers are used for rowids and to hold the number of
+** bytes of key and data in a btree cell.
+**
+** The content of a cell looks like this:
+**
+**    SIZE    DESCRIPTION
+**      4     Page number of the left child. Omitted if leaf flag is set.
+**     var    Number of bytes of data. Omitted if the zerodata flag is set.
+**     var    Number of bytes of key. Or the key itself if intkey flag is set.
+**      *     Payload
+**      4     First page of the overflow chain.  Omitted if no overflow
+**
+** Overflow pages form a linked list.  Each page except the last is completely
+** filled with data (pagesize - 4 bytes).  The last page can have as little
+** as 1 byte of data.
+**
+**    SIZE    DESCRIPTION
+**      4     Page number of next overflow page
+**      *     Data
+**
+** Freelist pages come in two subtypes: trunk pages and leaf pages.  The
+** file header points to the first in a linked list of trunk page.  Each trunk
+** page points to multiple leaf pages.  The content of a leaf page is
+** unspecified.  A trunk page looks like this:
+**
+**    SIZE    DESCRIPTION
+**      4     Page number of next trunk page
+**      4     Number of leaf pointers on this page
+**      *     zero or more pages numbers of leaves
+*/
+
+
+/* The following value is the maximum cell size assuming a maximum page
+** size give above.
+*/
+#define MX_CELL_SIZE(pBt)  ((int)(pBt->pageSize-8))
+
+/* The maximum number of cells on a single page of the database.  This
+** assumes a minimum cell size of 6 bytes  (4 bytes for the cell itself
+** plus 2 bytes for the index to the cell in the page header).  Such
+** small cells will be rare, but they are possible.
+*/
+#define MX_CELL(pBt) ((pBt->pageSize-8)/6)
+
+/* Forward declarations */
+typedef struct MemPage MemPage;
+typedef struct BtLock BtLock;
+
+/*
+** This is a magic string that appears at the beginning of every
+** SQLite database in order to identify the file as a real database.
+**
+** You can change this value at compile-time by specifying a
+** -DSQLITE_FILE_HEADER="..." on the compiler command-line.  The
+** header must be exactly 16 bytes including the zero-terminator so
+** the string itself should be 15 characters long.  If you change
+** the header, then your custom library will not be able to read 
+** databases generated by the standard tools and the standard tools
+** will not be able to read databases created by your custom library.
+*/
+#ifndef SQLITE_FILE_HEADER /* 123456789 123456 */
+#  define SQLITE_FILE_HEADER "SQLite format 3"
+#endif
+
+/*
+** Page type flags.  An ORed combination of these flags appear as the
+** first byte of on-disk image of every BTree page.
+*/
+#define PTF_INTKEY    0x01
+#define PTF_ZERODATA  0x02
+#define PTF_LEAFDATA  0x04
+#define PTF_LEAF      0x08
+
+/*
+** As each page of the file is loaded into memory, an instance of the following
+** structure is appended and initialized to zero.  This structure stores
+** information about the page that is decoded from the raw file page.
+**
+** The pParent field points back to the parent page.  This allows us to
+** walk up the BTree from any leaf to the root.  Care must be taken to
+** unref() the parent page pointer when this page is no longer referenced.
+** The pageDestructor() routine handles that chore.
+**
+** Access to all fields of this structure is controlled by the mutex
+** stored in MemPage.pBt->mutex.
+*/
+struct MemPage {
+  u8 isInit;           /* True if previously initialized. MUST BE FIRST! */
+  u8 nOverflow;        /* Number of overflow cell bodies in aCell[] */
+  u8 intKey;           /* True if table b-trees.  False for index b-trees */
+  u8 intKeyLeaf;       /* True if the leaf of an intKey table */
+  u8 noPayload;        /* True if internal intKey page (thus w/o data) */
+  u8 leaf;             /* True if a leaf page */
+  u8 hdrOffset;        /* 100 for page 1.  0 otherwise */
+  u8 childPtrSize;     /* 0 if leaf==1.  4 if leaf==0 */
+  u8 max1bytePayload;  /* min(maxLocal,127) */
+  u16 maxLocal;        /* Copy of BtShared.maxLocal or BtShared.maxLeaf */
+  u16 minLocal;        /* Copy of BtShared.minLocal or BtShared.minLeaf */
+  u16 cellOffset;      /* Index in aData of first cell pointer */
+  u16 nFree;           /* Number of free bytes on the page */
+  u16 nCell;           /* Number of cells on this page, local and ovfl */
+  u16 maskPage;        /* Mask for page offset */
+  u16 aiOvfl[5];       /* Insert the i-th overflow cell before the aiOvfl-th
+                       ** non-overflow cell */
+  u8 *apOvfl[5];       /* Pointers to the body of overflow cells */
+  BtShared *pBt;       /* Pointer to BtShared that this page is part of */
+  u8 *aData;           /* Pointer to disk image of the page data */
+  u8 *aDataEnd;        /* One byte past the end of usable data */
+  u8 *aCellIdx;        /* The cell index area */
+  DbPage *pDbPage;     /* Pager page handle */
+  Pgno pgno;           /* Page number for this page */
+};
+
+/*
+** The in-memory image of a disk page has the auxiliary information appended
+** to the end.  EXTRA_SIZE is the number of bytes of space needed to hold
+** that extra information.
+*/
+#define EXTRA_SIZE sizeof(MemPage)
+
+/*
+** A linked list of the following structures is stored at BtShared.pLock.
+** Locks are added (or upgraded from READ_LOCK to WRITE_LOCK) when a cursor 
+** is opened on the table with root page BtShared.iTable. Locks are removed
+** from this list when a transaction is committed or rolled back, or when
+** a btree handle is closed.
+*/
+struct BtLock {
+  Btree *pBtree;        /* Btree handle holding this lock */
+  Pgno iTable;          /* Root page of table */
+  u8 eLock;             /* READ_LOCK or WRITE_LOCK */
+  BtLock *pNext;        /* Next in BtShared.pLock list */
+};
+
+/* Candidate values for BtLock.eLock */
+#define READ_LOCK     1
+#define WRITE_LOCK    2
+
+/* A Btree handle
+**
+** A database connection contains a pointer to an instance of
+** this object for every database file that it has open.  This structure
+** is opaque to the database connection.  The database connection cannot
+** see the internals of this structure and only deals with pointers to
+** this structure.
+**
+** For some database files, the same underlying database cache might be 
+** shared between multiple connections.  In that case, each connection
+** has it own instance of this object.  But each instance of this object
+** points to the same BtShared object.  The database cache and the
+** schema associated with the database file are all contained within
+** the BtShared object.
+**
+** All fields in this structure are accessed under sqlite3.mutex.
+** The pBt pointer itself may not be changed while there exists cursors 
+** in the referenced BtShared that point back to this Btree since those
+** cursors have to go through this Btree to find their BtShared and
+** they often do so without holding sqlite3.mutex.
+*/
+struct Btree {
+  sqlite3 *db;       /* The database connection holding this btree */
+  BtShared *pBt;     /* Sharable content of this btree */
+  u8 inTrans;        /* TRANS_NONE, TRANS_READ or TRANS_WRITE */
+  u8 sharable;       /* True if we can share pBt with another db */
+  u8 locked;         /* True if db currently has pBt locked */
+  int wantToLock;    /* Number of nested calls to sqlite3BtreeEnter() */
+  int nBackup;       /* Number of backup operations reading this btree */
+  u32 iDataVersion;  /* Combines with pBt->pPager->iDataVersion */
+  Btree *pNext;      /* List of other sharable Btrees from the same db */
+  Btree *pPrev;      /* Back pointer of the same list */
