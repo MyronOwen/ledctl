@@ -51346,3 +51346,224 @@ SQLITE_PRIVATE int sqlite3WalFrames(
   iOffset = walFrameOffset(iFrame+1, szPage);
   szFrame = szPage + WAL_FRAME_HDRSIZE;
 
+  /* Write all frames into the log file exactly once */
+  for(p=pList; p; p=p->pDirty){
+    int nDbSize;   /* 0 normally.  Positive == commit flag */
+    iFrame++;
+    assert( iOffset==walFrameOffset(iFrame, szPage) );
+    nDbSize = (isCommit && p->pDirty==0) ? nTruncate : 0;
+    rc = walWriteOneFrame(&w, p, nDbSize, iOffset);
+    if( rc ) return rc;
+    pLast = p;
+    iOffset += szFrame;
+  }
+
+  /* If this is the end of a transaction, then we might need to pad
+  ** the transaction and/or sync the WAL file.
+  **
+  ** Padding and syncing only occur if this set of frames complete a
+  ** transaction and if PRAGMA synchronous=FULL.  If synchronous==NORMAL
+  ** or synchronous==OFF, then no padding or syncing are needed.
+  **
+  ** If SQLITE_IOCAP_POWERSAFE_OVERWRITE is defined, then padding is not
+  ** needed and only the sync is done.  If padding is needed, then the
+  ** final frame is repeated (with its commit mark) until the next sector
+  ** boundary is crossed.  Only the part of the WAL prior to the last
+  ** sector boundary is synced; the part of the last frame that extends
+  ** past the sector boundary is written after the sync.
+  */
+  if( isCommit && (sync_flags & WAL_SYNC_TRANSACTIONS)!=0 ){
+    if( pWal->padToSectorBoundary ){
+      int sectorSize = sqlite3SectorSize(pWal->pWalFd);
+      w.iSyncPoint = ((iOffset+sectorSize-1)/sectorSize)*sectorSize;
+      while( iOffset<w.iSyncPoint ){
+        rc = walWriteOneFrame(&w, pLast, nTruncate, iOffset);
+        if( rc ) return rc;
+        iOffset += szFrame;
+        nExtra++;
+      }
+    }else{
+      rc = sqlite3OsSync(w.pFd, sync_flags & SQLITE_SYNC_MASK);
+    }
+  }
+
+  /* If this frame set completes the first transaction in the WAL and
+  ** if PRAGMA journal_size_limit is set, then truncate the WAL to the
+  ** journal size limit, if possible.
+  */
+  if( isCommit && pWal->truncateOnCommit && pWal->mxWalSize>=0 ){
+    i64 sz = pWal->mxWalSize;
+    if( walFrameOffset(iFrame+nExtra+1, szPage)>pWal->mxWalSize ){
+      sz = walFrameOffset(iFrame+nExtra+1, szPage);
+    }
+    walLimitSize(pWal, sz);
+    pWal->truncateOnCommit = 0;
+  }
+
+  /* Append data to the wal-index. It is not necessary to lock the 
+  ** wal-index to do this as the SQLITE_SHM_WRITE lock held on the wal-index
+  ** guarantees that there are no other writers, and no data that may
+  ** be in use by existing readers is being overwritten.
+  */
+  iFrame = pWal->hdr.mxFrame;
+  for(p=pList; p && rc==SQLITE_OK; p=p->pDirty){
+    iFrame++;
+    rc = walIndexAppend(pWal, iFrame, p->pgno);
+  }
+  while( rc==SQLITE_OK && nExtra>0 ){
+    iFrame++;
+    nExtra--;
+    rc = walIndexAppend(pWal, iFrame, pLast->pgno);
+  }
+
+  if( rc==SQLITE_OK ){
+    /* Update the private copy of the header. */
+    pWal->hdr.szPage = (u16)((szPage&0xff00) | (szPage>>16));
+    testcase( szPage<=32768 );
+    testcase( szPage>=65536 );
+    pWal->hdr.mxFrame = iFrame;
+    if( isCommit ){
+      pWal->hdr.iChange++;
+      pWal->hdr.nPage = nTruncate;
+    }
+    /* If this is a commit, update the wal-index header too. */
+    if( isCommit ){
+      walIndexWriteHdr(pWal);
+      pWal->iCallback = iFrame;
+    }
+  }
+
+  WALTRACE(("WAL%p: frame write %s\n", pWal, rc ? "failed" : "ok"));
+  return rc;
+}
+
+/* 
+** This routine is called to implement sqlite3_wal_checkpoint() and
+** related interfaces.
+**
+** Obtain a CHECKPOINT lock and then backfill as much information as
+** we can from WAL into the database.
+**
+** If parameter xBusy is not NULL, it is a pointer to a busy-handler
+** callback. In this case this function runs a blocking checkpoint.
+*/
+SQLITE_PRIVATE int sqlite3WalCheckpoint(
+  Wal *pWal,                      /* Wal connection */
+  int eMode,                      /* PASSIVE, FULL, RESTART, or TRUNCATE */
+  int (*xBusy)(void*),            /* Function to call when busy */
+  void *pBusyArg,                 /* Context argument for xBusyHandler */
+  int sync_flags,                 /* Flags to sync db file with (or 0) */
+  int nBuf,                       /* Size of temporary buffer */
+  u8 *zBuf,                       /* Temporary buffer to use */
+  int *pnLog,                     /* OUT: Number of frames in WAL */
+  int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+){
+  int rc;                         /* Return code */
+  int isChanged = 0;              /* True if a new wal-index header is loaded */
+  int eMode2 = eMode;             /* Mode to pass to walCheckpoint() */
+  int (*xBusy2)(void*) = xBusy;   /* Busy handler for eMode2 */
+
+  assert( pWal->ckptLock==0 );
+  assert( pWal->writeLock==0 );
+
+  /* EVIDENCE-OF: R-62920-47450 The busy-handler callback is never invoked
+  ** in the SQLITE_CHECKPOINT_PASSIVE mode. */
+  assert( eMode!=SQLITE_CHECKPOINT_PASSIVE || xBusy==0 );
+
+  if( pWal->readOnly ) return SQLITE_READONLY;
+  WALTRACE(("WAL%p: checkpoint begins\n", pWal));
+
+  /* IMPLEMENTATION-OF: R-62028-47212 All calls obtain an exclusive 
+  ** "checkpoint" lock on the database file. */
+  rc = walLockExclusive(pWal, WAL_CKPT_LOCK, 1);
+  if( rc ){
+    /* EVIDENCE-OF: R-10421-19736 If any other process is running a
+    ** checkpoint operation at the same time, the lock cannot be obtained and
+    ** SQLITE_BUSY is returned.
+    ** EVIDENCE-OF: R-53820-33897 Even if there is a busy-handler configured,
+    ** it will not be invoked in this case.
+    */
+    testcase( rc==SQLITE_BUSY );
+    testcase( xBusy!=0 );
+    return rc;
+  }
+  pWal->ckptLock = 1;
+
+  /* IMPLEMENTATION-OF: R-59782-36818 The SQLITE_CHECKPOINT_FULL, RESTART and
+  ** TRUNCATE modes also obtain the exclusive "writer" lock on the database
+  ** file.
+  **
+  ** EVIDENCE-OF: R-60642-04082 If the writer lock cannot be obtained
+  ** immediately, and a busy-handler is configured, it is invoked and the
+  ** writer lock retried until either the busy-handler returns 0 or the
+  ** lock is successfully obtained.
+  */
+  if( eMode!=SQLITE_CHECKPOINT_PASSIVE ){
+    rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_WRITE_LOCK, 1);
+    if( rc==SQLITE_OK ){
+      pWal->writeLock = 1;
+    }else if( rc==SQLITE_BUSY ){
+      eMode2 = SQLITE_CHECKPOINT_PASSIVE;
+      xBusy2 = 0;
+      rc = SQLITE_OK;
+    }
+  }
+
+  /* Read the wal-index header. */
+  if( rc==SQLITE_OK ){
+    rc = walIndexReadHdr(pWal, &isChanged);
+    if( isChanged && pWal->pDbFd->pMethods->iVersion>=3 ){
+      sqlite3OsUnfetch(pWal->pDbFd, 0, 0);
+    }
+  }
+
+  /* Copy data from the log to the database file. */
+  if( rc==SQLITE_OK ){
+    if( pWal->hdr.mxFrame && walPagesize(pWal)!=nBuf ){
+      rc = SQLITE_CORRUPT_BKPT;
+    }else{
+      rc = walCheckpoint(pWal, eMode2, xBusy2, pBusyArg, sync_flags, zBuf);
+    }
+
+    /* If no error occurred, set the output variables. */
+    if( rc==SQLITE_OK || rc==SQLITE_BUSY ){
+      if( pnLog ) *pnLog = (int)pWal->hdr.mxFrame;
+      if( pnCkpt ) *pnCkpt = (int)(walCkptInfo(pWal)->nBackfill);
+    }
+  }
+
+  if( isChanged ){
+    /* If a new wal-index header was loaded before the checkpoint was 
+    ** performed, then the pager-cache associated with pWal is now
+    ** out of date. So zero the cached wal-index header to ensure that
+    ** next time the pager opens a snapshot on this database it knows that
+    ** the cache needs to be reset.
+    */
+    memset(&pWal->hdr, 0, sizeof(WalIndexHdr));
+  }
+
+  /* Release the locks. */
+  sqlite3WalEndWriteTransaction(pWal);
+  walUnlockExclusive(pWal, WAL_CKPT_LOCK, 1);
+  pWal->ckptLock = 0;
+  WALTRACE(("WAL%p: checkpoint %s\n", pWal, rc ? "failed" : "ok"));
+  return (rc==SQLITE_OK && eMode!=eMode2 ? SQLITE_BUSY : rc);
+}
+
+/* Return the value to pass to a sqlite3_wal_hook callback, the
+** number of frames in the WAL at the point of the last commit since
+** sqlite3WalCallback() was called.  If no commits have occurred since
+** the last call, then return 0.
+*/
+SQLITE_PRIVATE int sqlite3WalCallback(Wal *pWal){
+  u32 ret = 0;
+  if( pWal ){
+    ret = pWal->iCallback;
+    pWal->iCallback = 0;
+  }
+  return (int)ret;
+}
+
+/*
+** This function is called to change the WAL subsystem into or out
+** of locking_mode=EXCLUSIVE.
