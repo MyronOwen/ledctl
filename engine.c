@@ -52024,3 +52024,215 @@ struct Btree {
   u32 iDataVersion;  /* Combines with pBt->pPager->iDataVersion */
   Btree *pNext;      /* List of other sharable Btrees from the same db */
   Btree *pPrev;      /* Back pointer of the same list */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  BtLock lock;       /* Object used to lock page 1 */
+#endif
+};
+
+/*
+** Btree.inTrans may take one of the following values.
+**
+** If the shared-data extension is enabled, there may be multiple users
+** of the Btree structure. At most one of these may open a write transaction,
+** but any number may have active read transactions.
+*/
+#define TRANS_NONE  0
+#define TRANS_READ  1
+#define TRANS_WRITE 2
+
+/*
+** An instance of this object represents a single database file.
+** 
+** A single database file can be in use at the same time by two
+** or more database connections.  When two or more connections are
+** sharing the same database file, each connection has it own
+** private Btree object for the file and each of those Btrees points
+** to this one BtShared object.  BtShared.nRef is the number of
+** connections currently sharing this database file.
+**
+** Fields in this structure are accessed under the BtShared.mutex
+** mutex, except for nRef and pNext which are accessed under the
+** global SQLITE_MUTEX_STATIC_MASTER mutex.  The pPager field
+** may not be modified once it is initially set as long as nRef>0.
+** The pSchema field may be set once under BtShared.mutex and
+** thereafter is unchanged as long as nRef>0.
+**
+** isPending:
+**
+**   If a BtShared client fails to obtain a write-lock on a database
+**   table (because there exists one or more read-locks on the table),
+**   the shared-cache enters 'pending-lock' state and isPending is
+**   set to true.
+**
+**   The shared-cache leaves the 'pending lock' state when either of
+**   the following occur:
+**
+**     1) The current writer (BtShared.pWriter) concludes its transaction, OR
+**     2) The number of locks held by other connections drops to zero.
+**
+**   while in the 'pending-lock' state, no connection may start a new
+**   transaction.
+**
+**   This feature is included to help prevent writer-starvation.
+*/
+struct BtShared {
+  Pager *pPager;        /* The page cache */
+  sqlite3 *db;          /* Database connection currently using this Btree */
+  BtCursor *pCursor;    /* A list of all open cursors */
+  MemPage *pPage1;      /* First page of the database */
+  u8 openFlags;         /* Flags to sqlite3BtreeOpen() */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  u8 autoVacuum;        /* True if auto-vacuum is enabled */
+  u8 incrVacuum;        /* True if incr-vacuum is enabled */
+  u8 bDoTruncate;       /* True to truncate db on commit */
+#endif
+  u8 inTransaction;     /* Transaction state */
+  u8 max1bytePayload;   /* Maximum first byte of cell for a 1-byte payload */
+  u16 btsFlags;         /* Boolean parameters.  See BTS_* macros below */
+  u16 maxLocal;         /* Maximum local payload in non-LEAFDATA tables */
+  u16 minLocal;         /* Minimum local payload in non-LEAFDATA tables */
+  u16 maxLeaf;          /* Maximum local payload in a LEAFDATA table */
+  u16 minLeaf;          /* Minimum local payload in a LEAFDATA table */
+  u32 pageSize;         /* Total number of bytes on a page */
+  u32 usableSize;       /* Number of usable bytes on each page */
+  int nTransaction;     /* Number of open transactions (read + write) */
+  u32 nPage;            /* Number of pages in the database */
+  void *pSchema;        /* Pointer to space allocated by sqlite3BtreeSchema() */
+  void (*xFreeSchema)(void*);  /* Destructor for BtShared.pSchema */
+  sqlite3_mutex *mutex; /* Non-recursive mutex required to access this object */
+  Bitvec *pHasContent;  /* Set of pages moved to free-list this transaction */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  int nRef;             /* Number of references to this structure */
+  BtShared *pNext;      /* Next on a list of sharable BtShared structs */
+  BtLock *pLock;        /* List of locks held on this shared-btree struct */
+  Btree *pWriter;       /* Btree with currently open write transaction */
+#endif
+  u8 *pTmpSpace;        /* Temp space sufficient to hold a single cell */
+};
+
+/*
+** Allowed values for BtShared.btsFlags
+*/
+#define BTS_READ_ONLY        0x0001   /* Underlying file is readonly */
+#define BTS_PAGESIZE_FIXED   0x0002   /* Page size can no longer be changed */
+#define BTS_SECURE_DELETE    0x0004   /* PRAGMA secure_delete is enabled */
+#define BTS_INITIALLY_EMPTY  0x0008   /* Database was empty at trans start */
+#define BTS_NO_WAL           0x0010   /* Do not open write-ahead-log files */
+#define BTS_EXCLUSIVE        0x0020   /* pWriter has an exclusive lock */
+#define BTS_PENDING          0x0040   /* Waiting for read-locks to clear */
+
+/*
+** An instance of the following structure is used to hold information
+** about a cell.  The parseCellPtr() function fills in this structure
+** based on information extract from the raw disk page.
+*/
+typedef struct CellInfo CellInfo;
+struct CellInfo {
+  i64 nKey;      /* The key for INTKEY tables, or nPayload otherwise */
+  u8 *pPayload;  /* Pointer to the start of payload */
+  u32 nPayload;  /* Bytes of payload */
+  u16 nLocal;    /* Amount of payload held locally, not on overflow */
+  u16 iOverflow; /* Offset to overflow page number.  Zero if no overflow */
+  u16 nSize;     /* Size of the cell content on the main b-tree page */
+};
+
+/*
+** Maximum depth of an SQLite B-Tree structure. Any B-Tree deeper than
+** this will be declared corrupt. This value is calculated based on a
+** maximum database size of 2^31 pages a minimum fanout of 2 for a
+** root-node and 3 for all other internal nodes.
+**
+** If a tree that appears to be taller than this is encountered, it is
+** assumed that the database is corrupt.
+*/
+#define BTCURSOR_MAX_DEPTH 20
+
+/*
+** A cursor is a pointer to a particular entry within a particular
+** b-tree within a database file.
+**
+** The entry is identified by its MemPage and the index in
+** MemPage.aCell[] of the entry.
+**
+** A single database file can be shared by two more database connections,
+** but cursors cannot be shared.  Each cursor is associated with a
+** particular database connection identified BtCursor.pBtree.db.
+**
+** Fields in this structure are accessed under the BtShared.mutex
+** found at self->pBt->mutex. 
+**
+** skipNext meaning:
+**    eState==SKIPNEXT && skipNext>0:  Next sqlite3BtreeNext() is no-op.
+**    eState==SKIPNEXT && skipNext<0:  Next sqlite3BtreePrevious() is no-op.
+**    eState==FAULT:                   Cursor fault with skipNext as error code.
+*/
+struct BtCursor {
+  Btree *pBtree;            /* The Btree to which this cursor belongs */
+  BtShared *pBt;            /* The BtShared this cursor points to */
+  BtCursor *pNext, *pPrev;  /* Forms a linked list of all cursors */
+  struct KeyInfo *pKeyInfo; /* Argument passed to comparison function */
+  Pgno *aOverflow;          /* Cache of overflow page locations */
+  CellInfo info;            /* A parse of the cell we are pointing at */
+  i64 nKey;                 /* Size of pKey, or last integer key */
+  void *pKey;               /* Saved key that was cursor last known position */
+  Pgno pgnoRoot;            /* The root page of this tree */
+  int nOvflAlloc;           /* Allocated size of aOverflow[] array */
+  int skipNext;    /* Prev() is noop if negative. Next() is noop if positive.
+                   ** Error code if eState==CURSOR_FAULT */
+  u8 curFlags;              /* zero or more BTCF_* flags defined below */
+  u8 eState;                /* One of the CURSOR_XXX constants (see below) */
+  u8 hints;                             /* As configured by CursorSetHints() */
+  i16 iPage;                            /* Index of current page in apPage */
+  u16 aiIdx[BTCURSOR_MAX_DEPTH];        /* Current index in apPage[i] */
+  MemPage *apPage[BTCURSOR_MAX_DEPTH];  /* Pages from root to current page */
+};
+
+/*
+** Legal values for BtCursor.curFlags
+*/
+#define BTCF_WriteFlag    0x01   /* True if a write cursor */
+#define BTCF_ValidNKey    0x02   /* True if info.nKey is valid */
+#define BTCF_ValidOvfl    0x04   /* True if aOverflow is valid */
+#define BTCF_AtLast       0x08   /* Cursor is pointing ot the last entry */
+#define BTCF_Incrblob     0x10   /* True if an incremental I/O handle */
+
+/*
+** Potential values for BtCursor.eState.
+**
+** CURSOR_INVALID:
+**   Cursor does not point to a valid entry. This can happen (for example) 
+**   because the table is empty or because BtreeCursorFirst() has not been
+**   called.
+**
+** CURSOR_VALID:
+**   Cursor points to a valid entry. getPayload() etc. may be called.
+**
+** CURSOR_SKIPNEXT:
+**   Cursor is valid except that the Cursor.skipNext field is non-zero
+**   indicating that the next sqlite3BtreeNext() or sqlite3BtreePrevious()
+**   operation should be a no-op.
+**
+** CURSOR_REQUIRESEEK:
+**   The table that this cursor was opened on still exists, but has been 
+**   modified since the cursor was last used. The cursor position is saved
+**   in variables BtCursor.pKey and BtCursor.nKey. When a cursor is in 
+**   this state, restoreCursorPosition() can be called to attempt to
+**   seek the cursor to the saved position.
+**
+** CURSOR_FAULT:
+**   An unrecoverable error (an I/O error or a malloc failure) has occurred
+**   on a different connection that shares the BtShared cache with this
+**   cursor.  The error has left the cache in an inconsistent state.
+**   Do nothing else with this cursor.  Any attempt to use the cursor
+**   should return the error code stored in BtCursor.skipNext
+*/
+#define CURSOR_INVALID           0
+#define CURSOR_VALID             1
+#define CURSOR_SKIPNEXT          2
+#define CURSOR_REQUIRESEEK       3
+#define CURSOR_FAULT             4
+
+/* 
+** The database page the PENDING_BYTE occupies. This page is never used.
+*/
+# define PENDING_BYTE_PAGE(pBt) PAGER_MJ_PGNO(pBt)
