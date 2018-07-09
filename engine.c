@@ -52236,3 +52236,239 @@ struct BtCursor {
 ** The database page the PENDING_BYTE occupies. This page is never used.
 */
 # define PENDING_BYTE_PAGE(pBt) PAGER_MJ_PGNO(pBt)
+
+/*
+** These macros define the location of the pointer-map entry for a 
+** database page. The first argument to each is the number of usable
+** bytes on each page of the database (often 1024). The second is the
+** page number to look up in the pointer map.
+**
+** PTRMAP_PAGENO returns the database page number of the pointer-map
+** page that stores the required pointer. PTRMAP_PTROFFSET returns
+** the offset of the requested map entry.
+**
+** If the pgno argument passed to PTRMAP_PAGENO is a pointer-map page,
+** then pgno is returned. So (pgno==PTRMAP_PAGENO(pgsz, pgno)) can be
+** used to test if pgno is a pointer-map page. PTRMAP_ISPAGE implements
+** this test.
+*/
+#define PTRMAP_PAGENO(pBt, pgno) ptrmapPageno(pBt, pgno)
+#define PTRMAP_PTROFFSET(pgptrmap, pgno) (5*(pgno-pgptrmap-1))
+#define PTRMAP_ISPAGE(pBt, pgno) (PTRMAP_PAGENO((pBt),(pgno))==(pgno))
+
+/*
+** The pointer map is a lookup table that identifies the parent page for
+** each child page in the database file.  The parent page is the page that
+** contains a pointer to the child.  Every page in the database contains
+** 0 or 1 parent pages.  (In this context 'database page' refers
+** to any page that is not part of the pointer map itself.)  Each pointer map
+** entry consists of a single byte 'type' and a 4 byte parent page number.
+** The PTRMAP_XXX identifiers below are the valid types.
+**
+** The purpose of the pointer map is to facility moving pages from one
+** position in the file to another as part of autovacuum.  When a page
+** is moved, the pointer in its parent must be updated to point to the
+** new location.  The pointer map is used to locate the parent page quickly.
+**
+** PTRMAP_ROOTPAGE: The database page is a root-page. The page-number is not
+**                  used in this case.
+**
+** PTRMAP_FREEPAGE: The database page is an unused (free) page. The page-number 
+**                  is not used in this case.
+**
+** PTRMAP_OVERFLOW1: The database page is the first page in a list of 
+**                   overflow pages. The page number identifies the page that
+**                   contains the cell with a pointer to this overflow page.
+**
+** PTRMAP_OVERFLOW2: The database page is the second or later page in a list of
+**                   overflow pages. The page-number identifies the previous
+**                   page in the overflow page list.
+**
+** PTRMAP_BTREE: The database page is a non-root btree page. The page number
+**               identifies the parent page in the btree.
+*/
+#define PTRMAP_ROOTPAGE 1
+#define PTRMAP_FREEPAGE 2
+#define PTRMAP_OVERFLOW1 3
+#define PTRMAP_OVERFLOW2 4
+#define PTRMAP_BTREE 5
+
+/* A bunch of assert() statements to check the transaction state variables
+** of handle p (type Btree*) are internally consistent.
+*/
+#define btreeIntegrity(p) \
+  assert( p->pBt->inTransaction!=TRANS_NONE || p->pBt->nTransaction==0 ); \
+  assert( p->pBt->inTransaction>=p->inTrans ); 
+
+
+/*
+** The ISAUTOVACUUM macro is used within balance_nonroot() to determine
+** if the database supports auto-vacuum or not. Because it is used
+** within an expression that is an argument to another macro 
+** (sqliteMallocRaw), it is not possible to use conditional compilation.
+** So, this macro is defined instead.
+*/
+#ifndef SQLITE_OMIT_AUTOVACUUM
+#define ISAUTOVACUUM (pBt->autoVacuum)
+#else
+#define ISAUTOVACUUM 0
+#endif
+
+
+/*
+** This structure is passed around through all the sanity checking routines
+** in order to keep track of some global state information.
+**
+** The aRef[] array is allocated so that there is 1 bit for each page in
+** the database. As the integrity-check proceeds, for each page used in
+** the database the corresponding bit is set. This allows integrity-check to 
+** detect pages that are used twice and orphaned pages (both of which 
+** indicate corruption).
+*/
+typedef struct IntegrityCk IntegrityCk;
+struct IntegrityCk {
+  BtShared *pBt;    /* The tree being checked out */
+  Pager *pPager;    /* The associated pager.  Also accessible by pBt->pPager */
+  u8 *aPgRef;       /* 1 bit per page in the db (see above) */
+  Pgno nPage;       /* Number of pages in the database */
+  int mxErr;        /* Stop accumulating errors when this reaches zero */
+  int nErr;         /* Number of messages written to zErrMsg so far */
+  int mallocFailed; /* A memory allocation error has occurred */
+  const char *zPfx; /* Error message prefix */
+  int v1, v2;       /* Values for up to two %d fields in zPfx */
+  StrAccum errMsg;  /* Accumulate the error message text here */
+};
+
+/*
+** Routines to read or write a two- and four-byte big-endian integer values.
+*/
+#define get2byte(x)   ((x)[0]<<8 | (x)[1])
+#define put2byte(p,v) ((p)[0] = (u8)((v)>>8), (p)[1] = (u8)(v))
+#define get4byte sqlite3Get4byte
+#define put4byte sqlite3Put4byte
+
+/************** End of btreeInt.h ********************************************/
+/************** Continuing where we left off in btmutex.c ********************/
+#ifndef SQLITE_OMIT_SHARED_CACHE
+#if SQLITE_THREADSAFE
+
+/*
+** Obtain the BtShared mutex associated with B-Tree handle p. Also,
+** set BtShared.db to the database handle associated with p and the
+** p->locked boolean to true.
+*/
+static void lockBtreeMutex(Btree *p){
+  assert( p->locked==0 );
+  assert( sqlite3_mutex_notheld(p->pBt->mutex) );
+  assert( sqlite3_mutex_held(p->db->mutex) );
+
+  sqlite3_mutex_enter(p->pBt->mutex);
+  p->pBt->db = p->db;
+  p->locked = 1;
+}
+
+/*
+** Release the BtShared mutex associated with B-Tree handle p and
+** clear the p->locked boolean.
+*/
+static void SQLITE_NOINLINE unlockBtreeMutex(Btree *p){
+  BtShared *pBt = p->pBt;
+  assert( p->locked==1 );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  assert( p->db==pBt->db );
+
+  sqlite3_mutex_leave(pBt->mutex);
+  p->locked = 0;
+}
+
+/* Forward reference */
+static void SQLITE_NOINLINE btreeLockCarefully(Btree *p);
+
+/*
+** Enter a mutex on the given BTree object.
+**
+** If the object is not sharable, then no mutex is ever required
+** and this routine is a no-op.  The underlying mutex is non-recursive.
+** But we keep a reference count in Btree.wantToLock so the behavior
+** of this interface is recursive.
+**
+** To avoid deadlocks, multiple Btrees are locked in the same order
+** by all database connections.  The p->pNext is a list of other
+** Btrees belonging to the same database connection as the p Btree
+** which need to be locked after p.  If we cannot get a lock on
+** p, then first unlock all of the others on p->pNext, then wait
+** for the lock to become available on p, then relock all of the
+** subsequent Btrees that desire a lock.
+*/
+SQLITE_PRIVATE void sqlite3BtreeEnter(Btree *p){
+  /* Some basic sanity checking on the Btree.  The list of Btrees
+  ** connected by pNext and pPrev should be in sorted order by
+  ** Btree.pBt value. All elements of the list should belong to
+  ** the same connection. Only shared Btrees are on the list. */
+  assert( p->pNext==0 || p->pNext->pBt>p->pBt );
+  assert( p->pPrev==0 || p->pPrev->pBt<p->pBt );
+  assert( p->pNext==0 || p->pNext->db==p->db );
+  assert( p->pPrev==0 || p->pPrev->db==p->db );
+  assert( p->sharable || (p->pNext==0 && p->pPrev==0) );
+
+  /* Check for locking consistency */
+  assert( !p->locked || p->wantToLock>0 );
+  assert( p->sharable || p->wantToLock==0 );
+
+  /* We should already hold a lock on the database connection */
+  assert( sqlite3_mutex_held(p->db->mutex) );
+
+  /* Unless the database is sharable and unlocked, then BtShared.db
+  ** should already be set correctly. */
+  assert( (p->locked==0 && p->sharable) || p->pBt->db==p->db );
+
+  if( !p->sharable ) return;
+  p->wantToLock++;
+  if( p->locked ) return;
+  btreeLockCarefully(p);
+}
+
+/* This is a helper function for sqlite3BtreeLock(). By moving
+** complex, but seldom used logic, out of sqlite3BtreeLock() and
+** into this routine, we avoid unnecessary stack pointer changes
+** and thus help the sqlite3BtreeLock() routine to run much faster
+** in the common case.
+*/
+static void SQLITE_NOINLINE btreeLockCarefully(Btree *p){
+  Btree *pLater;
+
+  /* In most cases, we should be able to acquire the lock we
+  ** want without having to go through the ascending lock
+  ** procedure that follows.  Just be sure not to block.
+  */
+  if( sqlite3_mutex_try(p->pBt->mutex)==SQLITE_OK ){
+    p->pBt->db = p->db;
+    p->locked = 1;
+    return;
+  }
+
+  /* To avoid deadlock, first release all locks with a larger
+  ** BtShared address.  Then acquire our lock.  Then reacquire
+  ** the other BtShared locks that we used to hold in ascending
+  ** order.
+  */
+  for(pLater=p->pNext; pLater; pLater=pLater->pNext){
+    assert( pLater->sharable );
+    assert( pLater->pNext==0 || pLater->pNext->pBt>pLater->pBt );
+    assert( !pLater->locked || pLater->wantToLock>0 );
+    if( pLater->locked ){
+      unlockBtreeMutex(pLater);
+    }
+  }
+  lockBtreeMutex(p);
+  for(pLater=p->pNext; pLater; pLater=pLater->pNext){
+    if( pLater->wantToLock ){
+      lockBtreeMutex(pLater);
+    }
+  }
+}
+
+
+/*
+** Exit the recursive mutex on a Btree.
