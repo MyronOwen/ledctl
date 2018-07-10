@@ -52704,3 +52704,228 @@ int sqlite3BtreeTrace=1;  /* True to enable tracing */
 ** but the test harness needs to access it so we make it global for 
 ** test builds.
 **
+** Access to this variable is protected by SQLITE_MUTEX_STATIC_MASTER.
+*/
+#ifdef SQLITE_TEST
+SQLITE_PRIVATE BtShared *SQLITE_WSD sqlite3SharedCacheList = 0;
+#else
+static BtShared *SQLITE_WSD sqlite3SharedCacheList = 0;
+#endif
+#endif /* SQLITE_OMIT_SHARED_CACHE */
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+/*
+** Enable or disable the shared pager and schema features.
+**
+** This routine has no effect on existing database connections.
+** The shared cache setting effects only future calls to
+** sqlite3_open(), sqlite3_open16(), or sqlite3_open_v2().
+*/
+SQLITE_API int sqlite3_enable_shared_cache(int enable){
+  sqlite3GlobalConfig.sharedCacheEnabled = enable;
+  return SQLITE_OK;
+}
+#endif
+
+
+
+#ifdef SQLITE_OMIT_SHARED_CACHE
+  /*
+  ** The functions querySharedCacheTableLock(), setSharedCacheTableLock(),
+  ** and clearAllSharedCacheTableLocks()
+  ** manipulate entries in the BtShared.pLock linked list used to store
+  ** shared-cache table level locks. If the library is compiled with the
+  ** shared-cache feature disabled, then there is only ever one user
+  ** of each BtShared structure and so this locking is not necessary. 
+  ** So define the lock related functions as no-ops.
+  */
+  #define querySharedCacheTableLock(a,b,c) SQLITE_OK
+  #define setSharedCacheTableLock(a,b,c) SQLITE_OK
+  #define clearAllSharedCacheTableLocks(a)
+  #define downgradeAllSharedCacheTableLocks(a)
+  #define hasSharedCacheTableLock(a,b,c,d) 1
+  #define hasReadConflicts(a, b) 0
+#endif
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+
+#ifdef SQLITE_DEBUG
+/*
+**** This function is only used as part of an assert() statement. ***
+**
+** Check to see if pBtree holds the required locks to read or write to the 
+** table with root page iRoot.   Return 1 if it does and 0 if not.
+**
+** For example, when writing to a table with root-page iRoot via 
+** Btree connection pBtree:
+**
+**    assert( hasSharedCacheTableLock(pBtree, iRoot, 0, WRITE_LOCK) );
+**
+** When writing to an index that resides in a sharable database, the 
+** caller should have first obtained a lock specifying the root page of
+** the corresponding table. This makes things a bit more complicated,
+** as this module treats each table as a separate structure. To determine
+** the table corresponding to the index being written, this
+** function has to search through the database schema.
+**
+** Instead of a lock on the table/index rooted at page iRoot, the caller may
+** hold a write-lock on the schema table (root page 1). This is also
+** acceptable.
+*/
+static int hasSharedCacheTableLock(
+  Btree *pBtree,         /* Handle that must hold lock */
+  Pgno iRoot,            /* Root page of b-tree */
+  int isIndex,           /* True if iRoot is the root of an index b-tree */
+  int eLockType          /* Required lock type (READ_LOCK or WRITE_LOCK) */
+){
+  Schema *pSchema = (Schema *)pBtree->pBt->pSchema;
+  Pgno iTab = 0;
+  BtLock *pLock;
+
+  /* If this database is not shareable, or if the client is reading
+  ** and has the read-uncommitted flag set, then no lock is required. 
+  ** Return true immediately.
+  */
+  if( (pBtree->sharable==0)
+   || (eLockType==READ_LOCK && (pBtree->db->flags & SQLITE_ReadUncommitted))
+  ){
+    return 1;
+  }
+
+  /* If the client is reading  or writing an index and the schema is
+  ** not loaded, then it is too difficult to actually check to see if
+  ** the correct locks are held.  So do not bother - just return true.
+  ** This case does not come up very often anyhow.
+  */
+  if( isIndex && (!pSchema || (pSchema->schemaFlags&DB_SchemaLoaded)==0) ){
+    return 1;
+  }
+
+  /* Figure out the root-page that the lock should be held on. For table
+  ** b-trees, this is just the root page of the b-tree being read or
+  ** written. For index b-trees, it is the root page of the associated
+  ** table.  */
+  if( isIndex ){
+    HashElem *p;
+    for(p=sqliteHashFirst(&pSchema->idxHash); p; p=sqliteHashNext(p)){
+      Index *pIdx = (Index *)sqliteHashData(p);
+      if( pIdx->tnum==(int)iRoot ){
+        iTab = pIdx->pTable->tnum;
+      }
+    }
+  }else{
+    iTab = iRoot;
+  }
+
+  /* Search for the required lock. Either a write-lock on root-page iTab, a 
+  ** write-lock on the schema table, or (if the client is reading) a
+  ** read-lock on iTab will suffice. Return 1 if any of these are found.  */
+  for(pLock=pBtree->pBt->pLock; pLock; pLock=pLock->pNext){
+    if( pLock->pBtree==pBtree 
+     && (pLock->iTable==iTab || (pLock->eLock==WRITE_LOCK && pLock->iTable==1))
+     && pLock->eLock>=eLockType 
+    ){
+      return 1;
+    }
+  }
+
+  /* Failed to find the required lock. */
+  return 0;
+}
+#endif /* SQLITE_DEBUG */
+
+#ifdef SQLITE_DEBUG
+/*
+**** This function may be used as part of assert() statements only. ****
+**
+** Return true if it would be illegal for pBtree to write into the
+** table or index rooted at iRoot because other shared connections are
+** simultaneously reading that same table or index.
+**
+** It is illegal for pBtree to write if some other Btree object that
+** shares the same BtShared object is currently reading or writing
+** the iRoot table.  Except, if the other Btree object has the
+** read-uncommitted flag set, then it is OK for the other object to
+** have a read cursor.
+**
+** For example, before writing to any part of the table or index
+** rooted at page iRoot, one should call:
+**
+**    assert( !hasReadConflicts(pBtree, iRoot) );
+*/
+static int hasReadConflicts(Btree *pBtree, Pgno iRoot){
+  BtCursor *p;
+  for(p=pBtree->pBt->pCursor; p; p=p->pNext){
+    if( p->pgnoRoot==iRoot 
+     && p->pBtree!=pBtree
+     && 0==(p->pBtree->db->flags & SQLITE_ReadUncommitted)
+    ){
+      return 1;
+    }
+  }
+  return 0;
+}
+#endif    /* #ifdef SQLITE_DEBUG */
+
+/*
+** Query to see if Btree handle p may obtain a lock of type eLock 
+** (READ_LOCK or WRITE_LOCK) on the table with root-page iTab. Return
+** SQLITE_OK if the lock may be obtained (by calling
+** setSharedCacheTableLock()), or SQLITE_LOCKED if not.
+*/
+static int querySharedCacheTableLock(Btree *p, Pgno iTab, u8 eLock){
+  BtShared *pBt = p->pBt;
+  BtLock *pIter;
+
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( eLock==READ_LOCK || eLock==WRITE_LOCK );
+  assert( p->db!=0 );
+  assert( !(p->db->flags&SQLITE_ReadUncommitted)||eLock==WRITE_LOCK||iTab==1 );
+  
+  /* If requesting a write-lock, then the Btree must have an open write
+  ** transaction on this file. And, obviously, for this to be so there 
+  ** must be an open write transaction on the file itself.
+  */
+  assert( eLock==READ_LOCK || (p==pBt->pWriter && p->inTrans==TRANS_WRITE) );
+  assert( eLock==READ_LOCK || pBt->inTransaction==TRANS_WRITE );
+  
+  /* This routine is a no-op if the shared-cache is not enabled */
+  if( !p->sharable ){
+    return SQLITE_OK;
+  }
+
+  /* If some other connection is holding an exclusive lock, the
+  ** requested lock may not be obtained.
+  */
+  if( pBt->pWriter!=p && (pBt->btsFlags & BTS_EXCLUSIVE)!=0 ){
+    sqlite3ConnectionBlocked(p->db, pBt->pWriter->db);
+    return SQLITE_LOCKED_SHAREDCACHE;
+  }
+
+  for(pIter=pBt->pLock; pIter; pIter=pIter->pNext){
+    /* The condition (pIter->eLock!=eLock) in the following if(...) 
+    ** statement is a simplification of:
+    **
+    **   (eLock==WRITE_LOCK || pIter->eLock==WRITE_LOCK)
+    **
+    ** since we know that if eLock==WRITE_LOCK, then no other connection
+    ** may hold a WRITE_LOCK on any table in this file (since there can
+    ** only be a single writer).
+    */
+    assert( pIter->eLock==READ_LOCK || pIter->eLock==WRITE_LOCK );
+    assert( eLock==READ_LOCK || pIter->pBtree==p || pIter->eLock==READ_LOCK);
+    if( pIter->pBtree!=p && pIter->iTable==iTab && pIter->eLock!=eLock ){
+      sqlite3ConnectionBlocked(p->db, pIter->pBtree->db);
+      if( eLock==WRITE_LOCK ){
+        assert( p==pBt->pWriter );
+        pBt->btsFlags |= BTS_PENDING;
+      }
+      return SQLITE_LOCKED_SHAREDCACHE;
+    }
+  }
+  return SQLITE_OK;
+}
+#endif /* !SQLITE_OMIT_SHARED_CACHE */
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+/*
