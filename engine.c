@@ -52472,3 +52472,235 @@ static void SQLITE_NOINLINE btreeLockCarefully(Btree *p){
 
 /*
 ** Exit the recursive mutex on a Btree.
+*/
+SQLITE_PRIVATE void sqlite3BtreeLeave(Btree *p){
+  if( p->sharable ){
+    assert( p->wantToLock>0 );
+    p->wantToLock--;
+    if( p->wantToLock==0 ){
+      unlockBtreeMutex(p);
+    }
+  }
+}
+
+#ifndef NDEBUG
+/*
+** Return true if the BtShared mutex is held on the btree, or if the
+** B-Tree is not marked as sharable.
+**
+** This routine is used only from within assert() statements.
+*/
+SQLITE_PRIVATE int sqlite3BtreeHoldsMutex(Btree *p){
+  assert( p->sharable==0 || p->locked==0 || p->wantToLock>0 );
+  assert( p->sharable==0 || p->locked==0 || p->db==p->pBt->db );
+  assert( p->sharable==0 || p->locked==0 || sqlite3_mutex_held(p->pBt->mutex) );
+  assert( p->sharable==0 || p->locked==0 || sqlite3_mutex_held(p->db->mutex) );
+
+  return (p->sharable==0 || p->locked);
+}
+#endif
+
+
+#ifndef SQLITE_OMIT_INCRBLOB
+/*
+** Enter and leave a mutex on a Btree given a cursor owned by that
+** Btree.  These entry points are used by incremental I/O and can be
+** omitted if that module is not used.
+*/
+SQLITE_PRIVATE void sqlite3BtreeEnterCursor(BtCursor *pCur){
+  sqlite3BtreeEnter(pCur->pBtree);
+}
+SQLITE_PRIVATE void sqlite3BtreeLeaveCursor(BtCursor *pCur){
+  sqlite3BtreeLeave(pCur->pBtree);
+}
+#endif /* SQLITE_OMIT_INCRBLOB */
+
+
+/*
+** Enter the mutex on every Btree associated with a database
+** connection.  This is needed (for example) prior to parsing
+** a statement since we will be comparing table and column names
+** against all schemas and we do not want those schemas being
+** reset out from under us.
+**
+** There is a corresponding leave-all procedures.
+**
+** Enter the mutexes in accending order by BtShared pointer address
+** to avoid the possibility of deadlock when two threads with
+** two or more btrees in common both try to lock all their btrees
+** at the same instant.
+*/
+SQLITE_PRIVATE void sqlite3BtreeEnterAll(sqlite3 *db){
+  int i;
+  Btree *p;
+  assert( sqlite3_mutex_held(db->mutex) );
+  for(i=0; i<db->nDb; i++){
+    p = db->aDb[i].pBt;
+    if( p ) sqlite3BtreeEnter(p);
+  }
+}
+SQLITE_PRIVATE void sqlite3BtreeLeaveAll(sqlite3 *db){
+  int i;
+  Btree *p;
+  assert( sqlite3_mutex_held(db->mutex) );
+  for(i=0; i<db->nDb; i++){
+    p = db->aDb[i].pBt;
+    if( p ) sqlite3BtreeLeave(p);
+  }
+}
+
+/*
+** Return true if a particular Btree requires a lock.  Return FALSE if
+** no lock is ever required since it is not sharable.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSharable(Btree *p){
+  return p->sharable;
+}
+
+#ifndef NDEBUG
+/*
+** Return true if the current thread holds the database connection
+** mutex and all required BtShared mutexes.
+**
+** This routine is used inside assert() statements only.
+*/
+SQLITE_PRIVATE int sqlite3BtreeHoldsAllMutexes(sqlite3 *db){
+  int i;
+  if( !sqlite3_mutex_held(db->mutex) ){
+    return 0;
+  }
+  for(i=0; i<db->nDb; i++){
+    Btree *p;
+    p = db->aDb[i].pBt;
+    if( p && p->sharable &&
+         (p->wantToLock==0 || !sqlite3_mutex_held(p->pBt->mutex)) ){
+      return 0;
+    }
+  }
+  return 1;
+}
+#endif /* NDEBUG */
+
+#ifndef NDEBUG
+/*
+** Return true if the correct mutexes are held for accessing the
+** db->aDb[iDb].pSchema structure.  The mutexes required for schema
+** access are:
+**
+**   (1) The mutex on db
+**   (2) if iDb!=1, then the mutex on db->aDb[iDb].pBt.
+**
+** If pSchema is not NULL, then iDb is computed from pSchema and
+** db using sqlite3SchemaToIndex().
+*/
+SQLITE_PRIVATE int sqlite3SchemaMutexHeld(sqlite3 *db, int iDb, Schema *pSchema){
+  Btree *p;
+  assert( db!=0 );
+  if( pSchema ) iDb = sqlite3SchemaToIndex(db, pSchema);
+  assert( iDb>=0 && iDb<db->nDb );
+  if( !sqlite3_mutex_held(db->mutex) ) return 0;
+  if( iDb==1 ) return 1;
+  p = db->aDb[iDb].pBt;
+  assert( p!=0 );
+  return p->sharable==0 || p->locked==1;
+}
+#endif /* NDEBUG */
+
+#else /* SQLITE_THREADSAFE>0 above.  SQLITE_THREADSAFE==0 below */
+/*
+** The following are special cases for mutex enter routines for use
+** in single threaded applications that use shared cache.  Except for
+** these two routines, all mutex operations are no-ops in that case and
+** are null #defines in btree.h.
+**
+** If shared cache is disabled, then all btree mutex routines, including
+** the ones below, are no-ops and are null #defines in btree.h.
+*/
+
+SQLITE_PRIVATE void sqlite3BtreeEnter(Btree *p){
+  p->pBt->db = p->db;
+}
+SQLITE_PRIVATE void sqlite3BtreeEnterAll(sqlite3 *db){
+  int i;
+  for(i=0; i<db->nDb; i++){
+    Btree *p = db->aDb[i].pBt;
+    if( p ){
+      p->pBt->db = p->db;
+    }
+  }
+}
+#endif /* if SQLITE_THREADSAFE */
+#endif /* ifndef SQLITE_OMIT_SHARED_CACHE */
+
+/************** End of btmutex.c *********************************************/
+/************** Begin file btree.c *******************************************/
+/*
+** 2004 April 6
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file implements an external (disk-based) database using BTrees.
+** See the header comment on "btreeInt.h" for additional information.
+** Including a description of file format and an overview of operation.
+*/
+
+/*
+** The header string that appears at the beginning of every
+** SQLite database.
+*/
+static const char zMagicHeader[] = SQLITE_FILE_HEADER;
+
+/*
+** Set this global variable to 1 to enable tracing using the TRACE
+** macro.
+*/
+#if 0
+int sqlite3BtreeTrace=1;  /* True to enable tracing */
+# define TRACE(X)  if(sqlite3BtreeTrace){printf X;fflush(stdout);}
+#else
+# define TRACE(X)
+#endif
+
+/*
+** Extract a 2-byte big-endian integer from an array of unsigned bytes.
+** But if the value is zero, make it 65536.
+**
+** This routine is used to extract the "offset to cell content area" value
+** from the header of a btree page.  If the page size is 65536 and the page
+** is empty, the offset should be 65536, but the 2-byte value stores zero.
+** This routine makes the necessary adjustment to 65536.
+*/
+#define get2byteNotZero(X)  (((((int)get2byte(X))-1)&0xffff)+1)
+
+/*
+** Values passed as the 5th argument to allocateBtreePage()
+*/
+#define BTALLOC_ANY   0           /* Allocate any page */
+#define BTALLOC_EXACT 1           /* Allocate exact page if possible */
+#define BTALLOC_LE    2           /* Allocate any page <= the parameter */
+
+/*
+** Macro IfNotOmitAV(x) returns (x) if SQLITE_OMIT_AUTOVACUUM is not 
+** defined, or 0 if it is. For example:
+**
+**   bIncrVacuum = IfNotOmitAV(pBtShared->incrVacuum);
+*/
+#ifndef SQLITE_OMIT_AUTOVACUUM
+#define IfNotOmitAV(expr) (expr)
+#else
+#define IfNotOmitAV(expr) 0
+#endif
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+/*
+** A list of BtShared objects that are eligible for participation
+** in shared cache.  This variable has file scope during normal builds,
+** but the test harness needs to access it so we make it global for 
+** test builds.
+**
