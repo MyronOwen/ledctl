@@ -53399,3 +53399,250 @@ static int btreeRestoreCursorPosition(BtCursor *pCur){
          SQLITE_OK)
 
 /*
+** Determine whether or not a cursor has moved from the position where
+** it was last placed, or has been invalidated for any other reason.
+** Cursors can move when the row they are pointing at is deleted out
+** from under them, for example.  Cursor might also move if a btree
+** is rebalanced.
+**
+** Calling this routine with a NULL cursor pointer returns false.
+**
+** Use the separate sqlite3BtreeCursorRestore() routine to restore a cursor
+** back to where it ought to be if this routine returns true.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorHasMoved(BtCursor *pCur){
+  return pCur->eState!=CURSOR_VALID;
+}
+
+/*
+** This routine restores a cursor back to its original position after it
+** has been moved by some outside activity (such as a btree rebalance or
+** a row having been deleted out from under the cursor).  
+**
+** On success, the *pDifferentRow parameter is false if the cursor is left
+** pointing at exactly the same row.  *pDifferntRow is the row the cursor
+** was pointing to has been deleted, forcing the cursor to point to some
+** nearby row.
+**
+** This routine should only be called for a cursor that just returned
+** TRUE from sqlite3BtreeCursorHasMoved().
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorRestore(BtCursor *pCur, int *pDifferentRow){
+  int rc;
+
+  assert( pCur!=0 );
+  assert( pCur->eState!=CURSOR_VALID );
+  rc = restoreCursorPosition(pCur);
+  if( rc ){
+    *pDifferentRow = 1;
+    return rc;
+  }
+  if( pCur->eState!=CURSOR_VALID || NEVER(pCur->skipNext!=0) ){
+    *pDifferentRow = 1;
+  }else{
+    *pDifferentRow = 0;
+  }
+  return SQLITE_OK;
+}
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+/*
+** Given a page number of a regular database page, return the page
+** number for the pointer-map page that contains the entry for the
+** input page number.
+**
+** Return 0 (not a valid page) for pgno==1 since there is
+** no pointer map associated with page 1.  The integrity_check logic
+** requires that ptrmapPageno(*,1)!=1.
+*/
+static Pgno ptrmapPageno(BtShared *pBt, Pgno pgno){
+  int nPagesPerMapPage;
+  Pgno iPtrMap, ret;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  if( pgno<2 ) return 0;
+  nPagesPerMapPage = (pBt->usableSize/5)+1;
+  iPtrMap = (pgno-2)/nPagesPerMapPage;
+  ret = (iPtrMap*nPagesPerMapPage) + 2; 
+  if( ret==PENDING_BYTE_PAGE(pBt) ){
+    ret++;
+  }
+  return ret;
+}
+
+/*
+** Write an entry into the pointer map.
+**
+** This routine updates the pointer map entry for page number 'key'
+** so that it maps to type 'eType' and parent page number 'pgno'.
+**
+** If *pRC is initially non-zero (non-SQLITE_OK) then this routine is
+** a no-op.  If an error occurs, the appropriate error code is written
+** into *pRC.
+*/
+static void ptrmapPut(BtShared *pBt, Pgno key, u8 eType, Pgno parent, int *pRC){
+  DbPage *pDbPage;  /* The pointer map page */
+  u8 *pPtrmap;      /* The pointer map data */
+  Pgno iPtrmap;     /* The pointer map page number */
+  int offset;       /* Offset in pointer map page */
+  int rc;           /* Return code from subfunctions */
+
+  if( *pRC ) return;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  /* The master-journal page number must never be used as a pointer map page */
+  assert( 0==PTRMAP_ISPAGE(pBt, PENDING_BYTE_PAGE(pBt)) );
+
+  assert( pBt->autoVacuum );
+  if( key==0 ){
+    *pRC = SQLITE_CORRUPT_BKPT;
+    return;
+  }
+  iPtrmap = PTRMAP_PAGENO(pBt, key);
+  rc = sqlite3PagerGet(pBt->pPager, iPtrmap, &pDbPage);
+  if( rc!=SQLITE_OK ){
+    *pRC = rc;
+    return;
+  }
+  offset = PTRMAP_PTROFFSET(iPtrmap, key);
+  if( offset<0 ){
+    *pRC = SQLITE_CORRUPT_BKPT;
+    goto ptrmap_exit;
+  }
+  assert( offset <= (int)pBt->usableSize-5 );
+  pPtrmap = (u8 *)sqlite3PagerGetData(pDbPage);
+
+  if( eType!=pPtrmap[offset] || get4byte(&pPtrmap[offset+1])!=parent ){
+    TRACE(("PTRMAP_UPDATE: %d->(%d,%d)\n", key, eType, parent));
+    *pRC= rc = sqlite3PagerWrite(pDbPage);
+    if( rc==SQLITE_OK ){
+      pPtrmap[offset] = eType;
+      put4byte(&pPtrmap[offset+1], parent);
+    }
+  }
+
+ptrmap_exit:
+  sqlite3PagerUnref(pDbPage);
+}
+
+/*
+** Read an entry from the pointer map.
+**
+** This routine retrieves the pointer map entry for page 'key', writing
+** the type and parent page number to *pEType and *pPgno respectively.
+** An error code is returned if something goes wrong, otherwise SQLITE_OK.
+*/
+static int ptrmapGet(BtShared *pBt, Pgno key, u8 *pEType, Pgno *pPgno){
+  DbPage *pDbPage;   /* The pointer map page */
+  int iPtrmap;       /* Pointer map page index */
+  u8 *pPtrmap;       /* Pointer map page data */
+  int offset;        /* Offset of entry in pointer map */
+  int rc;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+
+  iPtrmap = PTRMAP_PAGENO(pBt, key);
+  rc = sqlite3PagerGet(pBt->pPager, iPtrmap, &pDbPage);
+  if( rc!=0 ){
+    return rc;
+  }
+  pPtrmap = (u8 *)sqlite3PagerGetData(pDbPage);
+
+  offset = PTRMAP_PTROFFSET(iPtrmap, key);
+  if( offset<0 ){
+    sqlite3PagerUnref(pDbPage);
+    return SQLITE_CORRUPT_BKPT;
+  }
+  assert( offset <= (int)pBt->usableSize-5 );
+  assert( pEType!=0 );
+  *pEType = pPtrmap[offset];
+  if( pPgno ) *pPgno = get4byte(&pPtrmap[offset+1]);
+
+  sqlite3PagerUnref(pDbPage);
+  if( *pEType<1 || *pEType>5 ) return SQLITE_CORRUPT_BKPT;
+  return SQLITE_OK;
+}
+
+#else /* if defined SQLITE_OMIT_AUTOVACUUM */
+  #define ptrmapPut(w,x,y,z,rc)
+  #define ptrmapGet(w,x,y,z) SQLITE_OK
+  #define ptrmapPutOvflPtr(x, y, rc)
+#endif
+
+/*
+** Given a btree page and a cell index (0 means the first cell on
+** the page, 1 means the second cell, and so forth) return a pointer
+** to the cell content.
+**
+** This routine works only for pages that do not contain overflow cells.
+*/
+#define findCell(P,I) \
+  ((P)->aData + ((P)->maskPage & get2byte(&(P)->aCellIdx[2*(I)])))
+#define findCellv2(D,M,O,I) (D+(M&get2byte(D+(O+2*(I)))))
+
+
+/*
+** This a more complex version of findCell() that works for
+** pages that do contain overflow cells.
+*/
+static u8 *findOverflowCell(MemPage *pPage, int iCell){
+  int i;
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  for(i=pPage->nOverflow-1; i>=0; i--){
+    int k;
+    k = pPage->aiOvfl[i];
+    if( k<=iCell ){
+      if( k==iCell ){
+        return pPage->apOvfl[i];
+      }
+      iCell--;
+    }
+  }
+  return findCell(pPage, iCell);
+}
+
+/*
+** Parse a cell content block and fill in the CellInfo structure.  There
+** are two versions of this function.  btreeParseCell() takes a 
+** cell index as the second argument and btreeParseCellPtr() 
+** takes a pointer to the body of the cell as its second argument.
+*/
+static void btreeParseCellPtr(
+  MemPage *pPage,         /* Page containing the cell */
+  u8 *pCell,              /* Pointer to the cell text. */
+  CellInfo *pInfo         /* Fill in this structure */
+){
+  u8 *pIter;              /* For scanning through pCell */
+  u32 nPayload;           /* Number of bytes of cell payload */
+
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( pPage->leaf==0 || pPage->leaf==1 );
+  if( pPage->intKeyLeaf ){
+    assert( pPage->childPtrSize==0 );
+    pIter = pCell + getVarint32(pCell, nPayload);
+    pIter += getVarint(pIter, (u64*)&pInfo->nKey);
+  }else if( pPage->noPayload ){
+    assert( pPage->childPtrSize==4 );
+    pInfo->nSize = 4 + getVarint(&pCell[4], (u64*)&pInfo->nKey);
+    pInfo->nPayload = 0;
+    pInfo->nLocal = 0;
+    pInfo->iOverflow = 0;
+    pInfo->pPayload = 0;
+    return;
+  }else{
+    pIter = pCell + pPage->childPtrSize;
+    pIter += getVarint32(pIter, nPayload);
+    pInfo->nKey = nPayload;
+  }
+  pInfo->nPayload = nPayload;
+  pInfo->pPayload = pIter;
+  testcase( nPayload==pPage->maxLocal );
+  testcase( nPayload==pPage->maxLocal+1 );
+  if( nPayload<=pPage->maxLocal ){
+    /* This is the (easy) common case where the entire payload fits
+    ** on the local page.  No overflow is required.
+    */
+    pInfo->nSize = nPayload + (u16)(pIter - pCell);
+    if( pInfo->nSize<4 ) pInfo->nSize = 4;
+    pInfo->nLocal = (u16)nPayload;
+    pInfo->iOverflow = 0;
+  }else{
