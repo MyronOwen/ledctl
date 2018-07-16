@@ -53853,3 +53853,234 @@ static int defragmentPage(MemPage *pPage){
   }
   assert( cbrk>=iCellFirst );
   put2byte(&data[hdr+5], cbrk);
+  data[hdr+1] = 0;
+  data[hdr+2] = 0;
+  data[hdr+7] = 0;
+  memset(&data[iCellFirst], 0, cbrk-iCellFirst);
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  if( cbrk-iCellFirst!=pPage->nFree ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Search the free-list on page pPg for space to store a cell nByte bytes in
+** size. If one can be found, return a pointer to the space and remove it
+** from the free-list.
+**
+** If no suitable space can be found on the free-list, return NULL.
+**
+** This function may detect corruption within pPg.  If corruption is
+** detected then *pRc is set to SQLITE_CORRUPT and NULL is returned.
+**
+** If a slot of at least nByte bytes is found but cannot be used because 
+** there are already at least 60 fragmented bytes on the page, return NULL.
+** In this case, if pbDefrag parameter is not NULL, set *pbDefrag to true.
+*/
+static u8 *pageFindSlot(MemPage *pPg, int nByte, int *pRc, int *pbDefrag){
+  const int hdr = pPg->hdrOffset;
+  u8 * const aData = pPg->aData;
+  int iAddr;
+  int pc;
+  int usableSize = pPg->pBt->usableSize;
+
+  for(iAddr=hdr+1; (pc = get2byte(&aData[iAddr]))>0; iAddr=pc){
+    int size;            /* Size of the free slot */
+    /* EVIDENCE-OF: R-06866-39125 Freeblocks are always connected in order of
+    ** increasing offset. */
+    if( pc>usableSize-4 || pc<iAddr+4 ){
+      *pRc = SQLITE_CORRUPT_BKPT;
+      return 0;
+    }
+    /* EVIDENCE-OF: R-22710-53328 The third and fourth bytes of each
+    ** freeblock form a big-endian integer which is the size of the freeblock
+    ** in bytes, including the 4-byte header. */
+    size = get2byte(&aData[pc+2]);
+    if( size>=nByte ){
+      int x = size - nByte;
+      testcase( x==4 );
+      testcase( x==3 );
+      if( x<4 ){
+        /* EVIDENCE-OF: R-11498-58022 In a well-formed b-tree page, the total
+        ** number of bytes in fragments may not exceed 60. */
+        if( aData[hdr+7]>=60 ){
+          if( pbDefrag ) *pbDefrag = 1;
+          return 0;
+        }
+        /* Remove the slot from the free-list. Update the number of
+        ** fragmented bytes within the page. */
+        memcpy(&aData[iAddr], &aData[pc], 2);
+        aData[hdr+7] += (u8)x;
+      }else if( size+pc > usableSize ){
+        *pRc = SQLITE_CORRUPT_BKPT;
+        return 0;
+      }else{
+        /* The slot remains on the free-list. Reduce its size to account
+         ** for the portion used by the new allocation. */
+        put2byte(&aData[pc+2], x);
+      }
+      return &aData[pc + x];
+    }
+  }
+
+  return 0;
+}
+
+/*
+** Allocate nByte bytes of space from within the B-Tree page passed
+** as the first argument. Write into *pIdx the index into pPage->aData[]
+** of the first byte of allocated space. Return either SQLITE_OK or
+** an error code (usually SQLITE_CORRUPT).
+**
+** The caller guarantees that there is sufficient space to make the
+** allocation.  This routine might need to defragment in order to bring
+** all the space together, however.  This routine will avoid using
+** the first two bytes past the cell pointer area since presumably this
+** allocation is being made in order to insert a new cell, so we will
+** also end up needing a new cell pointer.
+*/
+static int allocateSpace(MemPage *pPage, int nByte, int *pIdx){
+  const int hdr = pPage->hdrOffset;    /* Local cache of pPage->hdrOffset */
+  u8 * const data = pPage->aData;      /* Local cache of pPage->aData */
+  int top;                             /* First byte of cell content area */
+  int rc = SQLITE_OK;                  /* Integer return code */
+  int gap;        /* First byte of gap between cell pointers and cell content */
+  
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  assert( pPage->pBt );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( nByte>=0 );  /* Minimum cell size is 4 */
+  assert( pPage->nFree>=nByte );
+  assert( pPage->nOverflow==0 );
+  assert( nByte < (int)(pPage->pBt->usableSize-8) );
+
+  assert( pPage->cellOffset == hdr + 12 - 4*pPage->leaf );
+  gap = pPage->cellOffset + 2*pPage->nCell;
+  assert( gap<=65536 );
+  /* EVIDENCE-OF: R-29356-02391 If the database uses a 65536-byte page size
+  ** and the reserved space is zero (the usual value for reserved space)
+  ** then the cell content offset of an empty page wants to be 65536.
+  ** However, that integer is too large to be stored in a 2-byte unsigned
+  ** integer, so a value of 0 is used in its place. */
+  top = get2byteNotZero(&data[hdr+5]);
+  if( gap>top ) return SQLITE_CORRUPT_BKPT;
+
+  /* If there is enough space between gap and top for one more cell pointer
+  ** array entry offset, and if the freelist is not empty, then search the
+  ** freelist looking for a free slot big enough to satisfy the request.
+  */
+  testcase( gap+2==top );
+  testcase( gap+1==top );
+  testcase( gap==top );
+  if( gap+2<=top && (data[hdr+1] || data[hdr+2]) ){
+    int bDefrag = 0;
+    u8 *pSpace = pageFindSlot(pPage, nByte, &rc, &bDefrag);
+    if( rc ) return rc;
+    if( bDefrag ) goto defragment_page;
+    if( pSpace ){
+      assert( pSpace>=data && (pSpace - data)<65536 );
+      *pIdx = (int)(pSpace - data);
+      return SQLITE_OK;
+    }
+  }
+
+  /* The request could not be fulfilled using a freelist slot.  Check
+  ** to see if defragmentation is necessary.
+  */
+  testcase( gap+2+nByte==top );
+  if( gap+2+nByte>top ){
+ defragment_page:
+    assert( pPage->nCell>0 || CORRUPT_DB );
+    rc = defragmentPage(pPage);
+    if( rc ) return rc;
+    top = get2byteNotZero(&data[hdr+5]);
+    assert( gap+nByte<=top );
+  }
+
+
+  /* Allocate memory from the gap in between the cell pointer array
+  ** and the cell content area.  The btreeInitPage() call has already
+  ** validated the freelist.  Given that the freelist is valid, there
+  ** is no way that the allocation can extend off the end of the page.
+  ** The assert() below verifies the previous sentence.
+  */
+  top -= nByte;
+  put2byte(&data[hdr+5], top);
+  assert( top+nByte <= (int)pPage->pBt->usableSize );
+  *pIdx = top;
+  return SQLITE_OK;
+}
+
+/*
+** Return a section of the pPage->aData to the freelist.
+** The first byte of the new free block is pPage->aData[iStart]
+** and the size of the block is iSize bytes.
+**
+** Adjacent freeblocks are coalesced.
+**
+** Note that even though the freeblock list was checked by btreeInitPage(),
+** that routine will not detect overlap between cells or freeblocks.  Nor
+** does it detect cells or freeblocks that encrouch into the reserved bytes
+** at the end of the page.  So do additional corruption checks inside this
+** routine and return SQLITE_CORRUPT if any problems are found.
+*/
+static int freeSpace(MemPage *pPage, u16 iStart, u16 iSize){
+  u16 iPtr;                             /* Address of ptr to next freeblock */
+  u16 iFreeBlk;                         /* Address of the next freeblock */
+  u8 hdr;                               /* Page header size.  0 or 100 */
+  u8 nFrag = 0;                         /* Reduction in fragmentation */
+  u16 iOrigSize = iSize;                /* Original value of iSize */
+  u32 iLast = pPage->pBt->usableSize-4; /* Largest possible freeblock offset */
+  u32 iEnd = iStart + iSize;            /* First byte past the iStart buffer */
+  unsigned char *data = pPage->aData;   /* Page content */
+
+  assert( pPage->pBt!=0 );
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  assert( iStart>=pPage->hdrOffset+6+pPage->childPtrSize );
+  assert( CORRUPT_DB || iEnd <= pPage->pBt->usableSize );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( iSize>=4 );   /* Minimum cell size is 4 */
+  assert( iStart<=iLast );
+
+  /* Overwrite deleted information with zeros when the secure_delete
+  ** option is enabled */
+  if( pPage->pBt->btsFlags & BTS_SECURE_DELETE ){
+    memset(&data[iStart], 0, iSize);
+  }
+
+  /* The list of freeblocks must be in ascending order.  Find the 
+  ** spot on the list where iStart should be inserted.
+  */
+  hdr = pPage->hdrOffset;
+  iPtr = hdr + 1;
+  if( data[iPtr+1]==0 && data[iPtr]==0 ){
+    iFreeBlk = 0;  /* Shortcut for the case when the freelist is empty */
+  }else{
+    while( (iFreeBlk = get2byte(&data[iPtr]))>0 && iFreeBlk<iStart ){
+      if( iFreeBlk<iPtr+4 ) return SQLITE_CORRUPT_BKPT;
+      iPtr = iFreeBlk;
+    }
+    if( iFreeBlk>iLast ) return SQLITE_CORRUPT_BKPT;
+    assert( iFreeBlk>iPtr || iFreeBlk==0 );
+  
+    /* At this point:
+    **    iFreeBlk:   First freeblock after iStart, or zero if none
+    **    iPtr:       The address of a pointer iFreeBlk
+    **
+    ** Check to see if iFreeBlk should be coalesced onto the end of iStart.
+    */
+    if( iFreeBlk && iEnd+3>=iFreeBlk ){
+      nFrag = iFreeBlk - iEnd;
+      if( iEnd>iFreeBlk ) return SQLITE_CORRUPT_BKPT;
+      iEnd = iFreeBlk + get2byte(&data[iFreeBlk+2]);
+      iSize = iEnd - iStart;
+      iFreeBlk = get2byte(&data[iFreeBlk]);
+    }
+  
+    /* If iPtr is another freeblock (that is, if iPtr is not the freelist
+    ** pointer in the page header) then check to see if iStart should be
+    ** coalesced onto the end of iPtr.
+    */
+    if( iPtr>hdr+1 ){
+      int iPtrEnd = iPtr + get2byte(&data[iPtr+2]);
