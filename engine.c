@@ -54767,3 +54767,234 @@ SQLITE_PRIVATE int sqlite3BtreeOpen(
     }
   }
 #endif
+  *ppBtree = p;
+
+btree_open_out:
+  if( rc!=SQLITE_OK ){
+    if( pBt && pBt->pPager ){
+      sqlite3PagerClose(pBt->pPager);
+    }
+    sqlite3_free(pBt);
+    sqlite3_free(p);
+    *ppBtree = 0;
+  }else{
+    /* If the B-Tree was successfully opened, set the pager-cache size to the
+    ** default value. Except, when opening on an existing shared pager-cache,
+    ** do not change the pager-cache size.
+    */
+    if( sqlite3BtreeSchema(p, 0, 0)==0 ){
+      sqlite3PagerSetCachesize(p->pBt->pPager, SQLITE_DEFAULT_CACHE_SIZE);
+    }
+  }
+  if( mutexOpen ){
+    assert( sqlite3_mutex_held(mutexOpen) );
+    sqlite3_mutex_leave(mutexOpen);
+  }
+  return rc;
+}
+
+/*
+** Decrement the BtShared.nRef counter.  When it reaches zero,
+** remove the BtShared structure from the sharing list.  Return
+** true if the BtShared.nRef counter reaches zero and return
+** false if it is still positive.
+*/
+static int removeFromSharingList(BtShared *pBt){
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  MUTEX_LOGIC( sqlite3_mutex *pMaster; )
+  BtShared *pList;
+  int removed = 0;
+
+  assert( sqlite3_mutex_notheld(pBt->mutex) );
+  MUTEX_LOGIC( pMaster = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER); )
+  sqlite3_mutex_enter(pMaster);
+  pBt->nRef--;
+  if( pBt->nRef<=0 ){
+    if( GLOBAL(BtShared*,sqlite3SharedCacheList)==pBt ){
+      GLOBAL(BtShared*,sqlite3SharedCacheList) = pBt->pNext;
+    }else{
+      pList = GLOBAL(BtShared*,sqlite3SharedCacheList);
+      while( ALWAYS(pList) && pList->pNext!=pBt ){
+        pList=pList->pNext;
+      }
+      if( ALWAYS(pList) ){
+        pList->pNext = pBt->pNext;
+      }
+    }
+    if( SQLITE_THREADSAFE ){
+      sqlite3_mutex_free(pBt->mutex);
+    }
+    removed = 1;
+  }
+  sqlite3_mutex_leave(pMaster);
+  return removed;
+#else
+  return 1;
+#endif
+}
+
+/*
+** Make sure pBt->pTmpSpace points to an allocation of 
+** MX_CELL_SIZE(pBt) bytes with a 4-byte prefix for a left-child
+** pointer.
+*/
+static void allocateTempSpace(BtShared *pBt){
+  if( !pBt->pTmpSpace ){
+    pBt->pTmpSpace = sqlite3PageMalloc( pBt->pageSize );
+
+    /* One of the uses of pBt->pTmpSpace is to format cells before
+    ** inserting them into a leaf page (function fillInCell()). If
+    ** a cell is less than 4 bytes in size, it is rounded up to 4 bytes
+    ** by the various routines that manipulate binary cells. Which
+    ** can mean that fillInCell() only initializes the first 2 or 3
+    ** bytes of pTmpSpace, but that the first 4 bytes are copied from
+    ** it into a database page. This is not actually a problem, but it
+    ** does cause a valgrind error when the 1 or 2 bytes of unitialized 
+    ** data is passed to system call write(). So to avoid this error,
+    ** zero the first 4 bytes of temp space here.
+    **
+    ** Also:  Provide four bytes of initialized space before the
+    ** beginning of pTmpSpace as an area available to prepend the
+    ** left-child pointer to the beginning of a cell.
+    */
+    if( pBt->pTmpSpace ){
+      memset(pBt->pTmpSpace, 0, 8);
+      pBt->pTmpSpace += 4;
+    }
+  }
+}
+
+/*
+** Free the pBt->pTmpSpace allocation
+*/
+static void freeTempSpace(BtShared *pBt){
+  if( pBt->pTmpSpace ){
+    pBt->pTmpSpace -= 4;
+    sqlite3PageFree(pBt->pTmpSpace);
+    pBt->pTmpSpace = 0;
+  }
+}
+
+/*
+** Close an open database and invalidate all cursors.
+*/
+SQLITE_PRIVATE int sqlite3BtreeClose(Btree *p){
+  BtShared *pBt = p->pBt;
+  BtCursor *pCur;
+
+  /* Close all cursors opened via this handle.  */
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  pCur = pBt->pCursor;
+  while( pCur ){
+    BtCursor *pTmp = pCur;
+    pCur = pCur->pNext;
+    if( pTmp->pBtree==p ){
+      sqlite3BtreeCloseCursor(pTmp);
+    }
+  }
+
+  /* Rollback any active transaction and free the handle structure.
+  ** The call to sqlite3BtreeRollback() drops any table-locks held by
+  ** this handle.
+  */
+  sqlite3BtreeRollback(p, SQLITE_OK, 0);
+  sqlite3BtreeLeave(p);
+
+  /* If there are still other outstanding references to the shared-btree
+  ** structure, return now. The remainder of this procedure cleans 
+  ** up the shared-btree.
+  */
+  assert( p->wantToLock==0 && p->locked==0 );
+  if( !p->sharable || removeFromSharingList(pBt) ){
+    /* The pBt is no longer on the sharing list, so we can access
+    ** it without having to hold the mutex.
+    **
+    ** Clean out and delete the BtShared object.
+    */
+    assert( !pBt->pCursor );
+    sqlite3PagerClose(pBt->pPager);
+    if( pBt->xFreeSchema && pBt->pSchema ){
+      pBt->xFreeSchema(pBt->pSchema);
+    }
+    sqlite3DbFree(0, pBt->pSchema);
+    freeTempSpace(pBt);
+    sqlite3_free(pBt);
+  }
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  assert( p->wantToLock==0 );
+  assert( p->locked==0 );
+  if( p->pPrev ) p->pPrev->pNext = p->pNext;
+  if( p->pNext ) p->pNext->pPrev = p->pPrev;
+#endif
+
+  sqlite3_free(p);
+  return SQLITE_OK;
+}
+
+/*
+** Change the limit on the number of pages allowed in the cache.
+**
+** The maximum number of cache pages is set to the absolute
+** value of mxPage.  If mxPage is negative, the pager will
+** operate asynchronously - it will not stop to do fsync()s
+** to insure data is written to the disk surface before
+** continuing.  Transactions still work if synchronous is off,
+** and the database cannot be corrupted if this program
+** crashes.  But if the operating system crashes or there is
+** an abrupt power failure when synchronous is off, the database
+** could be left in an inconsistent and unrecoverable state.
+** Synchronous is on by default so database corruption is not
+** normally a worry.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetCacheSize(Btree *p, int mxPage){
+  BtShared *pBt = p->pBt;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetCachesize(pBt->pPager, mxPage);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+
+#if SQLITE_MAX_MMAP_SIZE>0
+/*
+** Change the limit on the amount of the database file that may be
+** memory mapped.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetMmapLimit(Btree *p, sqlite3_int64 szMmap){
+  BtShared *pBt = p->pBt;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetMmapLimit(pBt->pPager, szMmap);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+#endif /* SQLITE_MAX_MMAP_SIZE>0 */
+
+/*
+** Change the way data is synced to disk in order to increase or decrease
+** how well the database resists damage due to OS crashes and power
+** failures.  Level 1 is the same as asynchronous (no syncs() occur and
+** there is a high probability of damage)  Level 2 is the default.  There
+** is a very low but non-zero probability of damage.  Level 3 reduces the
+** probability of damage to near zero but with a write performance reduction.
+*/
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+SQLITE_PRIVATE int sqlite3BtreeSetPagerFlags(
+  Btree *p,              /* The btree to set the safety level on */
+  unsigned pgFlags       /* Various PAGER_* flags */
+){
+  BtShared *pBt = p->pBt;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetFlags(pBt->pPager, pgFlags);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** Return TRUE if the given btree is set to safety level 1.  In other
+** words, return TRUE if no sync() occurs on the disk files.
+*/
