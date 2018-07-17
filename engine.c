@@ -54317,3 +54317,240 @@ static void zeroPage(MemPage *pPage, int flags){
   assert( sqlite3PagerIswriteable(pPage->pDbPage) );
   assert( sqlite3_mutex_held(pBt->mutex) );
   if( pBt->btsFlags & BTS_SECURE_DELETE ){
+    memset(&data[hdr], 0, pBt->usableSize - hdr);
+  }
+  data[hdr] = (char)flags;
+  first = hdr + ((flags&PTF_LEAF)==0 ? 12 : 8);
+  memset(&data[hdr+1], 0, 4);
+  data[hdr+7] = 0;
+  put2byte(&data[hdr+5], pBt->usableSize);
+  pPage->nFree = (u16)(pBt->usableSize - first);
+  decodeFlags(pPage, flags);
+  pPage->cellOffset = first;
+  pPage->aDataEnd = &data[pBt->usableSize];
+  pPage->aCellIdx = &data[first];
+  pPage->nOverflow = 0;
+  assert( pBt->pageSize>=512 && pBt->pageSize<=65536 );
+  pPage->maskPage = (u16)(pBt->pageSize - 1);
+  pPage->nCell = 0;
+  pPage->isInit = 1;
+}
+
+
+/*
+** Convert a DbPage obtained from the pager into a MemPage used by
+** the btree layer.
+*/
+static MemPage *btreePageFromDbPage(DbPage *pDbPage, Pgno pgno, BtShared *pBt){
+  MemPage *pPage = (MemPage*)sqlite3PagerGetExtra(pDbPage);
+  pPage->aData = sqlite3PagerGetData(pDbPage);
+  pPage->pDbPage = pDbPage;
+  pPage->pBt = pBt;
+  pPage->pgno = pgno;
+  pPage->hdrOffset = pPage->pgno==1 ? 100 : 0;
+  return pPage; 
+}
+
+/*
+** Get a page from the pager.  Initialize the MemPage.pBt and
+** MemPage.aData elements if needed.
+**
+** If the noContent flag is set, it means that we do not care about
+** the content of the page at this time.  So do not go to the disk
+** to fetch the content.  Just fill in the content with zeros for now.
+** If in the future we call sqlite3PagerWrite() on this page, that
+** means we have started to be concerned about content and the disk
+** read should occur at that point.
+*/
+static int btreeGetPage(
+  BtShared *pBt,       /* The btree */
+  Pgno pgno,           /* Number of the page to fetch */
+  MemPage **ppPage,    /* Return the page in this parameter */
+  int flags            /* PAGER_GET_NOCONTENT or PAGER_GET_READONLY */
+){
+  int rc;
+  DbPage *pDbPage;
+
+  assert( flags==0 || flags==PAGER_GET_NOCONTENT || flags==PAGER_GET_READONLY );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  rc = sqlite3PagerAcquire(pBt->pPager, pgno, (DbPage**)&pDbPage, flags);
+  if( rc ) return rc;
+  *ppPage = btreePageFromDbPage(pDbPage, pgno, pBt);
+  return SQLITE_OK;
+}
+
+/*
+** Retrieve a page from the pager cache. If the requested page is not
+** already in the pager cache return NULL. Initialize the MemPage.pBt and
+** MemPage.aData elements if needed.
+*/
+static MemPage *btreePageLookup(BtShared *pBt, Pgno pgno){
+  DbPage *pDbPage;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  pDbPage = sqlite3PagerLookup(pBt->pPager, pgno);
+  if( pDbPage ){
+    return btreePageFromDbPage(pDbPage, pgno, pBt);
+  }
+  return 0;
+}
+
+/*
+** Return the size of the database file in pages. If there is any kind of
+** error, return ((unsigned int)-1).
+*/
+static Pgno btreePagecount(BtShared *pBt){
+  return pBt->nPage;
+}
+SQLITE_PRIVATE u32 sqlite3BtreeLastPage(Btree *p){
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( ((p->pBt->nPage)&0x8000000)==0 );
+  return btreePagecount(p->pBt);
+}
+
+/*
+** Get a page from the pager and initialize it.  This routine is just a
+** convenience wrapper around separate calls to btreeGetPage() and 
+** btreeInitPage().
+**
+** If an error occurs, then the value *ppPage is set to is undefined. It
+** may remain unchanged, or it may be set to an invalid value.
+*/
+static int getAndInitPage(
+  BtShared *pBt,                  /* The database file */
+  Pgno pgno,                      /* Number of the page to get */
+  MemPage **ppPage,               /* Write the page pointer here */
+  int bReadonly                   /* PAGER_GET_READONLY or 0 */
+){
+  int rc;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( bReadonly==PAGER_GET_READONLY || bReadonly==0 );
+
+  if( pgno>btreePagecount(pBt) ){
+    rc = SQLITE_CORRUPT_BKPT;
+  }else{
+    rc = btreeGetPage(pBt, pgno, ppPage, bReadonly);
+    if( rc==SQLITE_OK && (*ppPage)->isInit==0 ){
+      rc = btreeInitPage(*ppPage);
+      if( rc!=SQLITE_OK ){
+        releasePage(*ppPage);
+      }
+    }
+  }
+
+  testcase( pgno==0 );
+  assert( pgno!=0 || rc==SQLITE_CORRUPT );
+  return rc;
+}
+
+/*
+** Release a MemPage.  This should be called once for each prior
+** call to btreeGetPage.
+*/
+static void releasePage(MemPage *pPage){
+  if( pPage ){
+    assert( pPage->aData );
+    assert( pPage->pBt );
+    assert( pPage->pDbPage!=0 );
+    assert( sqlite3PagerGetExtra(pPage->pDbPage) == (void*)pPage );
+    assert( sqlite3PagerGetData(pPage->pDbPage)==pPage->aData );
+    assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+    sqlite3PagerUnrefNotNull(pPage->pDbPage);
+  }
+}
+
+/*
+** During a rollback, when the pager reloads information into the cache
+** so that the cache is restored to its original state at the start of
+** the transaction, for each page restored this routine is called.
+**
+** This routine needs to reset the extra data section at the end of the
+** page to agree with the restored data.
+*/
+static void pageReinit(DbPage *pData){
+  MemPage *pPage;
+  pPage = (MemPage *)sqlite3PagerGetExtra(pData);
+  assert( sqlite3PagerPageRefcount(pData)>0 );
+  if( pPage->isInit ){
+    assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+    pPage->isInit = 0;
+    if( sqlite3PagerPageRefcount(pData)>1 ){
+      /* pPage might not be a btree page;  it might be an overflow page
+      ** or ptrmap page or a free page.  In those cases, the following
+      ** call to btreeInitPage() will likely return SQLITE_CORRUPT.
+      ** But no harm is done by this.  And it is very important that
+      ** btreeInitPage() be called on every btree page so we make
+      ** the call for every page that comes in for re-initing. */
+      btreeInitPage(pPage);
+    }
+  }
+}
+
+/*
+** Invoke the busy handler for a btree.
+*/
+static int btreeInvokeBusyHandler(void *pArg){
+  BtShared *pBt = (BtShared*)pArg;
+  assert( pBt->db );
+  assert( sqlite3_mutex_held(pBt->db->mutex) );
+  return sqlite3InvokeBusyHandler(&pBt->db->busyHandler);
+}
+
+/*
+** Open a database file.
+** 
+** zFilename is the name of the database file.  If zFilename is NULL
+** then an ephemeral database is created.  The ephemeral database might
+** be exclusively in memory, or it might use a disk-based memory cache.
+** Either way, the ephemeral database will be automatically deleted 
+** when sqlite3BtreeClose() is called.
+**
+** If zFilename is ":memory:" then an in-memory database is created
+** that is automatically destroyed when it is closed.
+**
+** The "flags" parameter is a bitmask that might contain bits like
+** BTREE_OMIT_JOURNAL and/or BTREE_MEMORY.
+**
+** If the database is already opened in the same database connection
+** and we are in shared cache mode, then the open will fail with an
+** SQLITE_CONSTRAINT error.  We cannot allow two or more BtShared
+** objects in the same database connection since doing so will lead
+** to problems with locking.
+*/
+SQLITE_PRIVATE int sqlite3BtreeOpen(
+  sqlite3_vfs *pVfs,      /* VFS to use for this b-tree */
+  const char *zFilename,  /* Name of the file containing the BTree database */
+  sqlite3 *db,            /* Associated database handle */
+  Btree **ppBtree,        /* Pointer to new Btree object written here */
+  int flags,              /* Options */
+  int vfsFlags            /* Flags passed through to sqlite3_vfs.xOpen() */
+){
+  BtShared *pBt = 0;             /* Shared part of btree structure */
+  Btree *p;                      /* Handle to return */
+  sqlite3_mutex *mutexOpen = 0;  /* Prevents a race condition. Ticket #3537 */
+  int rc = SQLITE_OK;            /* Result code from this function */
+  u8 nReserve;                   /* Byte of unused space on each page */
+  unsigned char zDbHeader[100];  /* Database header content */
+
+  /* True if opening an ephemeral, temporary database */
+  const int isTempDb = zFilename==0 || zFilename[0]==0;
+
+  /* Set the variable isMemdb to true for an in-memory database, or 
+  ** false for a file-based database.
+  */
+#ifdef SQLITE_OMIT_MEMORYDB
+  const int isMemdb = 0;
+#else
+  const int isMemdb = (zFilename && strcmp(zFilename, ":memory:")==0)
+                       || (isTempDb && sqlite3TempInMemory(db))
+                       || (vfsFlags & SQLITE_OPEN_MEMORY)!=0;
+#endif
+
+  assert( db!=0 );
+  assert( pVfs!=0 );
+  assert( sqlite3_mutex_held(db->mutex) );
+  assert( (flags&0xff)==flags );   /* flags fit in 8 bits */
+
+  /* Only a BTREE_SINGLE database can be BTREE_UNORDERED */
+  assert( (flags & BTREE_UNORDERED)==0 || (flags & BTREE_SINGLE)!=0 );
+
+  /* A BTREE_SINGLE database is always a temporary and/or ephemeral */
