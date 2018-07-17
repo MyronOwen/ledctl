@@ -54998,3 +54998,219 @@ SQLITE_PRIVATE int sqlite3BtreeSetPagerFlags(
 ** Return TRUE if the given btree is set to safety level 1.  In other
 ** words, return TRUE if no sync() occurs on the disk files.
 */
+SQLITE_PRIVATE int sqlite3BtreeSyncDisabled(Btree *p){
+  BtShared *pBt = p->pBt;
+  int rc;
+  assert( sqlite3_mutex_held(p->db->mutex) );  
+  sqlite3BtreeEnter(p);
+  assert( pBt && pBt->pPager );
+  rc = sqlite3PagerNosync(pBt->pPager);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Change the default pages size and the number of reserved bytes per page.
+** Or, if the page size has already been fixed, return SQLITE_READONLY 
+** without changing anything.
+**
+** The page size must be a power of 2 between 512 and 65536.  If the page
+** size supplied does not meet this constraint then the page size is not
+** changed.
+**
+** Page sizes are constrained to be a power of two so that the region
+** of the database file used for locking (beginning at PENDING_BYTE,
+** the first byte past the 1GB boundary, 0x40000000) needs to occur
+** at the beginning of a page.
+**
+** If parameter nReserve is less than zero, then the number of reserved
+** bytes per page is left unchanged.
+**
+** If the iFix!=0 then the BTS_PAGESIZE_FIXED flag is set so that the page size
+** and autovacuum mode can no longer be changed.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetPageSize(Btree *p, int pageSize, int nReserve, int iFix){
+  int rc = SQLITE_OK;
+  BtShared *pBt = p->pBt;
+  assert( nReserve>=-1 && nReserve<=255 );
+  sqlite3BtreeEnter(p);
+  if( pBt->btsFlags & BTS_PAGESIZE_FIXED ){
+    sqlite3BtreeLeave(p);
+    return SQLITE_READONLY;
+  }
+  if( nReserve<0 ){
+    nReserve = pBt->pageSize - pBt->usableSize;
+  }
+  assert( nReserve>=0 && nReserve<=255 );
+  if( pageSize>=512 && pageSize<=SQLITE_MAX_PAGE_SIZE &&
+        ((pageSize-1)&pageSize)==0 ){
+    assert( (pageSize & 7)==0 );
+    assert( !pBt->pPage1 && !pBt->pCursor );
+    pBt->pageSize = (u32)pageSize;
+    freeTempSpace(pBt);
+  }
+  rc = sqlite3PagerSetPagesize(pBt->pPager, &pBt->pageSize, nReserve);
+  pBt->usableSize = pBt->pageSize - (u16)nReserve;
+  if( iFix ) pBt->btsFlags |= BTS_PAGESIZE_FIXED;
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Return the currently defined page size
+*/
+SQLITE_PRIVATE int sqlite3BtreeGetPageSize(Btree *p){
+  return p->pBt->pageSize;
+}
+
+#if defined(SQLITE_HAS_CODEC) || defined(SQLITE_DEBUG)
+/*
+** This function is similar to sqlite3BtreeGetReserve(), except that it
+** may only be called if it is guaranteed that the b-tree mutex is already
+** held.
+**
+** This is useful in one special case in the backup API code where it is
+** known that the shared b-tree mutex is held, but the mutex on the 
+** database handle that owns *p is not. In this case if sqlite3BtreeEnter()
+** were to be called, it might collide with some other operation on the
+** database handle that owns *p, causing undefined behavior.
+*/
+SQLITE_PRIVATE int sqlite3BtreeGetReserveNoMutex(Btree *p){
+  assert( sqlite3_mutex_held(p->pBt->mutex) );
+  return p->pBt->pageSize - p->pBt->usableSize;
+}
+#endif /* SQLITE_HAS_CODEC || SQLITE_DEBUG */
+
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS) || !defined(SQLITE_OMIT_VACUUM)
+/*
+** Return the number of bytes of space at the end of every page that
+** are intentually left unused.  This is the "reserved" space that is
+** sometimes used by extensions.
+*/
+SQLITE_PRIVATE int sqlite3BtreeGetReserve(Btree *p){
+  int n;
+  sqlite3BtreeEnter(p);
+  n = p->pBt->pageSize - p->pBt->usableSize;
+  sqlite3BtreeLeave(p);
+  return n;
+}
+
+/*
+** Set the maximum page count for a database if mxPage is positive.
+** No changes are made if mxPage is 0 or negative.
+** Regardless of the value of mxPage, return the maximum page count.
+*/
+SQLITE_PRIVATE int sqlite3BtreeMaxPageCount(Btree *p, int mxPage){
+  int n;
+  sqlite3BtreeEnter(p);
+  n = sqlite3PagerMaxPageCount(p->pBt->pPager, mxPage);
+  sqlite3BtreeLeave(p);
+  return n;
+}
+
+/*
+** Set the BTS_SECURE_DELETE flag if newFlag is 0 or 1.  If newFlag is -1,
+** then make no changes.  Always return the value of the BTS_SECURE_DELETE
+** setting after the change.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSecureDelete(Btree *p, int newFlag){
+  int b;
+  if( p==0 ) return 0;
+  sqlite3BtreeEnter(p);
+  if( newFlag>=0 ){
+    p->pBt->btsFlags &= ~BTS_SECURE_DELETE;
+    if( newFlag ) p->pBt->btsFlags |= BTS_SECURE_DELETE;
+  } 
+  b = (p->pBt->btsFlags & BTS_SECURE_DELETE)!=0;
+  sqlite3BtreeLeave(p);
+  return b;
+}
+#endif /* !defined(SQLITE_OMIT_PAGER_PRAGMAS) || !defined(SQLITE_OMIT_VACUUM) */
+
+/*
+** Change the 'auto-vacuum' property of the database. If the 'autoVacuum'
+** parameter is non-zero, then auto-vacuum mode is enabled. If zero, it
+** is disabled. The default value for the auto-vacuum property is 
+** determined by the SQLITE_DEFAULT_AUTOVACUUM macro.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetAutoVacuum(Btree *p, int autoVacuum){
+#ifdef SQLITE_OMIT_AUTOVACUUM
+  return SQLITE_READONLY;
+#else
+  BtShared *pBt = p->pBt;
+  int rc = SQLITE_OK;
+  u8 av = (u8)autoVacuum;
+
+  sqlite3BtreeEnter(p);
+  if( (pBt->btsFlags & BTS_PAGESIZE_FIXED)!=0 && (av ?1:0)!=pBt->autoVacuum ){
+    rc = SQLITE_READONLY;
+  }else{
+    pBt->autoVacuum = av ?1:0;
+    pBt->incrVacuum = av==2 ?1:0;
+  }
+  sqlite3BtreeLeave(p);
+  return rc;
+#endif
+}
+
+/*
+** Return the value of the 'auto-vacuum' property. If auto-vacuum is 
+** enabled 1 is returned. Otherwise 0.
+*/
+SQLITE_PRIVATE int sqlite3BtreeGetAutoVacuum(Btree *p){
+#ifdef SQLITE_OMIT_AUTOVACUUM
+  return BTREE_AUTOVACUUM_NONE;
+#else
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = (
+    (!p->pBt->autoVacuum)?BTREE_AUTOVACUUM_NONE:
+    (!p->pBt->incrVacuum)?BTREE_AUTOVACUUM_FULL:
+    BTREE_AUTOVACUUM_INCR
+  );
+  sqlite3BtreeLeave(p);
+  return rc;
+#endif
+}
+
+
+/*
+** Get a reference to pPage1 of the database file.  This will
+** also acquire a readlock on that file.
+**
+** SQLITE_OK is returned on success.  If the file is not a
+** well-formed database file, then SQLITE_CORRUPT is returned.
+** SQLITE_BUSY is returned if the database is locked.  SQLITE_NOMEM
+** is returned if we run out of memory. 
+*/
+static int lockBtree(BtShared *pBt){
+  int rc;              /* Result code from subfunctions */
+  MemPage *pPage1;     /* Page 1 of the database file */
+  int nPage;           /* Number of pages in the database */
+  int nPageFile = 0;   /* Number of pages in the database file */
+  int nPageHeader;     /* Number of pages in the database according to hdr */
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( pBt->pPage1==0 );
+  rc = sqlite3PagerSharedLock(pBt->pPager);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = btreeGetPage(pBt, 1, &pPage1, 0);
+  if( rc!=SQLITE_OK ) return rc;
+
+  /* Do some checking to help insure the file we opened really is
+  ** a valid database file. 
+  */
+  nPage = nPageHeader = get4byte(28+(u8*)pPage1->aData);
+  sqlite3PagerPagecount(pBt->pPager, &nPageFile);
+  if( nPage==0 || memcmp(24+(u8*)pPage1->aData, 92+(u8*)pPage1->aData,4)!=0 ){
+    nPage = nPageFile;
+  }
+  if( nPage>0 ){
+    u32 pageSize;
+    u32 usableSize;
+    u8 *page1 = pPage1->aData;
+    rc = SQLITE_NOTADB;
+    /* EVIDENCE-OF: R-43737-39999 Every valid SQLite database file begins
+    ** with the following 16 bytes (in hex): 53 51 4c 69 74 65 20 66 6f 72 6d
+    ** 61 74 20 33 00. */
+    if( memcmp(page1, zMagicHeader, 16)!=0 ){
