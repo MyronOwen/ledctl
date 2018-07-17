@@ -54554,3 +54554,216 @@ SQLITE_PRIVATE int sqlite3BtreeOpen(
   assert( (flags & BTREE_UNORDERED)==0 || (flags & BTREE_SINGLE)!=0 );
 
   /* A BTREE_SINGLE database is always a temporary and/or ephemeral */
+  assert( (flags & BTREE_SINGLE)==0 || isTempDb );
+
+  if( isMemdb ){
+    flags |= BTREE_MEMORY;
+  }
+  if( (vfsFlags & SQLITE_OPEN_MAIN_DB)!=0 && (isMemdb || isTempDb) ){
+    vfsFlags = (vfsFlags & ~SQLITE_OPEN_MAIN_DB) | SQLITE_OPEN_TEMP_DB;
+  }
+  p = sqlite3MallocZero(sizeof(Btree));
+  if( !p ){
+    return SQLITE_NOMEM;
+  }
+  p->inTrans = TRANS_NONE;
+  p->db = db;
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  p->lock.pBtree = p;
+  p->lock.iTable = 1;
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && !defined(SQLITE_OMIT_DISKIO)
+  /*
+  ** If this Btree is a candidate for shared cache, try to find an
+  ** existing BtShared object that we can share with
+  */
+  if( isTempDb==0 && (isMemdb==0 || (vfsFlags&SQLITE_OPEN_URI)!=0) ){
+    if( vfsFlags & SQLITE_OPEN_SHAREDCACHE ){
+      int nFullPathname = pVfs->mxPathname+1;
+      char *zFullPathname = sqlite3Malloc(nFullPathname);
+      MUTEX_LOGIC( sqlite3_mutex *mutexShared; )
+      p->sharable = 1;
+      if( !zFullPathname ){
+        sqlite3_free(p);
+        return SQLITE_NOMEM;
+      }
+      if( isMemdb ){
+        memcpy(zFullPathname, zFilename, sqlite3Strlen30(zFilename)+1);
+      }else{
+        rc = sqlite3OsFullPathname(pVfs, zFilename,
+                                   nFullPathname, zFullPathname);
+        if( rc ){
+          sqlite3_free(zFullPathname);
+          sqlite3_free(p);
+          return rc;
+        }
+      }
+#if SQLITE_THREADSAFE
+      mutexOpen = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_OPEN);
+      sqlite3_mutex_enter(mutexOpen);
+      mutexShared = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+      sqlite3_mutex_enter(mutexShared);
+#endif
+      for(pBt=GLOBAL(BtShared*,sqlite3SharedCacheList); pBt; pBt=pBt->pNext){
+        assert( pBt->nRef>0 );
+        if( 0==strcmp(zFullPathname, sqlite3PagerFilename(pBt->pPager, 0))
+                 && sqlite3PagerVfs(pBt->pPager)==pVfs ){
+          int iDb;
+          for(iDb=db->nDb-1; iDb>=0; iDb--){
+            Btree *pExisting = db->aDb[iDb].pBt;
+            if( pExisting && pExisting->pBt==pBt ){
+              sqlite3_mutex_leave(mutexShared);
+              sqlite3_mutex_leave(mutexOpen);
+              sqlite3_free(zFullPathname);
+              sqlite3_free(p);
+              return SQLITE_CONSTRAINT;
+            }
+          }
+          p->pBt = pBt;
+          pBt->nRef++;
+          break;
+        }
+      }
+      sqlite3_mutex_leave(mutexShared);
+      sqlite3_free(zFullPathname);
+    }
+#ifdef SQLITE_DEBUG
+    else{
+      /* In debug mode, we mark all persistent databases as sharable
+      ** even when they are not.  This exercises the locking code and
+      ** gives more opportunity for asserts(sqlite3_mutex_held())
+      ** statements to find locking problems.
+      */
+      p->sharable = 1;
+    }
+#endif
+  }
+#endif
+  if( pBt==0 ){
+    /*
+    ** The following asserts make sure that structures used by the btree are
+    ** the right size.  This is to guard against size changes that result
+    ** when compiling on a different architecture.
+    */
+    assert( sizeof(i64)==8 || sizeof(i64)==4 );
+    assert( sizeof(u64)==8 || sizeof(u64)==4 );
+    assert( sizeof(u32)==4 );
+    assert( sizeof(u16)==2 );
+    assert( sizeof(Pgno)==4 );
+  
+    pBt = sqlite3MallocZero( sizeof(*pBt) );
+    if( pBt==0 ){
+      rc = SQLITE_NOMEM;
+      goto btree_open_out;
+    }
+    rc = sqlite3PagerOpen(pVfs, &pBt->pPager, zFilename,
+                          EXTRA_SIZE, flags, vfsFlags, pageReinit);
+    if( rc==SQLITE_OK ){
+      sqlite3PagerSetMmapLimit(pBt->pPager, db->szMmap);
+      rc = sqlite3PagerReadFileheader(pBt->pPager,sizeof(zDbHeader),zDbHeader);
+    }
+    if( rc!=SQLITE_OK ){
+      goto btree_open_out;
+    }
+    pBt->openFlags = (u8)flags;
+    pBt->db = db;
+    sqlite3PagerSetBusyhandler(pBt->pPager, btreeInvokeBusyHandler, pBt);
+    p->pBt = pBt;
+  
+    pBt->pCursor = 0;
+    pBt->pPage1 = 0;
+    if( sqlite3PagerIsreadonly(pBt->pPager) ) pBt->btsFlags |= BTS_READ_ONLY;
+#ifdef SQLITE_SECURE_DELETE
+    pBt->btsFlags |= BTS_SECURE_DELETE;
+#endif
+    /* EVIDENCE-OF: R-51873-39618 The page size for a database file is
+    ** determined by the 2-byte integer located at an offset of 16 bytes from
+    ** the beginning of the database file. */
+    pBt->pageSize = (zDbHeader[16]<<8) | (zDbHeader[17]<<16);
+    if( pBt->pageSize<512 || pBt->pageSize>SQLITE_MAX_PAGE_SIZE
+         || ((pBt->pageSize-1)&pBt->pageSize)!=0 ){
+      pBt->pageSize = 0;
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      /* If the magic name ":memory:" will create an in-memory database, then
+      ** leave the autoVacuum mode at 0 (do not auto-vacuum), even if
+      ** SQLITE_DEFAULT_AUTOVACUUM is true. On the other hand, if
+      ** SQLITE_OMIT_MEMORYDB has been defined, then ":memory:" is just a
+      ** regular file-name. In this case the auto-vacuum applies as per normal.
+      */
+      if( zFilename && !isMemdb ){
+        pBt->autoVacuum = (SQLITE_DEFAULT_AUTOVACUUM ? 1 : 0);
+        pBt->incrVacuum = (SQLITE_DEFAULT_AUTOVACUUM==2 ? 1 : 0);
+      }
+#endif
+      nReserve = 0;
+    }else{
+      /* EVIDENCE-OF: R-37497-42412 The size of the reserved region is
+      ** determined by the one-byte unsigned integer found at an offset of 20
+      ** into the database file header. */
+      nReserve = zDbHeader[20];
+      pBt->btsFlags |= BTS_PAGESIZE_FIXED;
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      pBt->autoVacuum = (get4byte(&zDbHeader[36 + 4*4])?1:0);
+      pBt->incrVacuum = (get4byte(&zDbHeader[36 + 7*4])?1:0);
+#endif
+    }
+    rc = sqlite3PagerSetPagesize(pBt->pPager, &pBt->pageSize, nReserve);
+    if( rc ) goto btree_open_out;
+    pBt->usableSize = pBt->pageSize - nReserve;
+    assert( (pBt->pageSize & 7)==0 );  /* 8-byte alignment of pageSize */
+   
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && !defined(SQLITE_OMIT_DISKIO)
+    /* Add the new BtShared object to the linked list sharable BtShareds.
+    */
+    if( p->sharable ){
+      MUTEX_LOGIC( sqlite3_mutex *mutexShared; )
+      pBt->nRef = 1;
+      MUTEX_LOGIC( mutexShared = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);)
+      if( SQLITE_THREADSAFE && sqlite3GlobalConfig.bCoreMutex ){
+        pBt->mutex = sqlite3MutexAlloc(SQLITE_MUTEX_FAST);
+        if( pBt->mutex==0 ){
+          rc = SQLITE_NOMEM;
+          db->mallocFailed = 0;
+          goto btree_open_out;
+        }
+      }
+      sqlite3_mutex_enter(mutexShared);
+      pBt->pNext = GLOBAL(BtShared*,sqlite3SharedCacheList);
+      GLOBAL(BtShared*,sqlite3SharedCacheList) = pBt;
+      sqlite3_mutex_leave(mutexShared);
+    }
+#endif
+  }
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && !defined(SQLITE_OMIT_DISKIO)
+  /* If the new Btree uses a sharable pBtShared, then link the new
+  ** Btree into the list of all sharable Btrees for the same connection.
+  ** The list is kept in ascending order by pBt address.
+  */
+  if( p->sharable ){
+    int i;
+    Btree *pSib;
+    for(i=0; i<db->nDb; i++){
+      if( (pSib = db->aDb[i].pBt)!=0 && pSib->sharable ){
+        while( pSib->pPrev ){ pSib = pSib->pPrev; }
+        if( p->pBt<pSib->pBt ){
+          p->pNext = pSib;
+          p->pPrev = 0;
+          pSib->pPrev = p;
+        }else{
+          while( pSib->pNext && pSib->pNext->pBt<p->pBt ){
+            pSib = pSib->pNext;
+          }
+          p->pNext = pSib->pNext;
+          p->pPrev = pSib;
+          if( p->pNext ){
+            p->pNext->pPrev = p;
+          }
+          pSib->pNext = p;
+        }
+        break;
+      }
+    }
+  }
+#endif
