@@ -56128,3 +56128,216 @@ static void btreeEndTransaction(Btree *p){
       pBt->nTransaction--;
       if( 0==pBt->nTransaction ){
         pBt->inTransaction = TRANS_NONE;
+      }
+    }
+
+    /* Set the current transaction state to TRANS_NONE and unlock the 
+    ** pager if this call closed the only read or write transaction.  */
+    p->inTrans = TRANS_NONE;
+    unlockBtreeIfUnused(pBt);
+  }
+
+  btreeIntegrity(p);
+}
+
+/*
+** Commit the transaction currently in progress.
+**
+** This routine implements the second phase of a 2-phase commit.  The
+** sqlite3BtreeCommitPhaseOne() routine does the first phase and should
+** be invoked prior to calling this routine.  The sqlite3BtreeCommitPhaseOne()
+** routine did all the work of writing information out to disk and flushing the
+** contents so that they are written onto the disk platter.  All this
+** routine has to do is delete or truncate or zero the header in the
+** the rollback journal (which causes the transaction to commit) and
+** drop locks.
+**
+** Normally, if an error occurs while the pager layer is attempting to 
+** finalize the underlying journal file, this function returns an error and
+** the upper layer will attempt a rollback. However, if the second argument
+** is non-zero then this b-tree transaction is part of a multi-file 
+** transaction. In this case, the transaction has already been committed 
+** (by deleting a master journal file) and the caller will ignore this 
+** functions return code. So, even if an error occurs in the pager layer,
+** reset the b-tree objects internal state to indicate that the write
+** transaction has been closed. This is quite safe, as the pager will have
+** transitioned to the error state.
+**
+** This will release the write lock on the database file.  If there
+** are no active cursors, it also releases the read lock.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
+
+  if( p->inTrans==TRANS_NONE ) return SQLITE_OK;
+  sqlite3BtreeEnter(p);
+  btreeIntegrity(p);
+
+  /* If the handle has a write-transaction open, commit the shared-btrees 
+  ** transaction and set the shared state to TRANS_READ.
+  */
+  if( p->inTrans==TRANS_WRITE ){
+    int rc;
+    BtShared *pBt = p->pBt;
+    assert( pBt->inTransaction==TRANS_WRITE );
+    assert( pBt->nTransaction>0 );
+    rc = sqlite3PagerCommitPhaseTwo(pBt->pPager);
+    if( rc!=SQLITE_OK && bCleanup==0 ){
+      sqlite3BtreeLeave(p);
+      return rc;
+    }
+    p->iDataVersion--;  /* Compensate for pPager->iDataVersion++; */
+    pBt->inTransaction = TRANS_READ;
+    btreeClearHasContent(pBt);
+  }
+
+  btreeEndTransaction(p);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+
+/*
+** Do both phases of a commit.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCommit(Btree *p){
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = sqlite3BtreeCommitPhaseOne(p, 0);
+  if( rc==SQLITE_OK ){
+    rc = sqlite3BtreeCommitPhaseTwo(p, 0);
+  }
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** This routine sets the state to CURSOR_FAULT and the error
+** code to errCode for every cursor on any BtShared that pBtree
+** references.  Or if the writeOnly flag is set to 1, then only
+** trip write cursors and leave read cursors unchanged.
+**
+** Every cursor is a candidate to be tripped, including cursors
+** that belong to other database connections that happen to be
+** sharing the cache with pBtree.
+**
+** This routine gets called when a rollback occurs. If the writeOnly
+** flag is true, then only write-cursors need be tripped - read-only
+** cursors save their current positions so that they may continue 
+** following the rollback. Or, if writeOnly is false, all cursors are 
+** tripped. In general, writeOnly is false if the transaction being
+** rolled back modified the database schema. In this case b-tree root
+** pages may be moved or deleted from the database altogether, making
+** it unsafe for read cursors to continue.
+**
+** If the writeOnly flag is true and an error is encountered while 
+** saving the current position of a read-only cursor, all cursors, 
+** including all read-cursors are tripped.
+**
+** SQLITE_OK is returned if successful, or if an error occurs while
+** saving a cursor position, an SQLite error code.
+*/
+SQLITE_PRIVATE int sqlite3BtreeTripAllCursors(Btree *pBtree, int errCode, int writeOnly){
+  BtCursor *p;
+  int rc = SQLITE_OK;
+
+  assert( (writeOnly==0 || writeOnly==1) && BTCF_WriteFlag==1 );
+  if( pBtree ){
+    sqlite3BtreeEnter(pBtree);
+    for(p=pBtree->pBt->pCursor; p; p=p->pNext){
+      int i;
+      if( writeOnly && (p->curFlags & BTCF_WriteFlag)==0 ){
+        if( p->eState==CURSOR_VALID ){
+          rc = saveCursorPosition(p);
+          if( rc!=SQLITE_OK ){
+            (void)sqlite3BtreeTripAllCursors(pBtree, rc, 0);
+            break;
+          }
+        }
+      }else{
+        sqlite3BtreeClearCursor(p);
+        p->eState = CURSOR_FAULT;
+        p->skipNext = errCode;
+      }
+      for(i=0; i<=p->iPage; i++){
+        releasePage(p->apPage[i]);
+        p->apPage[i] = 0;
+      }
+    }
+    sqlite3BtreeLeave(pBtree);
+  }
+  return rc;
+}
+
+/*
+** Rollback the transaction in progress.
+**
+** If tripCode is not SQLITE_OK then cursors will be invalidated (tripped).
+** Only write cursors are tripped if writeOnly is true but all cursors are
+** tripped if writeOnly is false.  Any attempt to use
+** a tripped cursor will result in an error.
+**
+** This will release the write lock on the database file.  If there
+** are no active cursors, it also releases the read lock.
+*/
+SQLITE_PRIVATE int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
+  int rc;
+  BtShared *pBt = p->pBt;
+  MemPage *pPage1;
+
+  assert( writeOnly==1 || writeOnly==0 );
+  assert( tripCode==SQLITE_ABORT_ROLLBACK || tripCode==SQLITE_OK );
+  sqlite3BtreeEnter(p);
+  if( tripCode==SQLITE_OK ){
+    rc = tripCode = saveAllCursors(pBt, 0, 0);
+    if( rc ) writeOnly = 0;
+  }else{
+    rc = SQLITE_OK;
+  }
+  if( tripCode ){
+    int rc2 = sqlite3BtreeTripAllCursors(p, tripCode, writeOnly);
+    assert( rc==SQLITE_OK || (writeOnly==0 && rc2==SQLITE_OK) );
+    if( rc2!=SQLITE_OK ) rc = rc2;
+  }
+  btreeIntegrity(p);
+
+  if( p->inTrans==TRANS_WRITE ){
+    int rc2;
+
+    assert( TRANS_WRITE==pBt->inTransaction );
+    rc2 = sqlite3PagerRollback(pBt->pPager);
+    if( rc2!=SQLITE_OK ){
+      rc = rc2;
+    }
+
+    /* The rollback may have destroyed the pPage1->aData value.  So
+    ** call btreeGetPage() on page 1 again to make
+    ** sure pPage1->aData is set correctly. */
+    if( btreeGetPage(pBt, 1, &pPage1, 0)==SQLITE_OK ){
+      int nPage = get4byte(28+(u8*)pPage1->aData);
+      testcase( nPage==0 );
+      if( nPage==0 ) sqlite3PagerPagecount(pBt->pPager, &nPage);
+      testcase( pBt->nPage!=nPage );
+      pBt->nPage = nPage;
+      releasePage(pPage1);
+    }
+    assert( countValidCursors(pBt, 1)==0 );
+    pBt->inTransaction = TRANS_READ;
+    btreeClearHasContent(pBt);
+  }
+
+  btreeEndTransaction(p);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Start a statement subtransaction. The subtransaction can be rolled
+** back independently of the main transaction. You must start a transaction 
+** before starting a subtransaction. The subtransaction is ended automatically 
+** if the main transaction commits or rolls back.
+**
+** Statement subtransactions are used around individual SQL statements
+** that are contained within a BEGIN...COMMIT block.  If a constraint
+** error occurs within the statement, the effect of that one statement
+** can be rolled back without having to rollback the entire transaction.
+**
+** A statement sub-transaction is implemented as an anonymous savepoint. The
