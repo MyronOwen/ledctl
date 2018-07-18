@@ -55894,3 +55894,237 @@ static int incrVacuumStep(BtShared *pBt, Pgno nFin, Pgno iLastPg, int bCommit){
       */
       if( bCommit==0 ){
         eMode = BTALLOC_LE;
+        iNear = nFin;
+      }
+      do {
+        MemPage *pFreePg;
+        rc = allocateBtreePage(pBt, &pFreePg, &iFreePg, iNear, eMode);
+        if( rc!=SQLITE_OK ){
+          releasePage(pLastPg);
+          return rc;
+        }
+        releasePage(pFreePg);
+      }while( bCommit && iFreePg>nFin );
+      assert( iFreePg<iLastPg );
+      
+      rc = relocatePage(pBt, pLastPg, eType, iPtrPage, iFreePg, bCommit);
+      releasePage(pLastPg);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+    }
+  }
+
+  if( bCommit==0 ){
+    do {
+      iLastPg--;
+    }while( iLastPg==PENDING_BYTE_PAGE(pBt) || PTRMAP_ISPAGE(pBt, iLastPg) );
+    pBt->bDoTruncate = 1;
+    pBt->nPage = iLastPg;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** The database opened by the first argument is an auto-vacuum database
+** nOrig pages in size containing nFree free pages. Return the expected 
+** size of the database in pages following an auto-vacuum operation.
+*/
+static Pgno finalDbSize(BtShared *pBt, Pgno nOrig, Pgno nFree){
+  int nEntry;                     /* Number of entries on one ptrmap page */
+  Pgno nPtrmap;                   /* Number of PtrMap pages to be freed */
+  Pgno nFin;                      /* Return value */
+
+  nEntry = pBt->usableSize/5;
+  nPtrmap = (nFree-nOrig+PTRMAP_PAGENO(pBt, nOrig)+nEntry)/nEntry;
+  nFin = nOrig - nFree - nPtrmap;
+  if( nOrig>PENDING_BYTE_PAGE(pBt) && nFin<PENDING_BYTE_PAGE(pBt) ){
+    nFin--;
+  }
+  while( PTRMAP_ISPAGE(pBt, nFin) || nFin==PENDING_BYTE_PAGE(pBt) ){
+    nFin--;
+  }
+
+  return nFin;
+}
+
+/*
+** A write-transaction must be opened before calling this function.
+** It performs a single unit of work towards an incremental vacuum.
+**
+** If the incremental vacuum is finished after this function has run,
+** SQLITE_DONE is returned. If it is not finished, but no error occurred,
+** SQLITE_OK is returned. Otherwise an SQLite error code. 
+*/
+SQLITE_PRIVATE int sqlite3BtreeIncrVacuum(Btree *p){
+  int rc;
+  BtShared *pBt = p->pBt;
+
+  sqlite3BtreeEnter(p);
+  assert( pBt->inTransaction==TRANS_WRITE && p->inTrans==TRANS_WRITE );
+  if( !pBt->autoVacuum ){
+    rc = SQLITE_DONE;
+  }else{
+    Pgno nOrig = btreePagecount(pBt);
+    Pgno nFree = get4byte(&pBt->pPage1->aData[36]);
+    Pgno nFin = finalDbSize(pBt, nOrig, nFree);
+
+    if( nOrig<nFin ){
+      rc = SQLITE_CORRUPT_BKPT;
+    }else if( nFree>0 ){
+      rc = saveAllCursors(pBt, 0, 0);
+      if( rc==SQLITE_OK ){
+        invalidateAllOverflowCache(pBt);
+        rc = incrVacuumStep(pBt, nFin, nOrig, 0);
+      }
+      if( rc==SQLITE_OK ){
+        rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
+        put4byte(&pBt->pPage1->aData[28], pBt->nPage);
+      }
+    }else{
+      rc = SQLITE_DONE;
+    }
+  }
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** This routine is called prior to sqlite3PagerCommit when a transaction
+** is committed for an auto-vacuum database.
+**
+** If SQLITE_OK is returned, then *pnTrunc is set to the number of pages
+** the database file should be truncated to during the commit process. 
+** i.e. the database has been reorganized so that only the first *pnTrunc
+** pages are in use.
+*/
+static int autoVacuumCommit(BtShared *pBt){
+  int rc = SQLITE_OK;
+  Pager *pPager = pBt->pPager;
+  VVA_ONLY( int nRef = sqlite3PagerRefcount(pPager) );
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  invalidateAllOverflowCache(pBt);
+  assert(pBt->autoVacuum);
+  if( !pBt->incrVacuum ){
+    Pgno nFin;         /* Number of pages in database after autovacuuming */
+    Pgno nFree;        /* Number of pages on the freelist initially */
+    Pgno iFree;        /* The next page to be freed */
+    Pgno nOrig;        /* Database size before freeing */
+
+    nOrig = btreePagecount(pBt);
+    if( PTRMAP_ISPAGE(pBt, nOrig) || nOrig==PENDING_BYTE_PAGE(pBt) ){
+      /* It is not possible to create a database for which the final page
+      ** is either a pointer-map page or the pending-byte page. If one
+      ** is encountered, this indicates corruption.
+      */
+      return SQLITE_CORRUPT_BKPT;
+    }
+
+    nFree = get4byte(&pBt->pPage1->aData[36]);
+    nFin = finalDbSize(pBt, nOrig, nFree);
+    if( nFin>nOrig ) return SQLITE_CORRUPT_BKPT;
+    if( nFin<nOrig ){
+      rc = saveAllCursors(pBt, 0, 0);
+    }
+    for(iFree=nOrig; iFree>nFin && rc==SQLITE_OK; iFree--){
+      rc = incrVacuumStep(pBt, nFin, iFree, 1);
+    }
+    if( (rc==SQLITE_DONE || rc==SQLITE_OK) && nFree>0 ){
+      rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
+      put4byte(&pBt->pPage1->aData[32], 0);
+      put4byte(&pBt->pPage1->aData[36], 0);
+      put4byte(&pBt->pPage1->aData[28], nFin);
+      pBt->bDoTruncate = 1;
+      pBt->nPage = nFin;
+    }
+    if( rc!=SQLITE_OK ){
+      sqlite3PagerRollback(pPager);
+    }
+  }
+
+  assert( nRef>=sqlite3PagerRefcount(pPager) );
+  return rc;
+}
+
+#else /* ifndef SQLITE_OMIT_AUTOVACUUM */
+# define setChildPtrmaps(x) SQLITE_OK
+#endif
+
+/*
+** This routine does the first phase of a two-phase commit.  This routine
+** causes a rollback journal to be created (if it does not already exist)
+** and populated with enough information so that if a power loss occurs
+** the database can be restored to its original state by playing back
+** the journal.  Then the contents of the journal are flushed out to
+** the disk.  After the journal is safely on oxide, the changes to the
+** database are written into the database file and flushed to oxide.
+** At the end of this call, the rollback journal still exists on the
+** disk and we are still holding all locks, so the transaction has not
+** committed.  See sqlite3BtreeCommitPhaseTwo() for the second phase of the
+** commit process.
+**
+** This call is a no-op if no write-transaction is currently active on pBt.
+**
+** Otherwise, sync the database file for the btree pBt. zMaster points to
+** the name of a master journal file that should be written into the
+** individual journal file, or is NULL, indicating no master journal file 
+** (single database transaction).
+**
+** When this is called, the master journal should already have been
+** created, populated with this journal pointer and synced to disk.
+**
+** Once this is routine has returned, the only thing required to commit
+** the write-transaction for this database file is to delete the journal.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zMaster){
+  int rc = SQLITE_OK;
+  if( p->inTrans==TRANS_WRITE ){
+    BtShared *pBt = p->pBt;
+    sqlite3BtreeEnter(p);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( pBt->autoVacuum ){
+      rc = autoVacuumCommit(pBt);
+      if( rc!=SQLITE_OK ){
+        sqlite3BtreeLeave(p);
+        return rc;
+      }
+    }
+    if( pBt->bDoTruncate ){
+      sqlite3PagerTruncateImage(pBt->pPager, pBt->nPage);
+    }
+#endif
+    rc = sqlite3PagerCommitPhaseOne(pBt->pPager, zMaster, 0);
+    sqlite3BtreeLeave(p);
+  }
+  return rc;
+}
+
+/*
+** This function is called from both BtreeCommitPhaseTwo() and BtreeRollback()
+** at the conclusion of a transaction.
+*/
+static void btreeEndTransaction(Btree *p){
+  BtShared *pBt = p->pBt;
+  sqlite3 *db = p->db;
+  assert( sqlite3BtreeHoldsMutex(p) );
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  pBt->bDoTruncate = 0;
+#endif
+  if( p->inTrans>TRANS_NONE && db->nVdbeRead>1 ){
+    /* If there are other active statements that belong to this database
+    ** handle, downgrade to a read-only transaction. The other statements
+    ** may still be reading from the database.  */
+    downgradeAllSharedCacheTableLocks(p);
+    p->inTrans = TRANS_READ;
+  }else{
+    /* If the handle had any kind of transaction open, decrement the 
+    ** transaction count of the shared btree. If the transaction count 
+    ** reaches 0, set the shared state to TRANS_NONE. The unlockBtreeIfUnused()
+    ** call below will unlock the pager.  */
+    if( p->inTrans!=TRANS_NONE ){
+      clearAllSharedCacheTableLocks(p);
+      pBt->nTransaction--;
+      if( 0==pBt->nTransaction ){
+        pBt->inTransaction = TRANS_NONE;
