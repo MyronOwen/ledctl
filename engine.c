@@ -56341,3 +56341,241 @@ SQLITE_PRIVATE int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
 ** can be rolled back without having to rollback the entire transaction.
 **
 ** A statement sub-transaction is implemented as an anonymous savepoint. The
+** value passed as the second parameter is the total number of savepoints,
+** including the new anonymous savepoint, open on the B-Tree. i.e. if there
+** are no active savepoints and no other statement-transactions open,
+** iStatement is 1. This anonymous savepoint can be released or rolled back
+** using the sqlite3BtreeSavepoint() function.
+*/
+SQLITE_PRIVATE int sqlite3BtreeBeginStmt(Btree *p, int iStatement){
+  int rc;
+  BtShared *pBt = p->pBt;
+  sqlite3BtreeEnter(p);
+  assert( p->inTrans==TRANS_WRITE );
+  assert( (pBt->btsFlags & BTS_READ_ONLY)==0 );
+  assert( iStatement>0 );
+  assert( iStatement>p->db->nSavepoint );
+  assert( pBt->inTransaction==TRANS_WRITE );
+  /* At the pager level, a statement transaction is a savepoint with
+  ** an index greater than all savepoints created explicitly using
+  ** SQL statements. It is illegal to open, release or rollback any
+  ** such savepoints while the statement transaction savepoint is active.
+  */
+  rc = sqlite3PagerOpenSavepoint(pBt->pPager, iStatement);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** The second argument to this function, op, is always SAVEPOINT_ROLLBACK
+** or SAVEPOINT_RELEASE. This function either releases or rolls back the
+** savepoint identified by parameter iSavepoint, depending on the value 
+** of op.
+**
+** Normally, iSavepoint is greater than or equal to zero. However, if op is
+** SAVEPOINT_ROLLBACK, then iSavepoint may also be -1. In this case the 
+** contents of the entire transaction are rolled back. This is different
+** from a normal transaction rollback, as no locks are released and the
+** transaction remains open.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
+  int rc = SQLITE_OK;
+  if( p && p->inTrans==TRANS_WRITE ){
+    BtShared *pBt = p->pBt;
+    assert( op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
+    assert( iSavepoint>=0 || (iSavepoint==-1 && op==SAVEPOINT_ROLLBACK) );
+    sqlite3BtreeEnter(p);
+    rc = sqlite3PagerSavepoint(pBt->pPager, op, iSavepoint);
+    if( rc==SQLITE_OK ){
+      if( iSavepoint<0 && (pBt->btsFlags & BTS_INITIALLY_EMPTY)!=0 ){
+        pBt->nPage = 0;
+      }
+      rc = newDatabase(pBt);
+      pBt->nPage = get4byte(28 + pBt->pPage1->aData);
+
+      /* The database size was written into the offset 28 of the header
+      ** when the transaction started, so we know that the value at offset
+      ** 28 is nonzero. */
+      assert( pBt->nPage>0 );
+    }
+    sqlite3BtreeLeave(p);
+  }
+  return rc;
+}
+
+/*
+** Create a new cursor for the BTree whose root is on the page
+** iTable. If a read-only cursor is requested, it is assumed that
+** the caller already has at least a read-only transaction open
+** on the database already. If a write-cursor is requested, then
+** the caller is assumed to have an open write transaction.
+**
+** If wrFlag==0, then the cursor can only be used for reading.
+** If wrFlag==1, then the cursor can be used for reading or for
+** writing if other conditions for writing are also met.  These
+** are the conditions that must be met in order for writing to
+** be allowed:
+**
+** 1:  The cursor must have been opened with wrFlag==1
+**
+** 2:  Other database connections that share the same pager cache
+**     but which are not in the READ_UNCOMMITTED state may not have
+**     cursors open with wrFlag==0 on the same table.  Otherwise
+**     the changes made by this write cursor would be visible to
+**     the read cursors in the other database connection.
+**
+** 3:  The database must be writable (not on read-only media)
+**
+** 4:  There must be an active transaction.
+**
+** No checking is done to make sure that page iTable really is the
+** root page of a b-tree.  If it is not, then the cursor acquired
+** will not work correctly.
+**
+** It is assumed that the sqlite3BtreeCursorZero() has been called
+** on pCur to initialize the memory space prior to invoking this routine.
+*/
+static int btreeCursor(
+  Btree *p,                              /* The btree */
+  int iTable,                            /* Root page of table to open */
+  int wrFlag,                            /* 1 to write. 0 read-only */
+  struct KeyInfo *pKeyInfo,              /* First arg to comparison function */
+  BtCursor *pCur                         /* Space for new cursor */
+){
+  BtShared *pBt = p->pBt;                /* Shared b-tree handle */
+
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( wrFlag==0 || wrFlag==1 );
+
+  /* The following assert statements verify that if this is a sharable 
+  ** b-tree database, the connection is holding the required table locks, 
+  ** and that no other connection has any open cursor that conflicts with 
+  ** this lock.  */
+  assert( hasSharedCacheTableLock(p, iTable, pKeyInfo!=0, wrFlag+1) );
+  assert( wrFlag==0 || !hasReadConflicts(p, iTable) );
+
+  /* Assert that the caller has opened the required transaction. */
+  assert( p->inTrans>TRANS_NONE );
+  assert( wrFlag==0 || p->inTrans==TRANS_WRITE );
+  assert( pBt->pPage1 && pBt->pPage1->aData );
+
+  if( NEVER(wrFlag && (pBt->btsFlags & BTS_READ_ONLY)!=0) ){
+    return SQLITE_READONLY;
+  }
+  if( wrFlag ){
+    allocateTempSpace(pBt);
+    if( pBt->pTmpSpace==0 ) return SQLITE_NOMEM;
+  }
+  if( iTable==1 && btreePagecount(pBt)==0 ){
+    assert( wrFlag==0 );
+    iTable = 0;
+  }
+
+  /* Now that no other errors can occur, finish filling in the BtCursor
+  ** variables and link the cursor into the BtShared list.  */
+  pCur->pgnoRoot = (Pgno)iTable;
+  pCur->iPage = -1;
+  pCur->pKeyInfo = pKeyInfo;
+  pCur->pBtree = p;
+  pCur->pBt = pBt;
+  assert( wrFlag==0 || wrFlag==BTCF_WriteFlag );
+  pCur->curFlags = wrFlag;
+  pCur->pNext = pBt->pCursor;
+  if( pCur->pNext ){
+    pCur->pNext->pPrev = pCur;
+  }
+  pBt->pCursor = pCur;
+  pCur->eState = CURSOR_INVALID;
+  return SQLITE_OK;
+}
+SQLITE_PRIVATE int sqlite3BtreeCursor(
+  Btree *p,                                   /* The btree */
+  int iTable,                                 /* Root page of table to open */
+  int wrFlag,                                 /* 1 to write. 0 read-only */
+  struct KeyInfo *pKeyInfo,                   /* First arg to xCompare() */
+  BtCursor *pCur                              /* Write new cursor here */
+){
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = btreeCursor(p, iTable, wrFlag, pKeyInfo, pCur);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Return the size of a BtCursor object in bytes.
+**
+** This interfaces is needed so that users of cursors can preallocate
+** sufficient storage to hold a cursor.  The BtCursor object is opaque
+** to users so they cannot do the sizeof() themselves - they must call
+** this routine.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorSize(void){
+  return ROUND8(sizeof(BtCursor));
+}
+
+/*
+** Initialize memory that will be converted into a BtCursor object.
+**
+** The simple approach here would be to memset() the entire object
+** to zero.  But it turns out that the apPage[] and aiIdx[] arrays
+** do not need to be zeroed and they are large, so we can save a lot
+** of run-time by skipping the initialization of those elements.
+*/
+SQLITE_PRIVATE void sqlite3BtreeCursorZero(BtCursor *p){
+  memset(p, 0, offsetof(BtCursor, iPage));
+}
+
+/*
+** Close a cursor.  The read lock on the database file is released
+** when the last cursor is closed.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCloseCursor(BtCursor *pCur){
+  Btree *pBtree = pCur->pBtree;
+  if( pBtree ){
+    int i;
+    BtShared *pBt = pCur->pBt;
+    sqlite3BtreeEnter(pBtree);
+    sqlite3BtreeClearCursor(pCur);
+    if( pCur->pPrev ){
+      pCur->pPrev->pNext = pCur->pNext;
+    }else{
+      pBt->pCursor = pCur->pNext;
+    }
+    if( pCur->pNext ){
+      pCur->pNext->pPrev = pCur->pPrev;
+    }
+    for(i=0; i<=pCur->iPage; i++){
+      releasePage(pCur->apPage[i]);
+    }
+    unlockBtreeIfUnused(pBt);
+    sqlite3_free(pCur->aOverflow);
+    /* sqlite3_free(pCur); */
+    sqlite3BtreeLeave(pBtree);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Make sure the BtCursor* given in the argument has a valid
+** BtCursor.info structure.  If it is not already valid, call
+** btreeParseCell() to fill it in.
+**
+** BtCursor.info is a cache of the information in the current cell.
+** Using this cache reduces the number of calls to btreeParseCell().
+**
+** 2007-06-25:  There is a bug in some versions of MSVC that cause the
+** compiler to crash when getCellInfo() is implemented as a macro.
+** But there is a measureable speed advantage to using the macro on gcc
+** (when less compiler optimizations like -Os or -O0 are used and the
+** compiler is not doing aggressive inlining.)  So we use a real function
+** for MSVC and a macro for everything else.  Ticket #2457.
+*/
+#ifndef NDEBUG
+  static void assertCellInfo(BtCursor *pCur){
+    CellInfo info;
+    int iPage = pCur->iPage;
+    memset(&info, 0, sizeof(info));
+    btreeParseCell(pCur->apPage[iPage], pCur->aiIdx[iPage], &info);
+    assert( CORRUPT_DB || memcmp(&info, &pCur->info, sizeof(info))==0 );
+  }
