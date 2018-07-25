@@ -56579,3 +56579,218 @@ SQLITE_PRIVATE int sqlite3BtreeCloseCursor(BtCursor *pCur){
     btreeParseCell(pCur->apPage[iPage], pCur->aiIdx[iPage], &info);
     assert( CORRUPT_DB || memcmp(&info, &pCur->info, sizeof(info))==0 );
   }
+#else
+  #define assertCellInfo(x)
+#endif
+#ifdef _MSC_VER
+  /* Use a real function in MSVC to work around bugs in that compiler. */
+  static void getCellInfo(BtCursor *pCur){
+    if( pCur->info.nSize==0 ){
+      int iPage = pCur->iPage;
+      btreeParseCell(pCur->apPage[iPage],pCur->aiIdx[iPage],&pCur->info);
+      pCur->curFlags |= BTCF_ValidNKey;
+    }else{
+      assertCellInfo(pCur);
+    }
+  }
+#else /* if not _MSC_VER */
+  /* Use a macro in all other compilers so that the function is inlined */
+#define getCellInfo(pCur)                                                      \
+  if( pCur->info.nSize==0 ){                                                   \
+    int iPage = pCur->iPage;                                                   \
+    btreeParseCell(pCur->apPage[iPage],pCur->aiIdx[iPage],&pCur->info);        \
+    pCur->curFlags |= BTCF_ValidNKey;                                          \
+  }else{                                                                       \
+    assertCellInfo(pCur);                                                      \
+  }
+#endif /* _MSC_VER */
+
+#ifndef NDEBUG  /* The next routine used only within assert() statements */
+/*
+** Return true if the given BtCursor is valid.  A valid cursor is one
+** that is currently pointing to a row in a (non-empty) table.
+** This is a verification routine is used only within assert() statements.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorIsValid(BtCursor *pCur){
+  return pCur && pCur->eState==CURSOR_VALID;
+}
+#endif /* NDEBUG */
+
+/*
+** Set *pSize to the size of the buffer needed to hold the value of
+** the key for the current entry.  If the cursor is not pointing
+** to a valid entry, *pSize is set to 0. 
+**
+** For a table with the INTKEY flag set, this routine returns the key
+** itself, not the number of bytes in the key.
+**
+** The caller must position the cursor prior to invoking this routine.
+** 
+** This routine cannot fail.  It always returns SQLITE_OK.  
+*/
+SQLITE_PRIVATE int sqlite3BtreeKeySize(BtCursor *pCur, i64 *pSize){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  getCellInfo(pCur);
+  *pSize = pCur->info.nKey;
+  return SQLITE_OK;
+}
+
+/*
+** Set *pSize to the number of bytes of data in the entry the
+** cursor currently points to.
+**
+** The caller must guarantee that the cursor is pointing to a non-NULL
+** valid entry.  In other words, the calling procedure must guarantee
+** that the cursor has Cursor.eState==CURSOR_VALID.
+**
+** Failure is not possible.  This function always returns SQLITE_OK.
+** It might just as well be a procedure (returning void) but we continue
+** to return an integer result code for historical reasons.
+*/
+SQLITE_PRIVATE int sqlite3BtreeDataSize(BtCursor *pCur, u32 *pSize){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->apPage[pCur->iPage]->intKeyLeaf==1 );
+  getCellInfo(pCur);
+  *pSize = pCur->info.nPayload;
+  return SQLITE_OK;
+}
+
+/*
+** Given the page number of an overflow page in the database (parameter
+** ovfl), this function finds the page number of the next page in the 
+** linked list of overflow pages. If possible, it uses the auto-vacuum
+** pointer-map data instead of reading the content of page ovfl to do so. 
+**
+** If an error occurs an SQLite error code is returned. Otherwise:
+**
+** The page number of the next overflow page in the linked list is 
+** written to *pPgnoNext. If page ovfl is the last page in its linked 
+** list, *pPgnoNext is set to zero. 
+**
+** If ppPage is not NULL, and a reference to the MemPage object corresponding
+** to page number pOvfl was obtained, then *ppPage is set to point to that
+** reference. It is the responsibility of the caller to call releasePage()
+** on *ppPage to free the reference. In no reference was obtained (because
+** the pointer-map was used to obtain the value for *pPgnoNext), then
+** *ppPage is set to zero.
+*/
+static int getOverflowPage(
+  BtShared *pBt,               /* The database file */
+  Pgno ovfl,                   /* Current overflow page number */
+  MemPage **ppPage,            /* OUT: MemPage handle (may be NULL) */
+  Pgno *pPgnoNext              /* OUT: Next overflow page number */
+){
+  Pgno next = 0;
+  MemPage *pPage = 0;
+  int rc = SQLITE_OK;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert(pPgnoNext);
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  /* Try to find the next page in the overflow list using the
+  ** autovacuum pointer-map pages. Guess that the next page in 
+  ** the overflow list is page number (ovfl+1). If that guess turns 
+  ** out to be wrong, fall back to loading the data of page 
+  ** number ovfl to determine the next page number.
+  */
+  if( pBt->autoVacuum ){
+    Pgno pgno;
+    Pgno iGuess = ovfl+1;
+    u8 eType;
+
+    while( PTRMAP_ISPAGE(pBt, iGuess) || iGuess==PENDING_BYTE_PAGE(pBt) ){
+      iGuess++;
+    }
+
+    if( iGuess<=btreePagecount(pBt) ){
+      rc = ptrmapGet(pBt, iGuess, &eType, &pgno);
+      if( rc==SQLITE_OK && eType==PTRMAP_OVERFLOW2 && pgno==ovfl ){
+        next = iGuess;
+        rc = SQLITE_DONE;
+      }
+    }
+  }
+#endif
+
+  assert( next==0 || rc==SQLITE_DONE );
+  if( rc==SQLITE_OK ){
+    rc = btreeGetPage(pBt, ovfl, &pPage, (ppPage==0) ? PAGER_GET_READONLY : 0);
+    assert( rc==SQLITE_OK || pPage==0 );
+    if( rc==SQLITE_OK ){
+      next = get4byte(pPage->aData);
+    }
+  }
+
+  *pPgnoNext = next;
+  if( ppPage ){
+    *ppPage = pPage;
+  }else{
+    releasePage(pPage);
+  }
+  return (rc==SQLITE_DONE ? SQLITE_OK : rc);
+}
+
+/*
+** Copy data from a buffer to a page, or from a page to a buffer.
+**
+** pPayload is a pointer to data stored on database page pDbPage.
+** If argument eOp is false, then nByte bytes of data are copied
+** from pPayload to the buffer pointed at by pBuf. If eOp is true,
+** then sqlite3PagerWrite() is called on pDbPage and nByte bytes
+** of data are copied from the buffer pBuf to pPayload.
+**
+** SQLITE_OK is returned on success, otherwise an error code.
+*/
+static int copyPayload(
+  void *pPayload,           /* Pointer to page data */
+  void *pBuf,               /* Pointer to buffer */
+  int nByte,                /* Number of bytes to copy */
+  int eOp,                  /* 0 -> copy from page, 1 -> copy to page */
+  DbPage *pDbPage           /* Page containing pPayload */
+){
+  if( eOp ){
+    /* Copy data from buffer to page (a write operation) */
+    int rc = sqlite3PagerWrite(pDbPage);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    memcpy(pPayload, pBuf, nByte);
+  }else{
+    /* Copy data from page to buffer (a read operation) */
+    memcpy(pBuf, pPayload, nByte);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** This function is used to read or overwrite payload information
+** for the entry that the pCur cursor is pointing to. The eOp
+** argument is interpreted as follows:
+**
+**   0: The operation is a read. Populate the overflow cache.
+**   1: The operation is a write. Populate the overflow cache.
+**   2: The operation is a read. Do not populate the overflow cache.
+**
+** A total of "amt" bytes are read or written beginning at "offset".
+** Data is read to or from the buffer pBuf.
+**
+** The content being read or written might appear on the main page
+** or be scattered out on multiple overflow pages.
+**
+** If the current cursor entry uses one or more overflow pages and the
+** eOp argument is not 2, this function may allocate space for and lazily 
+** populates the overflow page-list cache array (BtCursor.aOverflow). 
+** Subsequent calls use this cache to make seeking to the supplied offset 
+** more efficient.
+**
+** Once an overflow page-list cache has been allocated, it may be
+** invalidated if some other cursor writes to the same table, or if
+** the cursor is moved to a different row. Additionally, in auto-vacuum
+** mode, the following events may invalidate an overflow page-list cache.
+**
+**   * An incremental vacuum,
+**   * A commit in auto_vacuum="full" mode,
+**   * Creating a table (may require moving an overflow page).
