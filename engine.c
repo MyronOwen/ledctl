@@ -57002,3 +57002,236 @@ static int accessPayload(
 SQLITE_PRIVATE int sqlite3BtreeKey(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
   assert( cursorHoldsMutex(pCur) );
   assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->iPage>=0 && pCur->apPage[pCur->iPage] );
+  assert( pCur->aiIdx[pCur->iPage]<pCur->apPage[pCur->iPage]->nCell );
+  return accessPayload(pCur, offset, amt, (unsigned char*)pBuf, 0);
+}
+
+/*
+** Read part of the data associated with cursor pCur.  Exactly
+** "amt" bytes will be transfered into pBuf[].  The transfer
+** begins at "offset".
+**
+** Return SQLITE_OK on success or an error code if anything goes
+** wrong.  An error is returned if "offset+amt" is larger than
+** the available payload.
+*/
+SQLITE_PRIVATE int sqlite3BtreeData(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
+  int rc;
+
+#ifndef SQLITE_OMIT_INCRBLOB
+  if ( pCur->eState==CURSOR_INVALID ){
+    return SQLITE_ABORT;
+  }
+#endif
+
+  assert( cursorHoldsMutex(pCur) );
+  rc = restoreCursorPosition(pCur);
+  if( rc==SQLITE_OK ){
+    assert( pCur->eState==CURSOR_VALID );
+    assert( pCur->iPage>=0 && pCur->apPage[pCur->iPage] );
+    assert( pCur->aiIdx[pCur->iPage]<pCur->apPage[pCur->iPage]->nCell );
+    rc = accessPayload(pCur, offset, amt, pBuf, 0);
+  }
+  return rc;
+}
+
+/*
+** Return a pointer to payload information from the entry that the 
+** pCur cursor is pointing to.  The pointer is to the beginning of
+** the key if index btrees (pPage->intKey==0) and is the data for
+** table btrees (pPage->intKey==1). The number of bytes of available
+** key/data is written into *pAmt.  If *pAmt==0, then the value
+** returned will not be a valid pointer.
+**
+** This routine is an optimization.  It is common for the entire key
+** and data to fit on the local page and for there to be no overflow
+** pages.  When that is so, this routine can be used to access the
+** key and data without making a copy.  If the key and/or data spills
+** onto overflow pages, then accessPayload() must be used to reassemble
+** the key/data and copy it into a preallocated buffer.
+**
+** The pointer returned by this routine looks directly into the cached
+** page of the database.  The data might change or move the next time
+** any btree routine is called.
+*/
+static const void *fetchPayload(
+  BtCursor *pCur,      /* Cursor pointing to entry to read from */
+  u32 *pAmt            /* Write the number of available bytes here */
+){
+  assert( pCur!=0 && pCur->iPage>=0 && pCur->apPage[pCur->iPage]);
+  assert( pCur->eState==CURSOR_VALID );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->aiIdx[pCur->iPage]<pCur->apPage[pCur->iPage]->nCell );
+  assert( pCur->info.nSize>0 );
+  *pAmt = pCur->info.nLocal;
+  return (void*)pCur->info.pPayload;
+}
+
+
+/*
+** For the entry that cursor pCur is point to, return as
+** many bytes of the key or data as are available on the local
+** b-tree page.  Write the number of available bytes into *pAmt.
+**
+** The pointer returned is ephemeral.  The key/data may move
+** or be destroyed on the next call to any Btree routine,
+** including calls from other threads against the same cache.
+** Hence, a mutex on the BtShared should be held prior to calling
+** this routine.
+**
+** These routines is used to get quick access to key and data
+** in the common case where no overflow pages are used.
+*/
+SQLITE_PRIVATE const void *sqlite3BtreeKeyFetch(BtCursor *pCur, u32 *pAmt){
+  return fetchPayload(pCur, pAmt);
+}
+SQLITE_PRIVATE const void *sqlite3BtreeDataFetch(BtCursor *pCur, u32 *pAmt){
+  return fetchPayload(pCur, pAmt);
+}
+
+
+/*
+** Move the cursor down to a new child page.  The newPgno argument is the
+** page number of the child page to move to.
+**
+** This function returns SQLITE_CORRUPT if the page-header flags field of
+** the new child page does not match the flags field of the parent (i.e.
+** if an intkey page appears to be the parent of a non-intkey page, or
+** vice-versa).
+*/
+static int moveToChild(BtCursor *pCur, u32 newPgno){
+  int rc;
+  int i = pCur->iPage;
+  MemPage *pNewPage;
+  BtShared *pBt = pCur->pBt;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->iPage<BTCURSOR_MAX_DEPTH );
+  assert( pCur->iPage>=0 );
+  if( pCur->iPage>=(BTCURSOR_MAX_DEPTH-1) ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  rc = getAndInitPage(pBt, newPgno, &pNewPage,
+               (pCur->curFlags & BTCF_WriteFlag)==0 ? PAGER_GET_READONLY : 0);
+  if( rc ) return rc;
+  pCur->apPage[i+1] = pNewPage;
+  pCur->aiIdx[i+1] = 0;
+  pCur->iPage++;
+
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+  if( pNewPage->nCell<1 || pNewPage->intKey!=pCur->apPage[i]->intKey ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  return SQLITE_OK;
+}
+
+#if 0
+/*
+** Page pParent is an internal (non-leaf) tree page. This function 
+** asserts that page number iChild is the left-child if the iIdx'th
+** cell in page pParent. Or, if iIdx is equal to the total number of
+** cells in pParent, that page number iChild is the right-child of
+** the page.
+*/
+static void assertParentIndex(MemPage *pParent, int iIdx, Pgno iChild){
+  assert( iIdx<=pParent->nCell );
+  if( iIdx==pParent->nCell ){
+    assert( get4byte(&pParent->aData[pParent->hdrOffset+8])==iChild );
+  }else{
+    assert( get4byte(findCell(pParent, iIdx))==iChild );
+  }
+}
+#else
+#  define assertParentIndex(x,y,z) 
+#endif
+
+/*
+** Move the cursor up to the parent page.
+**
+** pCur->idx is set to the cell index that contains the pointer
+** to the page we are coming from.  If we are coming from the
+** right-most child page then pCur->idx is set to one more than
+** the largest cell index.
+*/
+static void moveToParent(BtCursor *pCur){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->iPage>0 );
+  assert( pCur->apPage[pCur->iPage] );
+
+  /* UPDATE: It is actually possible for the condition tested by the assert
+  ** below to be untrue if the database file is corrupt. This can occur if
+  ** one cursor has modified page pParent while a reference to it is held 
+  ** by a second cursor. Which can only happen if a single page is linked
+  ** into more than one b-tree structure in a corrupt database.  */
+#if 0
+  assertParentIndex(
+    pCur->apPage[pCur->iPage-1], 
+    pCur->aiIdx[pCur->iPage-1], 
+    pCur->apPage[pCur->iPage]->pgno
+  );
+#endif
+  testcase( pCur->aiIdx[pCur->iPage-1] > pCur->apPage[pCur->iPage-1]->nCell );
+
+  releasePage(pCur->apPage[pCur->iPage]);
+  pCur->iPage--;
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+}
+
+/*
+** Move the cursor to point to the root page of its b-tree structure.
+**
+** If the table has a virtual root page, then the cursor is moved to point
+** to the virtual root page instead of the actual root page. A table has a
+** virtual root page when the actual root page contains no cells and a 
+** single child page. This can only happen with the table rooted at page 1.
+**
+** If the b-tree structure is empty, the cursor state is set to 
+** CURSOR_INVALID. Otherwise, the cursor is set to point to the first
+** cell located on the root (or virtual root) page and the cursor state
+** is set to CURSOR_VALID.
+**
+** If this function returns successfully, it may be assumed that the
+** page-header flags indicate that the [virtual] root-page is the expected 
+** kind of b-tree page (i.e. if when opening the cursor the caller did not
+** specify a KeyInfo structure the flags byte is set to 0x05 or 0x0D,
+** indicating a table b-tree, or if the caller did specify a KeyInfo 
+** structure the flags byte is set to 0x02 or 0x0A, indicating an index
+** b-tree).
+*/
+static int moveToRoot(BtCursor *pCur){
+  MemPage *pRoot;
+  int rc = SQLITE_OK;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( CURSOR_INVALID < CURSOR_REQUIRESEEK );
+  assert( CURSOR_VALID   < CURSOR_REQUIRESEEK );
+  assert( CURSOR_FAULT   > CURSOR_REQUIRESEEK );
+  if( pCur->eState>=CURSOR_REQUIRESEEK ){
+    if( pCur->eState==CURSOR_FAULT ){
+      assert( pCur->skipNext!=SQLITE_OK );
+      return pCur->skipNext;
+    }
+    sqlite3BtreeClearCursor(pCur);
+  }
+
+  if( pCur->iPage>=0 ){
+    while( pCur->iPage ) releasePage(pCur->apPage[pCur->iPage--]);
+  }else if( pCur->pgnoRoot==0 ){
+    pCur->eState = CURSOR_INVALID;
+    return SQLITE_OK;
+  }else{
+    rc = getAndInitPage(pCur->pBtree->pBt, pCur->pgnoRoot, &pCur->apPage[0],
+                 (pCur->curFlags & BTCF_WriteFlag)==0 ? PAGER_GET_READONLY : 0);
+    if( rc!=SQLITE_OK ){
+      pCur->eState = CURSOR_INVALID;
+      return rc;
+    }
+    pCur->iPage = 0;
+  }
+  pRoot = pCur->apPage[0];
