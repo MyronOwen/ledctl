@@ -56794,3 +56794,211 @@ static int copyPayload(
 **   * An incremental vacuum,
 **   * A commit in auto_vacuum="full" mode,
 **   * Creating a table (may require moving an overflow page).
+*/
+static int accessPayload(
+  BtCursor *pCur,      /* Cursor pointing to entry to read from */
+  u32 offset,          /* Begin reading this far into payload */
+  u32 amt,             /* Read this many bytes */
+  unsigned char *pBuf, /* Write the bytes into this buffer */ 
+  int eOp              /* zero to read. non-zero to write. */
+){
+  unsigned char *aPayload;
+  int rc = SQLITE_OK;
+  int iIdx = 0;
+  MemPage *pPage = pCur->apPage[pCur->iPage]; /* Btree page of current entry */
+  BtShared *pBt = pCur->pBt;                  /* Btree this cursor belongs to */
+#ifdef SQLITE_DIRECT_OVERFLOW_READ
+  unsigned char * const pBufStart = pBuf;
+  int bEnd;                                 /* True if reading to end of data */
+#endif
+
+  assert( pPage );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->aiIdx[pCur->iPage]<pPage->nCell );
+  assert( cursorHoldsMutex(pCur) );
+  assert( eOp!=2 || offset==0 );    /* Always start from beginning for eOp==2 */
+
+  getCellInfo(pCur);
+  aPayload = pCur->info.pPayload;
+#ifdef SQLITE_DIRECT_OVERFLOW_READ
+  bEnd = offset+amt==pCur->info.nPayload;
+#endif
+  assert( offset+amt <= pCur->info.nPayload );
+
+  if( &aPayload[pCur->info.nLocal] > &pPage->aData[pBt->usableSize] ){
+    /* Trying to read or write past the end of the data is an error */
+    return SQLITE_CORRUPT_BKPT;
+  }
+
+  /* Check if data must be read/written to/from the btree page itself. */
+  if( offset<pCur->info.nLocal ){
+    int a = amt;
+    if( a+offset>pCur->info.nLocal ){
+      a = pCur->info.nLocal - offset;
+    }
+    rc = copyPayload(&aPayload[offset], pBuf, a, (eOp & 0x01), pPage->pDbPage);
+    offset = 0;
+    pBuf += a;
+    amt -= a;
+  }else{
+    offset -= pCur->info.nLocal;
+  }
+
+
+  if( rc==SQLITE_OK && amt>0 ){
+    const u32 ovflSize = pBt->usableSize - 4;  /* Bytes content per ovfl page */
+    Pgno nextPage;
+
+    nextPage = get4byte(&aPayload[pCur->info.nLocal]);
+
+    /* If the BtCursor.aOverflow[] has not been allocated, allocate it now.
+    ** Except, do not allocate aOverflow[] for eOp==2.
+    **
+    ** The aOverflow[] array is sized at one entry for each overflow page
+    ** in the overflow chain. The page number of the first overflow page is
+    ** stored in aOverflow[0], etc. A value of 0 in the aOverflow[] array
+    ** means "not yet known" (the cache is lazily populated).
+    */
+    if( eOp!=2 && (pCur->curFlags & BTCF_ValidOvfl)==0 ){
+      int nOvfl = (pCur->info.nPayload-pCur->info.nLocal+ovflSize-1)/ovflSize;
+      if( nOvfl>pCur->nOvflAlloc ){
+        Pgno *aNew = (Pgno*)sqlite3Realloc(
+            pCur->aOverflow, nOvfl*2*sizeof(Pgno)
+        );
+        if( aNew==0 ){
+          rc = SQLITE_NOMEM;
+        }else{
+          pCur->nOvflAlloc = nOvfl*2;
+          pCur->aOverflow = aNew;
+        }
+      }
+      if( rc==SQLITE_OK ){
+        memset(pCur->aOverflow, 0, nOvfl*sizeof(Pgno));
+        pCur->curFlags |= BTCF_ValidOvfl;
+      }
+    }
+
+    /* If the overflow page-list cache has been allocated and the
+    ** entry for the first required overflow page is valid, skip
+    ** directly to it.
+    */
+    if( (pCur->curFlags & BTCF_ValidOvfl)!=0
+     && pCur->aOverflow[offset/ovflSize]
+    ){
+      iIdx = (offset/ovflSize);
+      nextPage = pCur->aOverflow[iIdx];
+      offset = (offset%ovflSize);
+    }
+
+    for( ; rc==SQLITE_OK && amt>0 && nextPage; iIdx++){
+
+      /* If required, populate the overflow page-list cache. */
+      if( (pCur->curFlags & BTCF_ValidOvfl)!=0 ){
+        assert(!pCur->aOverflow[iIdx] || pCur->aOverflow[iIdx]==nextPage);
+        pCur->aOverflow[iIdx] = nextPage;
+      }
+
+      if( offset>=ovflSize ){
+        /* The only reason to read this page is to obtain the page
+        ** number for the next page in the overflow chain. The page
+        ** data is not required. So first try to lookup the overflow
+        ** page-list cache, if any, then fall back to the getOverflowPage()
+        ** function.
+        **
+        ** Note that the aOverflow[] array must be allocated because eOp!=2
+        ** here.  If eOp==2, then offset==0 and this branch is never taken.
+        */
+        assert( eOp!=2 );
+        assert( pCur->curFlags & BTCF_ValidOvfl );
+        assert( pCur->pBtree->db==pBt->db );
+        if( pCur->aOverflow[iIdx+1] ){
+          nextPage = pCur->aOverflow[iIdx+1];
+        }else{
+          rc = getOverflowPage(pBt, nextPage, 0, &nextPage);
+        }
+        offset -= ovflSize;
+      }else{
+        /* Need to read this page properly. It contains some of the
+        ** range of data that is being read (eOp==0) or written (eOp!=0).
+        */
+#ifdef SQLITE_DIRECT_OVERFLOW_READ
+        sqlite3_file *fd;
+#endif
+        int a = amt;
+        if( a + offset > ovflSize ){
+          a = ovflSize - offset;
+        }
+
+#ifdef SQLITE_DIRECT_OVERFLOW_READ
+        /* If all the following are true:
+        **
+        **   1) this is a read operation, and 
+        **   2) data is required from the start of this overflow page, and
+        **   3) the database is file-backed, and
+        **   4) there is no open write-transaction, and
+        **   5) the database is not a WAL database,
+        **   6) all data from the page is being read.
+        **   7) at least 4 bytes have already been read into the output buffer 
+        **
+        ** then data can be read directly from the database file into the
+        ** output buffer, bypassing the page-cache altogether. This speeds
+        ** up loading large records that span many overflow pages.
+        */
+        if( (eOp&0x01)==0                                      /* (1) */
+         && offset==0                                          /* (2) */
+         && (bEnd || a==ovflSize)                              /* (6) */
+         && pBt->inTransaction==TRANS_READ                     /* (4) */
+         && (fd = sqlite3PagerFile(pBt->pPager))->pMethods     /* (3) */
+         && pBt->pPage1->aData[19]==0x01                       /* (5) */
+         && &pBuf[-4]>=pBufStart                               /* (7) */
+        ){
+          u8 aSave[4];
+          u8 *aWrite = &pBuf[-4];
+          assert( aWrite>=pBufStart );                         /* hence (7) */
+          memcpy(aSave, aWrite, 4);
+          rc = sqlite3OsRead(fd, aWrite, a+4, (i64)pBt->pageSize*(nextPage-1));
+          nextPage = get4byte(aWrite);
+          memcpy(aWrite, aSave, 4);
+        }else
+#endif
+
+        {
+          DbPage *pDbPage;
+          rc = sqlite3PagerAcquire(pBt->pPager, nextPage, &pDbPage,
+              ((eOp&0x01)==0 ? PAGER_GET_READONLY : 0)
+          );
+          if( rc==SQLITE_OK ){
+            aPayload = sqlite3PagerGetData(pDbPage);
+            nextPage = get4byte(aPayload);
+            rc = copyPayload(&aPayload[offset+4], pBuf, a, (eOp&0x01), pDbPage);
+            sqlite3PagerUnref(pDbPage);
+            offset = 0;
+          }
+        }
+        amt -= a;
+        pBuf += a;
+      }
+    }
+  }
+
+  if( rc==SQLITE_OK && amt>0 ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  return rc;
+}
+
+/*
+** Read part of the key associated with cursor pCur.  Exactly
+** "amt" bytes will be transferred into pBuf[].  The transfer
+** begins at "offset".
+**
+** The caller must ensure that pCur is pointing to a valid row
+** in the table.
+**
+** Return SQLITE_OK on success or an error code if anything goes
+** wrong.  An error is returned if "offset+amt" is larger than
+** the available payload.
+*/
+SQLITE_PRIVATE int sqlite3BtreeKey(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
