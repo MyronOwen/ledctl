@@ -57235,3 +57235,231 @@ static int moveToRoot(BtCursor *pCur){
     pCur->iPage = 0;
   }
   pRoot = pCur->apPage[0];
+  assert( pRoot->pgno==pCur->pgnoRoot );
+
+  /* If pCur->pKeyInfo is not NULL, then the caller that opened this cursor
+  ** expected to open it on an index b-tree. Otherwise, if pKeyInfo is
+  ** NULL, the caller expects a table b-tree. If this is not the case,
+  ** return an SQLITE_CORRUPT error. 
+  **
+  ** Earlier versions of SQLite assumed that this test could not fail
+  ** if the root page was already loaded when this function was called (i.e.
+  ** if pCur->iPage>=0). But this is not so if the database is corrupted 
+  ** in such a way that page pRoot is linked into a second b-tree table 
+  ** (or the freelist).  */
+  assert( pRoot->intKey==1 || pRoot->intKey==0 );
+  if( pRoot->isInit==0 || (pCur->pKeyInfo==0)!=pRoot->intKey ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+
+  pCur->aiIdx[0] = 0;
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidNKey|BTCF_ValidOvfl);
+
+  if( pRoot->nCell>0 ){
+    pCur->eState = CURSOR_VALID;
+  }else if( !pRoot->leaf ){
+    Pgno subpage;
+    if( pRoot->pgno!=1 ) return SQLITE_CORRUPT_BKPT;
+    subpage = get4byte(&pRoot->aData[pRoot->hdrOffset+8]);
+    pCur->eState = CURSOR_VALID;
+    rc = moveToChild(pCur, subpage);
+  }else{
+    pCur->eState = CURSOR_INVALID;
+  }
+  return rc;
+}
+
+/*
+** Move the cursor down to the left-most leaf entry beneath the
+** entry to which it is currently pointing.
+**
+** The left-most leaf is the one with the smallest key - the first
+** in ascending order.
+*/
+static int moveToLeftmost(BtCursor *pCur){
+  Pgno pgno;
+  int rc = SQLITE_OK;
+  MemPage *pPage;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  while( rc==SQLITE_OK && !(pPage = pCur->apPage[pCur->iPage])->leaf ){
+    assert( pCur->aiIdx[pCur->iPage]<pPage->nCell );
+    pgno = get4byte(findCell(pPage, pCur->aiIdx[pCur->iPage]));
+    rc = moveToChild(pCur, pgno);
+  }
+  return rc;
+}
+
+/*
+** Move the cursor down to the right-most leaf entry beneath the
+** page to which it is currently pointing.  Notice the difference
+** between moveToLeftmost() and moveToRightmost().  moveToLeftmost()
+** finds the left-most entry beneath the *entry* whereas moveToRightmost()
+** finds the right-most entry beneath the *page*.
+**
+** The right-most entry is the one with the largest key - the last
+** key in ascending order.
+*/
+static int moveToRightmost(BtCursor *pCur){
+  Pgno pgno;
+  int rc = SQLITE_OK;
+  MemPage *pPage = 0;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  while( !(pPage = pCur->apPage[pCur->iPage])->leaf ){
+    pgno = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+    pCur->aiIdx[pCur->iPage] = pPage->nCell;
+    rc = moveToChild(pCur, pgno);
+    if( rc ) return rc;
+  }
+  pCur->aiIdx[pCur->iPage] = pPage->nCell-1;
+  assert( pCur->info.nSize==0 );
+  assert( (pCur->curFlags & BTCF_ValidNKey)==0 );
+  return SQLITE_OK;
+}
+
+/* Move the cursor to the first entry in the table.  Return SQLITE_OK
+** on success.  Set *pRes to 0 if the cursor actually points to something
+** or set *pRes to 1 if the table is empty.
+*/
+SQLITE_PRIVATE int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
+  int rc;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  rc = moveToRoot(pCur);
+  if( rc==SQLITE_OK ){
+    if( pCur->eState==CURSOR_INVALID ){
+      assert( pCur->pgnoRoot==0 || pCur->apPage[pCur->iPage]->nCell==0 );
+      *pRes = 1;
+    }else{
+      assert( pCur->apPage[pCur->iPage]->nCell>0 );
+      *pRes = 0;
+      rc = moveToLeftmost(pCur);
+    }
+  }
+  return rc;
+}
+
+/* Move the cursor to the last entry in the table.  Return SQLITE_OK
+** on success.  Set *pRes to 0 if the cursor actually points to something
+** or set *pRes to 1 if the table is empty.
+*/
+SQLITE_PRIVATE int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
+  int rc;
+ 
+  assert( cursorHoldsMutex(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+
+  /* If the cursor already points to the last entry, this is a no-op. */
+  if( CURSOR_VALID==pCur->eState && (pCur->curFlags & BTCF_AtLast)!=0 ){
+#ifdef SQLITE_DEBUG
+    /* This block serves to assert() that the cursor really does point 
+    ** to the last entry in the b-tree. */
+    int ii;
+    for(ii=0; ii<pCur->iPage; ii++){
+      assert( pCur->aiIdx[ii]==pCur->apPage[ii]->nCell );
+    }
+    assert( pCur->aiIdx[pCur->iPage]==pCur->apPage[pCur->iPage]->nCell-1 );
+    assert( pCur->apPage[pCur->iPage]->leaf );
+#endif
+    return SQLITE_OK;
+  }
+
+  rc = moveToRoot(pCur);
+  if( rc==SQLITE_OK ){
+    if( CURSOR_INVALID==pCur->eState ){
+      assert( pCur->pgnoRoot==0 || pCur->apPage[pCur->iPage]->nCell==0 );
+      *pRes = 1;
+    }else{
+      assert( pCur->eState==CURSOR_VALID );
+      *pRes = 0;
+      rc = moveToRightmost(pCur);
+      if( rc==SQLITE_OK ){
+        pCur->curFlags |= BTCF_AtLast;
+      }else{
+        pCur->curFlags &= ~BTCF_AtLast;
+      }
+   
+    }
+  }
+  return rc;
+}
+
+/* Move the cursor so that it points to an entry near the key 
+** specified by pIdxKey or intKey.   Return a success code.
+**
+** For INTKEY tables, the intKey parameter is used.  pIdxKey 
+** must be NULL.  For index tables, pIdxKey is used and intKey
+** is ignored.
+**
+** If an exact match is not found, then the cursor is always
+** left pointing at a leaf page which would hold the entry if it
+** were present.  The cursor might point to an entry that comes
+** before or after the key.
+**
+** An integer is written into *pRes which is the result of
+** comparing the key with the entry to which the cursor is 
+** pointing.  The meaning of the integer written into
+** *pRes is as follows:
+**
+**     *pRes<0      The cursor is left pointing at an entry that
+**                  is smaller than intKey/pIdxKey or if the table is empty
+**                  and the cursor is therefore left point to nothing.
+**
+**     *pRes==0     The cursor is left pointing at an entry that
+**                  exactly matches intKey/pIdxKey.
+**
+**     *pRes>0      The cursor is left pointing at an entry that
+**                  is larger than intKey/pIdxKey.
+**
+*/
+SQLITE_PRIVATE int sqlite3BtreeMovetoUnpacked(
+  BtCursor *pCur,          /* The cursor to be moved */
+  UnpackedRecord *pIdxKey, /* Unpacked index key */
+  i64 intKey,              /* The table key */
+  int biasRight,           /* If true, bias the search to the high end */
+  int *pRes                /* Write search results here */
+){
+  int rc;
+  RecordCompare xRecordCompare;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  assert( pRes );
+  assert( (pIdxKey==0)==(pCur->pKeyInfo==0) );
+
+  /* If the cursor is already positioned at the point we are trying
+  ** to move to, then just return without doing any work */
+  if( pCur->eState==CURSOR_VALID && (pCur->curFlags & BTCF_ValidNKey)!=0
+   && pCur->apPage[0]->intKey 
+  ){
+    if( pCur->info.nKey==intKey ){
+      *pRes = 0;
+      return SQLITE_OK;
+    }
+    if( (pCur->curFlags & BTCF_AtLast)!=0 && pCur->info.nKey<intKey ){
+      *pRes = -1;
+      return SQLITE_OK;
+    }
+  }
+
+  if( pIdxKey ){
+    xRecordCompare = sqlite3VdbeFindCompare(pIdxKey);
+    pIdxKey->errCode = 0;
+    assert( pIdxKey->default_rc==1 
+         || pIdxKey->default_rc==0 
+         || pIdxKey->default_rc==-1
+    );
+  }else{
+    xRecordCompare = 0; /* All keys are integers */
+  }
+
+  rc = moveToRoot(pCur);
+  if( rc ){
+    return rc;
+  }
+  assert( pCur->pgnoRoot==0 || pCur->apPage[pCur->iPage] );
