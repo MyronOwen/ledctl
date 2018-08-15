@@ -57463,3 +57463,248 @@ SQLITE_PRIVATE int sqlite3BtreeMovetoUnpacked(
     return rc;
   }
   assert( pCur->pgnoRoot==0 || pCur->apPage[pCur->iPage] );
+  assert( pCur->pgnoRoot==0 || pCur->apPage[pCur->iPage]->isInit );
+  assert( pCur->eState==CURSOR_INVALID || pCur->apPage[pCur->iPage]->nCell>0 );
+  if( pCur->eState==CURSOR_INVALID ){
+    *pRes = -1;
+    assert( pCur->pgnoRoot==0 || pCur->apPage[pCur->iPage]->nCell==0 );
+    return SQLITE_OK;
+  }
+  assert( pCur->apPage[0]->intKey || pIdxKey );
+  for(;;){
+    int lwr, upr, idx, c;
+    Pgno chldPg;
+    MemPage *pPage = pCur->apPage[pCur->iPage];
+    u8 *pCell;                          /* Pointer to current cell in pPage */
+
+    /* pPage->nCell must be greater than zero. If this is the root-page
+    ** the cursor would have been INVALID above and this for(;;) loop
+    ** not run. If this is not the root-page, then the moveToChild() routine
+    ** would have already detected db corruption. Similarly, pPage must
+    ** be the right kind (index or table) of b-tree page. Otherwise
+    ** a moveToChild() or moveToRoot() call would have detected corruption.  */
+    assert( pPage->nCell>0 );
+    assert( pPage->intKey==(pIdxKey==0) );
+    lwr = 0;
+    upr = pPage->nCell-1;
+    assert( biasRight==0 || biasRight==1 );
+    idx = upr>>(1-biasRight); /* idx = biasRight ? upr : (lwr+upr)/2; */
+    pCur->aiIdx[pCur->iPage] = (u16)idx;
+    if( xRecordCompare==0 ){
+      for(;;){
+        i64 nCellKey;
+        pCell = findCell(pPage, idx) + pPage->childPtrSize;
+        if( pPage->intKeyLeaf ){
+          while( 0x80 <= *(pCell++) ){
+            if( pCell>=pPage->aDataEnd ) return SQLITE_CORRUPT_BKPT;
+          }
+        }
+        getVarint(pCell, (u64*)&nCellKey);
+        if( nCellKey<intKey ){
+          lwr = idx+1;
+          if( lwr>upr ){ c = -1; break; }
+        }else if( nCellKey>intKey ){
+          upr = idx-1;
+          if( lwr>upr ){ c = +1; break; }
+        }else{
+          assert( nCellKey==intKey );
+          pCur->curFlags |= BTCF_ValidNKey;
+          pCur->info.nKey = nCellKey;
+          pCur->aiIdx[pCur->iPage] = (u16)idx;
+          if( !pPage->leaf ){
+            lwr = idx;
+            goto moveto_next_layer;
+          }else{
+            *pRes = 0;
+            rc = SQLITE_OK;
+            goto moveto_finish;
+          }
+        }
+        assert( lwr+upr>=0 );
+        idx = (lwr+upr)>>1;  /* idx = (lwr+upr)/2; */
+      }
+    }else{
+      for(;;){
+        int nCell;
+        pCell = findCell(pPage, idx) + pPage->childPtrSize;
+
+        /* The maximum supported page-size is 65536 bytes. This means that
+        ** the maximum number of record bytes stored on an index B-Tree
+        ** page is less than 16384 bytes and may be stored as a 2-byte
+        ** varint. This information is used to attempt to avoid parsing 
+        ** the entire cell by checking for the cases where the record is 
+        ** stored entirely within the b-tree page by inspecting the first 
+        ** 2 bytes of the cell.
+        */
+        nCell = pCell[0];
+        if( nCell<=pPage->max1bytePayload ){
+          /* This branch runs if the record-size field of the cell is a
+          ** single byte varint and the record fits entirely on the main
+          ** b-tree page.  */
+          testcase( pCell+nCell+1==pPage->aDataEnd );
+          c = xRecordCompare(nCell, (void*)&pCell[1], pIdxKey);
+        }else if( !(pCell[1] & 0x80) 
+          && (nCell = ((nCell&0x7f)<<7) + pCell[1])<=pPage->maxLocal
+        ){
+          /* The record-size field is a 2 byte varint and the record 
+          ** fits entirely on the main b-tree page.  */
+          testcase( pCell+nCell+2==pPage->aDataEnd );
+          c = xRecordCompare(nCell, (void*)&pCell[2], pIdxKey);
+        }else{
+          /* The record flows over onto one or more overflow pages. In
+          ** this case the whole cell needs to be parsed, a buffer allocated
+          ** and accessPayload() used to retrieve the record into the
+          ** buffer before VdbeRecordCompare() can be called. */
+          void *pCellKey;
+          u8 * const pCellBody = pCell - pPage->childPtrSize;
+          btreeParseCellPtr(pPage, pCellBody, &pCur->info);
+          nCell = (int)pCur->info.nKey;
+          pCellKey = sqlite3Malloc( nCell );
+          if( pCellKey==0 ){
+            rc = SQLITE_NOMEM;
+            goto moveto_finish;
+          }
+          pCur->aiIdx[pCur->iPage] = (u16)idx;
+          rc = accessPayload(pCur, 0, nCell, (unsigned char*)pCellKey, 2);
+          if( rc ){
+            sqlite3_free(pCellKey);
+            goto moveto_finish;
+          }
+          c = xRecordCompare(nCell, pCellKey, pIdxKey);
+          sqlite3_free(pCellKey);
+        }
+        assert( 
+            (pIdxKey->errCode!=SQLITE_CORRUPT || c==0)
+         && (pIdxKey->errCode!=SQLITE_NOMEM || pCur->pBtree->db->mallocFailed)
+        );
+        if( c<0 ){
+          lwr = idx+1;
+        }else if( c>0 ){
+          upr = idx-1;
+        }else{
+          assert( c==0 );
+          *pRes = 0;
+          rc = SQLITE_OK;
+          pCur->aiIdx[pCur->iPage] = (u16)idx;
+          if( pIdxKey->errCode ) rc = SQLITE_CORRUPT;
+          goto moveto_finish;
+        }
+        if( lwr>upr ) break;
+        assert( lwr+upr>=0 );
+        idx = (lwr+upr)>>1;  /* idx = (lwr+upr)/2 */
+      }
+    }
+    assert( lwr==upr+1 || (pPage->intKey && !pPage->leaf) );
+    assert( pPage->isInit );
+    if( pPage->leaf ){
+      assert( pCur->aiIdx[pCur->iPage]<pCur->apPage[pCur->iPage]->nCell );
+      pCur->aiIdx[pCur->iPage] = (u16)idx;
+      *pRes = c;
+      rc = SQLITE_OK;
+      goto moveto_finish;
+    }
+moveto_next_layer:
+    if( lwr>=pPage->nCell ){
+      chldPg = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+    }else{
+      chldPg = get4byte(findCell(pPage, lwr));
+    }
+    pCur->aiIdx[pCur->iPage] = (u16)lwr;
+    rc = moveToChild(pCur, chldPg);
+    if( rc ) break;
+  }
+moveto_finish:
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+  return rc;
+}
+
+
+/*
+** Return TRUE if the cursor is not pointing at an entry of the table.
+**
+** TRUE will be returned after a call to sqlite3BtreeNext() moves
+** past the last entry in the table or sqlite3BtreePrev() moves past
+** the first entry.  TRUE is also returned if the table is empty.
+*/
+SQLITE_PRIVATE int sqlite3BtreeEof(BtCursor *pCur){
+  /* TODO: What if the cursor is in CURSOR_REQUIRESEEK but all table entries
+  ** have been deleted? This API will need to change to return an error code
+  ** as well as the boolean result value.
+  */
+  return (CURSOR_VALID!=pCur->eState);
+}
+
+/*
+** Advance the cursor to the next entry in the database.  If
+** successful then set *pRes=0.  If the cursor
+** was already pointing to the last entry in the database before
+** this routine was called, then set *pRes=1.
+**
+** The main entry point is sqlite3BtreeNext().  That routine is optimized
+** for the common case of merely incrementing the cell counter BtCursor.aiIdx
+** to the next cell on the current page.  The (slower) btreeNext() helper
+** routine is called when it is necessary to move to a different page or
+** to restore the cursor.
+**
+** The calling function will set *pRes to 0 or 1.  The initial *pRes value
+** will be 1 if the cursor being stepped corresponds to an SQL index and
+** if this routine could have been skipped if that SQL index had been
+** a unique index.  Otherwise the caller will have set *pRes to zero.
+** Zero is the common case. The btree implementation is free to use the
+** initial *pRes value as a hint to improve performance, but the current
+** SQLite btree implementation does not. (Note that the comdb2 btree
+** implementation does use this hint, however.)
+*/
+static SQLITE_NOINLINE int btreeNext(BtCursor *pCur, int *pRes){
+  int rc;
+  int idx;
+  MemPage *pPage;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->skipNext==0 || pCur->eState!=CURSOR_VALID );
+  assert( *pRes==0 );
+  if( pCur->eState!=CURSOR_VALID ){
+    assert( (pCur->curFlags & BTCF_ValidOvfl)==0 );
+    rc = restoreCursorPosition(pCur);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    if( CURSOR_INVALID==pCur->eState ){
+      *pRes = 1;
+      return SQLITE_OK;
+    }
+    if( pCur->skipNext ){
+      assert( pCur->eState==CURSOR_VALID || pCur->eState==CURSOR_SKIPNEXT );
+      pCur->eState = CURSOR_VALID;
+      if( pCur->skipNext>0 ){
+        pCur->skipNext = 0;
+        return SQLITE_OK;
+      }
+      pCur->skipNext = 0;
+    }
+  }
+
+  pPage = pCur->apPage[pCur->iPage];
+  idx = ++pCur->aiIdx[pCur->iPage];
+  assert( pPage->isInit );
+
+  /* If the database file is corrupt, it is possible for the value of idx 
+  ** to be invalid here. This can only occur if a second cursor modifies
+  ** the page while cursor pCur is holding a reference to it. Which can
+  ** only happen if the database is corrupt in such a way as to link the
+  ** page into more than one b-tree structure. */
+  testcase( idx>pPage->nCell );
+
+  if( idx>=pPage->nCell ){
+    if( !pPage->leaf ){
+      rc = moveToChild(pCur, get4byte(&pPage->aData[pPage->hdrOffset+8]));
+      if( rc ) return rc;
+      return moveToLeftmost(pCur);
+    }
+    do{
+      if( pCur->iPage==0 ){
+        *pRes = 1;
+        pCur->eState = CURSOR_INVALID;
+        return SQLITE_OK;
+      }
