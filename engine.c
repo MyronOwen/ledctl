@@ -57708,3 +57708,230 @@ static SQLITE_NOINLINE int btreeNext(BtCursor *pCur, int *pRes){
         pCur->eState = CURSOR_INVALID;
         return SQLITE_OK;
       }
+      moveToParent(pCur);
+      pPage = pCur->apPage[pCur->iPage];
+    }while( pCur->aiIdx[pCur->iPage]>=pPage->nCell );
+    if( pPage->intKey ){
+      return sqlite3BtreeNext(pCur, pRes);
+    }else{
+      return SQLITE_OK;
+    }
+  }
+  if( pPage->leaf ){
+    return SQLITE_OK;
+  }else{
+    return moveToLeftmost(pCur);
+  }
+}
+SQLITE_PRIVATE int sqlite3BtreeNext(BtCursor *pCur, int *pRes){
+  MemPage *pPage;
+  assert( cursorHoldsMutex(pCur) );
+  assert( pRes!=0 );
+  assert( *pRes==0 || *pRes==1 );
+  assert( pCur->skipNext==0 || pCur->eState!=CURSOR_VALID );
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+  *pRes = 0;
+  if( pCur->eState!=CURSOR_VALID ) return btreeNext(pCur, pRes);
+  pPage = pCur->apPage[pCur->iPage];
+  if( (++pCur->aiIdx[pCur->iPage])>=pPage->nCell ){
+    pCur->aiIdx[pCur->iPage]--;
+    return btreeNext(pCur, pRes);
+  }
+  if( pPage->leaf ){
+    return SQLITE_OK;
+  }else{
+    return moveToLeftmost(pCur);
+  }
+}
+
+/*
+** Step the cursor to the back to the previous entry in the database.  If
+** successful then set *pRes=0.  If the cursor
+** was already pointing to the first entry in the database before
+** this routine was called, then set *pRes=1.
+**
+** The main entry point is sqlite3BtreePrevious().  That routine is optimized
+** for the common case of merely decrementing the cell counter BtCursor.aiIdx
+** to the previous cell on the current page.  The (slower) btreePrevious()
+** helper routine is called when it is necessary to move to a different page
+** or to restore the cursor.
+**
+** The calling function will set *pRes to 0 or 1.  The initial *pRes value
+** will be 1 if the cursor being stepped corresponds to an SQL index and
+** if this routine could have been skipped if that SQL index had been
+** a unique index.  Otherwise the caller will have set *pRes to zero.
+** Zero is the common case. The btree implementation is free to use the
+** initial *pRes value as a hint to improve performance, but the current
+** SQLite btree implementation does not. (Note that the comdb2 btree
+** implementation does use this hint, however.)
+*/
+static SQLITE_NOINLINE int btreePrevious(BtCursor *pCur, int *pRes){
+  int rc;
+  MemPage *pPage;
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( pRes!=0 );
+  assert( *pRes==0 );
+  assert( pCur->skipNext==0 || pCur->eState!=CURSOR_VALID );
+  assert( (pCur->curFlags & (BTCF_AtLast|BTCF_ValidOvfl|BTCF_ValidNKey))==0 );
+  assert( pCur->info.nSize==0 );
+  if( pCur->eState!=CURSOR_VALID ){
+    rc = restoreCursorPosition(pCur);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    if( CURSOR_INVALID==pCur->eState ){
+      *pRes = 1;
+      return SQLITE_OK;
+    }
+    if( pCur->skipNext ){
+      assert( pCur->eState==CURSOR_VALID || pCur->eState==CURSOR_SKIPNEXT );
+      pCur->eState = CURSOR_VALID;
+      if( pCur->skipNext<0 ){
+        pCur->skipNext = 0;
+        return SQLITE_OK;
+      }
+      pCur->skipNext = 0;
+    }
+  }
+
+  pPage = pCur->apPage[pCur->iPage];
+  assert( pPage->isInit );
+  if( !pPage->leaf ){
+    int idx = pCur->aiIdx[pCur->iPage];
+    rc = moveToChild(pCur, get4byte(findCell(pPage, idx)));
+    if( rc ) return rc;
+    rc = moveToRightmost(pCur);
+  }else{
+    while( pCur->aiIdx[pCur->iPage]==0 ){
+      if( pCur->iPage==0 ){
+        pCur->eState = CURSOR_INVALID;
+        *pRes = 1;
+        return SQLITE_OK;
+      }
+      moveToParent(pCur);
+    }
+    assert( pCur->info.nSize==0 );
+    assert( (pCur->curFlags & (BTCF_ValidNKey|BTCF_ValidOvfl))==0 );
+
+    pCur->aiIdx[pCur->iPage]--;
+    pPage = pCur->apPage[pCur->iPage];
+    if( pPage->intKey && !pPage->leaf ){
+      rc = sqlite3BtreePrevious(pCur, pRes);
+    }else{
+      rc = SQLITE_OK;
+    }
+  }
+  return rc;
+}
+SQLITE_PRIVATE int sqlite3BtreePrevious(BtCursor *pCur, int *pRes){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pRes!=0 );
+  assert( *pRes==0 || *pRes==1 );
+  assert( pCur->skipNext==0 || pCur->eState!=CURSOR_VALID );
+  *pRes = 0;
+  pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidOvfl|BTCF_ValidNKey);
+  pCur->info.nSize = 0;
+  if( pCur->eState!=CURSOR_VALID
+   || pCur->aiIdx[pCur->iPage]==0
+   || pCur->apPage[pCur->iPage]->leaf==0
+  ){
+    return btreePrevious(pCur, pRes);
+  }
+  pCur->aiIdx[pCur->iPage]--;
+  return SQLITE_OK;
+}
+
+/*
+** Allocate a new page from the database file.
+**
+** The new page is marked as dirty.  (In other words, sqlite3PagerWrite()
+** has already been called on the new page.)  The new page has also
+** been referenced and the calling routine is responsible for calling
+** sqlite3PagerUnref() on the new page when it is done.
+**
+** SQLITE_OK is returned on success.  Any other return value indicates
+** an error.  *ppPage and *pPgno are undefined in the event of an error.
+** Do not invoke sqlite3PagerUnref() on *ppPage if an error is returned.
+**
+** If the "nearby" parameter is not 0, then an effort is made to 
+** locate a page close to the page number "nearby".  This can be used in an
+** attempt to keep related pages close to each other in the database file,
+** which in turn can make database access faster.
+**
+** If the eMode parameter is BTALLOC_EXACT and the nearby page exists
+** anywhere on the free-list, then it is guaranteed to be returned.  If
+** eMode is BTALLOC_LT then the page returned will be less than or equal
+** to nearby if any such page exists.  If eMode is BTALLOC_ANY then there
+** are no restrictions on which page is returned.
+*/
+static int allocateBtreePage(
+  BtShared *pBt,         /* The btree */
+  MemPage **ppPage,      /* Store pointer to the allocated page here */
+  Pgno *pPgno,           /* Store the page number here */
+  Pgno nearby,           /* Search for a page near this one */
+  u8 eMode               /* BTALLOC_EXACT, BTALLOC_LT, or BTALLOC_ANY */
+){
+  MemPage *pPage1;
+  int rc;
+  u32 n;     /* Number of pages on the freelist */
+  u32 k;     /* Number of leaves on the trunk of the freelist */
+  MemPage *pTrunk = 0;
+  MemPage *pPrevTrunk = 0;
+  Pgno mxPage;     /* Total size of the database file */
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( eMode==BTALLOC_ANY || (nearby>0 && IfNotOmitAV(pBt->autoVacuum)) );
+  pPage1 = pBt->pPage1;
+  mxPage = btreePagecount(pBt);
+  /* EVIDENCE-OF: R-05119-02637 The 4-byte big-endian integer at offset 36
+  ** stores stores the total number of pages on the freelist. */
+  n = get4byte(&pPage1->aData[36]);
+  testcase( n==mxPage-1 );
+  if( n>=mxPage ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  if( n>0 ){
+    /* There are pages on the freelist.  Reuse one of those pages. */
+    Pgno iTrunk;
+    u8 searchList = 0; /* If the free-list must be searched for 'nearby' */
+    
+    /* If eMode==BTALLOC_EXACT and a query of the pointer-map
+    ** shows that the page 'nearby' is somewhere on the free-list, then
+    ** the entire-list will be searched for that page.
+    */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( eMode==BTALLOC_EXACT ){
+      if( nearby<=mxPage ){
+        u8 eType;
+        assert( nearby>0 );
+        assert( pBt->autoVacuum );
+        rc = ptrmapGet(pBt, nearby, &eType, 0);
+        if( rc ) return rc;
+        if( eType==PTRMAP_FREEPAGE ){
+          searchList = 1;
+        }
+      }
+    }else if( eMode==BTALLOC_LE ){
+      searchList = 1;
+    }
+#endif
+
+    /* Decrement the free-list count by 1. Set iTrunk to the index of the
+    ** first free-list trunk page. iPrevTrunk is initially 1.
+    */
+    rc = sqlite3PagerWrite(pPage1->pDbPage);
+    if( rc ) return rc;
+    put4byte(&pPage1->aData[36], n-1);
+
+    /* The code within this loop is run only once if the 'searchList' variable
+    ** is not true. Otherwise, it runs once for each trunk-page on the
+    ** free-list until the page 'nearby' is located (eMode==BTALLOC_EXACT)
+    ** or until a page less than 'nearby' is located (eMode==BTALLOC_LT)
+    */
+    do {
+      pPrevTrunk = pTrunk;
+      if( pPrevTrunk ){
+        /* EVIDENCE-OF: R-01506-11053 The first integer on a freelist trunk page
+        ** is the page number of the next freelist trunk page in the list or
