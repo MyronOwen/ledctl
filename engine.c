@@ -59391,3 +59391,222 @@ static int balance_nonroot(
       ** the dropCell() routine will overwrite the entire cell with zeroes.
       ** In this case, temporarily copy the cell into the aOvflSpace[]
       ** buffer. It will be copied out again as soon as the aSpace[] buffer
+      ** is allocated.  */
+      if( pBt->btsFlags & BTS_SECURE_DELETE ){
+        int iOff;
+
+        iOff = SQLITE_PTR_TO_INT(apDiv[i]) - SQLITE_PTR_TO_INT(pParent->aData);
+        if( (iOff+szNew[i])>(int)pBt->usableSize ){
+          rc = SQLITE_CORRUPT_BKPT;
+          memset(apOld, 0, (i+1)*sizeof(MemPage*));
+          goto balance_cleanup;
+        }else{
+          memcpy(&aOvflSpace[iOff], apDiv[i], szNew[i]);
+          apDiv[i] = &aOvflSpace[apDiv[i]-pParent->aData];
+        }
+      }
+      dropCell(pParent, i+nxDiv-pParent->nOverflow, szNew[i], &rc);
+    }
+  }
+
+  /* Make nMaxCells a multiple of 4 in order to preserve 8-byte
+  ** alignment */
+  nMaxCells = (nMaxCells + 3)&~3;
+
+  /*
+  ** Allocate space for memory structures
+  */
+  szScratch =
+       nMaxCells*sizeof(u8*)                       /* apCell */
+     + nMaxCells*sizeof(u16)                       /* szCell */
+     + pBt->pageSize;                              /* aSpace1 */
+
+  /* EVIDENCE-OF: R-28375-38319 SQLite will never request a scratch buffer
+  ** that is more than 6 times the database page size. */
+  assert( szScratch<=6*(int)pBt->pageSize );
+  apCell = sqlite3ScratchMalloc( szScratch ); 
+  if( apCell==0 ){
+    rc = SQLITE_NOMEM;
+    goto balance_cleanup;
+  }
+  szCell = (u16*)&apCell[nMaxCells];
+  aSpace1 = (u8*)&szCell[nMaxCells];
+  assert( EIGHT_BYTE_ALIGNMENT(aSpace1) );
+
+  /*
+  ** Load pointers to all cells on sibling pages and the divider cells
+  ** into the local apCell[] array.  Make copies of the divider cells
+  ** into space obtained from aSpace1[]. The divider cells have already
+  ** been removed from pParent.
+  **
+  ** If the siblings are on leaf pages, then the child pointers of the
+  ** divider cells are stripped from the cells before they are copied
+  ** into aSpace1[].  In this way, all cells in apCell[] are without
+  ** child pointers.  If siblings are not leaves, then all cell in
+  ** apCell[] include child pointers.  Either way, all cells in apCell[]
+  ** are alike.
+  **
+  ** leafCorrection:  4 if pPage is a leaf.  0 if pPage is not a leaf.
+  **       leafData:  1 if pPage holds key+data and pParent holds only keys.
+  */
+  leafCorrection = apOld[0]->leaf*4;
+  leafData = apOld[0]->intKeyLeaf;
+  for(i=0; i<nOld; i++){
+    int limit;
+    MemPage *pOld = apOld[i];
+
+    limit = pOld->nCell+pOld->nOverflow;
+    if( pOld->nOverflow>0 ){
+      for(j=0; j<limit; j++){
+        assert( nCell<nMaxCells );
+        apCell[nCell] = findOverflowCell(pOld, j);
+        szCell[nCell] = cellSizePtr(pOld, apCell[nCell]);
+        nCell++;
+      }
+    }else{
+      u8 *aData = pOld->aData;
+      u16 maskPage = pOld->maskPage;
+      u16 cellOffset = pOld->cellOffset;
+      for(j=0; j<limit; j++){
+        assert( nCell<nMaxCells );
+        apCell[nCell] = findCellv2(aData, maskPage, cellOffset, j);
+        szCell[nCell] = cellSizePtr(pOld, apCell[nCell]);
+        nCell++;
+      }
+    }       
+    cntOld[i] = nCell;
+    if( i<nOld-1 && !leafData){
+      u16 sz = (u16)szNew[i];
+      u8 *pTemp;
+      assert( nCell<nMaxCells );
+      szCell[nCell] = sz;
+      pTemp = &aSpace1[iSpace1];
+      iSpace1 += sz;
+      assert( sz<=pBt->maxLocal+23 );
+      assert( iSpace1 <= (int)pBt->pageSize );
+      memcpy(pTemp, apDiv[i], sz);
+      apCell[nCell] = pTemp+leafCorrection;
+      assert( leafCorrection==0 || leafCorrection==4 );
+      szCell[nCell] = szCell[nCell] - leafCorrection;
+      if( !pOld->leaf ){
+        assert( leafCorrection==0 );
+        assert( pOld->hdrOffset==0 );
+        /* The right pointer of the child page pOld becomes the left
+        ** pointer of the divider cell */
+        memcpy(apCell[nCell], &pOld->aData[8], 4);
+      }else{
+        assert( leafCorrection==4 );
+        if( szCell[nCell]<4 ){
+          /* Do not allow any cells smaller than 4 bytes. If a smaller cell
+          ** does exist, pad it with 0x00 bytes. */
+          assert( szCell[nCell]==3 );
+          assert( apCell[nCell]==&aSpace1[iSpace1-3] );
+          aSpace1[iSpace1++] = 0x00;
+          szCell[nCell] = 4;
+        }
+      }
+      nCell++;
+    }
+  }
+
+  /*
+  ** Figure out the number of pages needed to hold all nCell cells.
+  ** Store this number in "k".  Also compute szNew[] which is the total
+  ** size of all cells on the i-th page and cntNew[] which is the index
+  ** in apCell[] of the cell that divides page i from page i+1.  
+  ** cntNew[k] should equal nCell.
+  **
+  ** Values computed by this block:
+  **
+  **           k: The total number of sibling pages
+  **    szNew[i]: Spaced used on the i-th sibling page.
+  **   cntNew[i]: Index in apCell[] and szCell[] for the first cell to
+  **              the right of the i-th sibling page.
+  ** usableSpace: Number of bytes of space available on each sibling.
+  ** 
+  */
+  usableSpace = pBt->usableSize - 12 + leafCorrection;
+  for(subtotal=k=i=0; i<nCell; i++){
+    assert( i<nMaxCells );
+    subtotal += szCell[i] + 2;
+    if( subtotal > usableSpace ){
+      szNew[k] = subtotal - szCell[i] - 2;
+      cntNew[k] = i;
+      if( leafData ){ i--; }
+      subtotal = 0;
+      k++;
+      if( k>NB+1 ){ rc = SQLITE_CORRUPT_BKPT; goto balance_cleanup; }
+    }
+  }
+  szNew[k] = subtotal;
+  cntNew[k] = nCell;
+  k++;
+
+  /*
+  ** The packing computed by the previous block is biased toward the siblings
+  ** on the left side (siblings with smaller keys). The left siblings are
+  ** always nearly full, while the right-most sibling might be nearly empty.
+  ** The next block of code attempts to adjust the packing of siblings to
+  ** get a better balance.
+  **
+  ** This adjustment is more than an optimization.  The packing above might
+  ** be so out of balance as to be illegal.  For example, the right-most
+  ** sibling might be completely empty.  This adjustment is not optional.
+  */
+  for(i=k-1; i>0; i--){
+    int szRight = szNew[i];  /* Size of sibling on the right */
+    int szLeft = szNew[i-1]; /* Size of sibling on the left */
+    int r;              /* Index of right-most cell in left sibling */
+    int d;              /* Index of first cell to the left of right sibling */
+
+    r = cntNew[i-1] - 1;
+    d = r + 1 - leafData;
+    assert( d<nMaxCells );
+    assert( r<nMaxCells );
+    while( szRight==0 
+       || (!bBulk && szRight+szCell[d]+2<=szLeft-(szCell[r]+2)) 
+    ){
+      szRight += szCell[d] + 2;
+      szLeft -= szCell[r] + 2;
+      cntNew[i-1]--;
+      r = cntNew[i-1] - 1;
+      d = r + 1 - leafData;
+    }
+    szNew[i] = szRight;
+    szNew[i-1] = szLeft;
+  }
+
+  /* Sanity check:  For a non-corrupt database file one of the follwing
+  ** must be true:
+  **    (1) We found one or more cells (cntNew[0])>0), or
+  **    (2) pPage is a virtual root page.  A virtual root page is when
+  **        the real root page is page 1 and we are the only child of
+  **        that page.
+  */
+  assert( cntNew[0]>0 || (pParent->pgno==1 && pParent->nCell==0) || CORRUPT_DB);
+  TRACE(("BALANCE: old: %d(nc=%d) %d(nc=%d) %d(nc=%d)\n",
+    apOld[0]->pgno, apOld[0]->nCell,
+    nOld>=2 ? apOld[1]->pgno : 0, nOld>=2 ? apOld[1]->nCell : 0,
+    nOld>=3 ? apOld[2]->pgno : 0, nOld>=3 ? apOld[2]->nCell : 0
+  ));
+
+  /*
+  ** Allocate k new pages.  Reuse old pages where possible.
+  */
+  if( apOld[0]->pgno<=1 ){
+    rc = SQLITE_CORRUPT_BKPT;
+    goto balance_cleanup;
+  }
+  pageFlags = apOld[0]->aData[0];
+  for(i=0; i<k; i++){
+    MemPage *pNew;
+    if( i<nOld ){
+      pNew = apNew[i] = apOld[i];
+      apOld[i] = 0;
+      rc = sqlite3PagerWrite(pNew->pDbPage);
+      nNew++;
+      if( rc ) goto balance_cleanup;
+    }else{
+      assert( i>0 );
+      rc = allocateBtreePage(pBt, &pNew, &pgno, (bBulk ? 1 : pgno), 0);
+      if( rc ) goto balance_cleanup;
