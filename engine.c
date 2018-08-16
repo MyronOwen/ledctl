@@ -58786,3 +58786,209 @@ static void rebuildPage(
   put2byte(&aData[hdr+1], 0);
   put2byte(&aData[hdr+3], pPg->nCell);
   put2byte(&aData[hdr+5], pData - aData);
+  aData[hdr+7] = 0x00;
+}
+
+/*
+** Array apCell[] contains nCell pointers to b-tree cells. Array szCell
+** contains the size in bytes of each such cell. This function attempts to 
+** add the cells stored in the array to page pPg. If it cannot (because 
+** the page needs to be defragmented before the cells will fit), non-zero
+** is returned. Otherwise, if the cells are added successfully, zero is
+** returned.
+**
+** Argument pCellptr points to the first entry in the cell-pointer array
+** (part of page pPg) to populate. After cell apCell[0] is written to the
+** page body, a 16-bit offset is written to pCellptr. And so on, for each
+** cell in the array. It is the responsibility of the caller to ensure
+** that it is safe to overwrite this part of the cell-pointer array.
+**
+** When this function is called, *ppData points to the start of the 
+** content area on page pPg. If the size of the content area is extended,
+** *ppData is updated to point to the new start of the content area
+** before returning.
+**
+** Finally, argument pBegin points to the byte immediately following the
+** end of the space required by this page for the cell-pointer area (for
+** all cells - not just those inserted by the current call). If the content
+** area must be extended to before this point in order to accomodate all
+** cells in apCell[], then the cells do not fit and non-zero is returned.
+*/
+static int pageInsertArray(
+  MemPage *pPg,                   /* Page to add cells to */
+  u8 *pBegin,                     /* End of cell-pointer array */
+  u8 **ppData,                    /* IN/OUT: Page content -area pointer */
+  u8 *pCellptr,                   /* Pointer to cell-pointer area */
+  int nCell,                      /* Number of cells to add to pPg */
+  u8 **apCell,                    /* Array of cells */
+  u16 *szCell                     /* Array of cell sizes */
+){
+  int i;
+  u8 *aData = pPg->aData;
+  u8 *pData = *ppData;
+  const int bFreelist = aData[1] || aData[2];
+  assert( CORRUPT_DB || pPg->hdrOffset==0 );    /* Never called on page 1 */
+  for(i=0; i<nCell; i++){
+    int sz = szCell[i];
+    int rc;
+    u8 *pSlot;
+    if( bFreelist==0 || (pSlot = pageFindSlot(pPg, sz, &rc, 0))==0 ){
+      pData -= sz;
+      if( pData<pBegin ) return 1;
+      pSlot = pData;
+    }
+    memcpy(pSlot, apCell[i], sz);
+    put2byte(pCellptr, (pSlot - aData));
+    pCellptr += 2;
+  }
+  *ppData = pData;
+  return 0;
+}
+
+/*
+** Array apCell[] contains nCell pointers to b-tree cells. Array szCell 
+** contains the size in bytes of each such cell. This function adds the
+** space associated with each cell in the array that is currently stored 
+** within the body of pPg to the pPg free-list. The cell-pointers and other
+** fields of the page are not updated.
+**
+** This function returns the total number of cells added to the free-list.
+*/
+static int pageFreeArray(
+  MemPage *pPg,                   /* Page to edit */
+  int nCell,                      /* Cells to delete */
+  u8 **apCell,                    /* Array of cells */
+  u16 *szCell                     /* Array of cell sizes */
+){
+  u8 * const aData = pPg->aData;
+  u8 * const pEnd = &aData[pPg->pBt->usableSize];
+  u8 * const pStart = &aData[pPg->hdrOffset + 8 + pPg->childPtrSize];
+  int nRet = 0;
+  int i;
+  u8 *pFree = 0;
+  int szFree = 0;
+
+  for(i=0; i<nCell; i++){
+    u8 *pCell = apCell[i];
+    if( pCell>=pStart && pCell<pEnd ){
+      int sz = szCell[i];
+      if( pFree!=(pCell + sz) ){
+        if( pFree ){
+          assert( pFree>aData && (pFree - aData)<65536 );
+          freeSpace(pPg, (u16)(pFree - aData), szFree);
+        }
+        pFree = pCell;
+        szFree = sz;
+        if( pFree+sz>pEnd ) return 0;
+      }else{
+        pFree = pCell;
+        szFree += sz;
+      }
+      nRet++;
+    }
+  }
+  if( pFree ){
+    assert( pFree>aData && (pFree - aData)<65536 );
+    freeSpace(pPg, (u16)(pFree - aData), szFree);
+  }
+  return nRet;
+}
+
+/*
+** apCell[] and szCell[] contains pointers to and sizes of all cells in the
+** pages being balanced.  The current page, pPg, has pPg->nCell cells starting
+** with apCell[iOld].  After balancing, this page should hold nNew cells
+** starting at apCell[iNew].
+**
+** This routine makes the necessary adjustments to pPg so that it contains
+** the correct cells after being balanced.
+**
+** The pPg->nFree field is invalid when this function returns. It is the
+** responsibility of the caller to set it correctly.
+*/
+static void editPage(
+  MemPage *pPg,                   /* Edit this page */
+  int iOld,                       /* Index of first cell currently on page */
+  int iNew,                       /* Index of new first cell on page */
+  int nNew,                       /* Final number of cells on page */
+  u8 **apCell,                    /* Array of cells */
+  u16 *szCell                     /* Array of cell sizes */
+){
+  u8 * const aData = pPg->aData;
+  const int hdr = pPg->hdrOffset;
+  u8 *pBegin = &pPg->aCellIdx[nNew * 2];
+  int nCell = pPg->nCell;       /* Cells stored on pPg */
+  u8 *pData;
+  u8 *pCellptr;
+  int i;
+  int iOldEnd = iOld + pPg->nCell + pPg->nOverflow;
+  int iNewEnd = iNew + nNew;
+
+#ifdef SQLITE_DEBUG
+  u8 *pTmp = sqlite3PagerTempSpace(pPg->pBt->pPager);
+  memcpy(pTmp, aData, pPg->pBt->usableSize);
+#endif
+
+  /* Remove cells from the start and end of the page */
+  if( iOld<iNew ){
+    int nShift = pageFreeArray(
+        pPg, iNew-iOld, &apCell[iOld], &szCell[iOld]
+    );
+    memmove(pPg->aCellIdx, &pPg->aCellIdx[nShift*2], nCell*2);
+    nCell -= nShift;
+  }
+  if( iNewEnd < iOldEnd ){
+    nCell -= pageFreeArray(
+        pPg, iOldEnd-iNewEnd, &apCell[iNewEnd], &szCell[iNewEnd]
+    );
+  }
+
+  pData = &aData[get2byteNotZero(&aData[hdr+5])];
+  if( pData<pBegin ) goto editpage_fail;
+
+  /* Add cells to the start of the page */
+  if( iNew<iOld ){
+    int nAdd = MIN(nNew,iOld-iNew);
+    assert( (iOld-iNew)<nNew || nCell==0 || CORRUPT_DB );
+    pCellptr = pPg->aCellIdx;
+    memmove(&pCellptr[nAdd*2], pCellptr, nCell*2);
+    if( pageInsertArray(
+          pPg, pBegin, &pData, pCellptr,
+          nAdd, &apCell[iNew], &szCell[iNew]
+    ) ) goto editpage_fail;
+    nCell += nAdd;
+  }
+
+  /* Add any overflow cells */
+  for(i=0; i<pPg->nOverflow; i++){
+    int iCell = (iOld + pPg->aiOvfl[i]) - iNew;
+    if( iCell>=0 && iCell<nNew ){
+      pCellptr = &pPg->aCellIdx[iCell * 2];
+      memmove(&pCellptr[2], pCellptr, (nCell - iCell) * 2);
+      nCell++;
+      if( pageInsertArray(
+            pPg, pBegin, &pData, pCellptr,
+            1, &apCell[iCell + iNew], &szCell[iCell + iNew]
+      ) ) goto editpage_fail;
+    }
+  }
+
+  /* Append cells to the end of the page */
+  pCellptr = &pPg->aCellIdx[nCell*2];
+  if( pageInsertArray(
+        pPg, pBegin, &pData, pCellptr,
+        nNew-nCell, &apCell[iNew+nCell], &szCell[iNew+nCell]
+  ) ) goto editpage_fail;
+
+  pPg->nCell = nNew;
+  pPg->nOverflow = 0;
+
+  put2byte(&aData[hdr+3], pPg->nCell);
+  put2byte(&aData[hdr+5], pData - aData);
+
+#ifdef SQLITE_DEBUG
+  for(i=0; i<nNew && !CORRUPT_DB; i++){
+    u8 *pCell = apCell[i+iNew];
+    int iOff = get2byte(&pPg->aCellIdx[i*2]);
+    if( pCell>=aData && pCell<&aData[pPg->pBt->usableSize] ){
+      pCell = &pTmp[pCell - aData];
