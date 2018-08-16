@@ -58545,3 +58545,244 @@ static int fillInCell(
       }
 
       /* If pToRelease is not zero than pPrior points into the data area
+      ** of pToRelease.  Make sure pToRelease is still writeable. */
+      assert( pToRelease==0 || sqlite3PagerIswriteable(pToRelease->pDbPage) );
+
+      /* If pPrior is part of the data area of pPage, then make sure pPage
+      ** is still writeable */
+      assert( pPrior<pPage->aData || pPrior>=&pPage->aData[pBt->pageSize]
+            || sqlite3PagerIswriteable(pPage->pDbPage) );
+
+      put4byte(pPrior, pgnoOvfl);
+      releasePage(pToRelease);
+      pToRelease = pOvfl;
+      pPrior = pOvfl->aData;
+      put4byte(pPrior, 0);
+      pPayload = &pOvfl->aData[4];
+      spaceLeft = pBt->usableSize - 4;
+    }
+    n = nPayload;
+    if( n>spaceLeft ) n = spaceLeft;
+
+    /* If pToRelease is not zero than pPayload points into the data area
+    ** of pToRelease.  Make sure pToRelease is still writeable. */
+    assert( pToRelease==0 || sqlite3PagerIswriteable(pToRelease->pDbPage) );
+
+    /* If pPayload is part of the data area of pPage, then make sure pPage
+    ** is still writeable */
+    assert( pPayload<pPage->aData || pPayload>=&pPage->aData[pBt->pageSize]
+            || sqlite3PagerIswriteable(pPage->pDbPage) );
+
+    if( nSrc>0 ){
+      if( n>nSrc ) n = nSrc;
+      assert( pSrc );
+      memcpy(pPayload, pSrc, n);
+    }else{
+      memset(pPayload, 0, n);
+    }
+    nPayload -= n;
+    pPayload += n;
+    pSrc += n;
+    nSrc -= n;
+    spaceLeft -= n;
+    if( nSrc==0 ){
+      nSrc = nData;
+      pSrc = pData;
+    }
+  }
+  releasePage(pToRelease);
+  return SQLITE_OK;
+}
+
+/*
+** Remove the i-th cell from pPage.  This routine effects pPage only.
+** The cell content is not freed or deallocated.  It is assumed that
+** the cell content has been copied someplace else.  This routine just
+** removes the reference to the cell from pPage.
+**
+** "sz" must be the number of bytes in the cell.
+*/
+static void dropCell(MemPage *pPage, int idx, int sz, int *pRC){
+  u32 pc;         /* Offset to cell content of cell being deleted */
+  u8 *data;       /* pPage->aData */
+  u8 *ptr;        /* Used to move bytes around within data[] */
+  int rc;         /* The return code */
+  int hdr;        /* Beginning of the header.  0 most pages.  100 page 1 */
+
+  if( *pRC ) return;
+
+  assert( idx>=0 && idx<pPage->nCell );
+  assert( sz==cellSize(pPage, idx) );
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  data = pPage->aData;
+  ptr = &pPage->aCellIdx[2*idx];
+  pc = get2byte(ptr);
+  hdr = pPage->hdrOffset;
+  testcase( pc==get2byte(&data[hdr+5]) );
+  testcase( pc+sz==pPage->pBt->usableSize );
+  if( pc < (u32)get2byte(&data[hdr+5]) || pc+sz > pPage->pBt->usableSize ){
+    *pRC = SQLITE_CORRUPT_BKPT;
+    return;
+  }
+  rc = freeSpace(pPage, pc, sz);
+  if( rc ){
+    *pRC = rc;
+    return;
+  }
+  pPage->nCell--;
+  if( pPage->nCell==0 ){
+    memset(&data[hdr+1], 0, 4);
+    data[hdr+7] = 0;
+    put2byte(&data[hdr+5], pPage->pBt->usableSize);
+    pPage->nFree = pPage->pBt->usableSize - pPage->hdrOffset
+                       - pPage->childPtrSize - 8;
+  }else{
+    memmove(ptr, ptr+2, 2*(pPage->nCell - idx));
+    put2byte(&data[hdr+3], pPage->nCell);
+    pPage->nFree += 2;
+  }
+}
+
+/*
+** Insert a new cell on pPage at cell index "i".  pCell points to the
+** content of the cell.
+**
+** If the cell content will fit on the page, then put it there.  If it
+** will not fit, then make a copy of the cell content into pTemp if
+** pTemp is not null.  Regardless of pTemp, allocate a new entry
+** in pPage->apOvfl[] and make it point to the cell content (either
+** in pTemp or the original pCell) and also record its index. 
+** Allocating a new entry in pPage->aCell[] implies that 
+** pPage->nOverflow is incremented.
+*/
+static void insertCell(
+  MemPage *pPage,   /* Page into which we are copying */
+  int i,            /* New cell becomes the i-th cell of the page */
+  u8 *pCell,        /* Content of the new cell */
+  int sz,           /* Bytes of content in pCell */
+  u8 *pTemp,        /* Temp storage space for pCell, if needed */
+  Pgno iChild,      /* If non-zero, replace first 4 bytes with this value */
+  int *pRC          /* Read and write return code from here */
+){
+  int idx = 0;      /* Where to write new cell content in data[] */
+  int j;            /* Loop counter */
+  int end;          /* First byte past the last cell pointer in data[] */
+  int ins;          /* Index in data[] where new cell pointer is inserted */
+  int cellOffset;   /* Address of first cell pointer in data[] */
+  u8 *data;         /* The content of the whole page */
+
+  if( *pRC ) return;
+
+  assert( i>=0 && i<=pPage->nCell+pPage->nOverflow );
+  assert( MX_CELL(pPage->pBt)<=10921 );
+  assert( pPage->nCell<=MX_CELL(pPage->pBt) || CORRUPT_DB );
+  assert( pPage->nOverflow<=ArraySize(pPage->apOvfl) );
+  assert( ArraySize(pPage->apOvfl)==ArraySize(pPage->aiOvfl) );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  /* The cell should normally be sized correctly.  However, when moving a
+  ** malformed cell from a leaf page to an interior page, if the cell size
+  ** wanted to be less than 4 but got rounded up to 4 on the leaf, then size
+  ** might be less than 8 (leaf-size + pointer) on the interior node.  Hence
+  ** the term after the || in the following assert(). */
+  assert( sz==cellSizePtr(pPage, pCell) || (sz==8 && iChild>0) );
+  if( pPage->nOverflow || sz+2>pPage->nFree ){
+    if( pTemp ){
+      memcpy(pTemp, pCell, sz);
+      pCell = pTemp;
+    }
+    if( iChild ){
+      put4byte(pCell, iChild);
+    }
+    j = pPage->nOverflow++;
+    assert( j<(int)(sizeof(pPage->apOvfl)/sizeof(pPage->apOvfl[0])) );
+    pPage->apOvfl[j] = pCell;
+    pPage->aiOvfl[j] = (u16)i;
+  }else{
+    int rc = sqlite3PagerWrite(pPage->pDbPage);
+    if( rc!=SQLITE_OK ){
+      *pRC = rc;
+      return;
+    }
+    assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+    data = pPage->aData;
+    cellOffset = pPage->cellOffset;
+    end = cellOffset + 2*pPage->nCell;
+    ins = cellOffset + 2*i;
+    rc = allocateSpace(pPage, sz, &idx);
+    if( rc ){ *pRC = rc; return; }
+    /* The allocateSpace() routine guarantees the following two properties
+    ** if it returns success */
+    assert( idx >= end+2 );
+    assert( idx+sz <= (int)pPage->pBt->usableSize );
+    pPage->nCell++;
+    pPage->nFree -= (u16)(2 + sz);
+    memcpy(&data[idx], pCell, sz);
+    if( iChild ){
+      put4byte(&data[idx], iChild);
+    }
+    memmove(&data[ins+2], &data[ins], end-ins);
+    put2byte(&data[ins], idx);
+    put2byte(&data[pPage->hdrOffset+3], pPage->nCell);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( pPage->pBt->autoVacuum ){
+      /* The cell may contain a pointer to an overflow page. If so, write
+      ** the entry for the overflow page into the pointer map.
+      */
+      ptrmapPutOvflPtr(pPage, pCell, pRC);
+    }
+#endif
+  }
+}
+
+/*
+** Array apCell[] contains pointers to nCell b-tree page cells. The 
+** szCell[] array contains the size in bytes of each cell. This function
+** replaces the current contents of page pPg with the contents of the cell
+** array.
+**
+** Some of the cells in apCell[] may currently be stored in pPg. This
+** function works around problems caused by this by making a copy of any 
+** such cells before overwriting the page data.
+**
+** The MemPage.nFree field is invalidated by this function. It is the 
+** responsibility of the caller to set it correctly.
+*/
+static void rebuildPage(
+  MemPage *pPg,                   /* Edit this page */
+  int nCell,                      /* Final number of cells on page */
+  u8 **apCell,                    /* Array of cells */
+  u16 *szCell                     /* Array of cell sizes */
+){
+  const int hdr = pPg->hdrOffset;          /* Offset of header on pPg */
+  u8 * const aData = pPg->aData;           /* Pointer to data for pPg */
+  const int usableSize = pPg->pBt->usableSize;
+  u8 * const pEnd = &aData[usableSize];
+  int i;
+  u8 *pCellptr = pPg->aCellIdx;
+  u8 *pTmp = sqlite3PagerTempSpace(pPg->pBt->pPager);
+  u8 *pData;
+
+  i = get2byte(&aData[hdr+5]);
+  memcpy(&pTmp[i], &aData[i], usableSize - i);
+
+  pData = pEnd;
+  for(i=0; i<nCell; i++){
+    u8 *pCell = apCell[i];
+    if( pCell>aData && pCell<pEnd ){
+      pCell = &pTmp[pCell - aData];
+    }
+    pData -= szCell[i];
+    memcpy(pData, pCell, szCell[i]);
+    put2byte(pCellptr, (pData - aData));
+    pCellptr += 2;
+    assert( szCell[i]==cellSizePtr(pPg, pCell) );
+  }
+
+  /* The pPg->nFree field is now set incorrectly. The caller will fix it. */
+  pPg->nCell = nCell;
+  pPg->nOverflow = 0;
+
+  put2byte(&aData[hdr+1], 0);
+  put2byte(&aData[hdr+3], pPg->nCell);
+  put2byte(&aData[hdr+5], pData - aData);
