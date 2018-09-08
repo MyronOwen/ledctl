@@ -59844,3 +59844,205 @@ static int balance_nonroot(
       ** only after iPg+1 has already been updated. */
       assert( cntNew[iPg]>=cntOld[iPg] || abDone[iPg+1] );
 
+      if( iPg==0 ){
+        iNew = iOld = 0;
+        nNewCell = cntNew[0];
+      }else{
+        iOld = iPg<nOld ? (cntOld[iPg-1] + !leafData) : nCell;
+        iNew = cntNew[iPg-1] + !leafData;
+        nNewCell = cntNew[iPg] - iNew;
+      }
+
+      editPage(apNew[iPg], iOld, iNew, nNewCell, apCell, szCell);
+      abDone[iPg]++;
+      apNew[iPg]->nFree = usableSpace-szNew[iPg];
+      assert( apNew[iPg]->nOverflow==0 );
+      assert( apNew[iPg]->nCell==nNewCell );
+    }
+  }
+
+  /* All pages have been processed exactly once */
+  assert( memcmp(abDone, "\01\01\01\01\01", nNew)==0 );
+
+  assert( nOld>0 );
+  assert( nNew>0 );
+
+  if( isRoot && pParent->nCell==0 && pParent->hdrOffset<=apNew[0]->nFree ){
+    /* The root page of the b-tree now contains no cells. The only sibling
+    ** page is the right-child of the parent. Copy the contents of the
+    ** child page into the parent, decreasing the overall height of the
+    ** b-tree structure by one. This is described as the "balance-shallower"
+    ** sub-algorithm in some documentation.
+    **
+    ** If this is an auto-vacuum database, the call to copyNodeContent() 
+    ** sets all pointer-map entries corresponding to database image pages 
+    ** for which the pointer is stored within the content being copied.
+    **
+    ** It is critical that the child page be defragmented before being
+    ** copied into the parent, because if the parent is page 1 then it will
+    ** by smaller than the child due to the database header, and so all the
+    ** free space needs to be up front.
+    */
+    assert( nNew==1 );
+    rc = defragmentPage(apNew[0]);
+    testcase( rc!=SQLITE_OK );
+    assert( apNew[0]->nFree == 
+        (get2byte(&apNew[0]->aData[5])-apNew[0]->cellOffset-apNew[0]->nCell*2)
+      || rc!=SQLITE_OK
+    );
+    copyNodeContent(apNew[0], pParent, &rc);
+    freePage(apNew[0], &rc);
+  }else if( ISAUTOVACUUM && !leafCorrection ){
+    /* Fix the pointer map entries associated with the right-child of each
+    ** sibling page. All other pointer map entries have already been taken
+    ** care of.  */
+    for(i=0; i<nNew; i++){
+      u32 key = get4byte(&apNew[i]->aData[8]);
+      ptrmapPut(pBt, key, PTRMAP_BTREE, apNew[i]->pgno, &rc);
+    }
+  }
+
+  assert( pParent->isInit );
+  TRACE(("BALANCE: finished: old=%d new=%d cells=%d\n",
+          nOld, nNew, nCell));
+
+  /* Free any old pages that were not reused as new pages.
+  */
+  for(i=nNew; i<nOld; i++){
+    freePage(apOld[i], &rc);
+  }
+
+#if 0
+  if( ISAUTOVACUUM && rc==SQLITE_OK && apNew[0]->isInit ){
+    /* The ptrmapCheckPages() contains assert() statements that verify that
+    ** all pointer map pages are set correctly. This is helpful while 
+    ** debugging. This is usually disabled because a corrupt database may
+    ** cause an assert() statement to fail.  */
+    ptrmapCheckPages(apNew, nNew);
+    ptrmapCheckPages(&pParent, 1);
+  }
+#endif
+
+  /*
+  ** Cleanup before returning.
+  */
+balance_cleanup:
+  sqlite3ScratchFree(apCell);
+  for(i=0; i<nOld; i++){
+    releasePage(apOld[i]);
+  }
+  for(i=0; i<nNew; i++){
+    releasePage(apNew[i]);
+  }
+
+  return rc;
+}
+#if defined(_MSC_VER) && _MSC_VER >= 1700 && defined(_M_ARM)
+#pragma optimize("", on)
+#endif
+
+
+/*
+** This function is called when the root page of a b-tree structure is
+** overfull (has one or more overflow pages).
+**
+** A new child page is allocated and the contents of the current root
+** page, including overflow cells, are copied into the child. The root
+** page is then overwritten to make it an empty page with the right-child 
+** pointer pointing to the new page.
+**
+** Before returning, all pointer-map entries corresponding to pages 
+** that the new child-page now contains pointers to are updated. The
+** entry corresponding to the new right-child pointer of the root
+** page is also updated.
+**
+** If successful, *ppChild is set to contain a reference to the child 
+** page and SQLITE_OK is returned. In this case the caller is required
+** to call releasePage() on *ppChild exactly once. If an error occurs,
+** an error code is returned and *ppChild is set to 0.
+*/
+static int balance_deeper(MemPage *pRoot, MemPage **ppChild){
+  int rc;                        /* Return value from subprocedures */
+  MemPage *pChild = 0;           /* Pointer to a new child page */
+  Pgno pgnoChild = 0;            /* Page number of the new child page */
+  BtShared *pBt = pRoot->pBt;    /* The BTree */
+
+  assert( pRoot->nOverflow>0 );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+
+  /* Make pRoot, the root page of the b-tree, writable. Allocate a new 
+  ** page that will become the new right-child of pPage. Copy the contents
+  ** of the node stored on pRoot into the new child page.
+  */
+  rc = sqlite3PagerWrite(pRoot->pDbPage);
+  if( rc==SQLITE_OK ){
+    rc = allocateBtreePage(pBt,&pChild,&pgnoChild,pRoot->pgno,0);
+    copyNodeContent(pRoot, pChild, &rc);
+    if( ISAUTOVACUUM ){
+      ptrmapPut(pBt, pgnoChild, PTRMAP_BTREE, pRoot->pgno, &rc);
+    }
+  }
+  if( rc ){
+    *ppChild = 0;
+    releasePage(pChild);
+    return rc;
+  }
+  assert( sqlite3PagerIswriteable(pChild->pDbPage) );
+  assert( sqlite3PagerIswriteable(pRoot->pDbPage) );
+  assert( pChild->nCell==pRoot->nCell );
+
+  TRACE(("BALANCE: copy root %d into %d\n", pRoot->pgno, pChild->pgno));
+
+  /* Copy the overflow cells from pRoot to pChild */
+  memcpy(pChild->aiOvfl, pRoot->aiOvfl,
+         pRoot->nOverflow*sizeof(pRoot->aiOvfl[0]));
+  memcpy(pChild->apOvfl, pRoot->apOvfl,
+         pRoot->nOverflow*sizeof(pRoot->apOvfl[0]));
+  pChild->nOverflow = pRoot->nOverflow;
+
+  /* Zero the contents of pRoot. Then install pChild as the right-child. */
+  zeroPage(pRoot, pChild->aData[0] & ~PTF_LEAF);
+  put4byte(&pRoot->aData[pRoot->hdrOffset+8], pgnoChild);
+
+  *ppChild = pChild;
+  return SQLITE_OK;
+}
+
+/*
+** The page that pCur currently points to has just been modified in
+** some way. This function figures out if this modification means the
+** tree needs to be balanced, and if so calls the appropriate balancing 
+** routine. Balancing routines are:
+**
+**   balance_quick()
+**   balance_deeper()
+**   balance_nonroot()
+*/
+static int balance(BtCursor *pCur){
+  int rc = SQLITE_OK;
+  const int nMin = pCur->pBt->usableSize * 2 / 3;
+  u8 aBalanceQuickSpace[13];
+  u8 *pFree = 0;
+
+  TESTONLY( int balance_quick_called = 0 );
+  TESTONLY( int balance_deeper_called = 0 );
+
+  do {
+    int iPage = pCur->iPage;
+    MemPage *pPage = pCur->apPage[iPage];
+
+    if( iPage==0 ){
+      if( pPage->nOverflow ){
+        /* The root page of the b-tree is overfull. In this case call the
+        ** balance_deeper() function to create a new child for the root-page
+        ** and copy the current contents of the root-page to it. The
+        ** next iteration of the do-loop will balance the child page.
+        */ 
+        assert( (balance_deeper_called++)==0 );
+        rc = balance_deeper(pPage, &pCur->apPage[1]);
+        if( rc==SQLITE_OK ){
+          pCur->iPage = 1;
+          pCur->aiIdx[0] = 0;
+          pCur->aiIdx[1] = 0;
+          assert( pCur->apPage[1]->nOverflow );
+        }
