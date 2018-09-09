@@ -60046,3 +60046,251 @@ static int balance(BtCursor *pCur){
           pCur->aiIdx[1] = 0;
           assert( pCur->apPage[1]->nOverflow );
         }
+      }else{
+        break;
+      }
+    }else if( pPage->nOverflow==0 && pPage->nFree<=nMin ){
+      break;
+    }else{
+      MemPage * const pParent = pCur->apPage[iPage-1];
+      int const iIdx = pCur->aiIdx[iPage-1];
+
+      rc = sqlite3PagerWrite(pParent->pDbPage);
+      if( rc==SQLITE_OK ){
+#ifndef SQLITE_OMIT_QUICKBALANCE
+        if( pPage->intKeyLeaf
+         && pPage->nOverflow==1
+         && pPage->aiOvfl[0]==pPage->nCell
+         && pParent->pgno!=1
+         && pParent->nCell==iIdx
+        ){
+          /* Call balance_quick() to create a new sibling of pPage on which
+          ** to store the overflow cell. balance_quick() inserts a new cell
+          ** into pParent, which may cause pParent overflow. If this
+          ** happens, the next iteration of the do-loop will balance pParent 
+          ** use either balance_nonroot() or balance_deeper(). Until this
+          ** happens, the overflow cell is stored in the aBalanceQuickSpace[]
+          ** buffer. 
+          **
+          ** The purpose of the following assert() is to check that only a
+          ** single call to balance_quick() is made for each call to this
+          ** function. If this were not verified, a subtle bug involving reuse
+          ** of the aBalanceQuickSpace[] might sneak in.
+          */
+          assert( (balance_quick_called++)==0 );
+          rc = balance_quick(pParent, pPage, aBalanceQuickSpace);
+        }else
+#endif
+        {
+          /* In this case, call balance_nonroot() to redistribute cells
+          ** between pPage and up to 2 of its sibling pages. This involves
+          ** modifying the contents of pParent, which may cause pParent to
+          ** become overfull or underfull. The next iteration of the do-loop
+          ** will balance the parent page to correct this.
+          ** 
+          ** If the parent page becomes overfull, the overflow cell or cells
+          ** are stored in the pSpace buffer allocated immediately below. 
+          ** A subsequent iteration of the do-loop will deal with this by
+          ** calling balance_nonroot() (balance_deeper() may be called first,
+          ** but it doesn't deal with overflow cells - just moves them to a
+          ** different page). Once this subsequent call to balance_nonroot() 
+          ** has completed, it is safe to release the pSpace buffer used by
+          ** the previous call, as the overflow cell data will have been 
+          ** copied either into the body of a database page or into the new
+          ** pSpace buffer passed to the latter call to balance_nonroot().
+          */
+          u8 *pSpace = sqlite3PageMalloc(pCur->pBt->pageSize);
+          rc = balance_nonroot(pParent, iIdx, pSpace, iPage==1, pCur->hints);
+          if( pFree ){
+            /* If pFree is not NULL, it points to the pSpace buffer used 
+            ** by a previous call to balance_nonroot(). Its contents are
+            ** now stored either on real database pages or within the 
+            ** new pSpace buffer, so it may be safely freed here. */
+            sqlite3PageFree(pFree);
+          }
+
+          /* The pSpace buffer will be freed after the next call to
+          ** balance_nonroot(), or just before this function returns, whichever
+          ** comes first. */
+          pFree = pSpace;
+        }
+      }
+
+      pPage->nOverflow = 0;
+
+      /* The next iteration of the do-loop balances the parent page. */
+      releasePage(pPage);
+      pCur->iPage--;
+    }
+  }while( rc==SQLITE_OK );
+
+  if( pFree ){
+    sqlite3PageFree(pFree);
+  }
+  return rc;
+}
+
+
+/*
+** Insert a new record into the BTree.  The key is given by (pKey,nKey)
+** and the data is given by (pData,nData).  The cursor is used only to
+** define what table the record should be inserted into.  The cursor
+** is left pointing at a random location.
+**
+** For an INTKEY table, only the nKey value of the key is used.  pKey is
+** ignored.  For a ZERODATA table, the pData and nData are both ignored.
+**
+** If the seekResult parameter is non-zero, then a successful call to
+** MovetoUnpacked() to seek cursor pCur to (pKey, nKey) has already
+** been performed. seekResult is the search result returned (a negative
+** number if pCur points at an entry that is smaller than (pKey, nKey), or
+** a positive value if pCur points at an entry that is larger than 
+** (pKey, nKey)). 
+**
+** If the seekResult parameter is non-zero, then the caller guarantees that
+** cursor pCur is pointing at the existing copy of a row that is to be
+** overwritten.  If the seekResult parameter is 0, then cursor pCur may
+** point to any entry or to no entry at all and so this function has to seek
+** the cursor before the new key can be inserted.
+*/
+SQLITE_PRIVATE int sqlite3BtreeInsert(
+  BtCursor *pCur,                /* Insert data into the table of this cursor */
+  const void *pKey, i64 nKey,    /* The key of the new record */
+  const void *pData, int nData,  /* The data of the new record */
+  int nZero,                     /* Number of extra 0 bytes to append to data */
+  int appendBias,                /* True if this is likely an append */
+  int seekResult                 /* Result of prior MovetoUnpacked() call */
+){
+  int rc;
+  int loc = seekResult;          /* -1: before desired location  +1: after */
+  int szNew = 0;
+  int idx;
+  MemPage *pPage;
+  Btree *p = pCur->pBtree;
+  BtShared *pBt = p->pBt;
+  unsigned char *oldCell;
+  unsigned char *newCell = 0;
+
+  if( pCur->eState==CURSOR_FAULT ){
+    assert( pCur->skipNext!=SQLITE_OK );
+    return pCur->skipNext;
+  }
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( (pCur->curFlags & BTCF_WriteFlag)!=0
+              && pBt->inTransaction==TRANS_WRITE
+              && (pBt->btsFlags & BTS_READ_ONLY)==0 );
+  assert( hasSharedCacheTableLock(p, pCur->pgnoRoot, pCur->pKeyInfo!=0, 2) );
+
+  /* Assert that the caller has been consistent. If this cursor was opened
+  ** expecting an index b-tree, then the caller should be inserting blob
+  ** keys with no associated data. If the cursor was opened expecting an
+  ** intkey table, the caller should be inserting integer keys with a
+  ** blob of associated data.  */
+  assert( (pKey==0)==(pCur->pKeyInfo==0) );
+
+  /* Save the positions of any other cursors open on this table.
+  **
+  ** In some cases, the call to btreeMoveto() below is a no-op. For
+  ** example, when inserting data into a table with auto-generated integer
+  ** keys, the VDBE layer invokes sqlite3BtreeLast() to figure out the 
+  ** integer key to use. It then calls this function to actually insert the 
+  ** data into the intkey B-Tree. In this case btreeMoveto() recognizes
+  ** that the cursor is already where it needs to be and returns without
+  ** doing any work. To avoid thwarting these optimizations, it is important
+  ** not to clear the cursor here.
+  */
+  rc = saveAllCursors(pBt, pCur->pgnoRoot, pCur);
+  if( rc ) return rc;
+
+  if( pCur->pKeyInfo==0 ){
+    /* If this is an insert into a table b-tree, invalidate any incrblob 
+    ** cursors open on the row being replaced */
+    invalidateIncrblobCursors(p, nKey, 0);
+
+    /* If the cursor is currently on the last row and we are appending a
+    ** new row onto the end, set the "loc" to avoid an unnecessary btreeMoveto()
+    ** call */
+    if( (pCur->curFlags&BTCF_ValidNKey)!=0 && nKey>0
+      && pCur->info.nKey==nKey-1 ){
+      loc = -1;
+    }
+  }
+
+  if( !loc ){
+    rc = btreeMoveto(pCur, pKey, nKey, appendBias, &loc);
+    if( rc ) return rc;
+  }
+  assert( pCur->eState==CURSOR_VALID || (pCur->eState==CURSOR_INVALID && loc) );
+
+  pPage = pCur->apPage[pCur->iPage];
+  assert( pPage->intKey || nKey>=0 );
+  assert( pPage->leaf || !pPage->intKey );
+
+  TRACE(("INSERT: table=%d nkey=%lld ndata=%d page=%d %s\n",
+          pCur->pgnoRoot, nKey, nData, pPage->pgno,
+          loc==0 ? "overwrite" : "new entry"));
+  assert( pPage->isInit );
+  newCell = pBt->pTmpSpace;
+  assert( newCell!=0 );
+  rc = fillInCell(pPage, newCell, pKey, nKey, pData, nData, nZero, &szNew);
+  if( rc ) goto end_insert;
+  assert( szNew==cellSizePtr(pPage, newCell) );
+  assert( szNew <= MX_CELL_SIZE(pBt) );
+  idx = pCur->aiIdx[pCur->iPage];
+  if( loc==0 ){
+    u16 szOld;
+    assert( idx<pPage->nCell );
+    rc = sqlite3PagerWrite(pPage->pDbPage);
+    if( rc ){
+      goto end_insert;
+    }
+    oldCell = findCell(pPage, idx);
+    if( !pPage->leaf ){
+      memcpy(newCell, oldCell, 4);
+    }
+    rc = clearCell(pPage, oldCell, &szOld);
+    dropCell(pPage, idx, szOld, &rc);
+    if( rc ) goto end_insert;
+  }else if( loc<0 && pPage->nCell>0 ){
+    assert( pPage->leaf );
+    idx = ++pCur->aiIdx[pCur->iPage];
+  }else{
+    assert( pPage->leaf );
+  }
+  insertCell(pPage, idx, newCell, szNew, 0, 0, &rc);
+  assert( rc!=SQLITE_OK || pPage->nCell>0 || pPage->nOverflow>0 );
+
+  /* If no error has occurred and pPage has an overflow cell, call balance() 
+  ** to redistribute the cells within the tree. Since balance() may move
+  ** the cursor, zero the BtCursor.info.nSize and BTCF_ValidNKey
+  ** variables.
+  **
+  ** Previous versions of SQLite called moveToRoot() to move the cursor
+  ** back to the root page as balance() used to invalidate the contents
+  ** of BtCursor.apPage[] and BtCursor.aiIdx[]. Instead of doing that,
+  ** set the cursor state to "invalid". This makes common insert operations
+  ** slightly faster.
+  **
+  ** There is a subtle but important optimization here too. When inserting
+  ** multiple records into an intkey b-tree using a single cursor (as can
+  ** happen while processing an "INSERT INTO ... SELECT" statement), it
+  ** is advantageous to leave the cursor pointing to the last entry in
+  ** the b-tree if possible. If the cursor is left pointing to the last
+  ** entry in the table, and the next row inserted has an integer key
+  ** larger than the largest existing key, it is possible to insert the
+  ** row without seeking the cursor. This can be a big performance boost.
+  */
+  pCur->info.nSize = 0;
+  if( rc==SQLITE_OK && pPage->nOverflow ){
+    pCur->curFlags &= ~(BTCF_ValidNKey);
+    rc = balance(pCur);
+
+    /* Must make sure nOverflow is reset to zero even if the balance()
+    ** fails. Internal data structure corruption will result otherwise. 
+    ** Also, set the cursor state to invalid. This stops saveCursorPosition()
+    ** from trying to save the current position of the cursor.  */
+    pCur->apPage[pCur->iPage]->nOverflow = 0;
+    pCur->eState = CURSOR_INVALID;
+  }
+  assert( pCur->apPage[pCur->iPage]->nOverflow==0 );
