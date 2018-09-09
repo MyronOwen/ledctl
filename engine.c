@@ -60294,3 +60294,246 @@ SQLITE_PRIVATE int sqlite3BtreeInsert(
     pCur->eState = CURSOR_INVALID;
   }
   assert( pCur->apPage[pCur->iPage]->nOverflow==0 );
+
+end_insert:
+  return rc;
+}
+
+/*
+** Delete the entry that the cursor is pointing to.  The cursor
+** is left pointing at an arbitrary location.
+*/
+SQLITE_PRIVATE int sqlite3BtreeDelete(BtCursor *pCur){
+  Btree *p = pCur->pBtree;
+  BtShared *pBt = p->pBt;              
+  int rc;                              /* Return code */
+  MemPage *pPage;                      /* Page to delete cell from */
+  unsigned char *pCell;                /* Pointer to cell to delete */
+  int iCellIdx;                        /* Index of cell to delete */
+  int iCellDepth;                      /* Depth of node containing pCell */ 
+  u16 szCell;                          /* Size of the cell being deleted */
+
+  assert( cursorHoldsMutex(pCur) );
+  assert( pBt->inTransaction==TRANS_WRITE );
+  assert( (pBt->btsFlags & BTS_READ_ONLY)==0 );
+  assert( pCur->curFlags & BTCF_WriteFlag );
+  assert( hasSharedCacheTableLock(p, pCur->pgnoRoot, pCur->pKeyInfo!=0, 2) );
+  assert( !hasReadConflicts(p, pCur->pgnoRoot) );
+
+  if( NEVER(pCur->aiIdx[pCur->iPage]>=pCur->apPage[pCur->iPage]->nCell) 
+   || NEVER(pCur->eState!=CURSOR_VALID)
+  ){
+    return SQLITE_ERROR;  /* Something has gone awry. */
+  }
+
+  iCellDepth = pCur->iPage;
+  iCellIdx = pCur->aiIdx[iCellDepth];
+  pPage = pCur->apPage[iCellDepth];
+  pCell = findCell(pPage, iCellIdx);
+
+  /* If the page containing the entry to delete is not a leaf page, move
+  ** the cursor to the largest entry in the tree that is smaller than
+  ** the entry being deleted. This cell will replace the cell being deleted
+  ** from the internal node. The 'previous' entry is used for this instead
+  ** of the 'next' entry, as the previous entry is always a part of the
+  ** sub-tree headed by the child page of the cell being deleted. This makes
+  ** balancing the tree following the delete operation easier.  */
+  if( !pPage->leaf ){
+    int notUsed = 0;
+    rc = sqlite3BtreePrevious(pCur, &notUsed);
+    if( rc ) return rc;
+  }
+
+  /* Save the positions of any other cursors open on this table before
+  ** making any modifications. Make the page containing the entry to be 
+  ** deleted writable. Then free any overflow pages associated with the 
+  ** entry and finally remove the cell itself from within the page.  
+  */
+  rc = saveAllCursors(pBt, pCur->pgnoRoot, pCur);
+  if( rc ) return rc;
+
+  /* If this is a delete operation to remove a row from a table b-tree,
+  ** invalidate any incrblob cursors open on the row being deleted.  */
+  if( pCur->pKeyInfo==0 ){
+    invalidateIncrblobCursors(p, pCur->info.nKey, 0);
+  }
+
+  rc = sqlite3PagerWrite(pPage->pDbPage);
+  if( rc ) return rc;
+  rc = clearCell(pPage, pCell, &szCell);
+  dropCell(pPage, iCellIdx, szCell, &rc);
+  if( rc ) return rc;
+
+  /* If the cell deleted was not located on a leaf page, then the cursor
+  ** is currently pointing to the largest entry in the sub-tree headed
+  ** by the child-page of the cell that was just deleted from an internal
+  ** node. The cell from the leaf node needs to be moved to the internal
+  ** node to replace the deleted cell.  */
+  if( !pPage->leaf ){
+    MemPage *pLeaf = pCur->apPage[pCur->iPage];
+    int nCell;
+    Pgno n = pCur->apPage[iCellDepth+1]->pgno;
+    unsigned char *pTmp;
+
+    pCell = findCell(pLeaf, pLeaf->nCell-1);
+    nCell = cellSizePtr(pLeaf, pCell);
+    assert( MX_CELL_SIZE(pBt) >= nCell );
+    pTmp = pBt->pTmpSpace;
+    assert( pTmp!=0 );
+    rc = sqlite3PagerWrite(pLeaf->pDbPage);
+    insertCell(pPage, iCellIdx, pCell-4, nCell+4, pTmp, n, &rc);
+    dropCell(pLeaf, pLeaf->nCell-1, nCell, &rc);
+    if( rc ) return rc;
+  }
+
+  /* Balance the tree. If the entry deleted was located on a leaf page,
+  ** then the cursor still points to that page. In this case the first
+  ** call to balance() repairs the tree, and the if(...) condition is
+  ** never true.
+  **
+  ** Otherwise, if the entry deleted was on an internal node page, then
+  ** pCur is pointing to the leaf page from which a cell was removed to
+  ** replace the cell deleted from the internal node. This is slightly
+  ** tricky as the leaf node may be underfull, and the internal node may
+  ** be either under or overfull. In this case run the balancing algorithm
+  ** on the leaf node first. If the balance proceeds far enough up the
+  ** tree that we can be sure that any problem in the internal node has
+  ** been corrected, so be it. Otherwise, after balancing the leaf node,
+  ** walk the cursor up the tree to the internal node and balance it as 
+  ** well.  */
+  rc = balance(pCur);
+  if( rc==SQLITE_OK && pCur->iPage>iCellDepth ){
+    while( pCur->iPage>iCellDepth ){
+      releasePage(pCur->apPage[pCur->iPage--]);
+    }
+    rc = balance(pCur);
+  }
+
+  if( rc==SQLITE_OK ){
+    moveToRoot(pCur);
+  }
+  return rc;
+}
+
+/*
+** Create a new BTree table.  Write into *piTable the page
+** number for the root page of the new table.
+**
+** The type of type is determined by the flags parameter.  Only the
+** following values of flags are currently in use.  Other values for
+** flags might not work:
+**
+**     BTREE_INTKEY|BTREE_LEAFDATA     Used for SQL tables with rowid keys
+**     BTREE_ZERODATA                  Used for SQL indices
+*/
+static int btreeCreateTable(Btree *p, int *piTable, int createTabFlags){
+  BtShared *pBt = p->pBt;
+  MemPage *pRoot;
+  Pgno pgnoRoot;
+  int rc;
+  int ptfFlags;          /* Page-type flage for the root page of new table */
+
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( pBt->inTransaction==TRANS_WRITE );
+  assert( (pBt->btsFlags & BTS_READ_ONLY)==0 );
+
+#ifdef SQLITE_OMIT_AUTOVACUUM
+  rc = allocateBtreePage(pBt, &pRoot, &pgnoRoot, 1, 0);
+  if( rc ){
+    return rc;
+  }
+#else
+  if( pBt->autoVacuum ){
+    Pgno pgnoMove;      /* Move a page here to make room for the root-page */
+    MemPage *pPageMove; /* The page to move to. */
+
+    /* Creating a new table may probably require moving an existing database
+    ** to make room for the new tables root page. In case this page turns
+    ** out to be an overflow page, delete all overflow page-map caches
+    ** held by open cursors.
+    */
+    invalidateAllOverflowCache(pBt);
+
+    /* Read the value of meta[3] from the database to determine where the
+    ** root page of the new table should go. meta[3] is the largest root-page
+    ** created so far, so the new root-page is (meta[3]+1).
+    */
+    sqlite3BtreeGetMeta(p, BTREE_LARGEST_ROOT_PAGE, &pgnoRoot);
+    pgnoRoot++;
+
+    /* The new root-page may not be allocated on a pointer-map page, or the
+    ** PENDING_BYTE page.
+    */
+    while( pgnoRoot==PTRMAP_PAGENO(pBt, pgnoRoot) ||
+        pgnoRoot==PENDING_BYTE_PAGE(pBt) ){
+      pgnoRoot++;
+    }
+    assert( pgnoRoot>=3 );
+
+    /* Allocate a page. The page that currently resides at pgnoRoot will
+    ** be moved to the allocated page (unless the allocated page happens
+    ** to reside at pgnoRoot).
+    */
+    rc = allocateBtreePage(pBt, &pPageMove, &pgnoMove, pgnoRoot, BTALLOC_EXACT);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+
+    if( pgnoMove!=pgnoRoot ){
+      /* pgnoRoot is the page that will be used for the root-page of
+      ** the new table (assuming an error did not occur). But we were
+      ** allocated pgnoMove. If required (i.e. if it was not allocated
+      ** by extending the file), the current page at position pgnoMove
+      ** is already journaled.
+      */
+      u8 eType = 0;
+      Pgno iPtrPage = 0;
+
+      /* Save the positions of any open cursors. This is required in
+      ** case they are holding a reference to an xFetch reference
+      ** corresponding to page pgnoRoot.  */
+      rc = saveAllCursors(pBt, 0, 0);
+      releasePage(pPageMove);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+
+      /* Move the page currently at pgnoRoot to pgnoMove. */
+      rc = btreeGetPage(pBt, pgnoRoot, &pRoot, 0);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+      rc = ptrmapGet(pBt, pgnoRoot, &eType, &iPtrPage);
+      if( eType==PTRMAP_ROOTPAGE || eType==PTRMAP_FREEPAGE ){
+        rc = SQLITE_CORRUPT_BKPT;
+      }
+      if( rc!=SQLITE_OK ){
+        releasePage(pRoot);
+        return rc;
+      }
+      assert( eType!=PTRMAP_ROOTPAGE );
+      assert( eType!=PTRMAP_FREEPAGE );
+      rc = relocatePage(pBt, pRoot, eType, iPtrPage, pgnoMove, 0);
+      releasePage(pRoot);
+
+      /* Obtain the page at pgnoRoot */
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+      rc = btreeGetPage(pBt, pgnoRoot, &pRoot, 0);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+      rc = sqlite3PagerWrite(pRoot->pDbPage);
+      if( rc!=SQLITE_OK ){
+        releasePage(pRoot);
+        return rc;
+      }
+    }else{
+      pRoot = pPageMove;
+    } 
+
+    /* Update the pointer-map and meta-data with the new root-page number. */
+    ptrmapPut(pBt, pgnoRoot, PTRMAP_ROOTPAGE, 0, &rc);
+    if( rc ){
+      releasePage(pRoot);
