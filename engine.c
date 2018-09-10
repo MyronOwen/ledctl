@@ -60537,3 +60537,214 @@ static int btreeCreateTable(Btree *p, int *piTable, int createTabFlags){
     ptrmapPut(pBt, pgnoRoot, PTRMAP_ROOTPAGE, 0, &rc);
     if( rc ){
       releasePage(pRoot);
+      return rc;
+    }
+
+    /* When the new root page was allocated, page 1 was made writable in
+    ** order either to increase the database filesize, or to decrement the
+    ** freelist count.  Hence, the sqlite3BtreeUpdateMeta() call cannot fail.
+    */
+    assert( sqlite3PagerIswriteable(pBt->pPage1->pDbPage) );
+    rc = sqlite3BtreeUpdateMeta(p, 4, pgnoRoot);
+    if( NEVER(rc) ){
+      releasePage(pRoot);
+      return rc;
+    }
+
+  }else{
+    rc = allocateBtreePage(pBt, &pRoot, &pgnoRoot, 1, 0);
+    if( rc ) return rc;
+  }
+#endif
+  assert( sqlite3PagerIswriteable(pRoot->pDbPage) );
+  if( createTabFlags & BTREE_INTKEY ){
+    ptfFlags = PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF;
+  }else{
+    ptfFlags = PTF_ZERODATA | PTF_LEAF;
+  }
+  zeroPage(pRoot, ptfFlags);
+  sqlite3PagerUnref(pRoot->pDbPage);
+  assert( (pBt->openFlags & BTREE_SINGLE)==0 || pgnoRoot==2 );
+  *piTable = (int)pgnoRoot;
+  return SQLITE_OK;
+}
+SQLITE_PRIVATE int sqlite3BtreeCreateTable(Btree *p, int *piTable, int flags){
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = btreeCreateTable(p, piTable, flags);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Erase the given database page and all its children.  Return
+** the page to the freelist.
+*/
+static int clearDatabasePage(
+  BtShared *pBt,           /* The BTree that contains the table */
+  Pgno pgno,               /* Page number to clear */
+  int freePageFlag,        /* Deallocate page if true */
+  int *pnChange            /* Add number of Cells freed to this counter */
+){
+  MemPage *pPage;
+  int rc;
+  unsigned char *pCell;
+  int i;
+  int hdr;
+  u16 szCell;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  if( pgno>btreePagecount(pBt) ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+
+  rc = getAndInitPage(pBt, pgno, &pPage, 0);
+  if( rc ) return rc;
+  hdr = pPage->hdrOffset;
+  for(i=0; i<pPage->nCell; i++){
+    pCell = findCell(pPage, i);
+    if( !pPage->leaf ){
+      rc = clearDatabasePage(pBt, get4byte(pCell), 1, pnChange);
+      if( rc ) goto cleardatabasepage_out;
+    }
+    rc = clearCell(pPage, pCell, &szCell);
+    if( rc ) goto cleardatabasepage_out;
+  }
+  if( !pPage->leaf ){
+    rc = clearDatabasePage(pBt, get4byte(&pPage->aData[hdr+8]), 1, pnChange);
+    if( rc ) goto cleardatabasepage_out;
+  }else if( pnChange ){
+    assert( pPage->intKey );
+    *pnChange += pPage->nCell;
+  }
+  if( freePageFlag ){
+    freePage(pPage, &rc);
+  }else if( (rc = sqlite3PagerWrite(pPage->pDbPage))==0 ){
+    zeroPage(pPage, pPage->aData[hdr] | PTF_LEAF);
+  }
+
+cleardatabasepage_out:
+  releasePage(pPage);
+  return rc;
+}
+
+/*
+** Delete all information from a single table in the database.  iTable is
+** the page number of the root of the table.  After this routine returns,
+** the root page is empty, but still exists.
+**
+** This routine will fail with SQLITE_LOCKED if there are any open
+** read cursors on the table.  Open write cursors are moved to the
+** root of the table.
+**
+** If pnChange is not NULL, then table iTable must be an intkey table. The
+** integer value pointed to by pnChange is incremented by the number of
+** entries in the table.
+*/
+SQLITE_PRIVATE int sqlite3BtreeClearTable(Btree *p, int iTable, int *pnChange){
+  int rc;
+  BtShared *pBt = p->pBt;
+  sqlite3BtreeEnter(p);
+  assert( p->inTrans==TRANS_WRITE );
+
+  rc = saveAllCursors(pBt, (Pgno)iTable, 0);
+
+  if( SQLITE_OK==rc ){
+    /* Invalidate all incrblob cursors open on table iTable (assuming iTable
+    ** is the root of a table b-tree - if it is not, the following call is
+    ** a no-op).  */
+    invalidateIncrblobCursors(p, 0, 1);
+    rc = clearDatabasePage(pBt, (Pgno)iTable, 0, pnChange);
+  }
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Delete all information from the single table that pCur is open on.
+**
+** This routine only work for pCur on an ephemeral table.
+*/
+SQLITE_PRIVATE int sqlite3BtreeClearTableOfCursor(BtCursor *pCur){
+  return sqlite3BtreeClearTable(pCur->pBtree, pCur->pgnoRoot, 0);
+}
+
+/*
+** Erase all information in a table and add the root of the table to
+** the freelist.  Except, the root of the principle table (the one on
+** page 1) is never added to the freelist.
+**
+** This routine will fail with SQLITE_LOCKED if there are any open
+** cursors on the table.
+**
+** If AUTOVACUUM is enabled and the page at iTable is not the last
+** root page in the database file, then the last root page 
+** in the database file is moved into the slot formerly occupied by
+** iTable and that last slot formerly occupied by the last root page
+** is added to the freelist instead of iTable.  In this say, all
+** root pages are kept at the beginning of the database file, which
+** is necessary for AUTOVACUUM to work right.  *piMoved is set to the 
+** page number that used to be the last root page in the file before
+** the move.  If no page gets moved, *piMoved is set to 0.
+** The last root page is recorded in meta[3] and the value of
+** meta[3] is updated by this procedure.
+*/
+static int btreeDropTable(Btree *p, Pgno iTable, int *piMoved){
+  int rc;
+  MemPage *pPage = 0;
+  BtShared *pBt = p->pBt;
+
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( p->inTrans==TRANS_WRITE );
+
+  /* It is illegal to drop a table if any cursors are open on the
+  ** database. This is because in auto-vacuum mode the backend may
+  ** need to move another root-page to fill a gap left by the deleted
+  ** root page. If an open cursor was using this page a problem would 
+  ** occur.
+  **
+  ** This error is caught long before control reaches this point.
+  */
+  if( NEVER(pBt->pCursor) ){
+    sqlite3ConnectionBlocked(p->db, pBt->pCursor->pBtree->db);
+    return SQLITE_LOCKED_SHAREDCACHE;
+  }
+
+  rc = btreeGetPage(pBt, (Pgno)iTable, &pPage, 0);
+  if( rc ) return rc;
+  rc = sqlite3BtreeClearTable(p, iTable, 0);
+  if( rc ){
+    releasePage(pPage);
+    return rc;
+  }
+
+  *piMoved = 0;
+
+  if( iTable>1 ){
+#ifdef SQLITE_OMIT_AUTOVACUUM
+    freePage(pPage, &rc);
+    releasePage(pPage);
+#else
+    if( pBt->autoVacuum ){
+      Pgno maxRootPgno;
+      sqlite3BtreeGetMeta(p, BTREE_LARGEST_ROOT_PAGE, &maxRootPgno);
+
+      if( iTable==maxRootPgno ){
+        /* If the table being dropped is the table with the largest root-page
+        ** number in the database, put the root page on the free list. 
+        */
+        freePage(pPage, &rc);
+        releasePage(pPage);
+        if( rc!=SQLITE_OK ){
+          return rc;
+        }
+      }else{
+        /* The table being dropped does not have the largest root-page
+        ** number in the database. So move the page that does into the 
+        ** gap left by the deleted root-page.
+        */
+        MemPage *pMove;
+        releasePage(pPage);
+        rc = btreeGetPage(pBt, maxRootPgno, &pMove, 0);
+        if( rc!=SQLITE_OK ){
+          return rc;
