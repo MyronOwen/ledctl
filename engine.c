@@ -60997,3 +60997,249 @@ static void checkAppendMsg(
 static int getPageReferenced(IntegrityCk *pCheck, Pgno iPg){
   assert( iPg<=pCheck->nPage && sizeof(pCheck->aPgRef[0])==1 );
   return (pCheck->aPgRef[iPg/8] & (1 << (iPg & 0x07)));
+}
+
+/*
+** Set the bit in the IntegrityCk.aPgRef[] array that corresponds to page iPg.
+*/
+static void setPageReferenced(IntegrityCk *pCheck, Pgno iPg){
+  assert( iPg<=pCheck->nPage && sizeof(pCheck->aPgRef[0])==1 );
+  pCheck->aPgRef[iPg/8] |= (1 << (iPg & 0x07));
+}
+
+
+/*
+** Add 1 to the reference count for page iPage.  If this is the second
+** reference to the page, add an error message to pCheck->zErrMsg.
+** Return 1 if there are 2 or more references to the page and 0 if
+** if this is the first reference to the page.
+**
+** Also check that the page number is in bounds.
+*/
+static int checkRef(IntegrityCk *pCheck, Pgno iPage){
+  if( iPage==0 ) return 1;
+  if( iPage>pCheck->nPage ){
+    checkAppendMsg(pCheck, "invalid page number %d", iPage);
+    return 1;
+  }
+  if( getPageReferenced(pCheck, iPage) ){
+    checkAppendMsg(pCheck, "2nd reference to page %d", iPage);
+    return 1;
+  }
+  setPageReferenced(pCheck, iPage);
+  return 0;
+}
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+/*
+** Check that the entry in the pointer-map for page iChild maps to 
+** page iParent, pointer type ptrType. If not, append an error message
+** to pCheck.
+*/
+static void checkPtrmap(
+  IntegrityCk *pCheck,   /* Integrity check context */
+  Pgno iChild,           /* Child page number */
+  u8 eType,              /* Expected pointer map type */
+  Pgno iParent           /* Expected pointer map parent page number */
+){
+  int rc;
+  u8 ePtrmapType;
+  Pgno iPtrmapParent;
+
+  rc = ptrmapGet(pCheck->pBt, iChild, &ePtrmapType, &iPtrmapParent);
+  if( rc!=SQLITE_OK ){
+    if( rc==SQLITE_NOMEM || rc==SQLITE_IOERR_NOMEM ) pCheck->mallocFailed = 1;
+    checkAppendMsg(pCheck, "Failed to read ptrmap key=%d", iChild);
+    return;
+  }
+
+  if( ePtrmapType!=eType || iPtrmapParent!=iParent ){
+    checkAppendMsg(pCheck,
+      "Bad ptr map entry key=%d expected=(%d,%d) got=(%d,%d)", 
+      iChild, eType, iParent, ePtrmapType, iPtrmapParent);
+  }
+}
+#endif
+
+/*
+** Check the integrity of the freelist or of an overflow page list.
+** Verify that the number of pages on the list is N.
+*/
+static void checkList(
+  IntegrityCk *pCheck,  /* Integrity checking context */
+  int isFreeList,       /* True for a freelist.  False for overflow page list */
+  int iPage,            /* Page number for first page in the list */
+  int N                 /* Expected number of pages in the list */
+){
+  int i;
+  int expected = N;
+  int iFirst = iPage;
+  while( N-- > 0 && pCheck->mxErr ){
+    DbPage *pOvflPage;
+    unsigned char *pOvflData;
+    if( iPage<1 ){
+      checkAppendMsg(pCheck,
+         "%d of %d pages missing from overflow list starting at %d",
+          N+1, expected, iFirst);
+      break;
+    }
+    if( checkRef(pCheck, iPage) ) break;
+    if( sqlite3PagerGet(pCheck->pPager, (Pgno)iPage, &pOvflPage) ){
+      checkAppendMsg(pCheck, "failed to get page %d", iPage);
+      break;
+    }
+    pOvflData = (unsigned char *)sqlite3PagerGetData(pOvflPage);
+    if( isFreeList ){
+      int n = get4byte(&pOvflData[4]);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      if( pCheck->pBt->autoVacuum ){
+        checkPtrmap(pCheck, iPage, PTRMAP_FREEPAGE, 0);
+      }
+#endif
+      if( n>(int)pCheck->pBt->usableSize/4-2 ){
+        checkAppendMsg(pCheck,
+           "freelist leaf count too big on page %d", iPage);
+        N--;
+      }else{
+        for(i=0; i<n; i++){
+          Pgno iFreePage = get4byte(&pOvflData[8+i*4]);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+          if( pCheck->pBt->autoVacuum ){
+            checkPtrmap(pCheck, iFreePage, PTRMAP_FREEPAGE, 0);
+          }
+#endif
+          checkRef(pCheck, iFreePage);
+        }
+        N -= n;
+      }
+    }
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    else{
+      /* If this database supports auto-vacuum and iPage is not the last
+      ** page in this overflow list, check that the pointer-map entry for
+      ** the following page matches iPage.
+      */
+      if( pCheck->pBt->autoVacuum && N>0 ){
+        i = get4byte(pOvflData);
+        checkPtrmap(pCheck, i, PTRMAP_OVERFLOW2, iPage);
+      }
+    }
+#endif
+    iPage = get4byte(pOvflData);
+    sqlite3PagerUnref(pOvflPage);
+  }
+}
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+/*
+** Do various sanity checks on a single page of a tree.  Return
+** the tree depth.  Root pages return 0.  Parents of root pages
+** return 1, and so forth.
+** 
+** These checks are done:
+**
+**      1.  Make sure that cells and freeblocks do not overlap
+**          but combine to completely cover the page.
+**  NO  2.  Make sure cell keys are in order.
+**  NO  3.  Make sure no key is less than or equal to zLowerBound.
+**  NO  4.  Make sure no key is greater than or equal to zUpperBound.
+**      5.  Check the integrity of overflow pages.
+**      6.  Recursively call checkTreePage on all children.
+**      7.  Verify that the depth of all children is the same.
+**      8.  Make sure this page is at least 33% full or else it is
+**          the root of the tree.
+*/
+static int checkTreePage(
+  IntegrityCk *pCheck,  /* Context for the sanity check */
+  int iPage,            /* Page number of the page to check */
+  i64 *pnParentMinKey, 
+  i64 *pnParentMaxKey
+){
+  MemPage *pPage;
+  int i, rc, depth, d2, pgno, cnt;
+  int hdr, cellStart;
+  int nCell;
+  u8 *data;
+  BtShared *pBt;
+  int usableSize;
+  char *hit = 0;
+  i64 nMinKey = 0;
+  i64 nMaxKey = 0;
+  const char *saved_zPfx = pCheck->zPfx;
+  int saved_v1 = pCheck->v1;
+  int saved_v2 = pCheck->v2;
+
+  /* Check that the page exists
+  */
+  pBt = pCheck->pBt;
+  usableSize = pBt->usableSize;
+  if( iPage==0 ) return 0;
+  if( checkRef(pCheck, iPage) ) return 0;
+  pCheck->zPfx = "Page %d: ";
+  pCheck->v1 = iPage;
+  if( (rc = btreeGetPage(pBt, (Pgno)iPage, &pPage, 0))!=0 ){
+    checkAppendMsg(pCheck,
+       "unable to get the page. error code=%d", rc);
+    depth = -1;
+    goto end_of_check;
+  }
+
+  /* Clear MemPage.isInit to make sure the corruption detection code in
+  ** btreeInitPage() is executed.  */
+  pPage->isInit = 0;
+  if( (rc = btreeInitPage(pPage))!=0 ){
+    assert( rc==SQLITE_CORRUPT );  /* The only possible error from InitPage */
+    checkAppendMsg(pCheck,
+                   "btreeInitPage() returns error code %d", rc);
+    releasePage(pPage);
+    depth = -1;
+    goto end_of_check;
+  }
+
+  /* Check out all the cells.
+  */
+  depth = 0;
+  for(i=0; i<pPage->nCell && pCheck->mxErr; i++){
+    u8 *pCell;
+    u32 sz;
+    CellInfo info;
+
+    /* Check payload overflow pages
+    */
+    pCheck->zPfx = "On tree page %d cell %d: ";
+    pCheck->v1 = iPage;
+    pCheck->v2 = i;
+    pCell = findCell(pPage,i);
+    btreeParseCellPtr(pPage, pCell, &info);
+    sz = info.nPayload;
+    /* For intKey pages, check that the keys are in order.
+    */
+    if( pPage->intKey ){
+      if( i==0 ){
+        nMinKey = nMaxKey = info.nKey;
+      }else if( info.nKey <= nMaxKey ){
+        checkAppendMsg(pCheck,
+           "Rowid %lld out of order (previous was %lld)", info.nKey, nMaxKey);
+      }
+      nMaxKey = info.nKey;
+    }
+    if( (sz>info.nLocal) 
+     && (&pCell[info.iOverflow]<=&pPage->aData[pBt->usableSize])
+    ){
+      int nPage = (sz - info.nLocal + usableSize - 5)/(usableSize - 4);
+      Pgno pgnoOvfl = get4byte(&pCell[info.iOverflow]);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      if( pBt->autoVacuum ){
+        checkPtrmap(pCheck, pgnoOvfl, PTRMAP_OVERFLOW1, iPage);
+      }
+#endif
+      checkList(pCheck, 0, pgnoOvfl, nPage);
+    }
+
+    /* Check sanity of left child page.
+    */
+    if( !pPage->leaf ){
+      pgno = get4byte(pCell);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      if( pBt->autoVacuum ){
