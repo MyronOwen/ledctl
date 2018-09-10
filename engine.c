@@ -60748,3 +60748,252 @@ static int btreeDropTable(Btree *p, Pgno iTable, int *piMoved){
         rc = btreeGetPage(pBt, maxRootPgno, &pMove, 0);
         if( rc!=SQLITE_OK ){
           return rc;
+        }
+        rc = relocatePage(pBt, pMove, PTRMAP_ROOTPAGE, 0, iTable, 0);
+        releasePage(pMove);
+        if( rc!=SQLITE_OK ){
+          return rc;
+        }
+        pMove = 0;
+        rc = btreeGetPage(pBt, maxRootPgno, &pMove, 0);
+        freePage(pMove, &rc);
+        releasePage(pMove);
+        if( rc!=SQLITE_OK ){
+          return rc;
+        }
+        *piMoved = maxRootPgno;
+      }
+
+      /* Set the new 'max-root-page' value in the database header. This
+      ** is the old value less one, less one more if that happens to
+      ** be a root-page number, less one again if that is the
+      ** PENDING_BYTE_PAGE.
+      */
+      maxRootPgno--;
+      while( maxRootPgno==PENDING_BYTE_PAGE(pBt)
+             || PTRMAP_ISPAGE(pBt, maxRootPgno) ){
+        maxRootPgno--;
+      }
+      assert( maxRootPgno!=PENDING_BYTE_PAGE(pBt) );
+
+      rc = sqlite3BtreeUpdateMeta(p, 4, maxRootPgno);
+    }else{
+      freePage(pPage, &rc);
+      releasePage(pPage);
+    }
+#endif
+  }else{
+    /* If sqlite3BtreeDropTable was called on page 1.
+    ** This really never should happen except in a corrupt
+    ** database. 
+    */
+    zeroPage(pPage, PTF_INTKEY|PTF_LEAF );
+    releasePage(pPage);
+  }
+  return rc;  
+}
+SQLITE_PRIVATE int sqlite3BtreeDropTable(Btree *p, int iTable, int *piMoved){
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = btreeDropTable(p, iTable, piMoved);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+
+/*
+** This function may only be called if the b-tree connection already
+** has a read or write transaction open on the database.
+**
+** Read the meta-information out of a database file.  Meta[0]
+** is the number of free pages currently in the database.  Meta[1]
+** through meta[15] are available for use by higher layers.  Meta[0]
+** is read-only, the others are read/write.
+** 
+** The schema layer numbers meta values differently.  At the schema
+** layer (and the SetCookie and ReadCookie opcodes) the number of
+** free pages is not visible.  So Cookie[0] is the same as Meta[1].
+**
+** This routine treats Meta[BTREE_DATA_VERSION] as a special case.  Instead
+** of reading the value out of the header, it instead loads the "DataVersion"
+** from the pager.  The BTREE_DATA_VERSION value is not actually stored in the
+** database file.  It is a number computed by the pager.  But its access
+** pattern is the same as header meta values, and so it is convenient to
+** read it from this routine.
+*/
+SQLITE_PRIVATE void sqlite3BtreeGetMeta(Btree *p, int idx, u32 *pMeta){
+  BtShared *pBt = p->pBt;
+
+  sqlite3BtreeEnter(p);
+  assert( p->inTrans>TRANS_NONE );
+  assert( SQLITE_OK==querySharedCacheTableLock(p, MASTER_ROOT, READ_LOCK) );
+  assert( pBt->pPage1 );
+  assert( idx>=0 && idx<=15 );
+
+  if( idx==BTREE_DATA_VERSION ){
+    *pMeta = sqlite3PagerDataVersion(pBt->pPager) + p->iDataVersion;
+  }else{
+    *pMeta = get4byte(&pBt->pPage1->aData[36 + idx*4]);
+  }
+
+  /* If auto-vacuum is disabled in this build and this is an auto-vacuum
+  ** database, mark the database as read-only.  */
+#ifdef SQLITE_OMIT_AUTOVACUUM
+  if( idx==BTREE_LARGEST_ROOT_PAGE && *pMeta>0 ){
+    pBt->btsFlags |= BTS_READ_ONLY;
+  }
+#endif
+
+  sqlite3BtreeLeave(p);
+}
+
+/*
+** Write meta-information back into the database.  Meta[0] is
+** read-only and may not be written.
+*/
+SQLITE_PRIVATE int sqlite3BtreeUpdateMeta(Btree *p, int idx, u32 iMeta){
+  BtShared *pBt = p->pBt;
+  unsigned char *pP1;
+  int rc;
+  assert( idx>=1 && idx<=15 );
+  sqlite3BtreeEnter(p);
+  assert( p->inTrans==TRANS_WRITE );
+  assert( pBt->pPage1!=0 );
+  pP1 = pBt->pPage1->aData;
+  rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
+  if( rc==SQLITE_OK ){
+    put4byte(&pP1[36 + idx*4], iMeta);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( idx==BTREE_INCR_VACUUM ){
+      assert( pBt->autoVacuum || iMeta==0 );
+      assert( iMeta==0 || iMeta==1 );
+      pBt->incrVacuum = (u8)iMeta;
+    }
+#endif
+  }
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+#ifndef SQLITE_OMIT_BTREECOUNT
+/*
+** The first argument, pCur, is a cursor opened on some b-tree. Count the
+** number of entries in the b-tree and write the result to *pnEntry.
+**
+** SQLITE_OK is returned if the operation is successfully executed. 
+** Otherwise, if an error is encountered (i.e. an IO error or database
+** corruption) an SQLite error code is returned.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCount(BtCursor *pCur, i64 *pnEntry){
+  i64 nEntry = 0;                      /* Value to return in *pnEntry */
+  int rc;                              /* Return code */
+
+  if( pCur->pgnoRoot==0 ){
+    *pnEntry = 0;
+    return SQLITE_OK;
+  }
+  rc = moveToRoot(pCur);
+
+  /* Unless an error occurs, the following loop runs one iteration for each
+  ** page in the B-Tree structure (not including overflow pages). 
+  */
+  while( rc==SQLITE_OK ){
+    int iIdx;                          /* Index of child node in parent */
+    MemPage *pPage;                    /* Current page of the b-tree */
+
+    /* If this is a leaf page or the tree is not an int-key tree, then 
+    ** this page contains countable entries. Increment the entry counter
+    ** accordingly.
+    */
+    pPage = pCur->apPage[pCur->iPage];
+    if( pPage->leaf || !pPage->intKey ){
+      nEntry += pPage->nCell;
+    }
+
+    /* pPage is a leaf node. This loop navigates the cursor so that it 
+    ** points to the first interior cell that it points to the parent of
+    ** the next page in the tree that has not yet been visited. The
+    ** pCur->aiIdx[pCur->iPage] value is set to the index of the parent cell
+    ** of the page, or to the number of cells in the page if the next page
+    ** to visit is the right-child of its parent.
+    **
+    ** If all pages in the tree have been visited, return SQLITE_OK to the
+    ** caller.
+    */
+    if( pPage->leaf ){
+      do {
+        if( pCur->iPage==0 ){
+          /* All pages of the b-tree have been visited. Return successfully. */
+          *pnEntry = nEntry;
+          return moveToRoot(pCur);
+        }
+        moveToParent(pCur);
+      }while ( pCur->aiIdx[pCur->iPage]>=pCur->apPage[pCur->iPage]->nCell );
+
+      pCur->aiIdx[pCur->iPage]++;
+      pPage = pCur->apPage[pCur->iPage];
+    }
+
+    /* Descend to the child node of the cell that the cursor currently 
+    ** points at. This is the right-child if (iIdx==pPage->nCell).
+    */
+    iIdx = pCur->aiIdx[pCur->iPage];
+    if( iIdx==pPage->nCell ){
+      rc = moveToChild(pCur, get4byte(&pPage->aData[pPage->hdrOffset+8]));
+    }else{
+      rc = moveToChild(pCur, get4byte(findCell(pPage, iIdx)));
+    }
+  }
+
+  /* An error has occurred. Return an error code. */
+  return rc;
+}
+#endif
+
+/*
+** Return the pager associated with a BTree.  This routine is used for
+** testing and debugging only.
+*/
+SQLITE_PRIVATE Pager *sqlite3BtreePager(Btree *p){
+  return p->pBt->pPager;
+}
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+/*
+** Append a message to the error message string.
+*/
+static void checkAppendMsg(
+  IntegrityCk *pCheck,
+  const char *zFormat,
+  ...
+){
+  va_list ap;
+  char zBuf[200];
+  if( !pCheck->mxErr ) return;
+  pCheck->mxErr--;
+  pCheck->nErr++;
+  va_start(ap, zFormat);
+  if( pCheck->errMsg.nChar ){
+    sqlite3StrAccumAppend(&pCheck->errMsg, "\n", 1);
+  }
+  if( pCheck->zPfx ){
+    sqlite3_snprintf(sizeof(zBuf), zBuf, pCheck->zPfx, pCheck->v1, pCheck->v2);
+    sqlite3StrAccumAppendAll(&pCheck->errMsg, zBuf);
+  }
+  sqlite3VXPrintf(&pCheck->errMsg, 1, zFormat, ap);
+  va_end(ap);
+  if( pCheck->errMsg.accError==STRACCUM_NOMEM ){
+    pCheck->mallocFailed = 1;
+  }
+}
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+
+/*
+** Return non-zero if the bit in the IntegrityCk.aPgRef[] array that
+** corresponds to page iPg is already set.
+*/
+static int getPageReferenced(IntegrityCk *pCheck, Pgno iPg){
+  assert( iPg<=pCheck->nPage && sizeof(pCheck->aPgRef[0])==1 );
+  return (pCheck->aPgRef[iPg/8] & (1 << (iPg & 0x07)));
