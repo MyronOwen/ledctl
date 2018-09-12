@@ -61474,3 +61474,231 @@ SQLITE_PRIVATE char *sqlite3BtreeIntegrityCheck(
   for(i=1; i<=sCheck.nPage && sCheck.mxErr; i++){
 #ifdef SQLITE_OMIT_AUTOVACUUM
     if( getPageReferenced(&sCheck, i)==0 ){
+      checkAppendMsg(&sCheck, "Page %d is never used", i);
+    }
+#else
+    /* If the database supports auto-vacuum, make sure no tables contain
+    ** references to pointer-map pages.
+    */
+    if( getPageReferenced(&sCheck, i)==0 && 
+       (PTRMAP_PAGENO(pBt, i)!=i || !pBt->autoVacuum) ){
+      checkAppendMsg(&sCheck, "Page %d is never used", i);
+    }
+    if( getPageReferenced(&sCheck, i)!=0 && 
+       (PTRMAP_PAGENO(pBt, i)==i && pBt->autoVacuum) ){
+      checkAppendMsg(&sCheck, "Pointer map page %d is referenced", i);
+    }
+#endif
+  }
+
+  /* Make sure this analysis did not leave any unref() pages.
+  ** This is an internal consistency check; an integrity check
+  ** of the integrity check.
+  */
+  if( NEVER(nRef != sqlite3PagerRefcount(pBt->pPager)) ){
+    checkAppendMsg(&sCheck,
+      "Outstanding page count goes from %d to %d during this analysis",
+      nRef, sqlite3PagerRefcount(pBt->pPager)
+    );
+  }
+
+  /* Clean  up and report errors.
+  */
+  sqlite3BtreeLeave(p);
+  sqlite3_free(sCheck.aPgRef);
+  if( sCheck.mallocFailed ){
+    sqlite3StrAccumReset(&sCheck.errMsg);
+    *pnErr = sCheck.nErr+1;
+    return 0;
+  }
+  *pnErr = sCheck.nErr;
+  if( sCheck.nErr==0 ) sqlite3StrAccumReset(&sCheck.errMsg);
+  return sqlite3StrAccumFinish(&sCheck.errMsg);
+}
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+/*
+** Return the full pathname of the underlying database file.  Return
+** an empty string if the database is in-memory or a TEMP database.
+**
+** The pager filename is invariant as long as the pager is
+** open so it is safe to access without the BtShared mutex.
+*/
+SQLITE_PRIVATE const char *sqlite3BtreeGetFilename(Btree *p){
+  assert( p->pBt->pPager!=0 );
+  return sqlite3PagerFilename(p->pBt->pPager, 1);
+}
+
+/*
+** Return the pathname of the journal file for this database. The return
+** value of this routine is the same regardless of whether the journal file
+** has been created or not.
+**
+** The pager journal filename is invariant as long as the pager is
+** open so it is safe to access without the BtShared mutex.
+*/
+SQLITE_PRIVATE const char *sqlite3BtreeGetJournalname(Btree *p){
+  assert( p->pBt->pPager!=0 );
+  return sqlite3PagerJournalname(p->pBt->pPager);
+}
+
+/*
+** Return non-zero if a transaction is active.
+*/
+SQLITE_PRIVATE int sqlite3BtreeIsInTrans(Btree *p){
+  assert( p==0 || sqlite3_mutex_held(p->db->mutex) );
+  return (p && (p->inTrans==TRANS_WRITE));
+}
+
+#ifndef SQLITE_OMIT_WAL
+/*
+** Run a checkpoint on the Btree passed as the first argument.
+**
+** Return SQLITE_LOCKED if this or any other connection has an open 
+** transaction on the shared-cache the argument Btree is connected to.
+**
+** Parameter eMode is one of SQLITE_CHECKPOINT_PASSIVE, FULL or RESTART.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCheckpoint(Btree *p, int eMode, int *pnLog, int *pnCkpt){
+  int rc = SQLITE_OK;
+  if( p ){
+    BtShared *pBt = p->pBt;
+    sqlite3BtreeEnter(p);
+    if( pBt->inTransaction!=TRANS_NONE ){
+      rc = SQLITE_LOCKED;
+    }else{
+      rc = sqlite3PagerCheckpoint(pBt->pPager, eMode, pnLog, pnCkpt);
+    }
+    sqlite3BtreeLeave(p);
+  }
+  return rc;
+}
+#endif
+
+/*
+** Return non-zero if a read (or write) transaction is active.
+*/
+SQLITE_PRIVATE int sqlite3BtreeIsInReadTrans(Btree *p){
+  assert( p );
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  return p->inTrans!=TRANS_NONE;
+}
+
+SQLITE_PRIVATE int sqlite3BtreeIsInBackup(Btree *p){
+  assert( p );
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  return p->nBackup!=0;
+}
+
+/*
+** This function returns a pointer to a blob of memory associated with
+** a single shared-btree. The memory is used by client code for its own
+** purposes (for example, to store a high-level schema associated with 
+** the shared-btree). The btree layer manages reference counting issues.
+**
+** The first time this is called on a shared-btree, nBytes bytes of memory
+** are allocated, zeroed, and returned to the caller. For each subsequent 
+** call the nBytes parameter is ignored and a pointer to the same blob
+** of memory returned. 
+**
+** If the nBytes parameter is 0 and the blob of memory has not yet been
+** allocated, a null pointer is returned. If the blob has already been
+** allocated, it is returned as normal.
+**
+** Just before the shared-btree is closed, the function passed as the 
+** xFree argument when the memory allocation was made is invoked on the 
+** blob of allocated memory. The xFree function should not call sqlite3_free()
+** on the memory, the btree layer does that.
+*/
+SQLITE_PRIVATE void *sqlite3BtreeSchema(Btree *p, int nBytes, void(*xFree)(void *)){
+  BtShared *pBt = p->pBt;
+  sqlite3BtreeEnter(p);
+  if( !pBt->pSchema && nBytes ){
+    pBt->pSchema = sqlite3DbMallocZero(0, nBytes);
+    pBt->xFreeSchema = xFree;
+  }
+  sqlite3BtreeLeave(p);
+  return pBt->pSchema;
+}
+
+/*
+** Return SQLITE_LOCKED_SHAREDCACHE if another user of the same shared 
+** btree as the argument handle holds an exclusive lock on the 
+** sqlite_master table. Otherwise SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSchemaLocked(Btree *p){
+  int rc;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  rc = querySharedCacheTableLock(p, MASTER_ROOT, READ_LOCK);
+  assert( rc==SQLITE_OK || rc==SQLITE_LOCKED_SHAREDCACHE );
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+/*
+** Obtain a lock on the table whose root page is iTab.  The
+** lock is a write lock if isWritelock is true or a read lock
+** if it is false.
+*/
+SQLITE_PRIVATE int sqlite3BtreeLockTable(Btree *p, int iTab, u8 isWriteLock){
+  int rc = SQLITE_OK;
+  assert( p->inTrans!=TRANS_NONE );
+  if( p->sharable ){
+    u8 lockType = READ_LOCK + isWriteLock;
+    assert( READ_LOCK+1==WRITE_LOCK );
+    assert( isWriteLock==0 || isWriteLock==1 );
+
+    sqlite3BtreeEnter(p);
+    rc = querySharedCacheTableLock(p, iTab, lockType);
+    if( rc==SQLITE_OK ){
+      rc = setSharedCacheTableLock(p, iTab, lockType);
+    }
+    sqlite3BtreeLeave(p);
+  }
+  return rc;
+}
+#endif
+
+#ifndef SQLITE_OMIT_INCRBLOB
+/*
+** Argument pCsr must be a cursor opened for writing on an 
+** INTKEY table currently pointing at a valid table entry. 
+** This function modifies the data stored as part of that entry.
+**
+** Only the data content may only be modified, it is not possible to 
+** change the length of the data stored. If this function is called with
+** parameters that attempt to write past the end of the existing data,
+** no modifications are made and SQLITE_CORRUPT is returned.
+*/
+SQLITE_PRIVATE int sqlite3BtreePutData(BtCursor *pCsr, u32 offset, u32 amt, void *z){
+  int rc;
+  assert( cursorHoldsMutex(pCsr) );
+  assert( sqlite3_mutex_held(pCsr->pBtree->db->mutex) );
+  assert( pCsr->curFlags & BTCF_Incrblob );
+
+  rc = restoreCursorPosition(pCsr);
+  if( rc!=SQLITE_OK ){
+    return rc;
+  }
+  assert( pCsr->eState!=CURSOR_REQUIRESEEK );
+  if( pCsr->eState!=CURSOR_VALID ){
+    return SQLITE_ABORT;
+  }
+
+  /* Save the positions of all other cursors open on this table. This is
+  ** required in case any of them are holding references to an xFetch
+  ** version of the b-tree page modified by the accessPayload call below.
+  **
+  ** Note that pCsr must be open on a INTKEY table and saveCursorPosition()
+  ** and hence saveAllCursors() cannot fail on a BTREE_INTKEY table, hence
+  ** saveAllCursors can only return SQLITE_OK.
+  */
+  VVA_ONLY(rc =) saveAllCursors(pCsr->pBt, pCsr->pgnoRoot, pCsr);
+  assert( rc==SQLITE_OK );
+
+  /* Check some assumptions: 
+  **   (a) the cursor is open for writing,
+  **   (b) there is a read/write transaction open,
