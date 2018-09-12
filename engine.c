@@ -61702,3 +61702,219 @@ SQLITE_PRIVATE int sqlite3BtreePutData(BtCursor *pCsr, u32 offset, u32 amt, void
   /* Check some assumptions: 
   **   (a) the cursor is open for writing,
   **   (b) there is a read/write transaction open,
+  **   (c) the connection holds a write-lock on the table (if required),
+  **   (d) there are no conflicting read-locks, and
+  **   (e) the cursor points at a valid row of an intKey table.
+  */
+  if( (pCsr->curFlags & BTCF_WriteFlag)==0 ){
+    return SQLITE_READONLY;
+  }
+  assert( (pCsr->pBt->btsFlags & BTS_READ_ONLY)==0
+              && pCsr->pBt->inTransaction==TRANS_WRITE );
+  assert( hasSharedCacheTableLock(pCsr->pBtree, pCsr->pgnoRoot, 0, 2) );
+  assert( !hasReadConflicts(pCsr->pBtree, pCsr->pgnoRoot) );
+  assert( pCsr->apPage[pCsr->iPage]->intKey );
+
+  return accessPayload(pCsr, offset, amt, (unsigned char *)z, 1);
+}
+
+/* 
+** Mark this cursor as an incremental blob cursor.
+*/
+SQLITE_PRIVATE void sqlite3BtreeIncrblobCursor(BtCursor *pCur){
+  pCur->curFlags |= BTCF_Incrblob;
+}
+#endif
+
+/*
+** Set both the "read version" (single byte at byte offset 18) and 
+** "write version" (single byte at byte offset 19) fields in the database
+** header to iVersion.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetVersion(Btree *pBtree, int iVersion){
+  BtShared *pBt = pBtree->pBt;
+  int rc;                         /* Return code */
+ 
+  assert( iVersion==1 || iVersion==2 );
+
+  /* If setting the version fields to 1, do not automatically open the
+  ** WAL connection, even if the version fields are currently set to 2.
+  */
+  pBt->btsFlags &= ~BTS_NO_WAL;
+  if( iVersion==1 ) pBt->btsFlags |= BTS_NO_WAL;
+
+  rc = sqlite3BtreeBeginTrans(pBtree, 0);
+  if( rc==SQLITE_OK ){
+    u8 *aData = pBt->pPage1->aData;
+    if( aData[18]!=(u8)iVersion || aData[19]!=(u8)iVersion ){
+      rc = sqlite3BtreeBeginTrans(pBtree, 2);
+      if( rc==SQLITE_OK ){
+        rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
+        if( rc==SQLITE_OK ){
+          aData[18] = (u8)iVersion;
+          aData[19] = (u8)iVersion;
+        }
+      }
+    }
+  }
+
+  pBt->btsFlags &= ~BTS_NO_WAL;
+  return rc;
+}
+
+/*
+** set the mask of hint flags for cursor pCsr. Currently the only valid
+** values are 0 and BTREE_BULKLOAD.
+*/
+SQLITE_PRIVATE void sqlite3BtreeCursorHints(BtCursor *pCsr, unsigned int mask){
+  assert( mask==BTREE_BULKLOAD || mask==0 );
+  pCsr->hints = mask;
+}
+
+/*
+** Return true if the given Btree is read-only.
+*/
+SQLITE_PRIVATE int sqlite3BtreeIsReadonly(Btree *p){
+  return (p->pBt->btsFlags & BTS_READ_ONLY)!=0;
+}
+
+/*
+** Return the size of the header added to each page by this module.
+*/
+SQLITE_PRIVATE int sqlite3HeaderSizeBtree(void){ return ROUND8(sizeof(MemPage)); }
+
+/************** End of btree.c ***********************************************/
+/************** Begin file backup.c ******************************************/
+/*
+** 2009 January 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the implementation of the sqlite3_backup_XXX() 
+** API functions and the related features.
+*/
+
+/*
+** Structure allocated for each backup operation.
+*/
+struct sqlite3_backup {
+  sqlite3* pDestDb;        /* Destination database handle */
+  Btree *pDest;            /* Destination b-tree file */
+  u32 iDestSchema;         /* Original schema cookie in destination */
+  int bDestLocked;         /* True once a write-transaction is open on pDest */
+
+  Pgno iNext;              /* Page number of the next source page to copy */
+  sqlite3* pSrcDb;         /* Source database handle */
+  Btree *pSrc;             /* Source b-tree file */
+
+  int rc;                  /* Backup process error code */
+
+  /* These two variables are set by every call to backup_step(). They are
+  ** read by calls to backup_remaining() and backup_pagecount().
+  */
+  Pgno nRemaining;         /* Number of pages left to copy */
+  Pgno nPagecount;         /* Total number of pages to copy */
+
+  int isAttached;          /* True once backup has been registered with pager */
+  sqlite3_backup *pNext;   /* Next backup associated with source pager */
+};
+
+/*
+** THREAD SAFETY NOTES:
+**
+**   Once it has been created using backup_init(), a single sqlite3_backup
+**   structure may be accessed via two groups of thread-safe entry points:
+**
+**     * Via the sqlite3_backup_XXX() API function backup_step() and 
+**       backup_finish(). Both these functions obtain the source database
+**       handle mutex and the mutex associated with the source BtShared 
+**       structure, in that order.
+**
+**     * Via the BackupUpdate() and BackupRestart() functions, which are
+**       invoked by the pager layer to report various state changes in
+**       the page cache associated with the source database. The mutex
+**       associated with the source database BtShared structure will always 
+**       be held when either of these functions are invoked.
+**
+**   The other sqlite3_backup_XXX() API functions, backup_remaining() and
+**   backup_pagecount() are not thread-safe functions. If they are called
+**   while some other thread is calling backup_step() or backup_finish(),
+**   the values returned may be invalid. There is no way for a call to
+**   BackupUpdate() or BackupRestart() to interfere with backup_remaining()
+**   or backup_pagecount().
+**
+**   Depending on the SQLite configuration, the database handles and/or
+**   the Btree objects may have their own mutexes that require locking.
+**   Non-sharable Btrees (in-memory databases for example), do not have
+**   associated mutexes.
+*/
+
+/*
+** Return a pointer corresponding to database zDb (i.e. "main", "temp")
+** in connection handle pDb. If such a database cannot be found, return
+** a NULL pointer and write an error message to pErrorDb.
+**
+** If the "temp" database is requested, it may need to be opened by this 
+** function. If an error occurs while doing so, return 0 and write an 
+** error message to pErrorDb.
+*/
+static Btree *findBtree(sqlite3 *pErrorDb, sqlite3 *pDb, const char *zDb){
+  int i = sqlite3FindDbName(pDb, zDb);
+
+  if( i==1 ){
+    Parse *pParse;
+    int rc = 0;
+    pParse = sqlite3StackAllocZero(pErrorDb, sizeof(*pParse));
+    if( pParse==0 ){
+      sqlite3ErrorWithMsg(pErrorDb, SQLITE_NOMEM, "out of memory");
+      rc = SQLITE_NOMEM;
+    }else{
+      pParse->db = pDb;
+      if( sqlite3OpenTempDatabase(pParse) ){
+        sqlite3ErrorWithMsg(pErrorDb, pParse->rc, "%s", pParse->zErrMsg);
+        rc = SQLITE_ERROR;
+      }
+      sqlite3DbFree(pErrorDb, pParse->zErrMsg);
+      sqlite3ParserReset(pParse);
+      sqlite3StackFree(pErrorDb, pParse);
+    }
+    if( rc ){
+      return 0;
+    }
+  }
+
+  if( i<0 ){
+    sqlite3ErrorWithMsg(pErrorDb, SQLITE_ERROR, "unknown database %s", zDb);
+    return 0;
+  }
+
+  return pDb->aDb[i].pBt;
+}
+
+/*
+** Attempt to set the page size of the destination to match the page size
+** of the source.
+*/
+static int setDestPgsz(sqlite3_backup *p){
+  int rc;
+  rc = sqlite3BtreeSetPageSize(p->pDest,sqlite3BtreeGetPageSize(p->pSrc),-1,0);
+  return rc;
+}
+
+/*
+** Check that there is no open read-transaction on the b-tree passed as the
+** second argument. If there is not, return SQLITE_OK. Otherwise, if there
+** is an open read-transaction, return SQLITE_ERROR and leave an error 
+** message in database handle db.
+*/
+static int checkReadTransaction(sqlite3 *db, Btree *p){
+  if( sqlite3BtreeIsInReadTrans(p) ){
+    sqlite3ErrorWithMsg(db, SQLITE_ERROR, "destination database is in use");
+    return SQLITE_ERROR;
+  }
