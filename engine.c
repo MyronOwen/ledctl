@@ -61918,3 +61918,239 @@ static int checkReadTransaction(sqlite3 *db, Btree *p){
     sqlite3ErrorWithMsg(db, SQLITE_ERROR, "destination database is in use");
     return SQLITE_ERROR;
   }
+  return SQLITE_OK;
+}
+
+/*
+** Create an sqlite3_backup process to copy the contents of zSrcDb from
+** connection handle pSrcDb to zDestDb in pDestDb. If successful, return
+** a pointer to the new sqlite3_backup object.
+**
+** If an error occurs, NULL is returned and an error code and error message
+** stored in database handle pDestDb.
+*/
+SQLITE_API sqlite3_backup *sqlite3_backup_init(
+  sqlite3* pDestDb,                     /* Database to write to */
+  const char *zDestDb,                  /* Name of database within pDestDb */
+  sqlite3* pSrcDb,                      /* Database connection to read from */
+  const char *zSrcDb                    /* Name of database within pSrcDb */
+){
+  sqlite3_backup *p;                    /* Value to return */
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(pSrcDb)||!sqlite3SafetyCheckOk(pDestDb) ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+
+  /* Lock the source database handle. The destination database
+  ** handle is not locked in this routine, but it is locked in
+  ** sqlite3_backup_step(). The user is required to ensure that no
+  ** other thread accesses the destination handle for the duration
+  ** of the backup operation.  Any attempt to use the destination
+  ** database connection while a backup is in progress may cause
+  ** a malfunction or a deadlock.
+  */
+  sqlite3_mutex_enter(pSrcDb->mutex);
+  sqlite3_mutex_enter(pDestDb->mutex);
+
+  if( pSrcDb==pDestDb ){
+    sqlite3ErrorWithMsg(
+        pDestDb, SQLITE_ERROR, "source and destination must be distinct"
+    );
+    p = 0;
+  }else {
+    /* Allocate space for a new sqlite3_backup object...
+    ** EVIDENCE-OF: R-64852-21591 The sqlite3_backup object is created by a
+    ** call to sqlite3_backup_init() and is destroyed by a call to
+    ** sqlite3_backup_finish(). */
+    p = (sqlite3_backup *)sqlite3MallocZero(sizeof(sqlite3_backup));
+    if( !p ){
+      sqlite3Error(pDestDb, SQLITE_NOMEM);
+    }
+  }
+
+  /* If the allocation succeeded, populate the new object. */
+  if( p ){
+    p->pSrc = findBtree(pDestDb, pSrcDb, zSrcDb);
+    p->pDest = findBtree(pDestDb, pDestDb, zDestDb);
+    p->pDestDb = pDestDb;
+    p->pSrcDb = pSrcDb;
+    p->iNext = 1;
+    p->isAttached = 0;
+
+    if( 0==p->pSrc || 0==p->pDest 
+     || setDestPgsz(p)==SQLITE_NOMEM 
+     || checkReadTransaction(pDestDb, p->pDest)!=SQLITE_OK 
+     ){
+      /* One (or both) of the named databases did not exist or an OOM
+      ** error was hit. Or there is a transaction open on the destination
+      ** database. The error has already been written into the pDestDb 
+      ** handle. All that is left to do here is free the sqlite3_backup 
+      ** structure.  */
+      sqlite3_free(p);
+      p = 0;
+    }
+  }
+  if( p ){
+    p->pSrc->nBackup++;
+  }
+
+  sqlite3_mutex_leave(pDestDb->mutex);
+  sqlite3_mutex_leave(pSrcDb->mutex);
+  return p;
+}
+
+/*
+** Argument rc is an SQLite error code. Return true if this error is 
+** considered fatal if encountered during a backup operation. All errors
+** are considered fatal except for SQLITE_BUSY and SQLITE_LOCKED.
+*/
+static int isFatalError(int rc){
+  return (rc!=SQLITE_OK && rc!=SQLITE_BUSY && ALWAYS(rc!=SQLITE_LOCKED));
+}
+
+/*
+** Parameter zSrcData points to a buffer containing the data for 
+** page iSrcPg from the source database. Copy this data into the 
+** destination database.
+*/
+static int backupOnePage(
+  sqlite3_backup *p,              /* Backup handle */
+  Pgno iSrcPg,                    /* Source database page to backup */
+  const u8 *zSrcData,             /* Source database page data */
+  int bUpdate                     /* True for an update, false otherwise */
+){
+  Pager * const pDestPager = sqlite3BtreePager(p->pDest);
+  const int nSrcPgsz = sqlite3BtreeGetPageSize(p->pSrc);
+  int nDestPgsz = sqlite3BtreeGetPageSize(p->pDest);
+  const int nCopy = MIN(nSrcPgsz, nDestPgsz);
+  const i64 iEnd = (i64)iSrcPg*(i64)nSrcPgsz;
+#ifdef SQLITE_HAS_CODEC
+  /* Use BtreeGetReserveNoMutex() for the source b-tree, as although it is
+  ** guaranteed that the shared-mutex is held by this thread, handle
+  ** p->pSrc may not actually be the owner.  */
+  int nSrcReserve = sqlite3BtreeGetReserveNoMutex(p->pSrc);
+  int nDestReserve = sqlite3BtreeGetReserve(p->pDest);
+#endif
+  int rc = SQLITE_OK;
+  i64 iOff;
+
+  assert( sqlite3BtreeGetReserveNoMutex(p->pSrc)>=0 );
+  assert( p->bDestLocked );
+  assert( !isFatalError(p->rc) );
+  assert( iSrcPg!=PENDING_BYTE_PAGE(p->pSrc->pBt) );
+  assert( zSrcData );
+
+  /* Catch the case where the destination is an in-memory database and the
+  ** page sizes of the source and destination differ. 
+  */
+  if( nSrcPgsz!=nDestPgsz && sqlite3PagerIsMemdb(pDestPager) ){
+    rc = SQLITE_READONLY;
+  }
+
+#ifdef SQLITE_HAS_CODEC
+  /* Backup is not possible if the page size of the destination is changing
+  ** and a codec is in use.
+  */
+  if( nSrcPgsz!=nDestPgsz && sqlite3PagerGetCodec(pDestPager)!=0 ){
+    rc = SQLITE_READONLY;
+  }
+
+  /* Backup is not possible if the number of bytes of reserve space differ
+  ** between source and destination.  If there is a difference, try to
+  ** fix the destination to agree with the source.  If that is not possible,
+  ** then the backup cannot proceed.
+  */
+  if( nSrcReserve!=nDestReserve ){
+    u32 newPgsz = nSrcPgsz;
+    rc = sqlite3PagerSetPagesize(pDestPager, &newPgsz, nSrcReserve);
+    if( rc==SQLITE_OK && newPgsz!=nSrcPgsz ) rc = SQLITE_READONLY;
+  }
+#endif
+
+  /* This loop runs once for each destination page spanned by the source 
+  ** page. For each iteration, variable iOff is set to the byte offset
+  ** of the destination page.
+  */
+  for(iOff=iEnd-(i64)nSrcPgsz; rc==SQLITE_OK && iOff<iEnd; iOff+=nDestPgsz){
+    DbPage *pDestPg = 0;
+    Pgno iDest = (Pgno)(iOff/nDestPgsz)+1;
+    if( iDest==PENDING_BYTE_PAGE(p->pDest->pBt) ) continue;
+    if( SQLITE_OK==(rc = sqlite3PagerGet(pDestPager, iDest, &pDestPg))
+     && SQLITE_OK==(rc = sqlite3PagerWrite(pDestPg))
+    ){
+      const u8 *zIn = &zSrcData[iOff%nSrcPgsz];
+      u8 *zDestData = sqlite3PagerGetData(pDestPg);
+      u8 *zOut = &zDestData[iOff%nDestPgsz];
+
+      /* Copy the data from the source page into the destination page.
+      ** Then clear the Btree layer MemPage.isInit flag. Both this module
+      ** and the pager code use this trick (clearing the first byte
+      ** of the page 'extra' space to invalidate the Btree layers
+      ** cached parse of the page). MemPage.isInit is marked 
+      ** "MUST BE FIRST" for this purpose.
+      */
+      memcpy(zOut, zIn, nCopy);
+      ((u8 *)sqlite3PagerGetExtra(pDestPg))[0] = 0;
+      if( iOff==0 && bUpdate==0 ){
+        sqlite3Put4byte(&zOut[28], sqlite3BtreeLastPage(p->pSrc));
+      }
+    }
+    sqlite3PagerUnref(pDestPg);
+  }
+
+  return rc;
+}
+
+/*
+** If pFile is currently larger than iSize bytes, then truncate it to
+** exactly iSize bytes. If pFile is not larger than iSize bytes, then
+** this function is a no-op.
+**
+** Return SQLITE_OK if everything is successful, or an SQLite error 
+** code if an error occurs.
+*/
+static int backupTruncateFile(sqlite3_file *pFile, i64 iSize){
+  i64 iCurrent;
+  int rc = sqlite3OsFileSize(pFile, &iCurrent);
+  if( rc==SQLITE_OK && iCurrent>iSize ){
+    rc = sqlite3OsTruncate(pFile, iSize);
+  }
+  return rc;
+}
+
+/*
+** Register this backup object with the associated source pager for
+** callbacks when pages are changed or the cache invalidated.
+*/
+static void attachBackupObject(sqlite3_backup *p){
+  sqlite3_backup **pp;
+  assert( sqlite3BtreeHoldsMutex(p->pSrc) );
+  pp = sqlite3PagerBackupPtr(sqlite3BtreePager(p->pSrc));
+  p->pNext = *pp;
+  *pp = p;
+  p->isAttached = 1;
+}
+
+/*
+** Copy nPage pages from the source b-tree to the destination.
+*/
+SQLITE_API int sqlite3_backup_step(sqlite3_backup *p, int nPage){
+  int rc;
+  int destMode;       /* Destination journal mode */
+  int pgszSrc = 0;    /* Source page size */
+  int pgszDest = 0;   /* Destination page size */
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( p==0 ) return SQLITE_MISUSE_BKPT;
+#endif
+  sqlite3_mutex_enter(p->pSrcDb->mutex);
+  sqlite3BtreeEnter(p->pSrc);
+  if( p->pDestDb ){
+    sqlite3_mutex_enter(p->pDestDb->mutex);
+  }
+
+  rc = p->rc;
+  if( !isFatalError(rc) ){
