@@ -64012,3 +64012,232 @@ SQLITE_PRIVATE int sqlite3Stat4ProbeSetValue(
   struct ValueNewStat4Ctx alloc;
 
   alloc.pParse = pParse;
+  alloc.pIdx = pIdx;
+  alloc.ppRec = ppRec;
+  alloc.iVal = iVal;
+
+  rc = stat4ValueFromExpr(pParse, pExpr, affinity, &alloc, &pVal);
+  assert( pVal==0 || pVal->db==pParse->db );
+  *pbOk = (pVal!=0);
+  return rc;
+}
+
+/*
+** Attempt to extract a value from expression pExpr using the methods
+** as described for sqlite3Stat4ProbeSetValue() above. 
+**
+** If successful, set *ppVal to point to a new value object and return 
+** SQLITE_OK. If no value can be extracted, but no other error occurs
+** (e.g. OOM), return SQLITE_OK and set *ppVal to NULL. Or, if an error
+** does occur, return an SQLite error code. The final value of *ppVal
+** is undefined in this case.
+*/
+SQLITE_PRIVATE int sqlite3Stat4ValueFromExpr(
+  Parse *pParse,                  /* Parse context */
+  Expr *pExpr,                    /* The expression to extract a value from */
+  u8 affinity,                    /* Affinity to use */
+  sqlite3_value **ppVal           /* OUT: New value object (or NULL) */
+){
+  return stat4ValueFromExpr(pParse, pExpr, affinity, 0, ppVal);
+}
+
+/*
+** Extract the iCol-th column from the nRec-byte record in pRec.  Write
+** the column value into *ppVal.  If *ppVal is initially NULL then a new
+** sqlite3_value object is allocated.
+**
+** If *ppVal is initially NULL then the caller is responsible for 
+** ensuring that the value written into *ppVal is eventually freed.
+*/
+SQLITE_PRIVATE int sqlite3Stat4Column(
+  sqlite3 *db,                    /* Database handle */
+  const void *pRec,               /* Pointer to buffer containing record */
+  int nRec,                       /* Size of buffer pRec in bytes */
+  int iCol,                       /* Column to extract */
+  sqlite3_value **ppVal           /* OUT: Extracted value */
+){
+  u32 t;                          /* a column type code */
+  int nHdr;                       /* Size of the header in the record */
+  int iHdr;                       /* Next unread header byte */
+  int iField;                     /* Next unread data byte */
+  int szField;                    /* Size of the current data field */
+  int i;                          /* Column index */
+  u8 *a = (u8*)pRec;              /* Typecast byte array */
+  Mem *pMem = *ppVal;             /* Write result into this Mem object */
+
+  assert( iCol>0 );
+  iHdr = getVarint32(a, nHdr);
+  if( nHdr>nRec || iHdr>=nHdr ) return SQLITE_CORRUPT_BKPT;
+  iField = nHdr;
+  for(i=0; i<=iCol; i++){
+    iHdr += getVarint32(&a[iHdr], t);
+    testcase( iHdr==nHdr );
+    testcase( iHdr==nHdr+1 );
+    if( iHdr>nHdr ) return SQLITE_CORRUPT_BKPT;
+    szField = sqlite3VdbeSerialTypeLen(t);
+    iField += szField;
+  }
+  testcase( iField==nRec );
+  testcase( iField==nRec+1 );
+  if( iField>nRec ) return SQLITE_CORRUPT_BKPT;
+  if( pMem==0 ){
+    pMem = *ppVal = sqlite3ValueNew(db);
+    if( pMem==0 ) return SQLITE_NOMEM;
+  }
+  sqlite3VdbeSerialGet(&a[iField-szField], t, pMem);
+  pMem->enc = ENC(db);
+  return SQLITE_OK;
+}
+
+/*
+** Unless it is NULL, the argument must be an UnpackedRecord object returned
+** by an earlier call to sqlite3Stat4ProbeSetValue(). This call deletes
+** the object.
+*/
+SQLITE_PRIVATE void sqlite3Stat4ProbeFree(UnpackedRecord *pRec){
+  if( pRec ){
+    int i;
+    int nCol = pRec->pKeyInfo->nField+pRec->pKeyInfo->nXField;
+    Mem *aMem = pRec->aMem;
+    sqlite3 *db = aMem[0].db;
+    for(i=0; i<nCol; i++){
+      if( aMem[i].szMalloc ) sqlite3DbFree(db, aMem[i].zMalloc);
+    }
+    sqlite3KeyInfoUnref(pRec->pKeyInfo);
+    sqlite3DbFree(db, pRec);
+  }
+}
+#endif /* ifdef SQLITE_ENABLE_STAT4 */
+
+/*
+** Change the string value of an sqlite3_value object
+*/
+SQLITE_PRIVATE void sqlite3ValueSetStr(
+  sqlite3_value *v,     /* Value to be set */
+  int n,                /* Length of string z */
+  const void *z,        /* Text of the new string */
+  u8 enc,               /* Encoding to use */
+  void (*xDel)(void*)   /* Destructor for the string */
+){
+  if( v ) sqlite3VdbeMemSetStr((Mem *)v, z, n, enc, xDel);
+}
+
+/*
+** Free an sqlite3_value object
+*/
+SQLITE_PRIVATE void sqlite3ValueFree(sqlite3_value *v){
+  if( !v ) return;
+  sqlite3VdbeMemRelease((Mem *)v);
+  sqlite3DbFree(((Mem*)v)->db, v);
+}
+
+/*
+** Return the number of bytes in the sqlite3_value object assuming
+** that it uses the encoding "enc"
+*/
+SQLITE_PRIVATE int sqlite3ValueBytes(sqlite3_value *pVal, u8 enc){
+  Mem *p = (Mem*)pVal;
+  if( (p->flags & MEM_Blob)!=0 || sqlite3ValueText(pVal, enc) ){
+    if( p->flags & MEM_Zero ){
+      return p->n + p->u.nZero;
+    }else{
+      return p->n;
+    }
+  }
+  return 0;
+}
+
+/************** End of vdbemem.c *********************************************/
+/************** Begin file vdbeaux.c *****************************************/
+/*
+** 2003 September 6
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code used for creating, destroying, and populating
+** a VDBE (or an "sqlite3_stmt" as it is known to the outside world.) 
+*/
+
+/*
+** Create a new virtual database engine.
+*/
+SQLITE_PRIVATE Vdbe *sqlite3VdbeCreate(Parse *pParse){
+  sqlite3 *db = pParse->db;
+  Vdbe *p;
+  p = sqlite3DbMallocZero(db, sizeof(Vdbe) );
+  if( p==0 ) return 0;
+  p->db = db;
+  if( db->pVdbe ){
+    db->pVdbe->pPrev = p;
+  }
+  p->pNext = db->pVdbe;
+  p->pPrev = 0;
+  db->pVdbe = p;
+  p->magic = VDBE_MAGIC_INIT;
+  p->pParse = pParse;
+  assert( pParse->aLabel==0 );
+  assert( pParse->nLabel==0 );
+  assert( pParse->nOpAlloc==0 );
+  return p;
+}
+
+/*
+** Remember the SQL string for a prepared statement.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetSql(Vdbe *p, const char *z, int n, int isPrepareV2){
+  assert( isPrepareV2==1 || isPrepareV2==0 );
+  if( p==0 ) return;
+#if defined(SQLITE_OMIT_TRACE) && !defined(SQLITE_ENABLE_SQLLOG)
+  if( !isPrepareV2 ) return;
+#endif
+  assert( p->zSql==0 );
+  p->zSql = sqlite3DbStrNDup(p->db, z, n);
+  p->isPrepareV2 = (u8)isPrepareV2;
+}
+
+/*
+** Return the SQL associated with a prepared statement
+*/
+SQLITE_API const char *sqlite3_sql(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe *)pStmt;
+  return (p && p->isPrepareV2) ? p->zSql : 0;
+}
+
+/*
+** Swap all content between two VDBE structures.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSwap(Vdbe *pA, Vdbe *pB){
+  Vdbe tmp, *pTmp;
+  char *zTmp;
+  tmp = *pA;
+  *pA = *pB;
+  *pB = tmp;
+  pTmp = pA->pNext;
+  pA->pNext = pB->pNext;
+  pB->pNext = pTmp;
+  pTmp = pA->pPrev;
+  pA->pPrev = pB->pPrev;
+  pB->pPrev = pTmp;
+  zTmp = pA->zSql;
+  pA->zSql = pB->zSql;
+  pB->zSql = zTmp;
+  pB->isPrepareV2 = pA->isPrepareV2;
+}
+
+/*
+** Resize the Vdbe.aOp array so that it is at least nOp elements larger 
+** than its current size. nOp is guaranteed to be less than or equal
+** to 1024/sizeof(Op).
+**
+** If an out-of-memory error occurs while resizing the array, return
+** SQLITE_NOMEM. In this case Vdbe.aOp and Parse.nOpAlloc remain 
+** unchanged (this is so that any opcodes already allocated can be 
+** correctly deallocated along with the rest of the Vdbe).
+*/
+static int growOpArray(Vdbe *v, int nOp){
