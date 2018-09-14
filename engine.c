@@ -62854,3 +62854,241 @@ SQLITE_PRIVATE int sqlite3VdbeMemNulTerminate(Mem *pMem){
 */
 SQLITE_PRIVATE int sqlite3VdbeMemStringify(Mem *pMem, u8 enc, u8 bForce){
   int fg = pMem->flags;
+  const int nByte = 32;
+
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( !(fg&MEM_Zero) );
+  assert( !(fg&(MEM_Str|MEM_Blob)) );
+  assert( fg&(MEM_Int|MEM_Real) );
+  assert( (pMem->flags&MEM_RowSet)==0 );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+
+  if( sqlite3VdbeMemClearAndResize(pMem, nByte) ){
+    return SQLITE_NOMEM;
+  }
+
+  /* For a Real or Integer, use sqlite3_snprintf() to produce the UTF-8
+  ** string representation of the value. Then, if the required encoding
+  ** is UTF-16le or UTF-16be do a translation.
+  ** 
+  ** FIX ME: It would be better if sqlite3_snprintf() could do UTF-16.
+  */
+  if( fg & MEM_Int ){
+    sqlite3_snprintf(nByte, pMem->z, "%lld", pMem->u.i);
+  }else{
+    assert( fg & MEM_Real );
+    sqlite3_snprintf(nByte, pMem->z, "%!.15g", pMem->u.r);
+  }
+  pMem->n = sqlite3Strlen30(pMem->z);
+  pMem->enc = SQLITE_UTF8;
+  pMem->flags |= MEM_Str|MEM_Term;
+  if( bForce ) pMem->flags &= ~(MEM_Int|MEM_Real);
+  sqlite3VdbeChangeEncoding(pMem, enc);
+  return SQLITE_OK;
+}
+
+/*
+** Memory cell pMem contains the context of an aggregate function.
+** This routine calls the finalize method for that function.  The
+** result of the aggregate is stored back into pMem.
+**
+** Return SQLITE_ERROR if the finalizer reports an error.  SQLITE_OK
+** otherwise.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemFinalize(Mem *pMem, FuncDef *pFunc){
+  int rc = SQLITE_OK;
+  if( ALWAYS(pFunc && pFunc->xFinalize) ){
+    sqlite3_context ctx;
+    Mem t;
+    assert( (pMem->flags & MEM_Null)!=0 || pFunc==pMem->u.pDef );
+    assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&t, 0, sizeof(t));
+    t.flags = MEM_Null;
+    t.db = pMem->db;
+    ctx.pOut = &t;
+    ctx.pMem = pMem;
+    ctx.pFunc = pFunc;
+    pFunc->xFinalize(&ctx); /* IMP: R-24505-23230 */
+    assert( (pMem->flags & MEM_Dyn)==0 );
+    if( pMem->szMalloc>0 ) sqlite3DbFree(pMem->db, pMem->zMalloc);
+    memcpy(pMem, &t, sizeof(t));
+    rc = ctx.isError;
+  }
+  return rc;
+}
+
+/*
+** If the memory cell contains a value that must be freed by
+** invoking the external callback in Mem.xDel, then this routine
+** will free that value.  It also sets Mem.flags to MEM_Null.
+**
+** This is a helper routine for sqlite3VdbeMemSetNull() and
+** for sqlite3VdbeMemRelease().  Use those other routines as the
+** entry point for releasing Mem resources.
+*/
+static SQLITE_NOINLINE void vdbeMemClearExternAndSetNull(Mem *p){
+  assert( p->db==0 || sqlite3_mutex_held(p->db->mutex) );
+  assert( VdbeMemDynamic(p) );
+  if( p->flags&MEM_Agg ){
+    sqlite3VdbeMemFinalize(p, p->u.pDef);
+    assert( (p->flags & MEM_Agg)==0 );
+    testcase( p->flags & MEM_Dyn );
+  }
+  if( p->flags&MEM_Dyn ){
+    assert( (p->flags&MEM_RowSet)==0 );
+    assert( p->xDel!=SQLITE_DYNAMIC && p->xDel!=0 );
+    p->xDel((void *)p->z);
+  }else if( p->flags&MEM_RowSet ){
+    sqlite3RowSetClear(p->u.pRowSet);
+  }else if( p->flags&MEM_Frame ){
+    VdbeFrame *pFrame = p->u.pFrame;
+    pFrame->pParent = pFrame->v->pDelFrame;
+    pFrame->v->pDelFrame = pFrame;
+  }
+  p->flags = MEM_Null;
+}
+
+/*
+** Release memory held by the Mem p, both external memory cleared
+** by p->xDel and memory in p->zMalloc.
+**
+** This is a helper routine invoked by sqlite3VdbeMemRelease() in
+** the unusual case where there really is memory in p that needs
+** to be freed.
+*/
+static SQLITE_NOINLINE void vdbeMemClear(Mem *p){
+  if( VdbeMemDynamic(p) ){
+    vdbeMemClearExternAndSetNull(p);
+  }
+  if( p->szMalloc ){
+    sqlite3DbFree(p->db, p->zMalloc);
+    p->szMalloc = 0;
+  }
+  p->z = 0;
+}
+
+/*
+** Release any memory resources held by the Mem.  Both the memory that is
+** free by Mem.xDel and the Mem.zMalloc allocation are freed.
+**
+** Use this routine prior to clean up prior to abandoning a Mem, or to
+** reset a Mem back to its minimum memory utilization.
+**
+** Use sqlite3VdbeMemSetNull() to release just the Mem.xDel space
+** prior to inserting new content into the Mem.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemRelease(Mem *p){
+  assert( sqlite3VdbeCheckMemInvariants(p) );
+  if( VdbeMemDynamic(p) || p->szMalloc ){
+    vdbeMemClear(p);
+  }
+}
+
+/*
+** Convert a 64-bit IEEE double into a 64-bit signed integer.
+** If the double is out of range of a 64-bit signed integer then
+** return the closest available 64-bit signed integer.
+*/
+static i64 doubleToInt64(double r){
+#ifdef SQLITE_OMIT_FLOATING_POINT
+  /* When floating-point is omitted, double and int64 are the same thing */
+  return r;
+#else
+  /*
+  ** Many compilers we encounter do not define constants for the
+  ** minimum and maximum 64-bit integers, or they define them
+  ** inconsistently.  And many do not understand the "LL" notation.
+  ** So we define our own static constants here using nothing
+  ** larger than a 32-bit integer constant.
+  */
+  static const i64 maxInt = LARGEST_INT64;
+  static const i64 minInt = SMALLEST_INT64;
+
+  if( r<=(double)minInt ){
+    return minInt;
+  }else if( r>=(double)maxInt ){
+    return maxInt;
+  }else{
+    return (i64)r;
+  }
+#endif
+}
+
+/*
+** Return some kind of integer value which is the best we can do
+** at representing the value that *pMem describes as an integer.
+** If pMem is an integer, then the value is exact.  If pMem is
+** a floating-point then the value returned is the integer part.
+** If pMem is a string or blob, then we make an attempt to convert
+** it into an integer and return that.  If pMem represents an
+** an SQL-NULL value, return 0.
+**
+** If pMem represents a string value, its encoding might be changed.
+*/
+SQLITE_PRIVATE i64 sqlite3VdbeIntValue(Mem *pMem){
+  int flags;
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+  flags = pMem->flags;
+  if( flags & MEM_Int ){
+    return pMem->u.i;
+  }else if( flags & MEM_Real ){
+    return doubleToInt64(pMem->u.r);
+  }else if( flags & (MEM_Str|MEM_Blob) ){
+    i64 value = 0;
+    assert( pMem->z || pMem->n==0 );
+    sqlite3Atoi64(pMem->z, &value, pMem->n, pMem->enc);
+    return value;
+  }else{
+    return 0;
+  }
+}
+
+/*
+** Return the best representation of pMem that we can get into a
+** double.  If pMem is already a double or an integer, return its
+** value.  If it is a string or blob, try to convert it to a double.
+** If it is a NULL, return 0.0.
+*/
+SQLITE_PRIVATE double sqlite3VdbeRealValue(Mem *pMem){
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+  if( pMem->flags & MEM_Real ){
+    return pMem->u.r;
+  }else if( pMem->flags & MEM_Int ){
+    return (double)pMem->u.i;
+  }else if( pMem->flags & (MEM_Str|MEM_Blob) ){
+    /* (double)0 In case of SQLITE_OMIT_FLOATING_POINT... */
+    double val = (double)0;
+    sqlite3AtoF(pMem->z, &val, pMem->n, pMem->enc);
+    return val;
+  }else{
+    /* (double)0 In case of SQLITE_OMIT_FLOATING_POINT... */
+    return (double)0;
+  }
+}
+
+/*
+** The MEM structure is already a MEM_Real.  Try to also make it a
+** MEM_Int if we can.
+*/
+SQLITE_PRIVATE void sqlite3VdbeIntegerAffinity(Mem *pMem){
+  i64 ix;
+  assert( pMem->flags & MEM_Real );
+  assert( (pMem->flags & MEM_RowSet)==0 );
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+  ix = doubleToInt64(pMem->u.r);
+
+  /* Only mark the value as an integer if
+  **
+  **    (1) the round-trip conversion real->int->real is a no-op, and
+  **    (2) The integer is neither the largest nor the smallest
+  **        possible integer (ticket #3922)
+  **
+  ** The second and third terms in the following conditional enforces
+  ** the second condition under the assumption that addition overflow causes
+  ** values to wrap around.
