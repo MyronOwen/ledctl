@@ -63563,3 +63563,234 @@ SQLITE_PRIVATE int sqlite3VdbeMemFromBtree(
       }else{
         sqlite3VdbeMemRelease(pMem);
       }
+    }
+  }
+
+  return rc;
+}
+
+/*
+** The pVal argument is known to be a value other than NULL.
+** Convert it into a string with encoding enc and return a pointer
+** to a zero-terminated version of that string.
+*/
+static SQLITE_NOINLINE const void *valueToText(sqlite3_value* pVal, u8 enc){
+  assert( pVal!=0 );
+  assert( pVal->db==0 || sqlite3_mutex_held(pVal->db->mutex) );
+  assert( (enc&3)==(enc&~SQLITE_UTF16_ALIGNED) );
+  assert( (pVal->flags & MEM_RowSet)==0 );
+  assert( (pVal->flags & (MEM_Null))==0 );
+  if( pVal->flags & (MEM_Blob|MEM_Str) ){
+    pVal->flags |= MEM_Str;
+    if( pVal->flags & MEM_Zero ){
+      sqlite3VdbeMemExpandBlob(pVal);
+    }
+    if( pVal->enc != (enc & ~SQLITE_UTF16_ALIGNED) ){
+      sqlite3VdbeChangeEncoding(pVal, enc & ~SQLITE_UTF16_ALIGNED);
+    }
+    if( (enc & SQLITE_UTF16_ALIGNED)!=0 && 1==(1&SQLITE_PTR_TO_INT(pVal->z)) ){
+      assert( (pVal->flags & (MEM_Ephem|MEM_Static))!=0 );
+      if( sqlite3VdbeMemMakeWriteable(pVal)!=SQLITE_OK ){
+        return 0;
+      }
+    }
+    sqlite3VdbeMemNulTerminate(pVal); /* IMP: R-31275-44060 */
+  }else{
+    sqlite3VdbeMemStringify(pVal, enc, 0);
+    assert( 0==(1&SQLITE_PTR_TO_INT(pVal->z)) );
+  }
+  assert(pVal->enc==(enc & ~SQLITE_UTF16_ALIGNED) || pVal->db==0
+              || pVal->db->mallocFailed );
+  if( pVal->enc==(enc & ~SQLITE_UTF16_ALIGNED) ){
+    return pVal->z;
+  }else{
+    return 0;
+  }
+}
+
+/* This function is only available internally, it is not part of the
+** external API. It works in a similar way to sqlite3_value_text(),
+** except the data returned is in the encoding specified by the second
+** parameter, which must be one of SQLITE_UTF16BE, SQLITE_UTF16LE or
+** SQLITE_UTF8.
+**
+** (2006-02-16:)  The enc value can be or-ed with SQLITE_UTF16_ALIGNED.
+** If that is the case, then the result must be aligned on an even byte
+** boundary.
+*/
+SQLITE_PRIVATE const void *sqlite3ValueText(sqlite3_value* pVal, u8 enc){
+  if( !pVal ) return 0;
+  assert( pVal->db==0 || sqlite3_mutex_held(pVal->db->mutex) );
+  assert( (enc&3)==(enc&~SQLITE_UTF16_ALIGNED) );
+  assert( (pVal->flags & MEM_RowSet)==0 );
+  if( (pVal->flags&(MEM_Str|MEM_Term))==(MEM_Str|MEM_Term) && pVal->enc==enc ){
+    return pVal->z;
+  }
+  if( pVal->flags&MEM_Null ){
+    return 0;
+  }
+  return valueToText(pVal, enc);
+}
+
+/*
+** Create a new sqlite3_value object.
+*/
+SQLITE_PRIVATE sqlite3_value *sqlite3ValueNew(sqlite3 *db){
+  Mem *p = sqlite3DbMallocZero(db, sizeof(*p));
+  if( p ){
+    p->flags = MEM_Null;
+    p->db = db;
+  }
+  return p;
+}
+
+/*
+** Context object passed by sqlite3Stat4ProbeSetValue() through to 
+** valueNew(). See comments above valueNew() for details.
+*/
+struct ValueNewStat4Ctx {
+  Parse *pParse;
+  Index *pIdx;
+  UnpackedRecord **ppRec;
+  int iVal;
+};
+
+/*
+** Allocate and return a pointer to a new sqlite3_value object. If
+** the second argument to this function is NULL, the object is allocated
+** by calling sqlite3ValueNew().
+**
+** Otherwise, if the second argument is non-zero, then this function is 
+** being called indirectly by sqlite3Stat4ProbeSetValue(). If it has not
+** already been allocated, allocate the UnpackedRecord structure that 
+** that function will return to its caller here. Then return a pointer 
+** an sqlite3_value within the UnpackedRecord.a[] array.
+*/
+static sqlite3_value *valueNew(sqlite3 *db, struct ValueNewStat4Ctx *p){
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  if( p ){
+    UnpackedRecord *pRec = p->ppRec[0];
+
+    if( pRec==0 ){
+      Index *pIdx = p->pIdx;      /* Index being probed */
+      int nByte;                  /* Bytes of space to allocate */
+      int i;                      /* Counter variable */
+      int nCol = pIdx->nColumn;   /* Number of index columns including rowid */
+  
+      nByte = sizeof(Mem) * nCol + ROUND8(sizeof(UnpackedRecord));
+      pRec = (UnpackedRecord*)sqlite3DbMallocZero(db, nByte);
+      if( pRec ){
+        pRec->pKeyInfo = sqlite3KeyInfoOfIndex(p->pParse, pIdx);
+        if( pRec->pKeyInfo ){
+          assert( pRec->pKeyInfo->nField+pRec->pKeyInfo->nXField==nCol );
+          assert( pRec->pKeyInfo->enc==ENC(db) );
+          pRec->aMem = (Mem *)((u8*)pRec + ROUND8(sizeof(UnpackedRecord)));
+          for(i=0; i<nCol; i++){
+            pRec->aMem[i].flags = MEM_Null;
+            pRec->aMem[i].db = db;
+          }
+        }else{
+          sqlite3DbFree(db, pRec);
+          pRec = 0;
+        }
+      }
+      if( pRec==0 ) return 0;
+      p->ppRec[0] = pRec;
+    }
+  
+    pRec->nField = p->iVal+1;
+    return &pRec->aMem[p->iVal];
+  }
+#else
+  UNUSED_PARAMETER(p);
+#endif /* defined(SQLITE_ENABLE_STAT3_OR_STAT4) */
+  return sqlite3ValueNew(db);
+}
+
+/*
+** Extract a value from the supplied expression in the manner described
+** above sqlite3ValueFromExpr(). Allocate the sqlite3_value object
+** using valueNew().
+**
+** If pCtx is NULL and an error occurs after the sqlite3_value object
+** has been allocated, it is freed before returning. Or, if pCtx is not
+** NULL, it is assumed that the caller will free any allocated object
+** in all cases.
+*/
+static int valueFromExpr(
+  sqlite3 *db,                    /* The database connection */
+  Expr *pExpr,                    /* The expression to evaluate */
+  u8 enc,                         /* Encoding to use */
+  u8 affinity,                    /* Affinity to use */
+  sqlite3_value **ppVal,          /* Write the new value here */
+  struct ValueNewStat4Ctx *pCtx   /* Second argument for valueNew() */
+){
+  int op;
+  char *zVal = 0;
+  sqlite3_value *pVal = 0;
+  int negInt = 1;
+  const char *zNeg = "";
+  int rc = SQLITE_OK;
+
+  if( !pExpr ){
+    *ppVal = 0;
+    return SQLITE_OK;
+  }
+  while( (op = pExpr->op)==TK_UPLUS ) pExpr = pExpr->pLeft;
+  if( NEVER(op==TK_REGISTER) ) op = pExpr->op2;
+
+  if( op==TK_CAST ){
+    u8 aff = sqlite3AffinityType(pExpr->u.zToken,0);
+    rc = valueFromExpr(db, pExpr->pLeft, enc, aff, ppVal, pCtx);
+    testcase( rc!=SQLITE_OK );
+    if( *ppVal ){
+      sqlite3VdbeMemCast(*ppVal, aff, SQLITE_UTF8);
+      sqlite3ValueApplyAffinity(*ppVal, affinity, SQLITE_UTF8);
+    }
+    return rc;
+  }
+
+  /* Handle negative integers in a single step.  This is needed in the
+  ** case when the value is -9223372036854775808.
+  */
+  if( op==TK_UMINUS
+   && (pExpr->pLeft->op==TK_INTEGER || pExpr->pLeft->op==TK_FLOAT) ){
+    pExpr = pExpr->pLeft;
+    op = pExpr->op;
+    negInt = -1;
+    zNeg = "-";
+  }
+
+  if( op==TK_STRING || op==TK_FLOAT || op==TK_INTEGER ){
+    pVal = valueNew(db, pCtx);
+    if( pVal==0 ) goto no_mem;
+    if( ExprHasProperty(pExpr, EP_IntValue) ){
+      sqlite3VdbeMemSetInt64(pVal, (i64)pExpr->u.iValue*negInt);
+    }else{
+      zVal = sqlite3MPrintf(db, "%s%s", zNeg, pExpr->u.zToken);
+      if( zVal==0 ) goto no_mem;
+      sqlite3ValueSetStr(pVal, -1, zVal, SQLITE_UTF8, SQLITE_DYNAMIC);
+    }
+    if( (op==TK_INTEGER || op==TK_FLOAT ) && affinity==SQLITE_AFF_NONE ){
+      sqlite3ValueApplyAffinity(pVal, SQLITE_AFF_NUMERIC, SQLITE_UTF8);
+    }else{
+      sqlite3ValueApplyAffinity(pVal, affinity, SQLITE_UTF8);
+    }
+    if( pVal->flags & (MEM_Int|MEM_Real) ) pVal->flags &= ~MEM_Str;
+    if( enc!=SQLITE_UTF8 ){
+      rc = sqlite3VdbeChangeEncoding(pVal, enc);
+    }
+  }else if( op==TK_UMINUS ) {
+    /* This branch happens for multiple negative signs.  Ex: -(-5) */
+    if( SQLITE_OK==sqlite3ValueFromExpr(db,pExpr->pLeft,enc,affinity,&pVal) 
+     && pVal!=0
+    ){
+      sqlite3VdbeMemNumerify(pVal);
+      if( pVal->flags & MEM_Real ){
+        pVal->u.r = -pVal->u.r;
+      }else if( pVal->u.i==SMALLEST_INT64 ){
+        pVal->u.r = -(double)SMALLEST_INT64;
+        MemSetTypeFlag(pVal, MEM_Real);
+      }else{
+        pVal->u.i = -pVal->u.i;
+      }
