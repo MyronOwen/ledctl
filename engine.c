@@ -64241,3 +64241,232 @@ SQLITE_PRIVATE void sqlite3VdbeSwap(Vdbe *pA, Vdbe *pB){
 ** correctly deallocated along with the rest of the Vdbe).
 */
 static int growOpArray(Vdbe *v, int nOp){
+  VdbeOp *pNew;
+  Parse *p = v->pParse;
+
+  /* The SQLITE_TEST_REALLOC_STRESS compile-time option is designed to force
+  ** more frequent reallocs and hence provide more opportunities for 
+  ** simulated OOM faults.  SQLITE_TEST_REALLOC_STRESS is generally used
+  ** during testing only.  With SQLITE_TEST_REALLOC_STRESS grow the op array
+  ** by the minimum* amount required until the size reaches 512.  Normal
+  ** operation (without SQLITE_TEST_REALLOC_STRESS) is to double the current
+  ** size of the op array or add 1KB of space, whichever is smaller. */
+#ifdef SQLITE_TEST_REALLOC_STRESS
+  int nNew = (p->nOpAlloc>=512 ? p->nOpAlloc*2 : p->nOpAlloc+nOp);
+#else
+  int nNew = (p->nOpAlloc ? p->nOpAlloc*2 : (int)(1024/sizeof(Op)));
+  UNUSED_PARAMETER(nOp);
+#endif
+
+  assert( nOp<=(1024/sizeof(Op)) );
+  assert( nNew>=(p->nOpAlloc+nOp) );
+  pNew = sqlite3DbRealloc(p->db, v->aOp, nNew*sizeof(Op));
+  if( pNew ){
+    p->nOpAlloc = sqlite3DbMallocSize(p->db, pNew)/sizeof(Op);
+    v->aOp = pNew;
+  }
+  return (pNew ? SQLITE_OK : SQLITE_NOMEM);
+}
+
+#ifdef SQLITE_DEBUG
+/* This routine is just a convenient place to set a breakpoint that will
+** fire after each opcode is inserted and displayed using
+** "PRAGMA vdbe_addoptrace=on".
+*/
+static void test_addop_breakpoint(void){
+  static int n = 0;
+  n++;
+}
+#endif
+
+/*
+** Add a new instruction to the list of instructions current in the
+** VDBE.  Return the address of the new instruction.
+**
+** Parameters:
+**
+**    p               Pointer to the VDBE
+**
+**    op              The opcode for this instruction
+**
+**    p1, p2, p3      Operands
+**
+** Use the sqlite3VdbeResolveLabel() function to fix an address and
+** the sqlite3VdbeChangeP4() function to change the value of the P4
+** operand.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOp3(Vdbe *p, int op, int p1, int p2, int p3){
+  int i;
+  VdbeOp *pOp;
+
+  i = p->nOp;
+  assert( p->magic==VDBE_MAGIC_INIT );
+  assert( op>0 && op<0xff );
+  if( p->pParse->nOpAlloc<=i ){
+    if( growOpArray(p, 1) ){
+      return 1;
+    }
+  }
+  p->nOp++;
+  pOp = &p->aOp[i];
+  pOp->opcode = (u8)op;
+  pOp->p5 = 0;
+  pOp->p1 = p1;
+  pOp->p2 = p2;
+  pOp->p3 = p3;
+  pOp->p4.p = 0;
+  pOp->p4type = P4_NOTUSED;
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+  pOp->zComment = 0;
+#endif
+#ifdef SQLITE_DEBUG
+  if( p->db->flags & SQLITE_VdbeAddopTrace ){
+    int jj, kk;
+    Parse *pParse = p->pParse;
+    for(jj=kk=0; jj<SQLITE_N_COLCACHE; jj++){
+      struct yColCache *x = pParse->aColCache + jj;
+      if( x->iLevel>pParse->iCacheLevel || x->iReg==0 ) continue;
+      printf(" r[%d]={%d:%d}", x->iReg, x->iTable, x->iColumn);
+      kk++;
+    }
+    if( kk ) printf("\n");
+    sqlite3VdbePrintOp(0, i, &p->aOp[i]);
+    test_addop_breakpoint();
+  }
+#endif
+#ifdef VDBE_PROFILE
+  pOp->cycles = 0;
+  pOp->cnt = 0;
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+  pOp->iSrcLine = 0;
+#endif
+  return i;
+}
+SQLITE_PRIVATE int sqlite3VdbeAddOp0(Vdbe *p, int op){
+  return sqlite3VdbeAddOp3(p, op, 0, 0, 0);
+}
+SQLITE_PRIVATE int sqlite3VdbeAddOp1(Vdbe *p, int op, int p1){
+  return sqlite3VdbeAddOp3(p, op, p1, 0, 0);
+}
+SQLITE_PRIVATE int sqlite3VdbeAddOp2(Vdbe *p, int op, int p1, int p2){
+  return sqlite3VdbeAddOp3(p, op, p1, p2, 0);
+}
+
+
+/*
+** Add an opcode that includes the p4 value as a pointer.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOp4(
+  Vdbe *p,            /* Add the opcode to this VM */
+  int op,             /* The new opcode */
+  int p1,             /* The P1 operand */
+  int p2,             /* The P2 operand */
+  int p3,             /* The P3 operand */
+  const char *zP4,    /* The P4 operand */
+  int p4type          /* P4 operand type */
+){
+  int addr = sqlite3VdbeAddOp3(p, op, p1, p2, p3);
+  sqlite3VdbeChangeP4(p, addr, zP4, p4type);
+  return addr;
+}
+
+/*
+** Add an OP_ParseSchema opcode.  This routine is broken out from
+** sqlite3VdbeAddOp4() since it needs to also needs to mark all btrees
+** as having been used.
+**
+** The zWhere string must have been obtained from sqlite3_malloc().
+** This routine will take ownership of the allocated memory.
+*/
+SQLITE_PRIVATE void sqlite3VdbeAddParseSchemaOp(Vdbe *p, int iDb, char *zWhere){
+  int j;
+  int addr = sqlite3VdbeAddOp3(p, OP_ParseSchema, iDb, 0, 0);
+  sqlite3VdbeChangeP4(p, addr, zWhere, P4_DYNAMIC);
+  for(j=0; j<p->db->nDb; j++) sqlite3VdbeUsesBtree(p, j);
+}
+
+/*
+** Add an opcode that includes the p4 value as an integer.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOp4Int(
+  Vdbe *p,            /* Add the opcode to this VM */
+  int op,             /* The new opcode */
+  int p1,             /* The P1 operand */
+  int p2,             /* The P2 operand */
+  int p3,             /* The P3 operand */
+  int p4              /* The P4 operand as an integer */
+){
+  int addr = sqlite3VdbeAddOp3(p, op, p1, p2, p3);
+  sqlite3VdbeChangeP4(p, addr, SQLITE_INT_TO_PTR(p4), P4_INT32);
+  return addr;
+}
+
+/*
+** Create a new symbolic label for an instruction that has yet to be
+** coded.  The symbolic label is really just a negative number.  The
+** label can be used as the P2 value of an operation.  Later, when
+** the label is resolved to a specific address, the VDBE will scan
+** through its operation list and change all values of P2 which match
+** the label into the resolved address.
+**
+** The VDBE knows that a P2 value is a label because labels are
+** always negative and P2 values are suppose to be non-negative.
+** Hence, a negative P2 value is a label that has yet to be resolved.
+**
+** Zero is returned if a malloc() fails.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMakeLabel(Vdbe *v){
+  Parse *p = v->pParse;
+  int i = p->nLabel++;
+  assert( v->magic==VDBE_MAGIC_INIT );
+  if( (i & (i-1))==0 ){
+    p->aLabel = sqlite3DbReallocOrFree(p->db, p->aLabel, 
+                                       (i*2+1)*sizeof(p->aLabel[0]));
+  }
+  if( p->aLabel ){
+    p->aLabel[i] = -1;
+  }
+  return -1-i;
+}
+
+/*
+** Resolve label "x" to be the address of the next instruction to
+** be inserted.  The parameter "x" must have been obtained from
+** a prior call to sqlite3VdbeMakeLabel().
+*/
+SQLITE_PRIVATE void sqlite3VdbeResolveLabel(Vdbe *v, int x){
+  Parse *p = v->pParse;
+  int j = -1-x;
+  assert( v->magic==VDBE_MAGIC_INIT );
+  assert( j<p->nLabel );
+  if( ALWAYS(j>=0) && p->aLabel ){
+    p->aLabel[j] = v->nOp;
+  }
+  p->iFixedOp = v->nOp - 1;
+}
+
+/*
+** Mark the VDBE as one that can only be run one time.
+*/
+SQLITE_PRIVATE void sqlite3VdbeRunOnlyOnce(Vdbe *p){
+  p->runOnlyOnce = 1;
+}
+
+#ifdef SQLITE_DEBUG /* sqlite3AssertMayAbort() logic */
+
+/*
+** The following type and function are used to iterate through all opcodes
+** in a Vdbe main program and each of the sub-programs (triggers) it may 
+** invoke directly or indirectly. It should be used as follows:
+**
+**   Op *pOp;
+**   VdbeOpIter sIter;
+**
+**   memset(&sIter, 0, sizeof(sIter));
+**   sIter.v = v;                            // v is of type Vdbe* 
+**   while( (pOp = opIterNext(&sIter)) ){
+**     // Do something with pOp
+**   }
+**   sqlite3DbFree(v->db, sIter.apSub);
+** 
