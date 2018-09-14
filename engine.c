@@ -64470,3 +64470,227 @@ SQLITE_PRIVATE void sqlite3VdbeRunOnlyOnce(Vdbe *p){
 **   }
 **   sqlite3DbFree(v->db, sIter.apSub);
 ** 
+*/
+typedef struct VdbeOpIter VdbeOpIter;
+struct VdbeOpIter {
+  Vdbe *v;                   /* Vdbe to iterate through the opcodes of */
+  SubProgram **apSub;        /* Array of subprograms */
+  int nSub;                  /* Number of entries in apSub */
+  int iAddr;                 /* Address of next instruction to return */
+  int iSub;                  /* 0 = main program, 1 = first sub-program etc. */
+};
+static Op *opIterNext(VdbeOpIter *p){
+  Vdbe *v = p->v;
+  Op *pRet = 0;
+  Op *aOp;
+  int nOp;
+
+  if( p->iSub<=p->nSub ){
+
+    if( p->iSub==0 ){
+      aOp = v->aOp;
+      nOp = v->nOp;
+    }else{
+      aOp = p->apSub[p->iSub-1]->aOp;
+      nOp = p->apSub[p->iSub-1]->nOp;
+    }
+    assert( p->iAddr<nOp );
+
+    pRet = &aOp[p->iAddr];
+    p->iAddr++;
+    if( p->iAddr==nOp ){
+      p->iSub++;
+      p->iAddr = 0;
+    }
+  
+    if( pRet->p4type==P4_SUBPROGRAM ){
+      int nByte = (p->nSub+1)*sizeof(SubProgram*);
+      int j;
+      for(j=0; j<p->nSub; j++){
+        if( p->apSub[j]==pRet->p4.pProgram ) break;
+      }
+      if( j==p->nSub ){
+        p->apSub = sqlite3DbReallocOrFree(v->db, p->apSub, nByte);
+        if( !p->apSub ){
+          pRet = 0;
+        }else{
+          p->apSub[p->nSub++] = pRet->p4.pProgram;
+        }
+      }
+    }
+  }
+
+  return pRet;
+}
+
+/*
+** Check if the program stored in the VM associated with pParse may
+** throw an ABORT exception (causing the statement, but not entire transaction
+** to be rolled back). This condition is true if the main program or any
+** sub-programs contains any of the following:
+**
+**   *  OP_Halt with P1=SQLITE_CONSTRAINT and P2=OE_Abort.
+**   *  OP_HaltIfNull with P1=SQLITE_CONSTRAINT and P2=OE_Abort.
+**   *  OP_Destroy
+**   *  OP_VUpdate
+**   *  OP_VRename
+**   *  OP_FkCounter with P2==0 (immediate foreign key constraint)
+**
+** Then check that the value of Parse.mayAbort is true if an
+** ABORT may be thrown, or false otherwise. Return true if it does
+** match, or false otherwise. This function is intended to be used as
+** part of an assert statement in the compiler. Similar to:
+**
+**   assert( sqlite3VdbeAssertMayAbort(pParse->pVdbe, pParse->mayAbort) );
+*/
+SQLITE_PRIVATE int sqlite3VdbeAssertMayAbort(Vdbe *v, int mayAbort){
+  int hasAbort = 0;
+  int hasFkCounter = 0;
+  Op *pOp;
+  VdbeOpIter sIter;
+  memset(&sIter, 0, sizeof(sIter));
+  sIter.v = v;
+
+  while( (pOp = opIterNext(&sIter))!=0 ){
+    int opcode = pOp->opcode;
+    if( opcode==OP_Destroy || opcode==OP_VUpdate || opcode==OP_VRename 
+     || ((opcode==OP_Halt || opcode==OP_HaltIfNull) 
+      && ((pOp->p1&0xff)==SQLITE_CONSTRAINT && pOp->p2==OE_Abort))
+    ){
+      hasAbort = 1;
+      break;
+    }
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+    if( opcode==OP_FkCounter && pOp->p1==0 && pOp->p2==1 ){
+      hasFkCounter = 1;
+    }
+#endif
+  }
+  sqlite3DbFree(v->db, sIter.apSub);
+
+  /* Return true if hasAbort==mayAbort. Or if a malloc failure occurred.
+  ** If malloc failed, then the while() loop above may not have iterated
+  ** through all opcodes and hasAbort may be set incorrectly. Return
+  ** true for this case to prevent the assert() in the callers frame
+  ** from failing.  */
+  return ( v->db->mallocFailed || hasAbort==mayAbort || hasFkCounter );
+}
+#endif /* SQLITE_DEBUG - the sqlite3AssertMayAbort() function */
+
+/*
+** Loop through the program looking for P2 values that are negative
+** on jump instructions.  Each such value is a label.  Resolve the
+** label by setting the P2 value to its correct non-zero value.
+**
+** This routine is called once after all opcodes have been inserted.
+**
+** Variable *pMaxFuncArgs is set to the maximum value of any P2 argument 
+** to an OP_Function, OP_AggStep or OP_VFilter opcode. This is used by 
+** sqlite3VdbeMakeReady() to size the Vdbe.apArg[] array.
+**
+** The Op.opflags field is set on all opcodes.
+*/
+static void resolveP2Values(Vdbe *p, int *pMaxFuncArgs){
+  int i;
+  int nMaxArgs = *pMaxFuncArgs;
+  Op *pOp;
+  Parse *pParse = p->pParse;
+  int *aLabel = pParse->aLabel;
+  p->readOnly = 1;
+  p->bIsReader = 0;
+  for(pOp=p->aOp, i=p->nOp-1; i>=0; i--, pOp++){
+    u8 opcode = pOp->opcode;
+
+    /* NOTE: Be sure to update mkopcodeh.awk when adding or removing
+    ** cases from this switch! */
+    switch( opcode ){
+      case OP_Function:
+      case OP_AggStep: {
+        if( pOp->p5>nMaxArgs ) nMaxArgs = pOp->p5;
+        break;
+      }
+      case OP_Transaction: {
+        if( pOp->p2!=0 ) p->readOnly = 0;
+        /* fall thru */
+      }
+      case OP_AutoCommit:
+      case OP_Savepoint: {
+        p->bIsReader = 1;
+        break;
+      }
+#ifndef SQLITE_OMIT_WAL
+      case OP_Checkpoint:
+#endif
+      case OP_Vacuum:
+      case OP_JournalMode: {
+        p->readOnly = 0;
+        p->bIsReader = 1;
+        break;
+      }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+      case OP_VUpdate: {
+        if( pOp->p2>nMaxArgs ) nMaxArgs = pOp->p2;
+        break;
+      }
+      case OP_VFilter: {
+        int n;
+        assert( p->nOp - i >= 3 );
+        assert( pOp[-1].opcode==OP_Integer );
+        n = pOp[-1].p1;
+        if( n>nMaxArgs ) nMaxArgs = n;
+        break;
+      }
+#endif
+      case OP_Next:
+      case OP_NextIfOpen:
+      case OP_SorterNext: {
+        pOp->p4.xAdvance = sqlite3BtreeNext;
+        pOp->p4type = P4_ADVANCE;
+        break;
+      }
+      case OP_Prev:
+      case OP_PrevIfOpen: {
+        pOp->p4.xAdvance = sqlite3BtreePrevious;
+        pOp->p4type = P4_ADVANCE;
+        break;
+      }
+    }
+
+    pOp->opflags = sqlite3OpcodeProperty[opcode];
+    if( (pOp->opflags & OPFLG_JUMP)!=0 && pOp->p2<0 ){
+      assert( -1-pOp->p2<pParse->nLabel );
+      pOp->p2 = aLabel[-1-pOp->p2];
+    }
+  }
+  sqlite3DbFree(p->db, pParse->aLabel);
+  pParse->aLabel = 0;
+  pParse->nLabel = 0;
+  *pMaxFuncArgs = nMaxArgs;
+  assert( p->bIsReader!=0 || DbMaskAllZero(p->btreeMask) );
+}
+
+/*
+** Return the address of the next instruction to be inserted.
+*/
+SQLITE_PRIVATE int sqlite3VdbeCurrentAddr(Vdbe *p){
+  assert( p->magic==VDBE_MAGIC_INIT );
+  return p->nOp;
+}
+
+/*
+** This function returns a pointer to the array of opcodes associated with
+** the Vdbe passed as the first argument. It is the callers responsibility
+** to arrange for the returned array to be eventually freed using the 
+** vdbeFreeOpArray() function.
+**
+** Before returning, *pnOp is set to the number of entries in the returned
+** array. Also, *pnMaxArg is set to the larger of its current value and 
+** the number of entries in the Vdbe.apArg[] array required to execute the 
+** returned program.
+*/
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeTakeOpArray(Vdbe *p, int *pnOp, int *pnMaxArg){
+  VdbeOp *aOp = p->aOp;
+  assert( aOp && !p->db->mallocFailed );
+
+  /* Check that sqlite3VdbeUsesBtree() was not called on this VM */
+  assert( DbMaskAllZero(p->btreeMask) );
