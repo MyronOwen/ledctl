@@ -62617,3 +62617,240 @@ SQLITE_PRIVATE int sqlite3VdbeCheckMemInvariants(Mem *p){
   assert( p->szMalloc==0
        || p->szMalloc==sqlite3DbMallocSize(p->db,p->zMalloc) );
 
+  /* If p holds a string or blob, the Mem.z must point to exactly
+  ** one of the following:
+  **
+  **   (1) Memory in Mem.zMalloc and managed by the Mem object
+  **   (2) Memory to be freed using Mem.xDel
+  **   (3) An ephemeral string or blob
+  **   (4) A static string or blob
+  */
+  if( (p->flags & (MEM_Str|MEM_Blob)) && p->n>0 ){
+    assert( 
+      ((p->szMalloc>0 && p->z==p->zMalloc)? 1 : 0) +
+      ((p->flags&MEM_Dyn)!=0 ? 1 : 0) +
+      ((p->flags&MEM_Ephem)!=0 ? 1 : 0) +
+      ((p->flags&MEM_Static)!=0 ? 1 : 0) == 1
+    );
+  }
+  return 1;
+}
+#endif
+
+
+/*
+** If pMem is an object with a valid string representation, this routine
+** ensures the internal encoding for the string representation is
+** 'desiredEnc', one of SQLITE_UTF8, SQLITE_UTF16LE or SQLITE_UTF16BE.
+**
+** If pMem is not a string object, or the encoding of the string
+** representation is already stored using the requested encoding, then this
+** routine is a no-op.
+**
+** SQLITE_OK is returned if the conversion is successful (or not required).
+** SQLITE_NOMEM may be returned if a malloc() fails during conversion
+** between formats.
+*/
+SQLITE_PRIVATE int sqlite3VdbeChangeEncoding(Mem *pMem, int desiredEnc){
+#ifndef SQLITE_OMIT_UTF16
+  int rc;
+#endif
+  assert( (pMem->flags&MEM_RowSet)==0 );
+  assert( desiredEnc==SQLITE_UTF8 || desiredEnc==SQLITE_UTF16LE
+           || desiredEnc==SQLITE_UTF16BE );
+  if( !(pMem->flags&MEM_Str) || pMem->enc==desiredEnc ){
+    return SQLITE_OK;
+  }
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+#ifdef SQLITE_OMIT_UTF16
+  return SQLITE_ERROR;
+#else
+
+  /* MemTranslate() may return SQLITE_OK or SQLITE_NOMEM. If NOMEM is returned,
+  ** then the encoding of the value may not have changed.
+  */
+  rc = sqlite3VdbeMemTranslate(pMem, (u8)desiredEnc);
+  assert(rc==SQLITE_OK    || rc==SQLITE_NOMEM);
+  assert(rc==SQLITE_OK    || pMem->enc!=desiredEnc);
+  assert(rc==SQLITE_NOMEM || pMem->enc==desiredEnc);
+  return rc;
+#endif
+}
+
+/*
+** Make sure pMem->z points to a writable allocation of at least 
+** min(n,32) bytes.
+**
+** If the bPreserve argument is true, then copy of the content of
+** pMem->z into the new allocation.  pMem must be either a string or
+** blob if bPreserve is true.  If bPreserve is false, any prior content
+** in pMem->z is discarded.
+*/
+SQLITE_PRIVATE SQLITE_NOINLINE int sqlite3VdbeMemGrow(Mem *pMem, int n, int bPreserve){
+  assert( sqlite3VdbeCheckMemInvariants(pMem) );
+  assert( (pMem->flags&MEM_RowSet)==0 );
+
+  /* If the bPreserve flag is set to true, then the memory cell must already
+  ** contain a valid string or blob value.  */
+  assert( bPreserve==0 || pMem->flags&(MEM_Blob|MEM_Str) );
+  testcase( bPreserve && pMem->z==0 );
+
+  assert( pMem->szMalloc==0
+       || pMem->szMalloc==sqlite3DbMallocSize(pMem->db, pMem->zMalloc) );
+  if( pMem->szMalloc<n ){
+    if( n<32 ) n = 32;
+    if( bPreserve && pMem->szMalloc>0 && pMem->z==pMem->zMalloc ){
+      pMem->z = pMem->zMalloc = sqlite3DbReallocOrFree(pMem->db, pMem->z, n);
+      bPreserve = 0;
+    }else{
+      if( pMem->szMalloc>0 ) sqlite3DbFree(pMem->db, pMem->zMalloc);
+      pMem->zMalloc = sqlite3DbMallocRaw(pMem->db, n);
+    }
+    if( pMem->zMalloc==0 ){
+      sqlite3VdbeMemSetNull(pMem);
+      pMem->z = 0;
+      pMem->szMalloc = 0;
+      return SQLITE_NOMEM;
+    }else{
+      pMem->szMalloc = sqlite3DbMallocSize(pMem->db, pMem->zMalloc);
+    }
+  }
+
+  if( bPreserve && pMem->z && pMem->z!=pMem->zMalloc ){
+    memcpy(pMem->zMalloc, pMem->z, pMem->n);
+  }
+  if( (pMem->flags&MEM_Dyn)!=0 ){
+    assert( pMem->xDel!=0 && pMem->xDel!=SQLITE_DYNAMIC );
+    pMem->xDel((void *)(pMem->z));
+  }
+
+  pMem->z = pMem->zMalloc;
+  pMem->flags &= ~(MEM_Dyn|MEM_Ephem|MEM_Static);
+  return SQLITE_OK;
+}
+
+/*
+** Change the pMem->zMalloc allocation to be at least szNew bytes.
+** If pMem->zMalloc already meets or exceeds the requested size, this
+** routine is a no-op.
+**
+** Any prior string or blob content in the pMem object may be discarded.
+** The pMem->xDel destructor is called, if it exists.  Though MEM_Str
+** and MEM_Blob values may be discarded, MEM_Int, MEM_Real, and MEM_Null
+** values are preserved.
+**
+** Return SQLITE_OK on success or an error code (probably SQLITE_NOMEM)
+** if unable to complete the resizing.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemClearAndResize(Mem *pMem, int szNew){
+  assert( szNew>0 );
+  assert( (pMem->flags & MEM_Dyn)==0 || pMem->szMalloc==0 );
+  if( pMem->szMalloc<szNew ){
+    return sqlite3VdbeMemGrow(pMem, szNew, 0);
+  }
+  assert( (pMem->flags & MEM_Dyn)==0 );
+  pMem->z = pMem->zMalloc;
+  pMem->flags &= (MEM_Null|MEM_Int|MEM_Real);
+  return SQLITE_OK;
+}
+
+/*
+** Change pMem so that its MEM_Str or MEM_Blob value is stored in
+** MEM.zMalloc, where it can be safely written.
+**
+** Return SQLITE_OK on success or SQLITE_NOMEM if malloc fails.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemMakeWriteable(Mem *pMem){
+  int f;
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( (pMem->flags&MEM_RowSet)==0 );
+  ExpandBlob(pMem);
+  f = pMem->flags;
+  if( (f&(MEM_Str|MEM_Blob)) && (pMem->szMalloc==0 || pMem->z!=pMem->zMalloc) ){
+    if( sqlite3VdbeMemGrow(pMem, pMem->n + 2, 1) ){
+      return SQLITE_NOMEM;
+    }
+    pMem->z[pMem->n] = 0;
+    pMem->z[pMem->n+1] = 0;
+    pMem->flags |= MEM_Term;
+#ifdef SQLITE_DEBUG
+    pMem->pScopyFrom = 0;
+#endif
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** If the given Mem* has a zero-filled tail, turn it into an ordinary
+** blob stored in dynamically allocated space.
+*/
+#ifndef SQLITE_OMIT_INCRBLOB
+SQLITE_PRIVATE int sqlite3VdbeMemExpandBlob(Mem *pMem){
+  if( pMem->flags & MEM_Zero ){
+    int nByte;
+    assert( pMem->flags&MEM_Blob );
+    assert( (pMem->flags&MEM_RowSet)==0 );
+    assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+
+    /* Set nByte to the number of bytes required to store the expanded blob. */
+    nByte = pMem->n + pMem->u.nZero;
+    if( nByte<=0 ){
+      nByte = 1;
+    }
+    if( sqlite3VdbeMemGrow(pMem, nByte, 1) ){
+      return SQLITE_NOMEM;
+    }
+
+    memset(&pMem->z[pMem->n], 0, pMem->u.nZero);
+    pMem->n += pMem->u.nZero;
+    pMem->flags &= ~(MEM_Zero|MEM_Term);
+  }
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** It is already known that pMem contains an unterminated string.
+** Add the zero terminator.
+*/
+static SQLITE_NOINLINE int vdbeMemAddTerminator(Mem *pMem){
+  if( sqlite3VdbeMemGrow(pMem, pMem->n+2, 1) ){
+    return SQLITE_NOMEM;
+  }
+  pMem->z[pMem->n] = 0;
+  pMem->z[pMem->n+1] = 0;
+  pMem->flags |= MEM_Term;
+  return SQLITE_OK;
+}
+
+/*
+** Make sure the given Mem is \u0000 terminated.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemNulTerminate(Mem *pMem){
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  testcase( (pMem->flags & (MEM_Term|MEM_Str))==(MEM_Term|MEM_Str) );
+  testcase( (pMem->flags & (MEM_Term|MEM_Str))==0 );
+  if( (pMem->flags & (MEM_Term|MEM_Str))!=MEM_Str ){
+    return SQLITE_OK;   /* Nothing to do */
+  }else{
+    return vdbeMemAddTerminator(pMem);
+  }
+}
+
+/*
+** Add MEM_Str to the set of representations for the given Mem.  Numbers
+** are converted using sqlite3_snprintf().  Converting a BLOB to a string
+** is a no-op.
+**
+** Existing representations MEM_Int and MEM_Real are invalidated if
+** bForce is true but are retained if bForce is false.
+**
+** A MEM_Null value will never be passed to this function. This function is
+** used for converting values to text for returning to the user (i.e. via
+** sqlite3_value_text()), or for ensuring that values to be used as btree
+** keys are strings. In the former case a NULL pointer is returned the
+** user and the latter is an internal programming error.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemStringify(Mem *pMem, u8 enc, u8 bForce){
+  int fg = pMem->flags;
