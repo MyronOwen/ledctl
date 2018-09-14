@@ -63092,3 +63092,254 @@ SQLITE_PRIVATE void sqlite3VdbeIntegerAffinity(Mem *pMem){
   ** The second and third terms in the following conditional enforces
   ** the second condition under the assumption that addition overflow causes
   ** values to wrap around.
+  */
+  if( pMem->u.r==ix && ix>SMALLEST_INT64 && ix<LARGEST_INT64 ){
+    pMem->u.i = ix;
+    MemSetTypeFlag(pMem, MEM_Int);
+  }
+}
+
+/*
+** Convert pMem to type integer.  Invalidate any prior representations.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemIntegerify(Mem *pMem){
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( (pMem->flags & MEM_RowSet)==0 );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+  pMem->u.i = sqlite3VdbeIntValue(pMem);
+  MemSetTypeFlag(pMem, MEM_Int);
+  return SQLITE_OK;
+}
+
+/*
+** Convert pMem so that it is of type MEM_Real.
+** Invalidate any prior representations.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemRealify(Mem *pMem){
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+  pMem->u.r = sqlite3VdbeRealValue(pMem);
+  MemSetTypeFlag(pMem, MEM_Real);
+  return SQLITE_OK;
+}
+
+/*
+** Convert pMem so that it has types MEM_Real or MEM_Int or both.
+** Invalidate any prior representations.
+**
+** Every effort is made to force the conversion, even if the input
+** is a string that does not look completely like a number.  Convert
+** as much of the string as we can and ignore the rest.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemNumerify(Mem *pMem){
+  if( (pMem->flags & (MEM_Int|MEM_Real|MEM_Null))==0 ){
+    assert( (pMem->flags & (MEM_Blob|MEM_Str))!=0 );
+    assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+    if( 0==sqlite3Atoi64(pMem->z, &pMem->u.i, pMem->n, pMem->enc) ){
+      MemSetTypeFlag(pMem, MEM_Int);
+    }else{
+      pMem->u.r = sqlite3VdbeRealValue(pMem);
+      MemSetTypeFlag(pMem, MEM_Real);
+      sqlite3VdbeIntegerAffinity(pMem);
+    }
+  }
+  assert( (pMem->flags & (MEM_Int|MEM_Real|MEM_Null))!=0 );
+  pMem->flags &= ~(MEM_Str|MEM_Blob);
+  return SQLITE_OK;
+}
+
+/*
+** Cast the datatype of the value in pMem according to the affinity
+** "aff".  Casting is different from applying affinity in that a cast
+** is forced.  In other words, the value is converted into the desired
+** affinity even if that results in loss of data.  This routine is
+** used (for example) to implement the SQL "cast()" operator.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemCast(Mem *pMem, u8 aff, u8 encoding){
+  if( pMem->flags & MEM_Null ) return;
+  switch( aff ){
+    case SQLITE_AFF_NONE: {   /* Really a cast to BLOB */
+      if( (pMem->flags & MEM_Blob)==0 ){
+        sqlite3ValueApplyAffinity(pMem, SQLITE_AFF_TEXT, encoding);
+        assert( pMem->flags & MEM_Str || pMem->db->mallocFailed );
+        MemSetTypeFlag(pMem, MEM_Blob);
+      }else{
+        pMem->flags &= ~(MEM_TypeMask&~MEM_Blob);
+      }
+      break;
+    }
+    case SQLITE_AFF_NUMERIC: {
+      sqlite3VdbeMemNumerify(pMem);
+      break;
+    }
+    case SQLITE_AFF_INTEGER: {
+      sqlite3VdbeMemIntegerify(pMem);
+      break;
+    }
+    case SQLITE_AFF_REAL: {
+      sqlite3VdbeMemRealify(pMem);
+      break;
+    }
+    default: {
+      assert( aff==SQLITE_AFF_TEXT );
+      assert( MEM_Str==(MEM_Blob>>3) );
+      pMem->flags |= (pMem->flags&MEM_Blob)>>3;
+      sqlite3ValueApplyAffinity(pMem, SQLITE_AFF_TEXT, encoding);
+      assert( pMem->flags & MEM_Str || pMem->db->mallocFailed );
+      pMem->flags &= ~(MEM_Int|MEM_Real|MEM_Blob|MEM_Zero);
+      break;
+    }
+  }
+}
+
+/*
+** Initialize bulk memory to be a consistent Mem object.
+**
+** The minimum amount of initialization feasible is performed.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemInit(Mem *pMem, sqlite3 *db, u16 flags){
+  assert( (flags & ~MEM_TypeMask)==0 );
+  pMem->flags = flags;
+  pMem->db = db;
+  pMem->szMalloc = 0;
+}
+
+
+/*
+** Delete any previous value and set the value stored in *pMem to NULL.
+**
+** This routine calls the Mem.xDel destructor to dispose of values that
+** require the destructor.  But it preserves the Mem.zMalloc memory allocation.
+** To free all resources, use sqlite3VdbeMemRelease(), which both calls this
+** routine to invoke the destructor and deallocates Mem.zMalloc.
+**
+** Use this routine to reset the Mem prior to insert a new value.
+**
+** Use sqlite3VdbeMemRelease() to complete erase the Mem prior to abandoning it.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemSetNull(Mem *pMem){
+  if( VdbeMemDynamic(pMem) ){
+    vdbeMemClearExternAndSetNull(pMem);
+  }else{
+    pMem->flags = MEM_Null;
+  }
+}
+SQLITE_PRIVATE void sqlite3ValueSetNull(sqlite3_value *p){
+  sqlite3VdbeMemSetNull((Mem*)p); 
+}
+
+/*
+** Delete any previous value and set the value to be a BLOB of length
+** n containing all zeros.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemSetZeroBlob(Mem *pMem, int n){
+  sqlite3VdbeMemRelease(pMem);
+  pMem->flags = MEM_Blob|MEM_Zero;
+  pMem->n = 0;
+  if( n<0 ) n = 0;
+  pMem->u.nZero = n;
+  pMem->enc = SQLITE_UTF8;
+  pMem->z = 0;
+}
+
+/*
+** The pMem is known to contain content that needs to be destroyed prior
+** to a value change.  So invoke the destructor, then set the value to
+** a 64-bit integer.
+*/
+static SQLITE_NOINLINE void vdbeReleaseAndSetInt64(Mem *pMem, i64 val){
+  sqlite3VdbeMemSetNull(pMem);
+  pMem->u.i = val;
+  pMem->flags = MEM_Int;
+}
+
+/*
+** Delete any previous value and set the value stored in *pMem to val,
+** manifest type INTEGER.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemSetInt64(Mem *pMem, i64 val){
+  if( VdbeMemDynamic(pMem) ){
+    vdbeReleaseAndSetInt64(pMem, val);
+  }else{
+    pMem->u.i = val;
+    pMem->flags = MEM_Int;
+  }
+}
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/*
+** Delete any previous value and set the value stored in *pMem to val,
+** manifest type REAL.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemSetDouble(Mem *pMem, double val){
+  sqlite3VdbeMemSetNull(pMem);
+  if( !sqlite3IsNaN(val) ){
+    pMem->u.r = val;
+    pMem->flags = MEM_Real;
+  }
+}
+#endif
+
+/*
+** Delete any previous value and set the value of pMem to be an
+** empty boolean index.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemSetRowSet(Mem *pMem){
+  sqlite3 *db = pMem->db;
+  assert( db!=0 );
+  assert( (pMem->flags & MEM_RowSet)==0 );
+  sqlite3VdbeMemRelease(pMem);
+  pMem->zMalloc = sqlite3DbMallocRaw(db, 64);
+  if( db->mallocFailed ){
+    pMem->flags = MEM_Null;
+    pMem->szMalloc = 0;
+  }else{
+    assert( pMem->zMalloc );
+    pMem->szMalloc = sqlite3DbMallocSize(db, pMem->zMalloc);
+    pMem->u.pRowSet = sqlite3RowSetInit(db, pMem->zMalloc, pMem->szMalloc);
+    assert( pMem->u.pRowSet!=0 );
+    pMem->flags = MEM_RowSet;
+  }
+}
+
+/*
+** Return true if the Mem object contains a TEXT or BLOB that is
+** too large - whose size exceeds SQLITE_MAX_LENGTH.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemTooBig(Mem *p){
+  assert( p->db!=0 );
+  if( p->flags & (MEM_Str|MEM_Blob) ){
+    int n = p->n;
+    if( p->flags & MEM_Zero ){
+      n += p->u.nZero;
+    }
+    return n>p->db->aLimit[SQLITE_LIMIT_LENGTH];
+  }
+  return 0; 
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** This routine prepares a memory cell for modification by breaking
+** its link to a shallow copy and by marking any current shallow
+** copies of this cell as invalid.
+**
+** This is used for testing and debugging only - to make sure shallow
+** copies are not misused.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemAboutToChange(Vdbe *pVdbe, Mem *pMem){
+  int i;
+  Mem *pX;
+  for(i=1, pX=&pVdbe->aMem[1]; i<=pVdbe->nMem; i++, pX++){
+    if( pX->pScopyFrom==pMem ){
+      pX->flags |= MEM_Undefined;
+      pX->pScopyFrom = 0;
+    }
+  }
+  pMem->pScopyFrom = 0;
+}
+#endif /* SQLITE_DEBUG */
+
+/*
