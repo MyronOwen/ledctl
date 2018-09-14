@@ -63343,3 +63343,223 @@ SQLITE_PRIVATE void sqlite3VdbeMemAboutToChange(Vdbe *pVdbe, Mem *pMem){
 #endif /* SQLITE_DEBUG */
 
 /*
+** Size of struct Mem not including the Mem.zMalloc member.
+*/
+#define MEMCELLSIZE offsetof(Mem,zMalloc)
+
+/*
+** Make an shallow copy of pFrom into pTo.  Prior contents of
+** pTo are freed.  The pFrom->z field is not duplicated.  If
+** pFrom->z is used, then pTo->z points to the same thing as pFrom->z
+** and flags gets srcType (either MEM_Ephem or MEM_Static).
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemShallowCopy(Mem *pTo, const Mem *pFrom, int srcType){
+  assert( (pFrom->flags & MEM_RowSet)==0 );
+  assert( pTo->db==pFrom->db );
+  if( VdbeMemDynamic(pTo) ) vdbeMemClearExternAndSetNull(pTo);
+  memcpy(pTo, pFrom, MEMCELLSIZE);
+  if( (pFrom->flags&MEM_Static)==0 ){
+    pTo->flags &= ~(MEM_Dyn|MEM_Static|MEM_Ephem);
+    assert( srcType==MEM_Ephem || srcType==MEM_Static );
+    pTo->flags |= srcType;
+  }
+}
+
+/*
+** Make a full copy of pFrom into pTo.  Prior contents of pTo are
+** freed before the copy is made.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemCopy(Mem *pTo, const Mem *pFrom){
+  int rc = SQLITE_OK;
+
+  assert( pTo->db==pFrom->db );
+  assert( (pFrom->flags & MEM_RowSet)==0 );
+  if( VdbeMemDynamic(pTo) ) vdbeMemClearExternAndSetNull(pTo);
+  memcpy(pTo, pFrom, MEMCELLSIZE);
+  pTo->flags &= ~MEM_Dyn;
+  if( pTo->flags&(MEM_Str|MEM_Blob) ){
+    if( 0==(pFrom->flags&MEM_Static) ){
+      pTo->flags |= MEM_Ephem;
+      rc = sqlite3VdbeMemMakeWriteable(pTo);
+    }
+  }
+
+  return rc;
+}
+
+/*
+** Transfer the contents of pFrom to pTo. Any existing value in pTo is
+** freed. If pFrom contains ephemeral data, a copy is made.
+**
+** pFrom contains an SQL NULL when this routine returns.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemMove(Mem *pTo, Mem *pFrom){
+  assert( pFrom->db==0 || sqlite3_mutex_held(pFrom->db->mutex) );
+  assert( pTo->db==0 || sqlite3_mutex_held(pTo->db->mutex) );
+  assert( pFrom->db==0 || pTo->db==0 || pFrom->db==pTo->db );
+
+  sqlite3VdbeMemRelease(pTo);
+  memcpy(pTo, pFrom, sizeof(Mem));
+  pFrom->flags = MEM_Null;
+  pFrom->szMalloc = 0;
+}
+
+/*
+** Change the value of a Mem to be a string or a BLOB.
+**
+** The memory management strategy depends on the value of the xDel
+** parameter. If the value passed is SQLITE_TRANSIENT, then the 
+** string is copied into a (possibly existing) buffer managed by the 
+** Mem structure. Otherwise, any existing buffer is freed and the
+** pointer copied.
+**
+** If the string is too large (if it exceeds the SQLITE_LIMIT_LENGTH
+** size limit) then no memory allocation occurs.  If the string can be
+** stored without allocating memory, then it is.  If a memory allocation
+** is required to store the string, then value of pMem is unchanged.  In
+** either case, SQLITE_TOOBIG is returned.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemSetStr(
+  Mem *pMem,          /* Memory cell to set to string value */
+  const char *z,      /* String pointer */
+  int n,              /* Bytes in string, or negative */
+  u8 enc,             /* Encoding of z.  0 for BLOBs */
+  void (*xDel)(void*) /* Destructor function */
+){
+  int nByte = n;      /* New value for pMem->n */
+  int iLimit;         /* Maximum allowed string or blob size */
+  u16 flags = 0;      /* New value for pMem->flags */
+
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( (pMem->flags & MEM_RowSet)==0 );
+
+  /* If z is a NULL pointer, set pMem to contain an SQL NULL. */
+  if( !z ){
+    sqlite3VdbeMemSetNull(pMem);
+    return SQLITE_OK;
+  }
+
+  if( pMem->db ){
+    iLimit = pMem->db->aLimit[SQLITE_LIMIT_LENGTH];
+  }else{
+    iLimit = SQLITE_MAX_LENGTH;
+  }
+  flags = (enc==0?MEM_Blob:MEM_Str);
+  if( nByte<0 ){
+    assert( enc!=0 );
+    if( enc==SQLITE_UTF8 ){
+      nByte = sqlite3Strlen30(z);
+      if( nByte>iLimit ) nByte = iLimit+1;
+    }else{
+      for(nByte=0; nByte<=iLimit && (z[nByte] | z[nByte+1]); nByte+=2){}
+    }
+    flags |= MEM_Term;
+  }
+
+  /* The following block sets the new values of Mem.z and Mem.xDel. It
+  ** also sets a flag in local variable "flags" to indicate the memory
+  ** management (one of MEM_Dyn or MEM_Static).
+  */
+  if( xDel==SQLITE_TRANSIENT ){
+    int nAlloc = nByte;
+    if( flags&MEM_Term ){
+      nAlloc += (enc==SQLITE_UTF8?1:2);
+    }
+    if( nByte>iLimit ){
+      return SQLITE_TOOBIG;
+    }
+    testcase( nAlloc==0 );
+    testcase( nAlloc==31 );
+    testcase( nAlloc==32 );
+    if( sqlite3VdbeMemClearAndResize(pMem, MAX(nAlloc,32)) ){
+      return SQLITE_NOMEM;
+    }
+    memcpy(pMem->z, z, nAlloc);
+  }else if( xDel==SQLITE_DYNAMIC ){
+    sqlite3VdbeMemRelease(pMem);
+    pMem->zMalloc = pMem->z = (char *)z;
+    pMem->szMalloc = sqlite3DbMallocSize(pMem->db, pMem->zMalloc);
+  }else{
+    sqlite3VdbeMemRelease(pMem);
+    pMem->z = (char *)z;
+    pMem->xDel = xDel;
+    flags |= ((xDel==SQLITE_STATIC)?MEM_Static:MEM_Dyn);
+  }
+
+  pMem->n = nByte;
+  pMem->flags = flags;
+  pMem->enc = (enc==0 ? SQLITE_UTF8 : enc);
+
+#ifndef SQLITE_OMIT_UTF16
+  if( pMem->enc!=SQLITE_UTF8 && sqlite3VdbeMemHandleBom(pMem) ){
+    return SQLITE_NOMEM;
+  }
+#endif
+
+  if( nByte>iLimit ){
+    return SQLITE_TOOBIG;
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** Move data out of a btree key or data field and into a Mem structure.
+** The data or key is taken from the entry that pCur is currently pointing
+** to.  offset and amt determine what portion of the data or key to retrieve.
+** key is true to get the key or false to get data.  The result is written
+** into the pMem element.
+**
+** The pMem object must have been initialized.  This routine will use
+** pMem->zMalloc to hold the content from the btree, if possible.  New
+** pMem->zMalloc space will be allocated if necessary.  The calling routine
+** is responsible for making sure that the pMem object is eventually
+** destroyed.
+**
+** If this routine fails for any reason (malloc returns NULL or unable
+** to read from the disk) then the pMem is left in an inconsistent state.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemFromBtree(
+  BtCursor *pCur,   /* Cursor pointing at record to retrieve. */
+  u32 offset,       /* Offset from the start of data to return bytes from. */
+  u32 amt,          /* Number of bytes to return. */
+  int key,          /* If true, retrieve from the btree key, not data. */
+  Mem *pMem         /* OUT: Return data in this Mem structure. */
+){
+  char *zData;        /* Data from the btree layer */
+  u32 available = 0;  /* Number of bytes available on the local btree page */
+  int rc = SQLITE_OK; /* Return code */
+
+  assert( sqlite3BtreeCursorIsValid(pCur) );
+  assert( !VdbeMemDynamic(pMem) );
+
+  /* Note: the calls to BtreeKeyFetch() and DataFetch() below assert() 
+  ** that both the BtShared and database handle mutexes are held. */
+  assert( (pMem->flags & MEM_RowSet)==0 );
+  if( key ){
+    zData = (char *)sqlite3BtreeKeyFetch(pCur, &available);
+  }else{
+    zData = (char *)sqlite3BtreeDataFetch(pCur, &available);
+  }
+  assert( zData!=0 );
+
+  if( offset+amt<=available ){
+    pMem->z = &zData[offset];
+    pMem->flags = MEM_Blob|MEM_Ephem;
+    pMem->n = (int)amt;
+  }else{
+    pMem->flags = MEM_Null;
+    if( SQLITE_OK==(rc = sqlite3VdbeMemClearAndResize(pMem, amt+2)) ){
+      if( key ){
+        rc = sqlite3BtreeKey(pCur, offset, amt, pMem->z);
+      }else{
+        rc = sqlite3BtreeData(pCur, offset, amt, pMem->z);
+      }
+      if( rc==SQLITE_OK ){
+        pMem->z[amt] = 0;
+        pMem->z[amt+1] = 0;
+        pMem->flags = MEM_Blob|MEM_Term;
+        pMem->n = (int)amt;
+      }else{
+        sqlite3VdbeMemRelease(pMem);
+      }
