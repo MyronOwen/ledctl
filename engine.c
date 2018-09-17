@@ -64694,3 +64694,248 @@ SQLITE_PRIVATE VdbeOp *sqlite3VdbeTakeOpArray(Vdbe *p, int *pnOp, int *pnMaxArg)
 
   /* Check that sqlite3VdbeUsesBtree() was not called on this VM */
   assert( DbMaskAllZero(p->btreeMask) );
+
+  resolveP2Values(p, pnMaxArg);
+  *pnOp = p->nOp;
+  p->aOp = 0;
+  return aOp;
+}
+
+/*
+** Add a whole list of operations to the operation stack.  Return the
+** address of the first operation added.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOpList(Vdbe *p, int nOp, VdbeOpList const *aOp, int iLineno){
+  int addr;
+  assert( p->magic==VDBE_MAGIC_INIT );
+  if( p->nOp + nOp > p->pParse->nOpAlloc && growOpArray(p, nOp) ){
+    return 0;
+  }
+  addr = p->nOp;
+  if( ALWAYS(nOp>0) ){
+    int i;
+    VdbeOpList const *pIn = aOp;
+    for(i=0; i<nOp; i++, pIn++){
+      int p2 = pIn->p2;
+      VdbeOp *pOut = &p->aOp[i+addr];
+      pOut->opcode = pIn->opcode;
+      pOut->p1 = pIn->p1;
+      if( p2<0 ){
+        assert( sqlite3OpcodeProperty[pOut->opcode] & OPFLG_JUMP );
+        pOut->p2 = addr + ADDR(p2);
+      }else{
+        pOut->p2 = p2;
+      }
+      pOut->p3 = pIn->p3;
+      pOut->p4type = P4_NOTUSED;
+      pOut->p4.p = 0;
+      pOut->p5 = 0;
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+      pOut->zComment = 0;
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+      pOut->iSrcLine = iLineno+i;
+#else
+      (void)iLineno;
+#endif
+#ifdef SQLITE_DEBUG
+      if( p->db->flags & SQLITE_VdbeAddopTrace ){
+        sqlite3VdbePrintOp(0, i+addr, &p->aOp[i+addr]);
+      }
+#endif
+    }
+    p->nOp += nOp;
+  }
+  return addr;
+}
+
+#if defined(SQLITE_ENABLE_STMT_SCANSTATUS)
+/*
+** Add an entry to the array of counters managed by sqlite3_stmt_scanstatus().
+*/
+SQLITE_PRIVATE void sqlite3VdbeScanStatus(
+  Vdbe *p,                        /* VM to add scanstatus() to */
+  int addrExplain,                /* Address of OP_Explain (or 0) */
+  int addrLoop,                   /* Address of loop counter */ 
+  int addrVisit,                  /* Address of rows visited counter */
+  LogEst nEst,                    /* Estimated number of output rows */
+  const char *zName               /* Name of table or index being scanned */
+){
+  int nByte = (p->nScan+1) * sizeof(ScanStatus);
+  ScanStatus *aNew;
+  aNew = (ScanStatus*)sqlite3DbRealloc(p->db, p->aScan, nByte);
+  if( aNew ){
+    ScanStatus *pNew = &aNew[p->nScan++];
+    pNew->addrExplain = addrExplain;
+    pNew->addrLoop = addrLoop;
+    pNew->addrVisit = addrVisit;
+    pNew->nEst = nEst;
+    pNew->zName = sqlite3DbStrDup(p->db, zName);
+    p->aScan = aNew;
+  }
+}
+#endif
+
+
+/*
+** Change the value of the P1 operand for a specific instruction.
+** This routine is useful when a large program is loaded from a
+** static array using sqlite3VdbeAddOpList but we want to make a
+** few minor changes to the program.
+*/
+SQLITE_PRIVATE void sqlite3VdbeChangeP1(Vdbe *p, u32 addr, int val){
+  assert( p!=0 );
+  if( ((u32)p->nOp)>addr ){
+    p->aOp[addr].p1 = val;
+  }
+}
+
+/*
+** Change the value of the P2 operand for a specific instruction.
+** This routine is useful for setting a jump destination.
+*/
+SQLITE_PRIVATE void sqlite3VdbeChangeP2(Vdbe *p, u32 addr, int val){
+  assert( p!=0 );
+  if( ((u32)p->nOp)>addr ){
+    p->aOp[addr].p2 = val;
+  }
+}
+
+/*
+** Change the value of the P3 operand for a specific instruction.
+*/
+SQLITE_PRIVATE void sqlite3VdbeChangeP3(Vdbe *p, u32 addr, int val){
+  assert( p!=0 );
+  if( ((u32)p->nOp)>addr ){
+    p->aOp[addr].p3 = val;
+  }
+}
+
+/*
+** Change the value of the P5 operand for the most recently
+** added operation.
+*/
+SQLITE_PRIVATE void sqlite3VdbeChangeP5(Vdbe *p, u8 val){
+  assert( p!=0 );
+  if( p->aOp ){
+    assert( p->nOp>0 );
+    p->aOp[p->nOp-1].p5 = val;
+  }
+}
+
+/*
+** Change the P2 operand of instruction addr so that it points to
+** the address of the next instruction to be coded.
+*/
+SQLITE_PRIVATE void sqlite3VdbeJumpHere(Vdbe *p, int addr){
+  sqlite3VdbeChangeP2(p, addr, p->nOp);
+  p->pParse->iFixedOp = p->nOp - 1;
+}
+
+
+/*
+** If the input FuncDef structure is ephemeral, then free it.  If
+** the FuncDef is not ephermal, then do nothing.
+*/
+static void freeEphemeralFunction(sqlite3 *db, FuncDef *pDef){
+  if( ALWAYS(pDef) && (pDef->funcFlags & SQLITE_FUNC_EPHEM)!=0 ){
+    sqlite3DbFree(db, pDef);
+  }
+}
+
+static void vdbeFreeOpArray(sqlite3 *, Op *, int);
+
+/*
+** Delete a P4 value if necessary.
+*/
+static void freeP4(sqlite3 *db, int p4type, void *p4){
+  if( p4 ){
+    assert( db );
+    switch( p4type ){
+      case P4_REAL:
+      case P4_INT64:
+      case P4_DYNAMIC:
+      case P4_INTARRAY: {
+        sqlite3DbFree(db, p4);
+        break;
+      }
+      case P4_KEYINFO: {
+        if( db->pnBytesFreed==0 ) sqlite3KeyInfoUnref((KeyInfo*)p4);
+        break;
+      }
+      case P4_MPRINTF: {
+        if( db->pnBytesFreed==0 ) sqlite3_free(p4);
+        break;
+      }
+      case P4_FUNCDEF: {
+        freeEphemeralFunction(db, (FuncDef*)p4);
+        break;
+      }
+      case P4_MEM: {
+        if( db->pnBytesFreed==0 ){
+          sqlite3ValueFree((sqlite3_value*)p4);
+        }else{
+          Mem *p = (Mem*)p4;
+          if( p->szMalloc ) sqlite3DbFree(db, p->zMalloc);
+          sqlite3DbFree(db, p);
+        }
+        break;
+      }
+      case P4_VTAB : {
+        if( db->pnBytesFreed==0 ) sqlite3VtabUnlock((VTable *)p4);
+        break;
+      }
+    }
+  }
+}
+
+/*
+** Free the space allocated for aOp and any p4 values allocated for the
+** opcodes contained within. If aOp is not NULL it is assumed to contain 
+** nOp entries. 
+*/
+static void vdbeFreeOpArray(sqlite3 *db, Op *aOp, int nOp){
+  if( aOp ){
+    Op *pOp;
+    for(pOp=aOp; pOp<&aOp[nOp]; pOp++){
+      freeP4(db, pOp->p4type, pOp->p4.p);
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+      sqlite3DbFree(db, pOp->zComment);
+#endif     
+    }
+  }
+  sqlite3DbFree(db, aOp);
+}
+
+/*
+** Link the SubProgram object passed as the second argument into the linked
+** list at Vdbe.pSubProgram. This list is used to delete all sub-program
+** objects when the VM is no longer required.
+*/
+SQLITE_PRIVATE void sqlite3VdbeLinkSubProgram(Vdbe *pVdbe, SubProgram *p){
+  p->pNext = pVdbe->pProgram;
+  pVdbe->pProgram = p;
+}
+
+/*
+** Change the opcode at addr into OP_Noop
+*/
+SQLITE_PRIVATE void sqlite3VdbeChangeToNoop(Vdbe *p, int addr){
+  if( addr<p->nOp ){
+    VdbeOp *pOp = &p->aOp[addr];
+    sqlite3 *db = p->db;
+    freeP4(db, pOp->p4type, pOp->p4.p);
+    memset(pOp, 0, sizeof(pOp[0]));
+    pOp->opcode = OP_Noop;
+    if( addr==p->nOp-1 ) p->nOp--;
+  }
+}
+
+/*
+** If the last opcode is "op" and it is not a jump destination,
+** then remove it.  Return true if and only if an opcode was removed.
+*/
+SQLITE_PRIVATE int sqlite3VdbeDeletePriorOpcode(Vdbe *p, u8 op){
+  if( (p->nOp-1)>(p->pParse->iFixedOp) && p->aOp[p->nOp-1].opcode==op ){
+    sqlite3VdbeChangeToNoop(p, p->nOp-1);
+    return 1;
