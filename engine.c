@@ -65171,3 +65171,204 @@ static int displayComment(
     }
     if( !seenCom && jj<nTemp-5 && pOp->zComment ){
       sqlite3_snprintf(nTemp-jj, zTemp+jj, "; %s", pOp->zComment);
+      jj += sqlite3Strlen30(zTemp+jj);
+    }
+    if( jj<nTemp ) zTemp[jj] = 0;
+  }else if( pOp->zComment ){
+    sqlite3_snprintf(nTemp, zTemp, "%s", pOp->zComment);
+    jj = sqlite3Strlen30(zTemp);
+  }else{
+    zTemp[0] = 0;
+    jj = 0;
+  }
+  return jj;
+}
+#endif /* SQLITE_DEBUG */
+
+
+#if !defined(SQLITE_OMIT_EXPLAIN) || !defined(NDEBUG) \
+     || defined(VDBE_PROFILE) || defined(SQLITE_DEBUG)
+/*
+** Compute a string that describes the P4 parameter for an opcode.
+** Use zTemp for any required temporary buffer space.
+*/
+static char *displayP4(Op *pOp, char *zTemp, int nTemp){
+  char *zP4 = zTemp;
+  assert( nTemp>=20 );
+  switch( pOp->p4type ){
+    case P4_KEYINFO: {
+      int i, j;
+      KeyInfo *pKeyInfo = pOp->p4.pKeyInfo;
+      assert( pKeyInfo->aSortOrder!=0 );
+      sqlite3_snprintf(nTemp, zTemp, "k(%d", pKeyInfo->nField);
+      i = sqlite3Strlen30(zTemp);
+      for(j=0; j<pKeyInfo->nField; j++){
+        CollSeq *pColl = pKeyInfo->aColl[j];
+        const char *zColl = pColl ? pColl->zName : "nil";
+        int n = sqlite3Strlen30(zColl);
+        if( n==6 && memcmp(zColl,"BINARY",6)==0 ){
+          zColl = "B";
+          n = 1;
+        }
+        if( i+n>nTemp-6 ){
+          memcpy(&zTemp[i],",...",4);
+          break;
+        }
+        zTemp[i++] = ',';
+        if( pKeyInfo->aSortOrder[j] ){
+          zTemp[i++] = '-';
+        }
+        memcpy(&zTemp[i], zColl, n+1);
+        i += n;
+      }
+      zTemp[i++] = ')';
+      zTemp[i] = 0;
+      assert( i<nTemp );
+      break;
+    }
+    case P4_COLLSEQ: {
+      CollSeq *pColl = pOp->p4.pColl;
+      sqlite3_snprintf(nTemp, zTemp, "(%.20s)", pColl->zName);
+      break;
+    }
+    case P4_FUNCDEF: {
+      FuncDef *pDef = pOp->p4.pFunc;
+      sqlite3_snprintf(nTemp, zTemp, "%s(%d)", pDef->zName, pDef->nArg);
+      break;
+    }
+    case P4_INT64: {
+      sqlite3_snprintf(nTemp, zTemp, "%lld", *pOp->p4.pI64);
+      break;
+    }
+    case P4_INT32: {
+      sqlite3_snprintf(nTemp, zTemp, "%d", pOp->p4.i);
+      break;
+    }
+    case P4_REAL: {
+      sqlite3_snprintf(nTemp, zTemp, "%.16g", *pOp->p4.pReal);
+      break;
+    }
+    case P4_MEM: {
+      Mem *pMem = pOp->p4.pMem;
+      if( pMem->flags & MEM_Str ){
+        zP4 = pMem->z;
+      }else if( pMem->flags & MEM_Int ){
+        sqlite3_snprintf(nTemp, zTemp, "%lld", pMem->u.i);
+      }else if( pMem->flags & MEM_Real ){
+        sqlite3_snprintf(nTemp, zTemp, "%.16g", pMem->u.r);
+      }else if( pMem->flags & MEM_Null ){
+        sqlite3_snprintf(nTemp, zTemp, "NULL");
+      }else{
+        assert( pMem->flags & MEM_Blob );
+        zP4 = "(blob)";
+      }
+      break;
+    }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    case P4_VTAB: {
+      sqlite3_vtab *pVtab = pOp->p4.pVtab->pVtab;
+      sqlite3_snprintf(nTemp, zTemp, "vtab:%p:%p", pVtab, pVtab->pModule);
+      break;
+    }
+#endif
+    case P4_INTARRAY: {
+      sqlite3_snprintf(nTemp, zTemp, "intarray");
+      break;
+    }
+    case P4_SUBPROGRAM: {
+      sqlite3_snprintf(nTemp, zTemp, "program");
+      break;
+    }
+    case P4_ADVANCE: {
+      zTemp[0] = 0;
+      break;
+    }
+    default: {
+      zP4 = pOp->p4.z;
+      if( zP4==0 ){
+        zP4 = zTemp;
+        zTemp[0] = 0;
+      }
+    }
+  }
+  assert( zP4!=0 );
+  return zP4;
+}
+#endif
+
+/*
+** Declare to the Vdbe that the BTree object at db->aDb[i] is used.
+**
+** The prepared statements need to know in advance the complete set of
+** attached databases that will be use.  A mask of these databases
+** is maintained in p->btreeMask.  The p->lockMask value is the subset of
+** p->btreeMask of databases that will require a lock.
+*/
+SQLITE_PRIVATE void sqlite3VdbeUsesBtree(Vdbe *p, int i){
+  assert( i>=0 && i<p->db->nDb && i<(int)sizeof(yDbMask)*8 );
+  assert( i<(int)sizeof(p->btreeMask)*8 );
+  DbMaskSet(p->btreeMask, i);
+  if( i!=1 && sqlite3BtreeSharable(p->db->aDb[i].pBt) ){
+    DbMaskSet(p->lockMask, i);
+  }
+}
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0
+/*
+** If SQLite is compiled to support shared-cache mode and to be threadsafe,
+** this routine obtains the mutex associated with each BtShared structure
+** that may be accessed by the VM passed as an argument. In doing so it also
+** sets the BtShared.db member of each of the BtShared structures, ensuring
+** that the correct busy-handler callback is invoked if required.
+**
+** If SQLite is not threadsafe but does support shared-cache mode, then
+** sqlite3BtreeEnter() is invoked to set the BtShared.db variables
+** of all of BtShared structures accessible via the database handle 
+** associated with the VM.
+**
+** If SQLite is not threadsafe and does not support shared-cache mode, this
+** function is a no-op.
+**
+** The p->btreeMask field is a bitmask of all btrees that the prepared 
+** statement p will ever use.  Let N be the number of bits in p->btreeMask
+** corresponding to btrees that use shared cache.  Then the runtime of
+** this routine is N*N.  But as N is rarely more than 1, this should not
+** be a problem.
+*/
+SQLITE_PRIVATE void sqlite3VdbeEnter(Vdbe *p){
+  int i;
+  sqlite3 *db;
+  Db *aDb;
+  int nDb;
+  if( DbMaskAllZero(p->lockMask) ) return;  /* The common case */
+  db = p->db;
+  aDb = db->aDb;
+  nDb = db->nDb;
+  for(i=0; i<nDb; i++){
+    if( i!=1 && DbMaskTest(p->lockMask,i) && ALWAYS(aDb[i].pBt!=0) ){
+      sqlite3BtreeEnter(aDb[i].pBt);
+    }
+  }
+}
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0
+/*
+** Unlock all of the btrees previously locked by a call to sqlite3VdbeEnter().
+*/
+SQLITE_PRIVATE void sqlite3VdbeLeave(Vdbe *p){
+  int i;
+  sqlite3 *db;
+  Db *aDb;
+  int nDb;
+  if( DbMaskAllZero(p->lockMask) ) return;  /* The common case */
+  db = p->db;
+  aDb = db->aDb;
+  nDb = db->nDb;
+  for(i=0; i<nDb; i++){
+    if( i!=1 && DbMaskTest(p->lockMask,i) && ALWAYS(aDb[i].pBt!=0) ){
+      sqlite3BtreeLeave(aDb[i].pBt);
+    }
+  }
+}
+#endif
