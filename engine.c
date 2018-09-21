@@ -65611,3 +65611,226 @@ SQLITE_PRIVATE int sqlite3VdbeList(
     }
     pMem->flags = MEM_Str|MEM_Term;
     zP4 = displayP4(pOp, pMem->z, 32);
+    if( zP4!=pMem->z ){
+      sqlite3VdbeMemSetStr(pMem, zP4, -1, SQLITE_UTF8, 0);
+    }else{
+      assert( pMem->z!=0 );
+      pMem->n = sqlite3Strlen30(pMem->z);
+      pMem->enc = SQLITE_UTF8;
+    }
+    pMem++;
+
+    if( p->explain==1 ){
+      if( sqlite3VdbeMemClearAndResize(pMem, 4) ){
+        assert( p->db->mallocFailed );
+        return SQLITE_ERROR;
+      }
+      pMem->flags = MEM_Str|MEM_Term;
+      pMem->n = 2;
+      sqlite3_snprintf(3, pMem->z, "%.2x", pOp->p5);   /* P5 */
+      pMem->enc = SQLITE_UTF8;
+      pMem++;
+  
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+      if( sqlite3VdbeMemClearAndResize(pMem, 500) ){
+        assert( p->db->mallocFailed );
+        return SQLITE_ERROR;
+      }
+      pMem->flags = MEM_Str|MEM_Term;
+      pMem->n = displayComment(pOp, zP4, pMem->z, 500);
+      pMem->enc = SQLITE_UTF8;
+#else
+      pMem->flags = MEM_Null;                       /* Comment */
+#endif
+    }
+
+    p->nResColumn = 8 - 4*(p->explain-1);
+    p->pResultSet = &p->aMem[1];
+    p->rc = SQLITE_OK;
+    rc = SQLITE_ROW;
+  }
+  return rc;
+}
+#endif /* SQLITE_OMIT_EXPLAIN */
+
+#ifdef SQLITE_DEBUG
+/*
+** Print the SQL that was used to generate a VDBE program.
+*/
+SQLITE_PRIVATE void sqlite3VdbePrintSql(Vdbe *p){
+  const char *z = 0;
+  if( p->zSql ){
+    z = p->zSql;
+  }else if( p->nOp>=1 ){
+    const VdbeOp *pOp = &p->aOp[0];
+    if( pOp->opcode==OP_Init && pOp->p4.z!=0 ){
+      z = pOp->p4.z;
+      while( sqlite3Isspace(*z) ) z++;
+    }
+  }
+  if( z ) printf("SQL: [%s]\n", z);
+}
+#endif
+
+#if !defined(SQLITE_OMIT_TRACE) && defined(SQLITE_ENABLE_IOTRACE)
+/*
+** Print an IOTRACE message showing SQL content.
+*/
+SQLITE_PRIVATE void sqlite3VdbeIOTraceSql(Vdbe *p){
+  int nOp = p->nOp;
+  VdbeOp *pOp;
+  if( sqlite3IoTrace==0 ) return;
+  if( nOp<1 ) return;
+  pOp = &p->aOp[0];
+  if( pOp->opcode==OP_Init && pOp->p4.z!=0 ){
+    int i, j;
+    char z[1000];
+    sqlite3_snprintf(sizeof(z), z, "%s", pOp->p4.z);
+    for(i=0; sqlite3Isspace(z[i]); i++){}
+    for(j=0; z[i]; i++){
+      if( sqlite3Isspace(z[i]) ){
+        if( z[i-1]!=' ' ){
+          z[j++] = ' ';
+        }
+      }else{
+        z[j++] = z[i];
+      }
+    }
+    z[j] = 0;
+    sqlite3IoTrace("SQL %s\n", z);
+  }
+}
+#endif /* !SQLITE_OMIT_TRACE && SQLITE_ENABLE_IOTRACE */
+
+/*
+** Allocate space from a fixed size buffer and return a pointer to
+** that space.  If insufficient space is available, return NULL.
+**
+** The pBuf parameter is the initial value of a pointer which will
+** receive the new memory.  pBuf is normally NULL.  If pBuf is not
+** NULL, it means that memory space has already been allocated and that
+** this routine should not allocate any new memory.  When pBuf is not
+** NULL simply return pBuf.  Only allocate new memory space when pBuf
+** is NULL.
+**
+** nByte is the number of bytes of space needed.
+**
+** *ppFrom points to available space and pEnd points to the end of the
+** available space.  When space is allocated, *ppFrom is advanced past
+** the end of the allocated space.
+**
+** *pnByte is a counter of the number of bytes of space that have failed
+** to allocate.  If there is insufficient space in *ppFrom to satisfy the
+** request, then increment *pnByte by the amount of the request.
+*/
+static void *allocSpace(
+  void *pBuf,          /* Where return pointer will be stored */
+  int nByte,           /* Number of bytes to allocate */
+  u8 **ppFrom,         /* IN/OUT: Allocate from *ppFrom */
+  u8 *pEnd,            /* Pointer to 1 byte past the end of *ppFrom buffer */
+  int *pnByte          /* If allocation cannot be made, increment *pnByte */
+){
+  assert( EIGHT_BYTE_ALIGNMENT(*ppFrom) );
+  if( pBuf ) return pBuf;
+  nByte = ROUND8(nByte);
+  if( &(*ppFrom)[nByte] <= pEnd ){
+    pBuf = (void*)*ppFrom;
+    *ppFrom += nByte;
+  }else{
+    *pnByte += nByte;
+  }
+  return pBuf;
+}
+
+/*
+** Rewind the VDBE back to the beginning in preparation for
+** running it.
+*/
+SQLITE_PRIVATE void sqlite3VdbeRewind(Vdbe *p){
+#if defined(SQLITE_DEBUG) || defined(VDBE_PROFILE)
+  int i;
+#endif
+  assert( p!=0 );
+  assert( p->magic==VDBE_MAGIC_INIT );
+
+  /* There should be at least one opcode.
+  */
+  assert( p->nOp>0 );
+
+  /* Set the magic to VDBE_MAGIC_RUN sooner rather than later. */
+  p->magic = VDBE_MAGIC_RUN;
+
+#ifdef SQLITE_DEBUG
+  for(i=1; i<p->nMem; i++){
+    assert( p->aMem[i].db==p->db );
+  }
+#endif
+  p->pc = -1;
+  p->rc = SQLITE_OK;
+  p->errorAction = OE_Abort;
+  p->magic = VDBE_MAGIC_RUN;
+  p->nChange = 0;
+  p->cacheCtr = 1;
+  p->minWriteFileFormat = 255;
+  p->iStatement = 0;
+  p->nFkConstraint = 0;
+#ifdef VDBE_PROFILE
+  for(i=0; i<p->nOp; i++){
+    p->aOp[i].cnt = 0;
+    p->aOp[i].cycles = 0;
+  }
+#endif
+}
+
+/*
+** Prepare a virtual machine for execution for the first time after
+** creating the virtual machine.  This involves things such
+** as allocating registers and initializing the program counter.
+** After the VDBE has be prepped, it can be executed by one or more
+** calls to sqlite3VdbeExec().  
+**
+** This function may be called exactly once on each virtual machine.
+** After this routine is called the VM has been "packaged" and is ready
+** to run.  After this routine is called, further calls to 
+** sqlite3VdbeAddOp() functions are prohibited.  This routine disconnects
+** the Vdbe from the Parse object that helped generate it so that the
+** the Vdbe becomes an independent entity and the Parse object can be
+** destroyed.
+**
+** Use the sqlite3VdbeRewind() procedure to restore a virtual machine back
+** to its initial state after it has been run.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMakeReady(
+  Vdbe *p,                       /* The VDBE */
+  Parse *pParse                  /* Parsing context */
+){
+  sqlite3 *db;                   /* The database connection */
+  int nVar;                      /* Number of parameters */
+  int nMem;                      /* Number of VM memory registers */
+  int nCursor;                   /* Number of cursors required */
+  int nArg;                      /* Number of arguments in subprograms */
+  int nOnce;                     /* Number of OP_Once instructions */
+  int n;                         /* Loop counter */
+  u8 *zCsr;                      /* Memory available for allocation */
+  u8 *zEnd;                      /* First byte past allocated memory */
+  int nByte;                     /* How much extra memory is needed */
+
+  assert( p!=0 );
+  assert( p->nOp>0 );
+  assert( pParse!=0 );
+  assert( p->magic==VDBE_MAGIC_INIT );
+  assert( pParse==p->pParse );
+  db = p->db;
+  assert( db->mallocFailed==0 );
+  nVar = pParse->nVar;
+  nMem = pParse->nMem;
+  nCursor = pParse->nTab;
+  nArg = pParse->nMaxArg;
+  nOnce = pParse->nOnce;
+  if( nOnce==0 ) nOnce = 1; /* Ensure at least one byte in p->aOnceFlag[] */
+  
+  /* For each cursor required, also allocate a memory cell. Memory
+  ** cells (nMem+1-nCursor)..nMem, inclusive, will never be used by
+  ** the vdbe program. Instead they are used to allocate space for
+  ** VdbeCursor/BtCursor structures. The blob of memory associated with 
+  ** cursor 0 is stored in memory cell nMem. Memory cell (nMem-1)
