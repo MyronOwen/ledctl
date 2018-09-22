@@ -65834,3 +65834,242 @@ SQLITE_PRIVATE void sqlite3VdbeMakeReady(
   ** the vdbe program. Instead they are used to allocate space for
   ** VdbeCursor/BtCursor structures. The blob of memory associated with 
   ** cursor 0 is stored in memory cell nMem. Memory cell (nMem-1)
+  ** stores the blob of memory associated with cursor 1, etc.
+  **
+  ** See also: allocateCursor().
+  */
+  nMem += nCursor;
+
+  /* Allocate space for memory registers, SQL variables, VDBE cursors and 
+  ** an array to marshal SQL function arguments in.
+  */
+  zCsr = (u8*)&p->aOp[p->nOp];            /* Memory avaliable for allocation */
+  zEnd = (u8*)&p->aOp[pParse->nOpAlloc];  /* First byte past end of zCsr[] */
+
+  resolveP2Values(p, &nArg);
+  p->usesStmtJournal = (u8)(pParse->isMultiWrite && pParse->mayAbort);
+  if( pParse->explain && nMem<10 ){
+    nMem = 10;
+  }
+  memset(zCsr, 0, zEnd-zCsr);
+  zCsr += (zCsr - (u8*)0)&7;
+  assert( EIGHT_BYTE_ALIGNMENT(zCsr) );
+  p->expired = 0;
+
+  /* Memory for registers, parameters, cursor, etc, is allocated in two
+  ** passes.  On the first pass, we try to reuse unused space at the 
+  ** end of the opcode array.  If we are unable to satisfy all memory
+  ** requirements by reusing the opcode array tail, then the second
+  ** pass will fill in the rest using a fresh allocation.  
+  **
+  ** This two-pass approach that reuses as much memory as possible from
+  ** the leftover space at the end of the opcode array can significantly
+  ** reduce the amount of memory held by a prepared statement.
+  */
+  do {
+    nByte = 0;
+    p->aMem = allocSpace(p->aMem, nMem*sizeof(Mem), &zCsr, zEnd, &nByte);
+    p->aVar = allocSpace(p->aVar, nVar*sizeof(Mem), &zCsr, zEnd, &nByte);
+    p->apArg = allocSpace(p->apArg, nArg*sizeof(Mem*), &zCsr, zEnd, &nByte);
+    p->azVar = allocSpace(p->azVar, nVar*sizeof(char*), &zCsr, zEnd, &nByte);
+    p->apCsr = allocSpace(p->apCsr, nCursor*sizeof(VdbeCursor*),
+                          &zCsr, zEnd, &nByte);
+    p->aOnceFlag = allocSpace(p->aOnceFlag, nOnce, &zCsr, zEnd, &nByte);
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+    p->anExec = allocSpace(p->anExec, p->nOp*sizeof(i64), &zCsr, zEnd, &nByte);
+#endif
+    if( nByte ){
+      p->pFree = sqlite3DbMallocZero(db, nByte);
+    }
+    zCsr = p->pFree;
+    zEnd = &zCsr[nByte];
+  }while( nByte && !db->mallocFailed );
+
+  p->nCursor = nCursor;
+  p->nOnceFlag = nOnce;
+  if( p->aVar ){
+    p->nVar = (ynVar)nVar;
+    for(n=0; n<nVar; n++){
+      p->aVar[n].flags = MEM_Null;
+      p->aVar[n].db = db;
+    }
+  }
+  if( p->azVar && pParse->nzVar>0 ){
+    p->nzVar = pParse->nzVar;
+    memcpy(p->azVar, pParse->azVar, p->nzVar*sizeof(p->azVar[0]));
+    memset(pParse->azVar, 0, pParse->nzVar*sizeof(pParse->azVar[0]));
+  }
+  if( p->aMem ){
+    p->aMem--;                      /* aMem[] goes from 1..nMem */
+    p->nMem = nMem;                 /*       not from 0..nMem-1 */
+    for(n=1; n<=nMem; n++){
+      p->aMem[n].flags = MEM_Undefined;
+      p->aMem[n].db = db;
+    }
+  }
+  p->explain = pParse->explain;
+  sqlite3VdbeRewind(p);
+}
+
+/*
+** Close a VDBE cursor and release all the resources that cursor 
+** happens to hold.
+*/
+SQLITE_PRIVATE void sqlite3VdbeFreeCursor(Vdbe *p, VdbeCursor *pCx){
+  if( pCx==0 ){
+    return;
+  }
+  sqlite3VdbeSorterClose(p->db, pCx);
+  if( pCx->pBt ){
+    sqlite3BtreeClose(pCx->pBt);
+    /* The pCx->pCursor will be close automatically, if it exists, by
+    ** the call above. */
+  }else if( pCx->pCursor ){
+    sqlite3BtreeCloseCursor(pCx->pCursor);
+  }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  else if( pCx->pVtabCursor ){
+    sqlite3_vtab_cursor *pVtabCursor = pCx->pVtabCursor;
+    const sqlite3_module *pModule = pVtabCursor->pVtab->pModule;
+    p->inVtabMethod = 1;
+    pModule->xClose(pVtabCursor);
+    p->inVtabMethod = 0;
+  }
+#endif
+}
+
+/*
+** Copy the values stored in the VdbeFrame structure to its Vdbe. This
+** is used, for example, when a trigger sub-program is halted to restore
+** control to the main program.
+*/
+SQLITE_PRIVATE int sqlite3VdbeFrameRestore(VdbeFrame *pFrame){
+  Vdbe *v = pFrame->v;
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  v->anExec = pFrame->anExec;
+#endif
+  v->aOnceFlag = pFrame->aOnceFlag;
+  v->nOnceFlag = pFrame->nOnceFlag;
+  v->aOp = pFrame->aOp;
+  v->nOp = pFrame->nOp;
+  v->aMem = pFrame->aMem;
+  v->nMem = pFrame->nMem;
+  v->apCsr = pFrame->apCsr;
+  v->nCursor = pFrame->nCursor;
+  v->db->lastRowid = pFrame->lastRowid;
+  v->nChange = pFrame->nChange;
+  v->db->nChange = pFrame->nDbChange;
+  return pFrame->pc;
+}
+
+/*
+** Close all cursors.
+**
+** Also release any dynamic memory held by the VM in the Vdbe.aMem memory 
+** cell array. This is necessary as the memory cell array may contain
+** pointers to VdbeFrame objects, which may in turn contain pointers to
+** open cursors.
+*/
+static void closeAllCursors(Vdbe *p){
+  if( p->pFrame ){
+    VdbeFrame *pFrame;
+    for(pFrame=p->pFrame; pFrame->pParent; pFrame=pFrame->pParent);
+    sqlite3VdbeFrameRestore(pFrame);
+    p->pFrame = 0;
+    p->nFrame = 0;
+  }
+  assert( p->nFrame==0 );
+
+  if( p->apCsr ){
+    int i;
+    for(i=0; i<p->nCursor; i++){
+      VdbeCursor *pC = p->apCsr[i];
+      if( pC ){
+        sqlite3VdbeFreeCursor(p, pC);
+        p->apCsr[i] = 0;
+      }
+    }
+  }
+  if( p->aMem ){
+    releaseMemArray(&p->aMem[1], p->nMem);
+  }
+  while( p->pDelFrame ){
+    VdbeFrame *pDel = p->pDelFrame;
+    p->pDelFrame = pDel->pParent;
+    sqlite3VdbeFrameDelete(pDel);
+  }
+
+  /* Delete any auxdata allocations made by the VM */
+  if( p->pAuxData ) sqlite3VdbeDeleteAuxData(p, -1, 0);
+  assert( p->pAuxData==0 );
+}
+
+/*
+** Clean up the VM after a single run.
+*/
+static void Cleanup(Vdbe *p){
+  sqlite3 *db = p->db;
+
+#ifdef SQLITE_DEBUG
+  /* Execute assert() statements to ensure that the Vdbe.apCsr[] and 
+  ** Vdbe.aMem[] arrays have already been cleaned up.  */
+  int i;
+  if( p->apCsr ) for(i=0; i<p->nCursor; i++) assert( p->apCsr[i]==0 );
+  if( p->aMem ){
+    for(i=1; i<=p->nMem; i++) assert( p->aMem[i].flags==MEM_Undefined );
+  }
+#endif
+
+  sqlite3DbFree(db, p->zErrMsg);
+  p->zErrMsg = 0;
+  p->pResultSet = 0;
+}
+
+/*
+** Set the number of result columns that will be returned by this SQL
+** statement. This is now set at compile time, rather than during
+** execution of the vdbe program so that sqlite3_column_count() can
+** be called on an SQL statement before sqlite3_step().
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetNumCols(Vdbe *p, int nResColumn){
+  Mem *pColName;
+  int n;
+  sqlite3 *db = p->db;
+
+  releaseMemArray(p->aColName, p->nResColumn*COLNAME_N);
+  sqlite3DbFree(db, p->aColName);
+  n = nResColumn*COLNAME_N;
+  p->nResColumn = (u16)nResColumn;
+  p->aColName = pColName = (Mem*)sqlite3DbMallocZero(db, sizeof(Mem)*n );
+  if( p->aColName==0 ) return;
+  while( n-- > 0 ){
+    pColName->flags = MEM_Null;
+    pColName->db = p->db;
+    pColName++;
+  }
+}
+
+/*
+** Set the name of the idx'th column to be returned by the SQL statement.
+** zName must be a pointer to a nul terminated string.
+**
+** This call must be made after a call to sqlite3VdbeSetNumCols().
+**
+** The final parameter, xDel, must be one of SQLITE_DYNAMIC, SQLITE_STATIC
+** or SQLITE_TRANSIENT. If it is SQLITE_DYNAMIC, then the buffer pointed
+** to by zName will be freed by sqlite3DbFree() when the vdbe is destroyed.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSetColName(
+  Vdbe *p,                         /* Vdbe being configured */
+  int idx,                         /* Index of column zName applies to */
+  int var,                         /* One of the COLNAME_* constants */
+  const char *zName,               /* Pointer to buffer containing name */
+  void (*xDel)(void*)              /* Memory management strategy for zName */
+){
+  int rc;
+  Mem *pColName;
+  assert( idx<p->nResColumn );
+  assert( var<COLNAME_N );
+  if( p->db->mallocFailed ){
+    assert( !zName || xDel!=SQLITE_DYNAMIC );
+    return SQLITE_NOMEM;
