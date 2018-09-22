@@ -66073,3 +66073,230 @@ SQLITE_PRIVATE int sqlite3VdbeSetColName(
   if( p->db->mallocFailed ){
     assert( !zName || xDel!=SQLITE_DYNAMIC );
     return SQLITE_NOMEM;
+  }
+  assert( p->aColName!=0 );
+  pColName = &(p->aColName[idx+var*p->nResColumn]);
+  rc = sqlite3VdbeMemSetStr(pColName, zName, -1, SQLITE_UTF8, xDel);
+  assert( rc!=0 || !zName || (pColName->flags&MEM_Term)!=0 );
+  return rc;
+}
+
+/*
+** A read or write transaction may or may not be active on database handle
+** db. If a transaction is active, commit it. If there is a
+** write-transaction spanning more than one database file, this routine
+** takes care of the master journal trickery.
+*/
+static int vdbeCommit(sqlite3 *db, Vdbe *p){
+  int i;
+  int nTrans = 0;  /* Number of databases with an active write-transaction */
+  int rc = SQLITE_OK;
+  int needXcommit = 0;
+
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+  /* With this option, sqlite3VtabSync() is defined to be simply 
+  ** SQLITE_OK so p is not used. 
+  */
+  UNUSED_PARAMETER(p);
+#endif
+
+  /* Before doing anything else, call the xSync() callback for any
+  ** virtual module tables written in this transaction. This has to
+  ** be done before determining whether a master journal file is 
+  ** required, as an xSync() callback may add an attached database
+  ** to the transaction.
+  */
+  rc = sqlite3VtabSync(db, p);
+
+  /* This loop determines (a) if the commit hook should be invoked and
+  ** (b) how many database files have open write transactions, not 
+  ** including the temp database. (b) is important because if more than 
+  ** one database file has an open write transaction, a master journal
+  ** file is required for an atomic commit.
+  */ 
+  for(i=0; rc==SQLITE_OK && i<db->nDb; i++){ 
+    Btree *pBt = db->aDb[i].pBt;
+    if( sqlite3BtreeIsInTrans(pBt) ){
+      needXcommit = 1;
+      if( i!=1 ) nTrans++;
+      sqlite3BtreeEnter(pBt);
+      rc = sqlite3PagerExclusiveLock(sqlite3BtreePager(pBt));
+      sqlite3BtreeLeave(pBt);
+    }
+  }
+  if( rc!=SQLITE_OK ){
+    return rc;
+  }
+
+  /* If there are any write-transactions at all, invoke the commit hook */
+  if( needXcommit && db->xCommitCallback ){
+    rc = db->xCommitCallback(db->pCommitArg);
+    if( rc ){
+      return SQLITE_CONSTRAINT_COMMITHOOK;
+    }
+  }
+
+  /* The simple case - no more than one database file (not counting the
+  ** TEMP database) has a transaction active.   There is no need for the
+  ** master-journal.
+  **
+  ** If the return value of sqlite3BtreeGetFilename() is a zero length
+  ** string, it means the main database is :memory: or a temp file.  In 
+  ** that case we do not support atomic multi-file commits, so use the 
+  ** simple case then too.
+  */
+  if( 0==sqlite3Strlen30(sqlite3BtreeGetFilename(db->aDb[0].pBt))
+   || nTrans<=1
+  ){
+    for(i=0; rc==SQLITE_OK && i<db->nDb; i++){
+      Btree *pBt = db->aDb[i].pBt;
+      if( pBt ){
+        rc = sqlite3BtreeCommitPhaseOne(pBt, 0);
+      }
+    }
+
+    /* Do the commit only if all databases successfully complete phase 1. 
+    ** If one of the BtreeCommitPhaseOne() calls fails, this indicates an
+    ** IO error while deleting or truncating a journal file. It is unlikely,
+    ** but could happen. In this case abandon processing and return the error.
+    */
+    for(i=0; rc==SQLITE_OK && i<db->nDb; i++){
+      Btree *pBt = db->aDb[i].pBt;
+      if( pBt ){
+        rc = sqlite3BtreeCommitPhaseTwo(pBt, 0);
+      }
+    }
+    if( rc==SQLITE_OK ){
+      sqlite3VtabCommit(db);
+    }
+  }
+
+  /* The complex case - There is a multi-file write-transaction active.
+  ** This requires a master journal file to ensure the transaction is
+  ** committed atomically.
+  */
+#ifndef SQLITE_OMIT_DISKIO
+  else{
+    sqlite3_vfs *pVfs = db->pVfs;
+    int needSync = 0;
+    char *zMaster = 0;   /* File-name for the master journal */
+    char const *zMainFile = sqlite3BtreeGetFilename(db->aDb[0].pBt);
+    sqlite3_file *pMaster = 0;
+    i64 offset = 0;
+    int res;
+    int retryCount = 0;
+    int nMainFile;
+
+    /* Select a master journal file name */
+    nMainFile = sqlite3Strlen30(zMainFile);
+    zMaster = sqlite3MPrintf(db, "%s-mjXXXXXX9XXz", zMainFile);
+    if( zMaster==0 ) return SQLITE_NOMEM;
+    do {
+      u32 iRandom;
+      if( retryCount ){
+        if( retryCount>100 ){
+          sqlite3_log(SQLITE_FULL, "MJ delete: %s", zMaster);
+          sqlite3OsDelete(pVfs, zMaster, 0);
+          break;
+        }else if( retryCount==1 ){
+          sqlite3_log(SQLITE_FULL, "MJ collide: %s", zMaster);
+        }
+      }
+      retryCount++;
+      sqlite3_randomness(sizeof(iRandom), &iRandom);
+      sqlite3_snprintf(13, &zMaster[nMainFile], "-mj%06X9%02X",
+                               (iRandom>>8)&0xffffff, iRandom&0xff);
+      /* The antipenultimate character of the master journal name must
+      ** be "9" to avoid name collisions when using 8+3 filenames. */
+      assert( zMaster[sqlite3Strlen30(zMaster)-3]=='9' );
+      sqlite3FileSuffix3(zMainFile, zMaster);
+      rc = sqlite3OsAccess(pVfs, zMaster, SQLITE_ACCESS_EXISTS, &res);
+    }while( rc==SQLITE_OK && res );
+    if( rc==SQLITE_OK ){
+      /* Open the master journal. */
+      rc = sqlite3OsOpenMalloc(pVfs, zMaster, &pMaster, 
+          SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|
+          SQLITE_OPEN_EXCLUSIVE|SQLITE_OPEN_MASTER_JOURNAL, 0
+      );
+    }
+    if( rc!=SQLITE_OK ){
+      sqlite3DbFree(db, zMaster);
+      return rc;
+    }
+ 
+    /* Write the name of each database file in the transaction into the new
+    ** master journal file. If an error occurs at this point close
+    ** and delete the master journal file. All the individual journal files
+    ** still have 'null' as the master journal pointer, so they will roll
+    ** back independently if a failure occurs.
+    */
+    for(i=0; i<db->nDb; i++){
+      Btree *pBt = db->aDb[i].pBt;
+      if( sqlite3BtreeIsInTrans(pBt) ){
+        char const *zFile = sqlite3BtreeGetJournalname(pBt);
+        if( zFile==0 ){
+          continue;  /* Ignore TEMP and :memory: databases */
+        }
+        assert( zFile[0]!=0 );
+        if( !needSync && !sqlite3BtreeSyncDisabled(pBt) ){
+          needSync = 1;
+        }
+        rc = sqlite3OsWrite(pMaster, zFile, sqlite3Strlen30(zFile)+1, offset);
+        offset += sqlite3Strlen30(zFile)+1;
+        if( rc!=SQLITE_OK ){
+          sqlite3OsCloseFree(pMaster);
+          sqlite3OsDelete(pVfs, zMaster, 0);
+          sqlite3DbFree(db, zMaster);
+          return rc;
+        }
+      }
+    }
+
+    /* Sync the master journal file. If the IOCAP_SEQUENTIAL device
+    ** flag is set this is not required.
+    */
+    if( needSync 
+     && 0==(sqlite3OsDeviceCharacteristics(pMaster)&SQLITE_IOCAP_SEQUENTIAL)
+     && SQLITE_OK!=(rc = sqlite3OsSync(pMaster, SQLITE_SYNC_NORMAL))
+    ){
+      sqlite3OsCloseFree(pMaster);
+      sqlite3OsDelete(pVfs, zMaster, 0);
+      sqlite3DbFree(db, zMaster);
+      return rc;
+    }
+
+    /* Sync all the db files involved in the transaction. The same call
+    ** sets the master journal pointer in each individual journal. If
+    ** an error occurs here, do not delete the master journal file.
+    **
+    ** If the error occurs during the first call to
+    ** sqlite3BtreeCommitPhaseOne(), then there is a chance that the
+    ** master journal file will be orphaned. But we cannot delete it,
+    ** in case the master journal file name was written into the journal
+    ** file before the failure occurred.
+    */
+    for(i=0; rc==SQLITE_OK && i<db->nDb; i++){ 
+      Btree *pBt = db->aDb[i].pBt;
+      if( pBt ){
+        rc = sqlite3BtreeCommitPhaseOne(pBt, zMaster);
+      }
+    }
+    sqlite3OsCloseFree(pMaster);
+    assert( rc!=SQLITE_BUSY );
+    if( rc!=SQLITE_OK ){
+      sqlite3DbFree(db, zMaster);
+      return rc;
+    }
+
+    /* Delete the master journal file. This commits the transaction. After
+    ** doing this the directory is synced again before any individual
+    ** transaction files are deleted.
+    */
+    rc = sqlite3OsDelete(pVfs, zMaster, 1);
+    sqlite3DbFree(db, zMaster);
+    zMaster = 0;
+    if( rc ){
+      return rc;
+    }
+
+    /* All files and directories have already been synced, so the following
