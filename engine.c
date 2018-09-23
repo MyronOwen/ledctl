@@ -66550,3 +66550,231 @@ SQLITE_PRIVATE int sqlite3VdbeHalt(Vdbe *p){
         rc = sqlite3VdbeCheckFk(p, 1);
         if( rc!=SQLITE_OK ){
           if( NEVER(p->readOnly) ){
+            sqlite3VdbeLeave(p);
+            return SQLITE_ERROR;
+          }
+          rc = SQLITE_CONSTRAINT_FOREIGNKEY;
+        }else{ 
+          /* The auto-commit flag is true, the vdbe program was successful 
+          ** or hit an 'OR FAIL' constraint and there are no deferred foreign
+          ** key constraints to hold up the transaction. This means a commit 
+          ** is required. */
+          rc = vdbeCommit(db, p);
+        }
+        if( rc==SQLITE_BUSY && p->readOnly ){
+          sqlite3VdbeLeave(p);
+          return SQLITE_BUSY;
+        }else if( rc!=SQLITE_OK ){
+          p->rc = rc;
+          sqlite3RollbackAll(db, SQLITE_OK);
+          p->nChange = 0;
+        }else{
+          db->nDeferredCons = 0;
+          db->nDeferredImmCons = 0;
+          db->flags &= ~SQLITE_DeferFKs;
+          sqlite3CommitInternalChanges(db);
+        }
+      }else{
+        sqlite3RollbackAll(db, SQLITE_OK);
+        p->nChange = 0;
+      }
+      db->nStatement = 0;
+    }else if( eStatementOp==0 ){
+      if( p->rc==SQLITE_OK || p->errorAction==OE_Fail ){
+        eStatementOp = SAVEPOINT_RELEASE;
+      }else if( p->errorAction==OE_Abort ){
+        eStatementOp = SAVEPOINT_ROLLBACK;
+      }else{
+        sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+        sqlite3CloseSavepoints(db);
+        db->autoCommit = 1;
+        p->nChange = 0;
+      }
+    }
+  
+    /* If eStatementOp is non-zero, then a statement transaction needs to
+    ** be committed or rolled back. Call sqlite3VdbeCloseStatement() to
+    ** do so. If this operation returns an error, and the current statement
+    ** error code is SQLITE_OK or SQLITE_CONSTRAINT, then promote the
+    ** current statement error code.
+    */
+    if( eStatementOp ){
+      rc = sqlite3VdbeCloseStatement(p, eStatementOp);
+      if( rc ){
+        if( p->rc==SQLITE_OK || (p->rc&0xff)==SQLITE_CONSTRAINT ){
+          p->rc = rc;
+          sqlite3DbFree(db, p->zErrMsg);
+          p->zErrMsg = 0;
+        }
+        sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+        sqlite3CloseSavepoints(db);
+        db->autoCommit = 1;
+        p->nChange = 0;
+      }
+    }
+  
+    /* If this was an INSERT, UPDATE or DELETE and no statement transaction
+    ** has been rolled back, update the database connection change-counter. 
+    */
+    if( p->changeCntOn ){
+      if( eStatementOp!=SAVEPOINT_ROLLBACK ){
+        sqlite3VdbeSetChanges(db, p->nChange);
+      }else{
+        sqlite3VdbeSetChanges(db, 0);
+      }
+      p->nChange = 0;
+    }
+
+    /* Release the locks */
+    sqlite3VdbeLeave(p);
+  }
+
+  /* We have successfully halted and closed the VM.  Record this fact. */
+  if( p->pc>=0 ){
+    db->nVdbeActive--;
+    if( !p->readOnly ) db->nVdbeWrite--;
+    if( p->bIsReader ) db->nVdbeRead--;
+    assert( db->nVdbeActive>=db->nVdbeRead );
+    assert( db->nVdbeRead>=db->nVdbeWrite );
+    assert( db->nVdbeWrite>=0 );
+  }
+  p->magic = VDBE_MAGIC_HALT;
+  checkActiveVdbeCnt(db);
+  if( p->db->mallocFailed ){
+    p->rc = SQLITE_NOMEM;
+  }
+
+  /* If the auto-commit flag is set to true, then any locks that were held
+  ** by connection db have now been released. Call sqlite3ConnectionUnlocked() 
+  ** to invoke any required unlock-notify callbacks.
+  */
+  if( db->autoCommit ){
+    sqlite3ConnectionUnlocked(db);
+  }
+
+  assert( db->nVdbeActive>0 || db->autoCommit==0 || db->nStatement==0 );
+  return (p->rc==SQLITE_BUSY ? SQLITE_BUSY : SQLITE_OK);
+}
+
+
+/*
+** Each VDBE holds the result of the most recent sqlite3_step() call
+** in p->rc.  This routine sets that result back to SQLITE_OK.
+*/
+SQLITE_PRIVATE void sqlite3VdbeResetStepResult(Vdbe *p){
+  p->rc = SQLITE_OK;
+}
+
+/*
+** Copy the error code and error message belonging to the VDBE passed
+** as the first argument to its database handle (so that they will be 
+** returned by calls to sqlite3_errcode() and sqlite3_errmsg()).
+**
+** This function does not clear the VDBE error code or message, just
+** copies them to the database handle.
+*/
+SQLITE_PRIVATE int sqlite3VdbeTransferError(Vdbe *p){
+  sqlite3 *db = p->db;
+  int rc = p->rc;
+  if( p->zErrMsg ){
+    u8 mallocFailed = db->mallocFailed;
+    sqlite3BeginBenignMalloc();
+    if( db->pErr==0 ) db->pErr = sqlite3ValueNew(db);
+    sqlite3ValueSetStr(db->pErr, -1, p->zErrMsg, SQLITE_UTF8, SQLITE_TRANSIENT);
+    sqlite3EndBenignMalloc();
+    db->mallocFailed = mallocFailed;
+    db->errCode = rc;
+  }else{
+    sqlite3Error(db, rc);
+  }
+  return rc;
+}
+
+#ifdef SQLITE_ENABLE_SQLLOG
+/*
+** If an SQLITE_CONFIG_SQLLOG hook is registered and the VM has been run, 
+** invoke it.
+*/
+static void vdbeInvokeSqllog(Vdbe *v){
+  if( sqlite3GlobalConfig.xSqllog && v->rc==SQLITE_OK && v->zSql && v->pc>=0 ){
+    char *zExpanded = sqlite3VdbeExpandSql(v, v->zSql);
+    assert( v->db->init.busy==0 );
+    if( zExpanded ){
+      sqlite3GlobalConfig.xSqllog(
+          sqlite3GlobalConfig.pSqllogArg, v->db, zExpanded, 1
+      );
+      sqlite3DbFree(v->db, zExpanded);
+    }
+  }
+}
+#else
+# define vdbeInvokeSqllog(x)
+#endif
+
+/*
+** Clean up a VDBE after execution but do not delete the VDBE just yet.
+** Write any error messages into *pzErrMsg.  Return the result code.
+**
+** After this routine is run, the VDBE should be ready to be executed
+** again.
+**
+** To look at it another way, this routine resets the state of the
+** virtual machine from VDBE_MAGIC_RUN or VDBE_MAGIC_HALT back to
+** VDBE_MAGIC_INIT.
+*/
+SQLITE_PRIVATE int sqlite3VdbeReset(Vdbe *p){
+  sqlite3 *db;
+  db = p->db;
+
+  /* If the VM did not run to completion or if it encountered an
+  ** error, then it might not have been halted properly.  So halt
+  ** it now.
+  */
+  sqlite3VdbeHalt(p);
+
+  /* If the VDBE has be run even partially, then transfer the error code
+  ** and error message from the VDBE into the main database structure.  But
+  ** if the VDBE has just been set to run but has not actually executed any
+  ** instructions yet, leave the main database error information unchanged.
+  */
+  if( p->pc>=0 ){
+    vdbeInvokeSqllog(p);
+    sqlite3VdbeTransferError(p);
+    sqlite3DbFree(db, p->zErrMsg);
+    p->zErrMsg = 0;
+    if( p->runOnlyOnce ) p->expired = 1;
+  }else if( p->rc && p->expired ){
+    /* The expired flag was set on the VDBE before the first call
+    ** to sqlite3_step(). For consistency (since sqlite3_step() was
+    ** called), set the database error in this case as well.
+    */
+    sqlite3ErrorWithMsg(db, p->rc, p->zErrMsg ? "%s" : 0, p->zErrMsg);
+    sqlite3DbFree(db, p->zErrMsg);
+    p->zErrMsg = 0;
+  }
+
+  /* Reclaim all memory used by the VDBE
+  */
+  Cleanup(p);
+
+  /* Save profiling information from this VDBE run.
+  */
+#ifdef VDBE_PROFILE
+  {
+    FILE *out = fopen("vdbe_profile.out", "a");
+    if( out ){
+      int i;
+      fprintf(out, "---- ");
+      for(i=0; i<p->nOp; i++){
+        fprintf(out, "%02x", p->aOp[i].opcode);
+      }
+      fprintf(out, "\n");
+      if( p->zSql ){
+        char c, pc = 0;
+        fprintf(out, "-- ");
+        for(i=0; (c = p->zSql[i])!=0; i++){
+          if( pc=='\n' ) fprintf(out, "-- ");
+          putc(c, out);
+          pc = c;
+        }
+        if( pc!='\n' ) fprintf(out, "\n");
