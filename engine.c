@@ -67216,3 +67216,222 @@ static u32 SQLITE_NOINLINE serialGet(
     ** endian.
     */
     static const u64 t1 = ((u64)0x3ff00000)<<32;
+    static const double r1 = 1.0;
+    u64 t2 = t1;
+    swapMixedEndianFloat(t2);
+    assert( sizeof(r1)==sizeof(t2) && memcmp(&r1, &t2, sizeof(r1))==0 );
+#endif
+    assert( sizeof(x)==8 && sizeof(pMem->u.r)==8 );
+    swapMixedEndianFloat(x);
+    memcpy(&pMem->u.r, &x, sizeof(x));
+    pMem->flags = sqlite3IsNaN(pMem->u.r) ? MEM_Null : MEM_Real;
+  }
+  return 8;
+}
+SQLITE_PRIVATE u32 sqlite3VdbeSerialGet(
+  const unsigned char *buf,     /* Buffer to deserialize from */
+  u32 serial_type,              /* Serial type to deserialize */
+  Mem *pMem                     /* Memory cell to write value into */
+){
+  switch( serial_type ){
+    case 10:   /* Reserved for future use */
+    case 11:   /* Reserved for future use */
+    case 0: {  /* Null */
+      /* EVIDENCE-OF: R-24078-09375 Value is a NULL. */
+      pMem->flags = MEM_Null;
+      break;
+    }
+    case 1: {
+      /* EVIDENCE-OF: R-44885-25196 Value is an 8-bit twos-complement
+      ** integer. */
+      pMem->u.i = ONE_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return 1;
+    }
+    case 2: { /* 2-byte signed integer */
+      /* EVIDENCE-OF: R-49794-35026 Value is a big-endian 16-bit
+      ** twos-complement integer. */
+      pMem->u.i = TWO_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return 2;
+    }
+    case 3: { /* 3-byte signed integer */
+      /* EVIDENCE-OF: R-37839-54301 Value is a big-endian 24-bit
+      ** twos-complement integer. */
+      pMem->u.i = THREE_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return 3;
+    }
+    case 4: { /* 4-byte signed integer */
+      /* EVIDENCE-OF: R-01849-26079 Value is a big-endian 32-bit
+      ** twos-complement integer. */
+      pMem->u.i = FOUR_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return 4;
+    }
+    case 5: { /* 6-byte signed integer */
+      /* EVIDENCE-OF: R-50385-09674 Value is a big-endian 48-bit
+      ** twos-complement integer. */
+      pMem->u.i = FOUR_BYTE_UINT(buf+2) + (((i64)1)<<32)*TWO_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return 6;
+    }
+    case 6:   /* 8-byte signed integer */
+    case 7: { /* IEEE floating point */
+      /* These use local variables, so do them in a separate routine
+      ** to avoid having to move the frame pointer in the common case */
+      return serialGet(buf,serial_type,pMem);
+    }
+    case 8:    /* Integer 0 */
+    case 9: {  /* Integer 1 */
+      /* EVIDENCE-OF: R-12976-22893 Value is the integer 0. */
+      /* EVIDENCE-OF: R-18143-12121 Value is the integer 1. */
+      pMem->u.i = serial_type-8;
+      pMem->flags = MEM_Int;
+      return 0;
+    }
+    default: {
+      /* EVIDENCE-OF: R-14606-31564 Value is a BLOB that is (N-12)/2 bytes in
+      ** length.
+      ** EVIDENCE-OF: R-28401-00140 Value is a string in the text encoding and
+      ** (N-13)/2 bytes in length. */
+      static const u16 aFlag[] = { MEM_Blob|MEM_Ephem, MEM_Str|MEM_Ephem };
+      pMem->z = (char *)buf;
+      pMem->n = (serial_type-12)/2;
+      pMem->flags = aFlag[serial_type&1];
+      return pMem->n;
+    }
+  }
+  return 0;
+}
+/*
+** This routine is used to allocate sufficient space for an UnpackedRecord
+** structure large enough to be used with sqlite3VdbeRecordUnpack() if
+** the first argument is a pointer to KeyInfo structure pKeyInfo.
+**
+** The space is either allocated using sqlite3DbMallocRaw() or from within
+** the unaligned buffer passed via the second and third arguments (presumably
+** stack space). If the former, then *ppFree is set to a pointer that should
+** be eventually freed by the caller using sqlite3DbFree(). Or, if the 
+** allocation comes from the pSpace/szSpace buffer, *ppFree is set to NULL
+** before returning.
+**
+** If an OOM error occurs, NULL is returned.
+*/
+SQLITE_PRIVATE UnpackedRecord *sqlite3VdbeAllocUnpackedRecord(
+  KeyInfo *pKeyInfo,              /* Description of the record */
+  char *pSpace,                   /* Unaligned space available */
+  int szSpace,                    /* Size of pSpace[] in bytes */
+  char **ppFree                   /* OUT: Caller should free this pointer */
+){
+  UnpackedRecord *p;              /* Unpacked record to return */
+  int nOff;                       /* Increment pSpace by nOff to align it */
+  int nByte;                      /* Number of bytes required for *p */
+
+  /* We want to shift the pointer pSpace up such that it is 8-byte aligned.
+  ** Thus, we need to calculate a value, nOff, between 0 and 7, to shift 
+  ** it by.  If pSpace is already 8-byte aligned, nOff should be zero.
+  */
+  nOff = (8 - (SQLITE_PTR_TO_INT(pSpace) & 7)) & 7;
+  nByte = ROUND8(sizeof(UnpackedRecord)) + sizeof(Mem)*(pKeyInfo->nField+1);
+  if( nByte>szSpace+nOff ){
+    p = (UnpackedRecord *)sqlite3DbMallocRaw(pKeyInfo->db, nByte);
+    *ppFree = (char *)p;
+    if( !p ) return 0;
+  }else{
+    p = (UnpackedRecord*)&pSpace[nOff];
+    *ppFree = 0;
+  }
+
+  p->aMem = (Mem*)&((char*)p)[ROUND8(sizeof(UnpackedRecord))];
+  assert( pKeyInfo->aSortOrder!=0 );
+  p->pKeyInfo = pKeyInfo;
+  p->nField = pKeyInfo->nField + 1;
+  return p;
+}
+
+/*
+** Given the nKey-byte encoding of a record in pKey[], populate the 
+** UnpackedRecord structure indicated by the fourth argument with the
+** contents of the decoded record.
+*/ 
+SQLITE_PRIVATE void sqlite3VdbeRecordUnpack(
+  KeyInfo *pKeyInfo,     /* Information about the record format */
+  int nKey,              /* Size of the binary record */
+  const void *pKey,      /* The binary record */
+  UnpackedRecord *p      /* Populate this structure before returning. */
+){
+  const unsigned char *aKey = (const unsigned char *)pKey;
+  int d; 
+  u32 idx;                        /* Offset in aKey[] to read from */
+  u16 u;                          /* Unsigned loop counter */
+  u32 szHdr;
+  Mem *pMem = p->aMem;
+
+  p->default_rc = 0;
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+  idx = getVarint32(aKey, szHdr);
+  d = szHdr;
+  u = 0;
+  while( idx<szHdr && d<=nKey ){
+    u32 serial_type;
+
+    idx += getVarint32(&aKey[idx], serial_type);
+    pMem->enc = pKeyInfo->enc;
+    pMem->db = pKeyInfo->db;
+    /* pMem->flags = 0; // sqlite3VdbeSerialGet() will set this for us */
+    pMem->szMalloc = 0;
+    d += sqlite3VdbeSerialGet(&aKey[d], serial_type, pMem);
+    pMem++;
+    if( (++u)>=p->nField ) break;
+  }
+  assert( u<=pKeyInfo->nField + 1 );
+  p->nField = u;
+}
+
+#if SQLITE_DEBUG
+/*
+** This function compares two index or table record keys in the same way
+** as the sqlite3VdbeRecordCompare() routine. Unlike VdbeRecordCompare(),
+** this function deserializes and compares values using the
+** sqlite3VdbeSerialGet() and sqlite3MemCompare() functions. It is used
+** in assert() statements to ensure that the optimized code in
+** sqlite3VdbeRecordCompare() returns results with these two primitives.
+**
+** Return true if the result of comparison is equivalent to desiredResult.
+** Return false if there is a disagreement.
+*/
+static int vdbeRecordCompareDebug(
+  int nKey1, const void *pKey1, /* Left key */
+  const UnpackedRecord *pPKey2, /* Right key */
+  int desiredResult             /* Correct answer */
+){
+  u32 d1;            /* Offset into aKey[] of next data element */
+  u32 idx1;          /* Offset into aKey[] of next header element */
+  u32 szHdr1;        /* Number of bytes in header */
+  int i = 0;
+  int rc = 0;
+  const unsigned char *aKey1 = (const unsigned char *)pKey1;
+  KeyInfo *pKeyInfo;
+  Mem mem1;
+
+  pKeyInfo = pPKey2->pKeyInfo;
+  if( pKeyInfo->db==0 ) return 1;
+  mem1.enc = pKeyInfo->enc;
+  mem1.db = pKeyInfo->db;
+  /* mem1.flags = 0;  // Will be initialized by sqlite3VdbeSerialGet() */
+  VVA_ONLY( mem1.szMalloc = 0; ) /* Only needed by assert() statements */
+
+  /* Compilers may complain that mem1.u.i is potentially uninitialized.
+  ** We could initialize it, as shown here, to silence those complaints.
+  ** But in fact, mem1.u.i will never actually be used uninitialized, and doing 
+  ** the unnecessary initialization has a measurable negative performance
+  ** impact, since this routine is a very high runner.  And so, we choose
+  ** to ignore the compiler warnings and leave this variable uninitialized.
+  */
+  /*  mem1.u.i = 0;  // not needed, here to silence compiler warning */
