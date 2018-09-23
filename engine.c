@@ -67011,3 +67011,208 @@ SQLITE_PRIVATE int sqlite3VdbeCursorMoveto(VdbeCursor *p){
 **      7                     8            IEEE float
 **      8                     0            Integer constant 0
 **      9                     0            Integer constant 1
+**     10,11                               reserved for expansion
+**    N>=12 and even       (N-12)/2        BLOB
+**    N>=13 and odd        (N-13)/2        text
+**
+** The 8 and 9 types were added in 3.3.0, file format 4.  Prior versions
+** of SQLite will not understand those serial types.
+*/
+
+/*
+** Return the serial-type for the value stored in pMem.
+*/
+SQLITE_PRIVATE u32 sqlite3VdbeSerialType(Mem *pMem, int file_format){
+  int flags = pMem->flags;
+  u32 n;
+
+  if( flags&MEM_Null ){
+    return 0;
+  }
+  if( flags&MEM_Int ){
+    /* Figure out whether to use 1, 2, 4, 6 or 8 bytes. */
+#   define MAX_6BYTE ((((i64)0x00008000)<<32)-1)
+    i64 i = pMem->u.i;
+    u64 u;
+    if( i<0 ){
+      u = ~i;
+    }else{
+      u = i;
+    }
+    if( u<=127 ){
+      return ((i&1)==i && file_format>=4) ? 8+(u32)u : 1;
+    }
+    if( u<=32767 ) return 2;
+    if( u<=8388607 ) return 3;
+    if( u<=2147483647 ) return 4;
+    if( u<=MAX_6BYTE ) return 5;
+    return 6;
+  }
+  if( flags&MEM_Real ){
+    return 7;
+  }
+  assert( pMem->db->mallocFailed || flags&(MEM_Str|MEM_Blob) );
+  assert( pMem->n>=0 );
+  n = (u32)pMem->n;
+  if( flags & MEM_Zero ){
+    n += pMem->u.nZero;
+  }
+  return ((n*2) + 12 + ((flags&MEM_Str)!=0));
+}
+
+/*
+** Return the length of the data corresponding to the supplied serial-type.
+*/
+SQLITE_PRIVATE u32 sqlite3VdbeSerialTypeLen(u32 serial_type){
+  if( serial_type>=12 ){
+    return (serial_type-12)/2;
+  }else{
+    static const u8 aSize[] = { 0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0 };
+    return aSize[serial_type];
+  }
+}
+
+/*
+** If we are on an architecture with mixed-endian floating 
+** points (ex: ARM7) then swap the lower 4 bytes with the 
+** upper 4 bytes.  Return the result.
+**
+** For most architectures, this is a no-op.
+**
+** (later):  It is reported to me that the mixed-endian problem
+** on ARM7 is an issue with GCC, not with the ARM7 chip.  It seems
+** that early versions of GCC stored the two words of a 64-bit
+** float in the wrong order.  And that error has been propagated
+** ever since.  The blame is not necessarily with GCC, though.
+** GCC might have just copying the problem from a prior compiler.
+** I am also told that newer versions of GCC that follow a different
+** ABI get the byte order right.
+**
+** Developers using SQLite on an ARM7 should compile and run their
+** application using -DSQLITE_DEBUG=1 at least once.  With DEBUG
+** enabled, some asserts below will ensure that the byte order of
+** floating point values is correct.
+**
+** (2007-08-30)  Frank van Vugt has studied this problem closely
+** and has send his findings to the SQLite developers.  Frank
+** writes that some Linux kernels offer floating point hardware
+** emulation that uses only 32-bit mantissas instead of a full 
+** 48-bits as required by the IEEE standard.  (This is the
+** CONFIG_FPE_FASTFPE option.)  On such systems, floating point
+** byte swapping becomes very complicated.  To avoid problems,
+** the necessary byte swapping is carried out using a 64-bit integer
+** rather than a 64-bit float.  Frank assures us that the code here
+** works for him.  We, the developers, have no way to independently
+** verify this, but Frank seems to know what he is talking about
+** so we trust him.
+*/
+#ifdef SQLITE_MIXED_ENDIAN_64BIT_FLOAT
+static u64 floatSwap(u64 in){
+  union {
+    u64 r;
+    u32 i[2];
+  } u;
+  u32 t;
+
+  u.r = in;
+  t = u.i[0];
+  u.i[0] = u.i[1];
+  u.i[1] = t;
+  return u.r;
+}
+# define swapMixedEndianFloat(X)  X = floatSwap(X)
+#else
+# define swapMixedEndianFloat(X)
+#endif
+
+/*
+** Write the serialized data blob for the value stored in pMem into 
+** buf. It is assumed that the caller has allocated sufficient space.
+** Return the number of bytes written.
+**
+** nBuf is the amount of space left in buf[].  The caller is responsible
+** for allocating enough space to buf[] to hold the entire field, exclusive
+** of the pMem->u.nZero bytes for a MEM_Zero value.
+**
+** Return the number of bytes actually written into buf[].  The number
+** of bytes in the zero-filled tail is included in the return value only
+** if those bytes were zeroed in buf[].
+*/ 
+SQLITE_PRIVATE u32 sqlite3VdbeSerialPut(u8 *buf, Mem *pMem, u32 serial_type){
+  u32 len;
+
+  /* Integer and Real */
+  if( serial_type<=7 && serial_type>0 ){
+    u64 v;
+    u32 i;
+    if( serial_type==7 ){
+      assert( sizeof(v)==sizeof(pMem->u.r) );
+      memcpy(&v, &pMem->u.r, sizeof(v));
+      swapMixedEndianFloat(v);
+    }else{
+      v = pMem->u.i;
+    }
+    len = i = sqlite3VdbeSerialTypeLen(serial_type);
+    assert( i>0 );
+    do{
+      buf[--i] = (u8)(v&0xFF);
+      v >>= 8;
+    }while( i );
+    return len;
+  }
+
+  /* String or blob */
+  if( serial_type>=12 ){
+    assert( pMem->n + ((pMem->flags & MEM_Zero)?pMem->u.nZero:0)
+             == (int)sqlite3VdbeSerialTypeLen(serial_type) );
+    len = pMem->n;
+    memcpy(buf, pMem->z, len);
+    return len;
+  }
+
+  /* NULL or constants 0 or 1 */
+  return 0;
+}
+
+/* Input "x" is a sequence of unsigned characters that represent a
+** big-endian integer.  Return the equivalent native integer
+*/
+#define ONE_BYTE_INT(x)    ((i8)(x)[0])
+#define TWO_BYTE_INT(x)    (256*(i8)((x)[0])|(x)[1])
+#define THREE_BYTE_INT(x)  (65536*(i8)((x)[0])|((x)[1]<<8)|(x)[2])
+#define FOUR_BYTE_UINT(x)  (((u32)(x)[0]<<24)|((x)[1]<<16)|((x)[2]<<8)|(x)[3])
+#define FOUR_BYTE_INT(x) (16777216*(i8)((x)[0])|((x)[1]<<16)|((x)[2]<<8)|(x)[3])
+
+/*
+** Deserialize the data blob pointed to by buf as serial type serial_type
+** and store the result in pMem.  Return the number of bytes read.
+**
+** This function is implemented as two separate routines for performance.
+** The few cases that require local variables are broken out into a separate
+** routine so that in most cases the overhead of moving the stack pointer
+** is avoided.
+*/ 
+static u32 SQLITE_NOINLINE serialGet(
+  const unsigned char *buf,     /* Buffer to deserialize from */
+  u32 serial_type,              /* Serial type to deserialize */
+  Mem *pMem                     /* Memory cell to write value into */
+){
+  u64 x = FOUR_BYTE_UINT(buf);
+  u32 y = FOUR_BYTE_UINT(buf+4);
+  x = (x<<32) + y;
+  if( serial_type==6 ){
+    /* EVIDENCE-OF: R-29851-52272 Value is a big-endian 64-bit
+    ** twos-complement integer. */
+    pMem->u.i = *(i64*)&x;
+    pMem->flags = MEM_Int;
+    testcase( pMem->u.i<0 );
+  }else{
+    /* EVIDENCE-OF: R-57343-49114 Value is a big-endian IEEE 754-2008 64-bit
+    ** floating point number. */
+#if !defined(NDEBUG) && !defined(SQLITE_OMIT_FLOATING_POINT)
+    /* Verify that integers and floating point values use the same
+    ** byte order.  Or, that if SQLITE_MIXED_ENDIAN_64BIT_FLOAT is
+    ** defined that 64-bit floating point values really are mixed
+    ** endian.
+    */
+    static const u64 t1 = ((u64)0x3ff00000)<<32;
