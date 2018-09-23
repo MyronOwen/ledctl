@@ -66778,3 +66778,236 @@ SQLITE_PRIVATE int sqlite3VdbeReset(Vdbe *p){
           pc = c;
         }
         if( pc!='\n' ) fprintf(out, "\n");
+      }
+      for(i=0; i<p->nOp; i++){
+        char zHdr[100];
+        sqlite3_snprintf(sizeof(zHdr), zHdr, "%6u %12llu %8llu ",
+           p->aOp[i].cnt,
+           p->aOp[i].cycles,
+           p->aOp[i].cnt>0 ? p->aOp[i].cycles/p->aOp[i].cnt : 0
+        );
+        fprintf(out, "%s", zHdr);
+        sqlite3VdbePrintOp(out, i, &p->aOp[i]);
+      }
+      fclose(out);
+    }
+  }
+#endif
+  p->iCurrentTime = 0;
+  p->magic = VDBE_MAGIC_INIT;
+  return p->rc & db->errMask;
+}
+ 
+/*
+** Clean up and delete a VDBE after execution.  Return an integer which is
+** the result code.  Write any error message text into *pzErrMsg.
+*/
+SQLITE_PRIVATE int sqlite3VdbeFinalize(Vdbe *p){
+  int rc = SQLITE_OK;
+  if( p->magic==VDBE_MAGIC_RUN || p->magic==VDBE_MAGIC_HALT ){
+    rc = sqlite3VdbeReset(p);
+    assert( (rc & p->db->errMask)==rc );
+  }
+  sqlite3VdbeDelete(p);
+  return rc;
+}
+
+/*
+** If parameter iOp is less than zero, then invoke the destructor for
+** all auxiliary data pointers currently cached by the VM passed as
+** the first argument.
+**
+** Or, if iOp is greater than or equal to zero, then the destructor is
+** only invoked for those auxiliary data pointers created by the user 
+** function invoked by the OP_Function opcode at instruction iOp of 
+** VM pVdbe, and only then if:
+**
+**    * the associated function parameter is the 32nd or later (counting
+**      from left to right), or
+**
+**    * the corresponding bit in argument mask is clear (where the first
+**      function parameter corresponds to bit 0 etc.).
+*/
+SQLITE_PRIVATE void sqlite3VdbeDeleteAuxData(Vdbe *pVdbe, int iOp, int mask){
+  AuxData **pp = &pVdbe->pAuxData;
+  while( *pp ){
+    AuxData *pAux = *pp;
+    if( (iOp<0)
+     || (pAux->iOp==iOp && (pAux->iArg>31 || !(mask & MASKBIT32(pAux->iArg))))
+    ){
+      testcase( pAux->iArg==31 );
+      if( pAux->xDelete ){
+        pAux->xDelete(pAux->pAux);
+      }
+      *pp = pAux->pNext;
+      sqlite3DbFree(pVdbe->db, pAux);
+    }else{
+      pp= &pAux->pNext;
+    }
+  }
+}
+
+/*
+** Free all memory associated with the Vdbe passed as the second argument,
+** except for object itself, which is preserved.
+**
+** The difference between this function and sqlite3VdbeDelete() is that
+** VdbeDelete() also unlinks the Vdbe from the list of VMs associated with
+** the database connection and frees the object itself.
+*/
+SQLITE_PRIVATE void sqlite3VdbeClearObject(sqlite3 *db, Vdbe *p){
+  SubProgram *pSub, *pNext;
+  int i;
+  assert( p->db==0 || p->db==db );
+  releaseMemArray(p->aVar, p->nVar);
+  releaseMemArray(p->aColName, p->nResColumn*COLNAME_N);
+  for(pSub=p->pProgram; pSub; pSub=pNext){
+    pNext = pSub->pNext;
+    vdbeFreeOpArray(db, pSub->aOp, pSub->nOp);
+    sqlite3DbFree(db, pSub);
+  }
+  for(i=p->nzVar-1; i>=0; i--) sqlite3DbFree(db, p->azVar[i]);
+  vdbeFreeOpArray(db, p->aOp, p->nOp);
+  sqlite3DbFree(db, p->aColName);
+  sqlite3DbFree(db, p->zSql);
+  sqlite3DbFree(db, p->pFree);
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  for(i=0; i<p->nScan; i++){
+    sqlite3DbFree(db, p->aScan[i].zName);
+  }
+  sqlite3DbFree(db, p->aScan);
+#endif
+}
+
+/*
+** Delete an entire VDBE.
+*/
+SQLITE_PRIVATE void sqlite3VdbeDelete(Vdbe *p){
+  sqlite3 *db;
+
+  if( NEVER(p==0) ) return;
+  db = p->db;
+  assert( sqlite3_mutex_held(db->mutex) );
+  sqlite3VdbeClearObject(db, p);
+  if( p->pPrev ){
+    p->pPrev->pNext = p->pNext;
+  }else{
+    assert( db->pVdbe==p );
+    db->pVdbe = p->pNext;
+  }
+  if( p->pNext ){
+    p->pNext->pPrev = p->pPrev;
+  }
+  p->magic = VDBE_MAGIC_DEAD;
+  p->db = 0;
+  sqlite3DbFree(db, p);
+}
+
+/*
+** The cursor "p" has a pending seek operation that has not yet been
+** carried out.  Seek the cursor now.  If an error occurs, return
+** the appropriate error code.
+*/
+static int SQLITE_NOINLINE handleDeferredMoveto(VdbeCursor *p){
+  int res, rc;
+#ifdef SQLITE_TEST
+  extern int sqlite3_search_count;
+#endif
+  assert( p->deferredMoveto );
+  assert( p->isTable );
+  rc = sqlite3BtreeMovetoUnpacked(p->pCursor, 0, p->movetoTarget, 0, &res);
+  if( rc ) return rc;
+  if( res!=0 ) return SQLITE_CORRUPT_BKPT;
+#ifdef SQLITE_TEST
+  sqlite3_search_count++;
+#endif
+  p->deferredMoveto = 0;
+  p->cacheStatus = CACHE_STALE;
+  return SQLITE_OK;
+}
+
+/*
+** Something has moved cursor "p" out of place.  Maybe the row it was
+** pointed to was deleted out from under it.  Or maybe the btree was
+** rebalanced.  Whatever the cause, try to restore "p" to the place it
+** is supposed to be pointing.  If the row was deleted out from under the
+** cursor, set the cursor to point to a NULL row.
+*/
+static int SQLITE_NOINLINE handleMovedCursor(VdbeCursor *p){
+  int isDifferentRow, rc;
+  assert( p->pCursor!=0 );
+  assert( sqlite3BtreeCursorHasMoved(p->pCursor) );
+  rc = sqlite3BtreeCursorRestore(p->pCursor, &isDifferentRow);
+  p->cacheStatus = CACHE_STALE;
+  if( isDifferentRow ) p->nullRow = 1;
+  return rc;
+}
+
+/*
+** Check to ensure that the cursor is valid.  Restore the cursor
+** if need be.  Return any I/O error from the restore operation.
+*/
+SQLITE_PRIVATE int sqlite3VdbeCursorRestore(VdbeCursor *p){
+  if( sqlite3BtreeCursorHasMoved(p->pCursor) ){
+    return handleMovedCursor(p);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Make sure the cursor p is ready to read or write the row to which it
+** was last positioned.  Return an error code if an OOM fault or I/O error
+** prevents us from positioning the cursor to its correct position.
+**
+** If a MoveTo operation is pending on the given cursor, then do that
+** MoveTo now.  If no move is pending, check to see if the row has been
+** deleted out from under the cursor and if it has, mark the row as
+** a NULL row.
+**
+** If the cursor is already pointing to the correct row and that row has
+** not been deleted out from under the cursor, then this routine is a no-op.
+*/
+SQLITE_PRIVATE int sqlite3VdbeCursorMoveto(VdbeCursor *p){
+  if( p->deferredMoveto ){
+    return handleDeferredMoveto(p);
+  }
+  if( p->pCursor && sqlite3BtreeCursorHasMoved(p->pCursor) ){
+    return handleMovedCursor(p);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** The following functions:
+**
+** sqlite3VdbeSerialType()
+** sqlite3VdbeSerialTypeLen()
+** sqlite3VdbeSerialLen()
+** sqlite3VdbeSerialPut()
+** sqlite3VdbeSerialGet()
+**
+** encapsulate the code that serializes values for storage in SQLite
+** data and index records. Each serialized value consists of a
+** 'serial-type' and a blob of data. The serial type is an 8-byte unsigned
+** integer, stored as a varint.
+**
+** In an SQLite index record, the serial type is stored directly before
+** the blob of data that it corresponds to. In a table record, all serial
+** types are stored at the start of the record, and the blobs of data at
+** the end. Hence these functions allow the caller to handle the
+** serial-type and data blob separately.
+**
+** The following table describes the various storage classes for data:
+**
+**   serial type        bytes of data      type
+**   --------------     ---------------    ---------------
+**      0                     0            NULL
+**      1                     1            signed integer
+**      2                     2            signed integer
+**      3                     3            signed integer
+**      4                     4            signed integer
+**      5                     6            signed integer
+**      6                     8            signed integer
+**      7                     8            IEEE float
+**      8                     0            Integer constant 0
+**      9                     0            Integer constant 1
