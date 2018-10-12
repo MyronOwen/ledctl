@@ -68150,3 +68150,256 @@ SQLITE_PRIVATE int sqlite3VdbeIdxRowid(sqlite3 *db, BtCursor *pCur, i64 *rowid){
   *rowid = v.u.i;
   sqlite3VdbeMemRelease(&m);
   return SQLITE_OK;
+
+  /* Jump here if database corruption is detected after m has been
+  ** allocated.  Free the m object and return SQLITE_CORRUPT. */
+idx_rowid_corruption:
+  testcase( m.szMalloc!=0 );
+  sqlite3VdbeMemRelease(&m);
+  return SQLITE_CORRUPT_BKPT;
+}
+
+/*
+** Compare the key of the index entry that cursor pC is pointing to against
+** the key string in pUnpacked.  Write into *pRes a number
+** that is negative, zero, or positive if pC is less than, equal to,
+** or greater than pUnpacked.  Return SQLITE_OK on success.
+**
+** pUnpacked is either created without a rowid or is truncated so that it
+** omits the rowid at the end.  The rowid at the end of the index entry
+** is ignored as well.  Hence, this routine only compares the prefixes 
+** of the keys prior to the final rowid, not the entire key.
+*/
+SQLITE_PRIVATE int sqlite3VdbeIdxKeyCompare(
+  sqlite3 *db,                     /* Database connection */
+  VdbeCursor *pC,                  /* The cursor to compare against */
+  UnpackedRecord *pUnpacked,       /* Unpacked version of key */
+  int *res                         /* Write the comparison result here */
+){
+  i64 nCellKey = 0;
+  int rc;
+  BtCursor *pCur = pC->pCursor;
+  Mem m;
+
+  assert( sqlite3BtreeCursorIsValid(pCur) );
+  VVA_ONLY(rc =) sqlite3BtreeKeySize(pCur, &nCellKey);
+  assert( rc==SQLITE_OK );    /* pCur is always valid so KeySize cannot fail */
+  /* nCellKey will always be between 0 and 0xffffffff because of the way
+  ** that btreeParseCellPtr() and sqlite3GetVarint32() are implemented */
+  if( nCellKey<=0 || nCellKey>0x7fffffff ){
+    *res = 0;
+    return SQLITE_CORRUPT_BKPT;
+  }
+  sqlite3VdbeMemInit(&m, db, 0);
+  rc = sqlite3VdbeMemFromBtree(pC->pCursor, 0, (u32)nCellKey, 1, &m);
+  if( rc ){
+    return rc;
+  }
+  *res = sqlite3VdbeRecordCompare(m.n, m.z, pUnpacked);
+  sqlite3VdbeMemRelease(&m);
+  return SQLITE_OK;
+}
+
+/*
+** This routine sets the value to be returned by subsequent calls to
+** sqlite3_changes() on the database handle 'db'. 
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetChanges(sqlite3 *db, int nChange){
+  assert( sqlite3_mutex_held(db->mutex) );
+  db->nChange = nChange;
+  db->nTotalChange += nChange;
+}
+
+/*
+** Set a flag in the vdbe to update the change counter when it is finalised
+** or reset.
+*/
+SQLITE_PRIVATE void sqlite3VdbeCountChanges(Vdbe *v){
+  v->changeCntOn = 1;
+}
+
+/*
+** Mark every prepared statement associated with a database connection
+** as expired.
+**
+** An expired statement means that recompilation of the statement is
+** recommend.  Statements expire when things happen that make their
+** programs obsolete.  Removing user-defined functions or collating
+** sequences, or changing an authorization function are the types of
+** things that make prepared statements obsolete.
+*/
+SQLITE_PRIVATE void sqlite3ExpirePreparedStatements(sqlite3 *db){
+  Vdbe *p;
+  for(p = db->pVdbe; p; p=p->pNext){
+    p->expired = 1;
+  }
+}
+
+/*
+** Return the database associated with the Vdbe.
+*/
+SQLITE_PRIVATE sqlite3 *sqlite3VdbeDb(Vdbe *v){
+  return v->db;
+}
+
+/*
+** Return a pointer to an sqlite3_value structure containing the value bound
+** parameter iVar of VM v. Except, if the value is an SQL NULL, return 
+** 0 instead. Unless it is NULL, apply affinity aff (one of the SQLITE_AFF_*
+** constants) to the value before returning it.
+**
+** The returned value must be freed by the caller using sqlite3ValueFree().
+*/
+SQLITE_PRIVATE sqlite3_value *sqlite3VdbeGetBoundValue(Vdbe *v, int iVar, u8 aff){
+  assert( iVar>0 );
+  if( v ){
+    Mem *pMem = &v->aVar[iVar-1];
+    if( 0==(pMem->flags & MEM_Null) ){
+      sqlite3_value *pRet = sqlite3ValueNew(v->db);
+      if( pRet ){
+        sqlite3VdbeMemCopy((Mem *)pRet, pMem);
+        sqlite3ValueApplyAffinity(pRet, aff, SQLITE_UTF8);
+      }
+      return pRet;
+    }
+  }
+  return 0;
+}
+
+/*
+** Configure SQL variable iVar so that binding a new value to it signals
+** to sqlite3_reoptimize() that re-preparing the statement may result
+** in a better query plan.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetVarmask(Vdbe *v, int iVar){
+  assert( iVar>0 );
+  if( iVar>32 ){
+    v->expmask = 0xffffffff;
+  }else{
+    v->expmask |= ((u32)1 << (iVar-1));
+  }
+}
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/*
+** Transfer error message text from an sqlite3_vtab.zErrMsg (text stored
+** in memory obtained from sqlite3_malloc) into a Vdbe.zErrMsg (text stored
+** in memory obtained from sqlite3DbMalloc).
+*/
+SQLITE_PRIVATE void sqlite3VtabImportErrmsg(Vdbe *p, sqlite3_vtab *pVtab){
+  sqlite3 *db = p->db;
+  sqlite3DbFree(db, p->zErrMsg);
+  p->zErrMsg = sqlite3DbStrDup(db, pVtab->zErrMsg);
+  sqlite3_free(pVtab->zErrMsg);
+  pVtab->zErrMsg = 0;
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+/************** End of vdbeaux.c *********************************************/
+/************** Begin file vdbeapi.c *****************************************/
+/*
+** 2004 May 26
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code use to implement APIs that are part of the
+** VDBE.
+*/
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Return TRUE (non-zero) of the statement supplied as an argument needs
+** to be recompiled.  A statement needs to be recompiled whenever the
+** execution environment changes in a way that would alter the program
+** that sqlite3_prepare() generates.  For example, if new functions or
+** collating sequences are registered or if an authorizer function is
+** added or changed.
+*/
+SQLITE_API int sqlite3_expired(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  return p==0 || p->expired;
+}
+#endif
+
+/*
+** Check on a Vdbe to make sure it has not been finalized.  Log
+** an error and return true if it has been finalized (or is otherwise
+** invalid).  Return false if it is ok.
+*/
+static int vdbeSafety(Vdbe *p){
+  if( p->db==0 ){
+    sqlite3_log(SQLITE_MISUSE, "API called with finalized prepared statement");
+    return 1;
+  }else{
+    return 0;
+  }
+}
+static int vdbeSafetyNotNull(Vdbe *p){
+  if( p==0 ){
+    sqlite3_log(SQLITE_MISUSE, "API called with NULL prepared statement");
+    return 1;
+  }else{
+    return vdbeSafety(p);
+  }
+}
+
+/*
+** The following routine destroys a virtual machine that is created by
+** the sqlite3_compile() routine. The integer returned is an SQLITE_
+** success/failure code that describes the result of executing the virtual
+** machine.
+**
+** This routine sets the error code and string returned by
+** sqlite3_errcode(), sqlite3_errmsg() and sqlite3_errmsg16().
+*/
+SQLITE_API int sqlite3_finalize(sqlite3_stmt *pStmt){
+  int rc;
+  if( pStmt==0 ){
+    /* IMPLEMENTATION-OF: R-57228-12904 Invoking sqlite3_finalize() on a NULL
+    ** pointer is a harmless no-op. */
+    rc = SQLITE_OK;
+  }else{
+    Vdbe *v = (Vdbe*)pStmt;
+    sqlite3 *db = v->db;
+    if( vdbeSafety(v) ) return SQLITE_MISUSE_BKPT;
+    sqlite3_mutex_enter(db->mutex);
+    rc = sqlite3VdbeFinalize(v);
+    rc = sqlite3ApiExit(db, rc);
+    sqlite3LeaveMutexAndCloseZombie(db);
+  }
+  return rc;
+}
+
+/*
+** Terminate the current execution of an SQL statement and reset it
+** back to its starting state so that it can be reused. A success code from
+** the prior execution is returned.
+**
+** This routine sets the error code and string returned by
+** sqlite3_errcode(), sqlite3_errmsg() and sqlite3_errmsg16().
+*/
+SQLITE_API int sqlite3_reset(sqlite3_stmt *pStmt){
+  int rc;
+  if( pStmt==0 ){
+    rc = SQLITE_OK;
+  }else{
+    Vdbe *v = (Vdbe*)pStmt;
+    sqlite3_mutex_enter(v->db->mutex);
+    rc = sqlite3VdbeReset(v);
+    sqlite3VdbeRewind(v);
+    assert( (rc & (v->db->errMask))==rc );
+    rc = sqlite3ApiExit(v->db, rc);
+    sqlite3_mutex_leave(v->db->mutex);
+  }
+  return rc;
+}
+
+/*
+** Set all the parameters in the compiled SQL statement to NULL.
