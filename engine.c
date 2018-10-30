@@ -69597,3 +69597,228 @@ SQLITE_API int sqlite3_bind_value(sqlite3_stmt *pStmt, int i, const sqlite3_valu
                               pValue->enc);
       break;
     }
+    default: {
+      rc = sqlite3_bind_null(pStmt, i);
+      break;
+    }
+  }
+  return rc;
+}
+SQLITE_API int sqlite3_bind_zeroblob(sqlite3_stmt *pStmt, int i, int n){
+  int rc;
+  Vdbe *p = (Vdbe *)pStmt;
+  rc = vdbeUnbind(p, i);
+  if( rc==SQLITE_OK ){
+    sqlite3VdbeMemSetZeroBlob(&p->aVar[i-1], n);
+    sqlite3_mutex_leave(p->db->mutex);
+  }
+  return rc;
+}
+
+/*
+** Return the number of wildcards that can be potentially bound to.
+** This routine is added to support DBD::SQLite.  
+*/
+SQLITE_API int sqlite3_bind_parameter_count(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  return p ? p->nVar : 0;
+}
+
+/*
+** Return the name of a wildcard parameter.  Return NULL if the index
+** is out of range or if the wildcard is unnamed.
+**
+** The result is always UTF-8.
+*/
+SQLITE_API const char *sqlite3_bind_parameter_name(sqlite3_stmt *pStmt, int i){
+  Vdbe *p = (Vdbe*)pStmt;
+  if( p==0 || i<1 || i>p->nzVar ){
+    return 0;
+  }
+  return p->azVar[i-1];
+}
+
+/*
+** Given a wildcard parameter name, return the index of the variable
+** with that name.  If there is no variable with the given name,
+** return 0.
+*/
+SQLITE_PRIVATE int sqlite3VdbeParameterIndex(Vdbe *p, const char *zName, int nName){
+  int i;
+  if( p==0 ){
+    return 0;
+  }
+  if( zName ){
+    for(i=0; i<p->nzVar; i++){
+      const char *z = p->azVar[i];
+      if( z && strncmp(z,zName,nName)==0 && z[nName]==0 ){
+        return i+1;
+      }
+    }
+  }
+  return 0;
+}
+SQLITE_API int sqlite3_bind_parameter_index(sqlite3_stmt *pStmt, const char *zName){
+  return sqlite3VdbeParameterIndex((Vdbe*)pStmt, zName, sqlite3Strlen30(zName));
+}
+
+/*
+** Transfer all bindings from the first statement over to the second.
+*/
+SQLITE_PRIVATE int sqlite3TransferBindings(sqlite3_stmt *pFromStmt, sqlite3_stmt *pToStmt){
+  Vdbe *pFrom = (Vdbe*)pFromStmt;
+  Vdbe *pTo = (Vdbe*)pToStmt;
+  int i;
+  assert( pTo->db==pFrom->db );
+  assert( pTo->nVar==pFrom->nVar );
+  sqlite3_mutex_enter(pTo->db->mutex);
+  for(i=0; i<pFrom->nVar; i++){
+    sqlite3VdbeMemMove(&pTo->aVar[i], &pFrom->aVar[i]);
+  }
+  sqlite3_mutex_leave(pTo->db->mutex);
+  return SQLITE_OK;
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Deprecated external interface.  Internal/core SQLite code
+** should call sqlite3TransferBindings.
+**
+** It is misuse to call this routine with statements from different
+** database connections.  But as this is a deprecated interface, we
+** will not bother to check for that condition.
+**
+** If the two statements contain a different number of bindings, then
+** an SQLITE_ERROR is returned.  Nothing else can go wrong, so otherwise
+** SQLITE_OK is returned.
+*/
+SQLITE_API int sqlite3_transfer_bindings(sqlite3_stmt *pFromStmt, sqlite3_stmt *pToStmt){
+  Vdbe *pFrom = (Vdbe*)pFromStmt;
+  Vdbe *pTo = (Vdbe*)pToStmt;
+  if( pFrom->nVar!=pTo->nVar ){
+    return SQLITE_ERROR;
+  }
+  if( pTo->isPrepareV2 && pTo->expmask ){
+    pTo->expired = 1;
+  }
+  if( pFrom->isPrepareV2 && pFrom->expmask ){
+    pFrom->expired = 1;
+  }
+  return sqlite3TransferBindings(pFromStmt, pToStmt);
+}
+#endif
+
+/*
+** Return the sqlite3* database handle to which the prepared statement given
+** in the argument belongs.  This is the same database handle that was
+** the first argument to the sqlite3_prepare() that was used to create
+** the statement in the first place.
+*/
+SQLITE_API sqlite3 *sqlite3_db_handle(sqlite3_stmt *pStmt){
+  return pStmt ? ((Vdbe*)pStmt)->db : 0;
+}
+
+/*
+** Return true if the prepared statement is guaranteed to not modify the
+** database.
+*/
+SQLITE_API int sqlite3_stmt_readonly(sqlite3_stmt *pStmt){
+  return pStmt ? ((Vdbe*)pStmt)->readOnly : 1;
+}
+
+/*
+** Return true if the prepared statement is in need of being reset.
+*/
+SQLITE_API int sqlite3_stmt_busy(sqlite3_stmt *pStmt){
+  Vdbe *v = (Vdbe*)pStmt;
+  return v!=0 && v->pc>=0 && v->magic==VDBE_MAGIC_RUN;
+}
+
+/*
+** Return a pointer to the next prepared statement after pStmt associated
+** with database connection pDb.  If pStmt is NULL, return the first
+** prepared statement for the database connection.  Return NULL if there
+** are no more.
+*/
+SQLITE_API sqlite3_stmt *sqlite3_next_stmt(sqlite3 *pDb, sqlite3_stmt *pStmt){
+  sqlite3_stmt *pNext;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(pDb) ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+  sqlite3_mutex_enter(pDb->mutex);
+  if( pStmt==0 ){
+    pNext = (sqlite3_stmt*)pDb->pVdbe;
+  }else{
+    pNext = (sqlite3_stmt*)((Vdbe*)pStmt)->pNext;
+  }
+  sqlite3_mutex_leave(pDb->mutex);
+  return pNext;
+}
+
+/*
+** Return the value of a status counter for a prepared statement
+*/
+SQLITE_API int sqlite3_stmt_status(sqlite3_stmt *pStmt, int op, int resetFlag){
+  Vdbe *pVdbe = (Vdbe*)pStmt;
+  u32 v;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !pStmt ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+  v = pVdbe->aCounter[op];
+  if( resetFlag ) pVdbe->aCounter[op] = 0;
+  return (int)v;
+}
+
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+/*
+** Return status data for a single loop within query pStmt.
+*/
+SQLITE_API int sqlite3_stmt_scanstatus(
+  sqlite3_stmt *pStmt,            /* Prepared statement being queried */
+  int idx,                        /* Index of loop to report on */
+  int iScanStatusOp,              /* Which metric to return */
+  void *pOut                      /* OUT: Write the answer here */
+){
+  Vdbe *p = (Vdbe*)pStmt;
+  ScanStatus *pScan;
+  if( idx<0 || idx>=p->nScan ) return 1;
+  pScan = &p->aScan[idx];
+  switch( iScanStatusOp ){
+    case SQLITE_SCANSTAT_NLOOP: {
+      *(sqlite3_int64*)pOut = p->anExec[pScan->addrLoop];
+      break;
+    }
+    case SQLITE_SCANSTAT_NVISIT: {
+      *(sqlite3_int64*)pOut = p->anExec[pScan->addrVisit];
+      break;
+    }
+    case SQLITE_SCANSTAT_EST: {
+      double r = 1.0;
+      LogEst x = pScan->nEst;
+      while( x<100 ){
+        x += 10;
+        r *= 0.5;
+      }
+      *(double*)pOut = r*sqlite3LogEstToInt(x);
+      break;
+    }
+    case SQLITE_SCANSTAT_NAME: {
+      *(const char**)pOut = pScan->zName;
+      break;
+    }
+    case SQLITE_SCANSTAT_EXPLAIN: {
+      if( pScan->addrExplain ){
+        *(const char**)pOut = p->aOp[ pScan->addrExplain ].p4.z;
+      }else{
+        *(const char**)pOut = 0;
+      }
+      break;
+    }
+    case SQLITE_SCANSTAT_SELECTID: {
+      if( pScan->addrExplain ){
