@@ -70565,3 +70565,235 @@ static void registerTrace(int iReg, Mem *p){
      __asm {
         rdtsc
         ret       ; return value at EDX:EAX
+     }
+  }
+
+  #endif
+
+#elif (defined(__GNUC__) && defined(__x86_64__))
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+      unsigned long val;
+      __asm__ __volatile__ ("rdtsc" : "=A" (val));
+      return val;
+  }
+ 
+#elif (defined(__GNUC__) && defined(__ppc__))
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+      unsigned long long retval;
+      unsigned long junk;
+      __asm__ __volatile__ ("\n\
+          1:      mftbu   %1\n\
+                  mftb    %L0\n\
+                  mftbu   %0\n\
+                  cmpw    %0,%1\n\
+                  bne     1b"
+                  : "=r" (retval), "=r" (junk));
+      return retval;
+  }
+
+#else
+
+  #error Need implementation of sqlite3Hwtime() for your platform.
+
+  /*
+  ** To compile without implementing sqlite3Hwtime() for your platform,
+  ** you can remove the above #error and use the following
+  ** stub function.  You will lose timing support for many
+  ** of the debugging and testing utilities, but it should at
+  ** least compile and run.
+  */
+SQLITE_PRIVATE   sqlite_uint64 sqlite3Hwtime(void){ return ((sqlite_uint64)0); }
+
+#endif
+
+#endif /* !defined(_HWTIME_H_) */
+
+/************** End of hwtime.h **********************************************/
+/************** Continuing where we left off in vdbe.c ***********************/
+
+#endif
+
+#ifndef NDEBUG
+/*
+** This function is only called from within an assert() expression. It
+** checks that the sqlite3.nTransaction variable is correctly set to
+** the number of non-transaction savepoints currently in the 
+** linked list starting at sqlite3.pSavepoint.
+** 
+** Usage:
+**
+**     assert( checkSavepointCount(db) );
+*/
+static int checkSavepointCount(sqlite3 *db){
+  int n = 0;
+  Savepoint *p;
+  for(p=db->pSavepoint; p; p=p->pNext) n++;
+  assert( n==(db->nSavepoint + db->isTransactionSavepoint) );
+  return 1;
+}
+#endif
+
+
+/*
+** Execute as much of a VDBE program as we can.
+** This is the core of sqlite3_step().  
+*/
+SQLITE_PRIVATE int sqlite3VdbeExec(
+  Vdbe *p                    /* The VDBE */
+){
+  int pc=0;                  /* The program counter */
+  Op *aOp = p->aOp;          /* Copy of p->aOp */
+  Op *pOp;                   /* Current operation */
+  int rc = SQLITE_OK;        /* Value to return */
+  sqlite3 *db = p->db;       /* The database */
+  u8 resetSchemaOnFault = 0; /* Reset schema after an error if positive */
+  u8 encoding = ENC(db);     /* The database encoding */
+  int iCompare = 0;          /* Result of last OP_Compare operation */
+  unsigned nVmStep = 0;      /* Number of virtual machine steps */
+#ifndef SQLITE_OMIT_PROGRESS_CALLBACK
+  unsigned nProgressLimit = 0;/* Invoke xProgress() when nVmStep reaches this */
+#endif
+  Mem *aMem = p->aMem;       /* Copy of p->aMem */
+  Mem *pIn1 = 0;             /* 1st input operand */
+  Mem *pIn2 = 0;             /* 2nd input operand */
+  Mem *pIn3 = 0;             /* 3rd input operand */
+  Mem *pOut = 0;             /* Output operand */
+  int *aPermute = 0;         /* Permutation of columns for OP_Compare */
+  i64 lastRowid = db->lastRowid;  /* Saved value of the last insert ROWID */
+#ifdef VDBE_PROFILE
+  u64 start;                 /* CPU clock count at start of opcode */
+#endif
+  /*** INSERT STACK UNION HERE ***/
+
+  assert( p->magic==VDBE_MAGIC_RUN );  /* sqlite3_step() verifies this */
+  sqlite3VdbeEnter(p);
+  if( p->rc==SQLITE_NOMEM ){
+    /* This happens if a malloc() inside a call to sqlite3_column_text() or
+    ** sqlite3_column_text16() failed.  */
+    goto no_mem;
+  }
+  assert( p->rc==SQLITE_OK || p->rc==SQLITE_BUSY );
+  assert( p->bIsReader || p->readOnly!=0 );
+  p->rc = SQLITE_OK;
+  p->iCurrentTime = 0;
+  assert( p->explain==0 );
+  p->pResultSet = 0;
+  db->busyHandler.nBusy = 0;
+  if( db->u1.isInterrupted ) goto abort_due_to_interrupt;
+  sqlite3VdbeIOTraceSql(p);
+#ifndef SQLITE_OMIT_PROGRESS_CALLBACK
+  if( db->xProgress ){
+    assert( 0 < db->nProgressOps );
+    nProgressLimit = (unsigned)p->aCounter[SQLITE_STMTSTATUS_VM_STEP];
+    if( nProgressLimit==0 ){
+      nProgressLimit = db->nProgressOps;
+    }else{
+      nProgressLimit %= (unsigned)db->nProgressOps;
+    }
+  }
+#endif
+#ifdef SQLITE_DEBUG
+  sqlite3BeginBenignMalloc();
+  if( p->pc==0
+   && (p->db->flags & (SQLITE_VdbeListing|SQLITE_VdbeEQP|SQLITE_VdbeTrace))!=0
+  ){
+    int i;
+    int once = 1;
+    sqlite3VdbePrintSql(p);
+    if( p->db->flags & SQLITE_VdbeListing ){
+      printf("VDBE Program Listing:\n");
+      for(i=0; i<p->nOp; i++){
+        sqlite3VdbePrintOp(stdout, i, &aOp[i]);
+      }
+    }
+    if( p->db->flags & SQLITE_VdbeEQP ){
+      for(i=0; i<p->nOp; i++){
+        if( aOp[i].opcode==OP_Explain ){
+          if( once ) printf("VDBE Query Plan:\n");
+          printf("%s\n", aOp[i].p4.z);
+          once = 0;
+        }
+      }
+    }
+    if( p->db->flags & SQLITE_VdbeTrace )  printf("VDBE Trace:\n");
+  }
+  sqlite3EndBenignMalloc();
+#endif
+  for(pc=p->pc; rc==SQLITE_OK; pc++){
+    assert( pc>=0 && pc<p->nOp );
+    if( db->mallocFailed ) goto no_mem;
+#ifdef VDBE_PROFILE
+    start = sqlite3Hwtime();
+#endif
+    nVmStep++;
+    pOp = &aOp[pc];
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+    if( p->anExec ) p->anExec[pc]++;
+#endif
+
+    /* Only allow tracing if SQLITE_DEBUG is defined.
+    */
+#ifdef SQLITE_DEBUG
+    if( db->flags & SQLITE_VdbeTrace ){
+      sqlite3VdbePrintOp(stdout, pc, pOp);
+    }
+#endif
+      
+
+    /* Check to see if we need to simulate an interrupt.  This only happens
+    ** if we have a special test build.
+    */
+#ifdef SQLITE_TEST
+    if( sqlite3_interrupt_count>0 ){
+      sqlite3_interrupt_count--;
+      if( sqlite3_interrupt_count==0 ){
+        sqlite3_interrupt(db);
+      }
+    }
+#endif
+
+    /* On any opcode with the "out2-prerelease" tag, free any
+    ** external allocations out of mem[p2] and set mem[p2] to be
+    ** an undefined integer.  Opcodes will either fill in the integer
+    ** value or convert mem[p2] to a different type.
+    */
+    assert( pOp->opflags==sqlite3OpcodeProperty[pOp->opcode] );
+    if( pOp->opflags & OPFLG_OUT2_PRERELEASE ){
+      assert( pOp->p2>0 );
+      assert( pOp->p2<=(p->nMem-p->nCursor) );
+      pOut = &aMem[pOp->p2];
+      memAboutToChange(p, pOut);
+      if( VdbeMemDynamic(pOut) ) sqlite3VdbeMemSetNull(pOut);
+      pOut->flags = MEM_Int;
+    }
+
+    /* Sanity checking on other operands */
+#ifdef SQLITE_DEBUG
+    if( (pOp->opflags & OPFLG_IN1)!=0 ){
+      assert( pOp->p1>0 );
+      assert( pOp->p1<=(p->nMem-p->nCursor) );
+      assert( memIsValid(&aMem[pOp->p1]) );
+      assert( sqlite3VdbeCheckMemInvariants(&aMem[pOp->p1]) );
+      REGISTER_TRACE(pOp->p1, &aMem[pOp->p1]);
+    }
+    if( (pOp->opflags & OPFLG_IN2)!=0 ){
+      assert( pOp->p2>0 );
+      assert( pOp->p2<=(p->nMem-p->nCursor) );
+      assert( memIsValid(&aMem[pOp->p2]) );
+      assert( sqlite3VdbeCheckMemInvariants(&aMem[pOp->p2]) );
+      REGISTER_TRACE(pOp->p2, &aMem[pOp->p2]);
+    }
+    if( (pOp->opflags & OPFLG_IN3)!=0 ){
+      assert( pOp->p3>0 );
+      assert( pOp->p3<=(p->nMem-p->nCursor) );
+      assert( memIsValid(&aMem[pOp->p3]) );
+      assert( sqlite3VdbeCheckMemInvariants(&aMem[pOp->p3]) );
+      REGISTER_TRACE(pOp->p3, &aMem[pOp->p3]);
+    }
+    if( (pOp->opflags & OPFLG_OUT2)!=0 ){
+      assert( pOp->p2>0 );
+      assert( pOp->p2<=(p->nMem-p->nCursor) );
+      memAboutToChange(p, &aMem[pOp->p2]);
+    }
