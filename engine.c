@@ -70073,3 +70073,268 @@ SQLITE_PRIVATE char *sqlite3VdbeExpandSql(
 ** moves, either by the OP_SeekXX, OP_Next, or OP_Prev opcodes.  The test
 ** procedures use this information to make sure that indices are
 ** working correctly.  This variable has no function other than to
+** help verify the correct operation of the library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_search_count = 0;
+#endif
+
+/*
+** When this global variable is positive, it gets decremented once before
+** each instruction in the VDBE.  When it reaches zero, the u1.isInterrupted
+** field of the sqlite3 structure is set in order to simulate an interrupt.
+**
+** This facility is used for testing purposes only.  It does not function
+** in an ordinary build.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_interrupt_count = 0;
+#endif
+
+/*
+** The next global variable is incremented each type the OP_Sort opcode
+** is executed.  The test procedures use this information to make sure that
+** sorting is occurring or not occurring at appropriate times.   This variable
+** has no function other than to help verify the correct operation of the
+** library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_sort_count = 0;
+#endif
+
+/*
+** The next global variable records the size of the largest MEM_Blob
+** or MEM_Str that has been used by a VDBE opcode.  The test procedures
+** use this information to make sure that the zero-blob functionality
+** is working correctly.   This variable has no function other than to
+** help verify the correct operation of the library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_max_blobsize = 0;
+static void updateMaxBlobsize(Mem *p){
+  if( (p->flags & (MEM_Str|MEM_Blob))!=0 && p->n>sqlite3_max_blobsize ){
+    sqlite3_max_blobsize = p->n;
+  }
+}
+#endif
+
+/*
+** The next global variable is incremented each time the OP_Found opcode
+** is executed. This is used to test whether or not the foreign key
+** operation implemented using OP_FkIsZero is working. This variable
+** has no function other than to help verify the correct operation of the
+** library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_found_count = 0;
+#endif
+
+/*
+** Test a register to see if it exceeds the current maximum blob size.
+** If it does, record the new maximum blob size.
+*/
+#if defined(SQLITE_TEST) && !defined(SQLITE_OMIT_BUILTIN_TEST)
+# define UPDATE_MAX_BLOBSIZE(P)  updateMaxBlobsize(P)
+#else
+# define UPDATE_MAX_BLOBSIZE(P)
+#endif
+
+/*
+** Invoke the VDBE coverage callback, if that callback is defined.  This
+** feature is used for test suite validation only and does not appear an
+** production builds.
+**
+** M is an integer, 2 or 3, that indices how many different ways the
+** branch can go.  It is usually 2.  "I" is the direction the branch
+** goes.  0 means falls through.  1 means branch is taken.  2 means the
+** second alternative branch is taken.
+**
+** iSrcLine is the source code line (from the __LINE__ macro) that
+** generated the VDBE instruction.  This instrumentation assumes that all
+** source code is in a single file (the amalgamation).  Special values 1
+** and 2 for the iSrcLine parameter mean that this particular branch is
+** always taken or never taken, respectively.
+*/
+#if !defined(SQLITE_VDBE_COVERAGE)
+# define VdbeBranchTaken(I,M)
+#else
+# define VdbeBranchTaken(I,M) vdbeTakeBranch(pOp->iSrcLine,I,M)
+  static void vdbeTakeBranch(int iSrcLine, u8 I, u8 M){
+    if( iSrcLine<=2 && ALWAYS(iSrcLine>0) ){
+      M = iSrcLine;
+      /* Assert the truth of VdbeCoverageAlwaysTaken() and 
+      ** VdbeCoverageNeverTaken() */
+      assert( (M & I)==I );
+    }else{
+      if( sqlite3GlobalConfig.xVdbeBranch==0 ) return;  /*NO_TEST*/
+      sqlite3GlobalConfig.xVdbeBranch(sqlite3GlobalConfig.pVdbeBranchArg,
+                                      iSrcLine,I,M);
+    }
+  }
+#endif
+
+/*
+** Convert the given register into a string if it isn't one
+** already. Return non-zero if a malloc() fails.
+*/
+#define Stringify(P, enc) \
+   if(((P)->flags&(MEM_Str|MEM_Blob))==0 && sqlite3VdbeMemStringify(P,enc,0)) \
+     { goto no_mem; }
+
+/*
+** An ephemeral string value (signified by the MEM_Ephem flag) contains
+** a pointer to a dynamically allocated string where some other entity
+** is responsible for deallocating that string.  Because the register
+** does not control the string, it might be deleted without the register
+** knowing it.
+**
+** This routine converts an ephemeral string into a dynamically allocated
+** string that the register itself controls.  In other words, it
+** converts an MEM_Ephem string into a string with P.z==P.zMalloc.
+*/
+#define Deephemeralize(P) \
+   if( ((P)->flags&MEM_Ephem)!=0 \
+       && sqlite3VdbeMemMakeWriteable(P) ){ goto no_mem;}
+
+/* Return true if the cursor was opened using the OP_OpenSorter opcode. */
+#define isSorter(x) ((x)->pSorter!=0)
+
+/*
+** Allocate VdbeCursor number iCur.  Return a pointer to it.  Return NULL
+** if we run out of memory.
+*/
+static VdbeCursor *allocateCursor(
+  Vdbe *p,              /* The virtual machine */
+  int iCur,             /* Index of the new VdbeCursor */
+  int nField,           /* Number of fields in the table or index */
+  int iDb,              /* Database the cursor belongs to, or -1 */
+  int isBtreeCursor     /* True for B-Tree.  False for pseudo-table or vtab */
+){
+  /* Find the memory cell that will be used to store the blob of memory
+  ** required for this VdbeCursor structure. It is convenient to use a 
+  ** vdbe memory cell to manage the memory allocation required for a
+  ** VdbeCursor structure for the following reasons:
+  **
+  **   * Sometimes cursor numbers are used for a couple of different
+  **     purposes in a vdbe program. The different uses might require
+  **     different sized allocations. Memory cells provide growable
+  **     allocations.
+  **
+  **   * When using ENABLE_MEMORY_MANAGEMENT, memory cell buffers can
+  **     be freed lazily via the sqlite3_release_memory() API. This
+  **     minimizes the number of malloc calls made by the system.
+  **
+  ** Memory cells for cursors are allocated at the top of the address
+  ** space. Memory cell (p->nMem) corresponds to cursor 0. Space for
+  ** cursor 1 is managed by memory cell (p->nMem-1), etc.
+  */
+  Mem *pMem = &p->aMem[p->nMem-iCur];
+
+  int nByte;
+  VdbeCursor *pCx = 0;
+  nByte = 
+      ROUND8(sizeof(VdbeCursor)) + 2*sizeof(u32)*nField + 
+      (isBtreeCursor?sqlite3BtreeCursorSize():0);
+
+  assert( iCur<p->nCursor );
+  if( p->apCsr[iCur] ){
+    sqlite3VdbeFreeCursor(p, p->apCsr[iCur]);
+    p->apCsr[iCur] = 0;
+  }
+  if( SQLITE_OK==sqlite3VdbeMemClearAndResize(pMem, nByte) ){
+    p->apCsr[iCur] = pCx = (VdbeCursor*)pMem->z;
+    memset(pCx, 0, sizeof(VdbeCursor));
+    pCx->iDb = iDb;
+    pCx->nField = nField;
+    pCx->aOffset = &pCx->aType[nField];
+    if( isBtreeCursor ){
+      pCx->pCursor = (BtCursor*)
+          &pMem->z[ROUND8(sizeof(VdbeCursor))+2*sizeof(u32)*nField];
+      sqlite3BtreeCursorZero(pCx->pCursor);
+    }
+  }
+  return pCx;
+}
+
+/*
+** Try to convert a value into a numeric representation if we can
+** do so without loss of information.  In other words, if the string
+** looks like a number, convert it into a number.  If it does not
+** look like a number, leave it alone.
+**
+** If the bTryForInt flag is true, then extra effort is made to give
+** an integer representation.  Strings that look like floating point
+** values but which have no fractional component (example: '48.00')
+** will have a MEM_Int representation when bTryForInt is true.
+**
+** If bTryForInt is false, then if the input string contains a decimal
+** point or exponential notation, the result is only MEM_Real, even
+** if there is an exact integer representation of the quantity.
+*/
+static void applyNumericAffinity(Mem *pRec, int bTryForInt){
+  double rValue;
+  i64 iValue;
+  u8 enc = pRec->enc;
+  assert( (pRec->flags & (MEM_Str|MEM_Int|MEM_Real))==MEM_Str );
+  if( sqlite3AtoF(pRec->z, &rValue, pRec->n, enc)==0 ) return;
+  if( 0==sqlite3Atoi64(pRec->z, &iValue, pRec->n, enc) ){
+    pRec->u.i = iValue;
+    pRec->flags |= MEM_Int;
+  }else{
+    pRec->u.r = rValue;
+    pRec->flags |= MEM_Real;
+    if( bTryForInt ) sqlite3VdbeIntegerAffinity(pRec);
+  }
+}
+
+/*
+** Processing is determine by the affinity parameter:
+**
+** SQLITE_AFF_INTEGER:
+** SQLITE_AFF_REAL:
+** SQLITE_AFF_NUMERIC:
+**    Try to convert pRec to an integer representation or a 
+**    floating-point representation if an integer representation
+**    is not possible.  Note that the integer representation is
+**    always preferred, even if the affinity is REAL, because
+**    an integer representation is more space efficient on disk.
+**
+** SQLITE_AFF_TEXT:
+**    Convert pRec to a text representation.
+**
+** SQLITE_AFF_NONE:
+**    No-op.  pRec is unchanged.
+*/
+static void applyAffinity(
+  Mem *pRec,          /* The value to apply affinity to */
+  char affinity,      /* The affinity to be applied */
+  u8 enc              /* Use this text encoding */
+){
+  if( affinity>=SQLITE_AFF_NUMERIC ){
+    assert( affinity==SQLITE_AFF_INTEGER || affinity==SQLITE_AFF_REAL
+             || affinity==SQLITE_AFF_NUMERIC );
+    if( (pRec->flags & MEM_Int)==0 ){
+      if( (pRec->flags & MEM_Real)==0 ){
+        if( pRec->flags & MEM_Str ) applyNumericAffinity(pRec,1);
+      }else{
+        sqlite3VdbeIntegerAffinity(pRec);
+      }
+    }
+  }else if( affinity==SQLITE_AFF_TEXT ){
+    /* Only attempt the conversion to TEXT if there is an integer or real
+    ** representation (blob and NULL do not get converted) but no string
+    ** representation.
+    */
+    if( 0==(pRec->flags&MEM_Str) && (pRec->flags&(MEM_Real|MEM_Int)) ){
+      sqlite3VdbeMemStringify(pRec, enc, 1);
+    }
+  }
+}
+
+/*
+** Try to convert the type of a function argument or a result column
+** into a numeric representation.  Use either INTEGER or REAL whichever
+** is appropriate.  But only do the conversion if it is possible without
+** loss of information and return the revised type of the argument.
+*/
+SQLITE_API int sqlite3_value_numeric_type(sqlite3_value *pVal){
