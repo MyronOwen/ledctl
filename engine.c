@@ -70338,3 +70338,230 @@ static void applyAffinity(
 ** loss of information and return the revised type of the argument.
 */
 SQLITE_API int sqlite3_value_numeric_type(sqlite3_value *pVal){
+  int eType = sqlite3_value_type(pVal);
+  if( eType==SQLITE_TEXT ){
+    Mem *pMem = (Mem*)pVal;
+    applyNumericAffinity(pMem, 0);
+    eType = sqlite3_value_type(pVal);
+  }
+  return eType;
+}
+
+/*
+** Exported version of applyAffinity(). This one works on sqlite3_value*, 
+** not the internal Mem* type.
+*/
+SQLITE_PRIVATE void sqlite3ValueApplyAffinity(
+  sqlite3_value *pVal, 
+  u8 affinity, 
+  u8 enc
+){
+  applyAffinity((Mem *)pVal, affinity, enc);
+}
+
+/*
+** pMem currently only holds a string type (or maybe a BLOB that we can
+** interpret as a string if we want to).  Compute its corresponding
+** numeric type, if has one.  Set the pMem->u.r and pMem->u.i fields
+** accordingly.
+*/
+static u16 SQLITE_NOINLINE computeNumericType(Mem *pMem){
+  assert( (pMem->flags & (MEM_Int|MEM_Real))==0 );
+  assert( (pMem->flags & (MEM_Str|MEM_Blob))!=0 );
+  if( sqlite3AtoF(pMem->z, &pMem->u.r, pMem->n, pMem->enc)==0 ){
+    return 0;
+  }
+  if( sqlite3Atoi64(pMem->z, &pMem->u.i, pMem->n, pMem->enc)==SQLITE_OK ){
+    return MEM_Int;
+  }
+  return MEM_Real;
+}
+
+/*
+** Return the numeric type for pMem, either MEM_Int or MEM_Real or both or
+** none.  
+**
+** Unlike applyNumericAffinity(), this routine does not modify pMem->flags.
+** But it does set pMem->u.r and pMem->u.i appropriately.
+*/
+static u16 numericType(Mem *pMem){
+  if( pMem->flags & (MEM_Int|MEM_Real) ){
+    return pMem->flags & (MEM_Int|MEM_Real);
+  }
+  if( pMem->flags & (MEM_Str|MEM_Blob) ){
+    return computeNumericType(pMem);
+  }
+  return 0;
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Write a nice string representation of the contents of cell pMem
+** into buffer zBuf, length nBuf.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMemPrettyPrint(Mem *pMem, char *zBuf){
+  char *zCsr = zBuf;
+  int f = pMem->flags;
+
+  static const char *const encnames[] = {"(X)", "(8)", "(16LE)", "(16BE)"};
+
+  if( f&MEM_Blob ){
+    int i;
+    char c;
+    if( f & MEM_Dyn ){
+      c = 'z';
+      assert( (f & (MEM_Static|MEM_Ephem))==0 );
+    }else if( f & MEM_Static ){
+      c = 't';
+      assert( (f & (MEM_Dyn|MEM_Ephem))==0 );
+    }else if( f & MEM_Ephem ){
+      c = 'e';
+      assert( (f & (MEM_Static|MEM_Dyn))==0 );
+    }else{
+      c = 's';
+    }
+
+    sqlite3_snprintf(100, zCsr, "%c", c);
+    zCsr += sqlite3Strlen30(zCsr);
+    sqlite3_snprintf(100, zCsr, "%d[", pMem->n);
+    zCsr += sqlite3Strlen30(zCsr);
+    for(i=0; i<16 && i<pMem->n; i++){
+      sqlite3_snprintf(100, zCsr, "%02X", ((int)pMem->z[i] & 0xFF));
+      zCsr += sqlite3Strlen30(zCsr);
+    }
+    for(i=0; i<16 && i<pMem->n; i++){
+      char z = pMem->z[i];
+      if( z<32 || z>126 ) *zCsr++ = '.';
+      else *zCsr++ = z;
+    }
+
+    sqlite3_snprintf(100, zCsr, "]%s", encnames[pMem->enc]);
+    zCsr += sqlite3Strlen30(zCsr);
+    if( f & MEM_Zero ){
+      sqlite3_snprintf(100, zCsr,"+%dz",pMem->u.nZero);
+      zCsr += sqlite3Strlen30(zCsr);
+    }
+    *zCsr = '\0';
+  }else if( f & MEM_Str ){
+    int j, k;
+    zBuf[0] = ' ';
+    if( f & MEM_Dyn ){
+      zBuf[1] = 'z';
+      assert( (f & (MEM_Static|MEM_Ephem))==0 );
+    }else if( f & MEM_Static ){
+      zBuf[1] = 't';
+      assert( (f & (MEM_Dyn|MEM_Ephem))==0 );
+    }else if( f & MEM_Ephem ){
+      zBuf[1] = 'e';
+      assert( (f & (MEM_Static|MEM_Dyn))==0 );
+    }else{
+      zBuf[1] = 's';
+    }
+    k = 2;
+    sqlite3_snprintf(100, &zBuf[k], "%d", pMem->n);
+    k += sqlite3Strlen30(&zBuf[k]);
+    zBuf[k++] = '[';
+    for(j=0; j<15 && j<pMem->n; j++){
+      u8 c = pMem->z[j];
+      if( c>=0x20 && c<0x7f ){
+        zBuf[k++] = c;
+      }else{
+        zBuf[k++] = '.';
+      }
+    }
+    zBuf[k++] = ']';
+    sqlite3_snprintf(100,&zBuf[k], encnames[pMem->enc]);
+    k += sqlite3Strlen30(&zBuf[k]);
+    zBuf[k++] = 0;
+  }
+}
+#endif
+
+#ifdef SQLITE_DEBUG
+/*
+** Print the value of a register for tracing purposes:
+*/
+static void memTracePrint(Mem *p){
+  if( p->flags & MEM_Undefined ){
+    printf(" undefined");
+  }else if( p->flags & MEM_Null ){
+    printf(" NULL");
+  }else if( (p->flags & (MEM_Int|MEM_Str))==(MEM_Int|MEM_Str) ){
+    printf(" si:%lld", p->u.i);
+  }else if( p->flags & MEM_Int ){
+    printf(" i:%lld", p->u.i);
+#ifndef SQLITE_OMIT_FLOATING_POINT
+  }else if( p->flags & MEM_Real ){
+    printf(" r:%g", p->u.r);
+#endif
+  }else if( p->flags & MEM_RowSet ){
+    printf(" (rowset)");
+  }else{
+    char zBuf[200];
+    sqlite3VdbeMemPrettyPrint(p, zBuf);
+    printf(" %s", zBuf);
+  }
+}
+static void registerTrace(int iReg, Mem *p){
+  printf("REG[%d] = ", iReg);
+  memTracePrint(p);
+  printf("\n");
+}
+#endif
+
+#ifdef SQLITE_DEBUG
+#  define REGISTER_TRACE(R,M) if(db->flags&SQLITE_VdbeTrace)registerTrace(R,M)
+#else
+#  define REGISTER_TRACE(R,M)
+#endif
+
+
+#ifdef VDBE_PROFILE
+
+/* 
+** hwtime.h contains inline assembler code for implementing 
+** high-performance timing routines.
+*/
+/************** Include hwtime.h in the middle of vdbe.c *********************/
+/************** Begin file hwtime.h ******************************************/
+/*
+** 2008 May 27
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains inline asm code for retrieving "high-performance"
+** counters for x86 class CPUs.
+*/
+#ifndef _HWTIME_H_
+#define _HWTIME_H_
+
+/*
+** The following routine only works on pentium-class (or newer) processors.
+** It uses the RDTSC opcode to read the cycle count value out of the
+** processor and returns that value.  This can be used for high-res
+** profiling.
+*/
+#if (defined(__GNUC__) || defined(_MSC_VER)) && \
+      (defined(i386) || defined(__i386__) || defined(_M_IX86))
+
+  #if defined(__GNUC__)
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+     unsigned int lo, hi;
+     __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+     return (sqlite_uint64)hi << 32 | lo;
+  }
+
+  #elif defined(_MSC_VER)
+
+  __declspec(naked) __inline sqlite_uint64 __cdecl sqlite3Hwtime(void){
+     __asm {
+        rdtsc
+        ret       ; return value at EDX:EAX
