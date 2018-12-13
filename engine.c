@@ -71220,3 +71220,251 @@ case OP_Null: {           /* out2-prerelease */
 ** previously copied using OP_SCopy, the copies will continue to be valid.
 */
 case OP_SoftNull: {
+  assert( pOp->p1>0 && pOp->p1<=(p->nMem-p->nCursor) );
+  pOut = &aMem[pOp->p1];
+  pOut->flags = (pOut->flags|MEM_Null)&~MEM_Undefined;
+  break;
+}
+
+/* Opcode: Blob P1 P2 * P4 *
+** Synopsis: r[P2]=P4 (len=P1)
+**
+** P4 points to a blob of data P1 bytes long.  Store this
+** blob in register P2.
+*/
+case OP_Blob: {                /* out2-prerelease */
+  assert( pOp->p1 <= SQLITE_MAX_LENGTH );
+  sqlite3VdbeMemSetStr(pOut, pOp->p4.z, pOp->p1, 0, 0);
+  pOut->enc = encoding;
+  UPDATE_MAX_BLOBSIZE(pOut);
+  break;
+}
+
+/* Opcode: Variable P1 P2 * P4 *
+** Synopsis: r[P2]=parameter(P1,P4)
+**
+** Transfer the values of bound parameter P1 into register P2
+**
+** If the parameter is named, then its name appears in P4.
+** The P4 value is used by sqlite3_bind_parameter_name().
+*/
+case OP_Variable: {            /* out2-prerelease */
+  Mem *pVar;       /* Value being transferred */
+
+  assert( pOp->p1>0 && pOp->p1<=p->nVar );
+  assert( pOp->p4.z==0 || pOp->p4.z==p->azVar[pOp->p1-1] );
+  pVar = &p->aVar[pOp->p1 - 1];
+  if( sqlite3VdbeMemTooBig(pVar) ){
+    goto too_big;
+  }
+  sqlite3VdbeMemShallowCopy(pOut, pVar, MEM_Static);
+  UPDATE_MAX_BLOBSIZE(pOut);
+  break;
+}
+
+/* Opcode: Move P1 P2 P3 * *
+** Synopsis:  r[P2@P3]=r[P1@P3]
+**
+** Move the P3 values in register P1..P1+P3-1 over into
+** registers P2..P2+P3-1.  Registers P1..P1+P3-1 are
+** left holding a NULL.  It is an error for register ranges
+** P1..P1+P3-1 and P2..P2+P3-1 to overlap.  It is an error
+** for P3 to be less than 1.
+*/
+case OP_Move: {
+  int n;           /* Number of registers left to copy */
+  int p1;          /* Register to copy from */
+  int p2;          /* Register to copy to */
+
+  n = pOp->p3;
+  p1 = pOp->p1;
+  p2 = pOp->p2;
+  assert( n>0 && p1>0 && p2>0 );
+  assert( p1+n<=p2 || p2+n<=p1 );
+
+  pIn1 = &aMem[p1];
+  pOut = &aMem[p2];
+  do{
+    assert( pOut<=&aMem[(p->nMem-p->nCursor)] );
+    assert( pIn1<=&aMem[(p->nMem-p->nCursor)] );
+    assert( memIsValid(pIn1) );
+    memAboutToChange(p, pOut);
+    sqlite3VdbeMemMove(pOut, pIn1);
+#ifdef SQLITE_DEBUG
+    if( pOut->pScopyFrom>=&aMem[p1] && pOut->pScopyFrom<&aMem[p1+pOp->p3] ){
+      pOut->pScopyFrom += p1 - pOp->p2;
+    }
+#endif
+    REGISTER_TRACE(p2++, pOut);
+    pIn1++;
+    pOut++;
+  }while( --n );
+  break;
+}
+
+/* Opcode: Copy P1 P2 P3 * *
+** Synopsis: r[P2@P3+1]=r[P1@P3+1]
+**
+** Make a copy of registers P1..P1+P3 into registers P2..P2+P3.
+**
+** This instruction makes a deep copy of the value.  A duplicate
+** is made of any string or blob constant.  See also OP_SCopy.
+*/
+case OP_Copy: {
+  int n;
+
+  n = pOp->p3;
+  pIn1 = &aMem[pOp->p1];
+  pOut = &aMem[pOp->p2];
+  assert( pOut!=pIn1 );
+  while( 1 ){
+    sqlite3VdbeMemShallowCopy(pOut, pIn1, MEM_Ephem);
+    Deephemeralize(pOut);
+#ifdef SQLITE_DEBUG
+    pOut->pScopyFrom = 0;
+#endif
+    REGISTER_TRACE(pOp->p2+pOp->p3-n, pOut);
+    if( (n--)==0 ) break;
+    pOut++;
+    pIn1++;
+  }
+  break;
+}
+
+/* Opcode: SCopy P1 P2 * * *
+** Synopsis: r[P2]=r[P1]
+**
+** Make a shallow copy of register P1 into register P2.
+**
+** This instruction makes a shallow copy of the value.  If the value
+** is a string or blob, then the copy is only a pointer to the
+** original and hence if the original changes so will the copy.
+** Worse, if the original is deallocated, the copy becomes invalid.
+** Thus the program must guarantee that the original will not change
+** during the lifetime of the copy.  Use OP_Copy to make a complete
+** copy.
+*/
+case OP_SCopy: {            /* out2 */
+  pIn1 = &aMem[pOp->p1];
+  pOut = &aMem[pOp->p2];
+  assert( pOut!=pIn1 );
+  sqlite3VdbeMemShallowCopy(pOut, pIn1, MEM_Ephem);
+#ifdef SQLITE_DEBUG
+  if( pOut->pScopyFrom==0 ) pOut->pScopyFrom = pIn1;
+#endif
+  break;
+}
+
+/* Opcode: ResultRow P1 P2 * * *
+** Synopsis:  output=r[P1@P2]
+**
+** The registers P1 through P1+P2-1 contain a single row of
+** results. This opcode causes the sqlite3_step() call to terminate
+** with an SQLITE_ROW return code and it sets up the sqlite3_stmt
+** structure to provide access to the r(P1)..r(P1+P2-1) values as
+** the result row.
+*/
+case OP_ResultRow: {
+  Mem *pMem;
+  int i;
+  assert( p->nResColumn==pOp->p2 );
+  assert( pOp->p1>0 );
+  assert( pOp->p1+pOp->p2<=(p->nMem-p->nCursor)+1 );
+
+#ifndef SQLITE_OMIT_PROGRESS_CALLBACK
+  /* Run the progress counter just before returning.
+  */
+  if( db->xProgress!=0
+   && nVmStep>=nProgressLimit
+   && db->xProgress(db->pProgressArg)!=0
+  ){
+    rc = SQLITE_INTERRUPT;
+    goto vdbe_error_halt;
+  }
+#endif
+
+  /* If this statement has violated immediate foreign key constraints, do
+  ** not return the number of rows modified. And do not RELEASE the statement
+  ** transaction. It needs to be rolled back.  */
+  if( SQLITE_OK!=(rc = sqlite3VdbeCheckFk(p, 0)) ){
+    assert( db->flags&SQLITE_CountRows );
+    assert( p->usesStmtJournal );
+    break;
+  }
+
+  /* If the SQLITE_CountRows flag is set in sqlite3.flags mask, then 
+  ** DML statements invoke this opcode to return the number of rows 
+  ** modified to the user. This is the only way that a VM that
+  ** opens a statement transaction may invoke this opcode.
+  **
+  ** In case this is such a statement, close any statement transaction
+  ** opened by this VM before returning control to the user. This is to
+  ** ensure that statement-transactions are always nested, not overlapping.
+  ** If the open statement-transaction is not closed here, then the user
+  ** may step another VM that opens its own statement transaction. This
+  ** may lead to overlapping statement transactions.
+  **
+  ** The statement transaction is never a top-level transaction.  Hence
+  ** the RELEASE call below can never fail.
+  */
+  assert( p->iStatement==0 || db->flags&SQLITE_CountRows );
+  rc = sqlite3VdbeCloseStatement(p, SAVEPOINT_RELEASE);
+  if( NEVER(rc!=SQLITE_OK) ){
+    break;
+  }
+
+  /* Invalidate all ephemeral cursor row caches */
+  p->cacheCtr = (p->cacheCtr + 2)|1;
+
+  /* Make sure the results of the current row are \000 terminated
+  ** and have an assigned type.  The results are de-ephemeralized as
+  ** a side effect.
+  */
+  pMem = p->pResultSet = &aMem[pOp->p1];
+  for(i=0; i<pOp->p2; i++){
+    assert( memIsValid(&pMem[i]) );
+    Deephemeralize(&pMem[i]);
+    assert( (pMem[i].flags & MEM_Ephem)==0
+            || (pMem[i].flags & (MEM_Str|MEM_Blob))==0 );
+    sqlite3VdbeMemNulTerminate(&pMem[i]);
+    REGISTER_TRACE(pOp->p1+i, &pMem[i]);
+  }
+  if( db->mallocFailed ) goto no_mem;
+
+  /* Return SQLITE_ROW
+  */
+  p->pc = pc + 1;
+  rc = SQLITE_ROW;
+  goto vdbe_return;
+}
+
+/* Opcode: Concat P1 P2 P3 * *
+** Synopsis: r[P3]=r[P2]+r[P1]
+**
+** Add the text in register P1 onto the end of the text in
+** register P2 and store the result in register P3.
+** If either the P1 or P2 text are NULL then store NULL in P3.
+**
+**   P3 = P2 || P1
+**
+** It is illegal for P1 and P3 to be the same register. Sometimes,
+** if P3 is the same register as P2, the implementation is able
+** to avoid a memcpy().
+*/
+case OP_Concat: {           /* same as TK_CONCAT, in1, in2, out3 */
+  i64 nByte;
+
+  pIn1 = &aMem[pOp->p1];
+  pIn2 = &aMem[pOp->p2];
+  pOut = &aMem[pOp->p3];
+  assert( pIn1!=pOut );
+  if( (pIn1->flags | pIn2->flags) & MEM_Null ){
+    sqlite3VdbeMemSetNull(pOut);
+    break;
+  }
+  if( ExpandBlob(pIn1) || ExpandBlob(pIn2) ) goto no_mem;
+  Stringify(pIn1, encoding);
+  Stringify(pIn2, encoding);
+  nByte = pIn1->n + pIn2->n;
+  if( nByte>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    goto too_big;
