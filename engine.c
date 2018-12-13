@@ -70997,3 +70997,226 @@ case OP_Yield: {            /* in1, jump */
 */
 case OP_HaltIfNull: {      /* in3 */
   pIn3 = &aMem[pOp->p3];
+  if( (pIn3->flags & MEM_Null)==0 ) break;
+  /* Fall through into OP_Halt */
+}
+
+/* Opcode:  Halt P1 P2 * P4 P5
+**
+** Exit immediately.  All open cursors, etc are closed
+** automatically.
+**
+** P1 is the result code returned by sqlite3_exec(), sqlite3_reset(),
+** or sqlite3_finalize().  For a normal halt, this should be SQLITE_OK (0).
+** For errors, it can be some other value.  If P1!=0 then P2 will determine
+** whether or not to rollback the current transaction.  Do not rollback
+** if P2==OE_Fail. Do the rollback if P2==OE_Rollback.  If P2==OE_Abort,
+** then back out all changes that have occurred during this execution of the
+** VDBE, but do not rollback the transaction. 
+**
+** If P4 is not null then it is an error message string.
+**
+** P5 is a value between 0 and 4, inclusive, that modifies the P4 string.
+**
+**    0:  (no change)
+**    1:  NOT NULL contraint failed: P4
+**    2:  UNIQUE constraint failed: P4
+**    3:  CHECK constraint failed: P4
+**    4:  FOREIGN KEY constraint failed: P4
+**
+** If P5 is not zero and P4 is NULL, then everything after the ":" is
+** omitted.
+**
+** There is an implied "Halt 0 0 0" instruction inserted at the very end of
+** every program.  So a jump past the last instruction of the program
+** is the same as executing Halt.
+*/
+case OP_Halt: {
+  const char *zType;
+  const char *zLogFmt;
+
+  if( pOp->p1==SQLITE_OK && p->pFrame ){
+    /* Halt the sub-program. Return control to the parent frame. */
+    VdbeFrame *pFrame = p->pFrame;
+    p->pFrame = pFrame->pParent;
+    p->nFrame--;
+    sqlite3VdbeSetChanges(db, p->nChange);
+    pc = sqlite3VdbeFrameRestore(pFrame);
+    lastRowid = db->lastRowid;
+    if( pOp->p2==OE_Ignore ){
+      /* Instruction pc is the OP_Program that invoked the sub-program 
+      ** currently being halted. If the p2 instruction of this OP_Halt
+      ** instruction is set to OE_Ignore, then the sub-program is throwing
+      ** an IGNORE exception. In this case jump to the address specified
+      ** as the p2 of the calling OP_Program.  */
+      pc = p->aOp[pc].p2-1;
+    }
+    aOp = p->aOp;
+    aMem = p->aMem;
+    break;
+  }
+  p->rc = pOp->p1;
+  p->errorAction = (u8)pOp->p2;
+  p->pc = pc;
+  if( p->rc ){
+    if( pOp->p5 ){
+      static const char * const azType[] = { "NOT NULL", "UNIQUE", "CHECK",
+                                             "FOREIGN KEY" };
+      assert( pOp->p5>=1 && pOp->p5<=4 );
+      testcase( pOp->p5==1 );
+      testcase( pOp->p5==2 );
+      testcase( pOp->p5==3 );
+      testcase( pOp->p5==4 );
+      zType = azType[pOp->p5-1];
+    }else{
+      zType = 0;
+    }
+    assert( zType!=0 || pOp->p4.z!=0 );
+    zLogFmt = "abort at %d in [%s]: %s";
+    if( zType && pOp->p4.z ){
+      sqlite3SetString(&p->zErrMsg, db, "%s constraint failed: %s", 
+                       zType, pOp->p4.z);
+    }else if( pOp->p4.z ){
+      sqlite3SetString(&p->zErrMsg, db, "%s", pOp->p4.z);
+    }else{
+      sqlite3SetString(&p->zErrMsg, db, "%s constraint failed", zType);
+    }
+    sqlite3_log(pOp->p1, zLogFmt, pc, p->zSql, p->zErrMsg);
+  }
+  rc = sqlite3VdbeHalt(p);
+  assert( rc==SQLITE_BUSY || rc==SQLITE_OK || rc==SQLITE_ERROR );
+  if( rc==SQLITE_BUSY ){
+    p->rc = rc = SQLITE_BUSY;
+  }else{
+    assert( rc==SQLITE_OK || (p->rc&0xff)==SQLITE_CONSTRAINT );
+    assert( rc==SQLITE_OK || db->nDeferredCons>0 || db->nDeferredImmCons>0 );
+    rc = p->rc ? SQLITE_ERROR : SQLITE_DONE;
+  }
+  goto vdbe_return;
+}
+
+/* Opcode: Integer P1 P2 * * *
+** Synopsis: r[P2]=P1
+**
+** The 32-bit integer value P1 is written into register P2.
+*/
+case OP_Integer: {         /* out2-prerelease */
+  pOut->u.i = pOp->p1;
+  break;
+}
+
+/* Opcode: Int64 * P2 * P4 *
+** Synopsis: r[P2]=P4
+**
+** P4 is a pointer to a 64-bit integer value.
+** Write that value into register P2.
+*/
+case OP_Int64: {           /* out2-prerelease */
+  assert( pOp->p4.pI64!=0 );
+  pOut->u.i = *pOp->p4.pI64;
+  break;
+}
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/* Opcode: Real * P2 * P4 *
+** Synopsis: r[P2]=P4
+**
+** P4 is a pointer to a 64-bit floating point value.
+** Write that value into register P2.
+*/
+case OP_Real: {            /* same as TK_FLOAT, out2-prerelease */
+  pOut->flags = MEM_Real;
+  assert( !sqlite3IsNaN(*pOp->p4.pReal) );
+  pOut->u.r = *pOp->p4.pReal;
+  break;
+}
+#endif
+
+/* Opcode: String8 * P2 * P4 *
+** Synopsis: r[P2]='P4'
+**
+** P4 points to a nul terminated UTF-8 string. This opcode is transformed 
+** into a String before it is executed for the first time.  During
+** this transformation, the length of string P4 is computed and stored
+** as the P1 parameter.
+*/
+case OP_String8: {         /* same as TK_STRING, out2-prerelease */
+  assert( pOp->p4.z!=0 );
+  pOp->opcode = OP_String;
+  pOp->p1 = sqlite3Strlen30(pOp->p4.z);
+
+#ifndef SQLITE_OMIT_UTF16
+  if( encoding!=SQLITE_UTF8 ){
+    rc = sqlite3VdbeMemSetStr(pOut, pOp->p4.z, -1, SQLITE_UTF8, SQLITE_STATIC);
+    if( rc==SQLITE_TOOBIG ) goto too_big;
+    if( SQLITE_OK!=sqlite3VdbeChangeEncoding(pOut, encoding) ) goto no_mem;
+    assert( pOut->szMalloc>0 && pOut->zMalloc==pOut->z );
+    assert( VdbeMemDynamic(pOut)==0 );
+    pOut->szMalloc = 0;
+    pOut->flags |= MEM_Static;
+    if( pOp->p4type==P4_DYNAMIC ){
+      sqlite3DbFree(db, pOp->p4.z);
+    }
+    pOp->p4type = P4_DYNAMIC;
+    pOp->p4.z = pOut->z;
+    pOp->p1 = pOut->n;
+  }
+#endif
+  if( pOp->p1>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    goto too_big;
+  }
+  /* Fall through to the next case, OP_String */
+}
+  
+/* Opcode: String P1 P2 * P4 *
+** Synopsis: r[P2]='P4' (len=P1)
+**
+** The string value P4 of length P1 (bytes) is stored in register P2.
+*/
+case OP_String: {          /* out2-prerelease */
+  assert( pOp->p4.z!=0 );
+  pOut->flags = MEM_Str|MEM_Static|MEM_Term;
+  pOut->z = pOp->p4.z;
+  pOut->n = pOp->p1;
+  pOut->enc = encoding;
+  UPDATE_MAX_BLOBSIZE(pOut);
+  break;
+}
+
+/* Opcode: Null P1 P2 P3 * *
+** Synopsis:  r[P2..P3]=NULL
+**
+** Write a NULL into registers P2.  If P3 greater than P2, then also write
+** NULL into register P3 and every register in between P2 and P3.  If P3
+** is less than P2 (typically P3 is zero) then only register P2 is
+** set to NULL.
+**
+** If the P1 value is non-zero, then also set the MEM_Cleared flag so that
+** NULL values will not compare equal even if SQLITE_NULLEQ is set on
+** OP_Ne or OP_Eq.
+*/
+case OP_Null: {           /* out2-prerelease */
+  int cnt;
+  u16 nullFlag;
+  cnt = pOp->p3-pOp->p2;
+  assert( pOp->p3<=(p->nMem-p->nCursor) );
+  pOut->flags = nullFlag = pOp->p1 ? (MEM_Null|MEM_Cleared) : MEM_Null;
+  while( cnt>0 ){
+    pOut++;
+    memAboutToChange(p, pOut);
+    sqlite3VdbeMemSetNull(pOut);
+    pOut->flags = nullFlag;
+    cnt--;
+  }
+  break;
+}
+
+/* Opcode: SoftNull P1 * * * *
+** Synopsis:  r[P1]=NULL
+**
+** Set register P1 to have the value NULL as seen by the OP_MakeRecord
+** instruction, but do not free any string or blob memory associated with
+** the register, so that if the value was a string or blob that was
+** previously copied using OP_SCopy, the copies will continue to be valid.
+*/
+case OP_SoftNull: {
