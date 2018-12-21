@@ -71468,3 +71468,239 @@ case OP_Concat: {           /* same as TK_CONCAT, in1, in2, out3 */
   nByte = pIn1->n + pIn2->n;
   if( nByte>db->aLimit[SQLITE_LIMIT_LENGTH] ){
     goto too_big;
+  }
+  if( sqlite3VdbeMemGrow(pOut, (int)nByte+2, pOut==pIn2) ){
+    goto no_mem;
+  }
+  MemSetTypeFlag(pOut, MEM_Str);
+  if( pOut!=pIn2 ){
+    memcpy(pOut->z, pIn2->z, pIn2->n);
+  }
+  memcpy(&pOut->z[pIn2->n], pIn1->z, pIn1->n);
+  pOut->z[nByte]=0;
+  pOut->z[nByte+1] = 0;
+  pOut->flags |= MEM_Term;
+  pOut->n = (int)nByte;
+  pOut->enc = encoding;
+  UPDATE_MAX_BLOBSIZE(pOut);
+  break;
+}
+
+/* Opcode: Add P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P1]+r[P2]
+**
+** Add the value in register P1 to the value in register P2
+** and store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+/* Opcode: Multiply P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P1]*r[P2]
+**
+**
+** Multiply the value in register P1 by the value in register P2
+** and store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+/* Opcode: Subtract P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P2]-r[P1]
+**
+** Subtract the value in register P1 from the value in register P2
+** and store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+/* Opcode: Divide P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P2]/r[P1]
+**
+** Divide the value in register P1 by the value in register P2
+** and store the result in register P3 (P3=P2/P1). If the value in 
+** register P1 is zero, then the result is NULL. If either input is 
+** NULL, the result is NULL.
+*/
+/* Opcode: Remainder P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P2]%r[P1]
+**
+** Compute the remainder after integer register P2 is divided by 
+** register P1 and store the result in register P3. 
+** If the value in register P1 is zero the result is NULL.
+** If either operand is NULL, the result is NULL.
+*/
+case OP_Add:                   /* same as TK_PLUS, in1, in2, out3 */
+case OP_Subtract:              /* same as TK_MINUS, in1, in2, out3 */
+case OP_Multiply:              /* same as TK_STAR, in1, in2, out3 */
+case OP_Divide:                /* same as TK_SLASH, in1, in2, out3 */
+case OP_Remainder: {           /* same as TK_REM, in1, in2, out3 */
+  char bIntint;   /* Started out as two integer operands */
+  u16 flags;      /* Combined MEM_* flags from both inputs */
+  u16 type1;      /* Numeric type of left operand */
+  u16 type2;      /* Numeric type of right operand */
+  i64 iA;         /* Integer value of left operand */
+  i64 iB;         /* Integer value of right operand */
+  double rA;      /* Real value of left operand */
+  double rB;      /* Real value of right operand */
+
+  pIn1 = &aMem[pOp->p1];
+  type1 = numericType(pIn1);
+  pIn2 = &aMem[pOp->p2];
+  type2 = numericType(pIn2);
+  pOut = &aMem[pOp->p3];
+  flags = pIn1->flags | pIn2->flags;
+  if( (flags & MEM_Null)!=0 ) goto arithmetic_result_is_null;
+  if( (type1 & type2 & MEM_Int)!=0 ){
+    iA = pIn1->u.i;
+    iB = pIn2->u.i;
+    bIntint = 1;
+    switch( pOp->opcode ){
+      case OP_Add:       if( sqlite3AddInt64(&iB,iA) ) goto fp_math;  break;
+      case OP_Subtract:  if( sqlite3SubInt64(&iB,iA) ) goto fp_math;  break;
+      case OP_Multiply:  if( sqlite3MulInt64(&iB,iA) ) goto fp_math;  break;
+      case OP_Divide: {
+        if( iA==0 ) goto arithmetic_result_is_null;
+        if( iA==-1 && iB==SMALLEST_INT64 ) goto fp_math;
+        iB /= iA;
+        break;
+      }
+      default: {
+        if( iA==0 ) goto arithmetic_result_is_null;
+        if( iA==-1 ) iA = 1;
+        iB %= iA;
+        break;
+      }
+    }
+    pOut->u.i = iB;
+    MemSetTypeFlag(pOut, MEM_Int);
+  }else{
+    bIntint = 0;
+fp_math:
+    rA = sqlite3VdbeRealValue(pIn1);
+    rB = sqlite3VdbeRealValue(pIn2);
+    switch( pOp->opcode ){
+      case OP_Add:         rB += rA;       break;
+      case OP_Subtract:    rB -= rA;       break;
+      case OP_Multiply:    rB *= rA;       break;
+      case OP_Divide: {
+        /* (double)0 In case of SQLITE_OMIT_FLOATING_POINT... */
+        if( rA==(double)0 ) goto arithmetic_result_is_null;
+        rB /= rA;
+        break;
+      }
+      default: {
+        iA = (i64)rA;
+        iB = (i64)rB;
+        if( iA==0 ) goto arithmetic_result_is_null;
+        if( iA==-1 ) iA = 1;
+        rB = (double)(iB % iA);
+        break;
+      }
+    }
+#ifdef SQLITE_OMIT_FLOATING_POINT
+    pOut->u.i = rB;
+    MemSetTypeFlag(pOut, MEM_Int);
+#else
+    if( sqlite3IsNaN(rB) ){
+      goto arithmetic_result_is_null;
+    }
+    pOut->u.r = rB;
+    MemSetTypeFlag(pOut, MEM_Real);
+    if( ((type1|type2)&MEM_Real)==0 && !bIntint ){
+      sqlite3VdbeIntegerAffinity(pOut);
+    }
+#endif
+  }
+  break;
+
+arithmetic_result_is_null:
+  sqlite3VdbeMemSetNull(pOut);
+  break;
+}
+
+/* Opcode: CollSeq P1 * * P4
+**
+** P4 is a pointer to a CollSeq struct. If the next call to a user function
+** or aggregate calls sqlite3GetFuncCollSeq(), this collation sequence will
+** be returned. This is used by the built-in min(), max() and nullif()
+** functions.
+**
+** If P1 is not zero, then it is a register that a subsequent min() or
+** max() aggregate will set to 1 if the current row is not the minimum or
+** maximum.  The P1 register is initialized to 0 by this instruction.
+**
+** The interface used by the implementation of the aforementioned functions
+** to retrieve the collation sequence set by this opcode is not available
+** publicly, only to user functions defined in func.c.
+*/
+case OP_CollSeq: {
+  assert( pOp->p4type==P4_COLLSEQ );
+  if( pOp->p1 ){
+    sqlite3VdbeMemSetInt64(&aMem[pOp->p1], 0);
+  }
+  break;
+}
+
+/* Opcode: Function P1 P2 P3 P4 P5
+** Synopsis: r[P3]=func(r[P2@P5])
+**
+** Invoke a user function (P4 is a pointer to a Function structure that
+** defines the function) with P5 arguments taken from register P2 and
+** successors.  The result of the function is stored in register P3.
+** Register P3 must not be one of the function inputs.
+**
+** P1 is a 32-bit bitmask indicating whether or not each argument to the 
+** function was determined to be constant at compile time. If the first
+** argument was constant then bit 0 of P1 is set. This is used to determine
+** whether meta data associated with a user function argument using the
+** sqlite3_set_auxdata() API may be safely retained until the next
+** invocation of this opcode.
+**
+** See also: AggStep and AggFinal
+*/
+case OP_Function: {
+  int i;
+  Mem *pArg;
+  sqlite3_context ctx;
+  sqlite3_value **apVal;
+  int n;
+
+  n = pOp->p5;
+  apVal = p->apArg;
+  assert( apVal || n==0 );
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem-p->nCursor) );
+  ctx.pOut = &aMem[pOp->p3];
+  memAboutToChange(p, ctx.pOut);
+
+  assert( n==0 || (pOp->p2>0 && pOp->p2+n<=(p->nMem-p->nCursor)+1) );
+  assert( pOp->p3<pOp->p2 || pOp->p3>=pOp->p2+n );
+  pArg = &aMem[pOp->p2];
+  for(i=0; i<n; i++, pArg++){
+    assert( memIsValid(pArg) );
+    apVal[i] = pArg;
+    Deephemeralize(pArg);
+    REGISTER_TRACE(pOp->p2+i, pArg);
+  }
+
+  assert( pOp->p4type==P4_FUNCDEF );
+  ctx.pFunc = pOp->p4.pFunc;
+  ctx.iOp = pc;
+  ctx.pVdbe = p;
+  MemSetTypeFlag(ctx.pOut, MEM_Null);
+  ctx.fErrorOrAux = 0;
+  db->lastRowid = lastRowid;
+  (*ctx.pFunc->xFunc)(&ctx, n, apVal); /* IMP: R-24505-23230 */
+  lastRowid = db->lastRowid;  /* Remember rowid changes made by xFunc */
+
+  /* If the function returned an error, throw an exception */
+  if( ctx.fErrorOrAux ){
+    if( ctx.isError ){
+      sqlite3SetString(&p->zErrMsg, db, "%s", sqlite3_value_text(ctx.pOut));
+      rc = ctx.isError;
+    }
+    sqlite3VdbeDeleteAuxData(p, pc, pOp->p1);
+  }
+
+  /* Copy the result of the function into register P3 */
+  sqlite3VdbeChangeEncoding(ctx.pOut, encoding);
+  if( sqlite3VdbeMemTooBig(ctx.pOut) ){
+    goto too_big;
+  }
+
+  REGISTER_TRACE(pOp->p3, ctx.pOut);
+  UPDATE_MAX_BLOBSIZE(ctx.pOut);
