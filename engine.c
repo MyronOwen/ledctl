@@ -73283,3 +73283,236 @@ case OP_SetCookie: {       /* in3 */
 ** database.  Give the new cursor an identifier of P1.  The P1
 ** values need not be contiguous but all P1 values should be small integers.
 ** It is an error for P1 to be negative.
+**
+** If P5!=0 then use the content of register P2 as the root page, not
+** the value of P2 itself.
+**
+** There will be a read lock on the database whenever there is an
+** open cursor.  If the database was unlocked prior to this instruction
+** then a read lock is acquired as part of this instruction.  A read
+** lock allows other processes to read the database but prohibits
+** any other process from modifying the database.  The read lock is
+** released when all cursors are closed.  If this instruction attempts
+** to get a read lock but fails, the script terminates with an
+** SQLITE_BUSY error code.
+**
+** The P4 value may be either an integer (P4_INT32) or a pointer to
+** a KeyInfo structure (P4_KEYINFO). If it is a pointer to a KeyInfo 
+** structure, then said structure defines the content and collating 
+** sequence of the index being opened. Otherwise, if P4 is an integer 
+** value, it is set to the number of columns in the table.
+**
+** See also: OpenWrite, ReopenIdx
+*/
+/* Opcode: ReopenIdx P1 P2 P3 P4 P5
+** Synopsis: root=P2 iDb=P3
+**
+** The ReopenIdx opcode works exactly like ReadOpen except that it first
+** checks to see if the cursor on P1 is already open with a root page
+** number of P2 and if it is this opcode becomes a no-op.  In other words,
+** if the cursor is already open, do not reopen it.
+**
+** The ReopenIdx opcode may only be used with P5==0 and with P4 being
+** a P4_KEYINFO object.  Furthermore, the P3 value must be the same as
+** every other ReopenIdx or OpenRead for the same cursor number.
+**
+** See the OpenRead opcode documentation for additional information.
+*/
+/* Opcode: OpenWrite P1 P2 P3 P4 P5
+** Synopsis: root=P2 iDb=P3
+**
+** Open a read/write cursor named P1 on the table or index whose root
+** page is P2.  Or if P5!=0 use the content of register P2 to find the
+** root page.
+**
+** The P4 value may be either an integer (P4_INT32) or a pointer to
+** a KeyInfo structure (P4_KEYINFO). If it is a pointer to a KeyInfo 
+** structure, then said structure defines the content and collating 
+** sequence of the index being opened. Otherwise, if P4 is an integer 
+** value, it is set to the number of columns in the table, or to the
+** largest index of any column of the table that is actually used.
+**
+** This instruction works just like OpenRead except that it opens the cursor
+** in read/write mode.  For a given table, there can be one or more read-only
+** cursors or a single read/write cursor but not both.
+**
+** See also OpenRead.
+*/
+case OP_ReopenIdx: {
+  VdbeCursor *pCur;
+
+  assert( pOp->p5==0 );
+  assert( pOp->p4type==P4_KEYINFO );
+  pCur = p->apCsr[pOp->p1];
+  if( pCur && pCur->pgnoRoot==(u32)pOp->p2 ){
+    assert( pCur->iDb==pOp->p3 );      /* Guaranteed by the code generator */
+    break;
+  }
+  /* If the cursor is not currently open or is open on a different
+  ** index, then fall through into OP_OpenRead to force a reopen */
+}
+case OP_OpenRead:
+case OP_OpenWrite: {
+  int nField;
+  KeyInfo *pKeyInfo;
+  int p2;
+  int iDb;
+  int wrFlag;
+  Btree *pX;
+  VdbeCursor *pCur;
+  Db *pDb;
+
+  assert( (pOp->p5&(OPFLAG_P2ISREG|OPFLAG_BULKCSR))==pOp->p5 );
+  assert( pOp->opcode==OP_OpenWrite || pOp->p5==0 );
+  assert( p->bIsReader );
+  assert( pOp->opcode==OP_OpenRead || pOp->opcode==OP_ReopenIdx
+          || p->readOnly==0 );
+
+  if( p->expired ){
+    rc = SQLITE_ABORT_ROLLBACK;
+    break;
+  }
+
+  nField = 0;
+  pKeyInfo = 0;
+  p2 = pOp->p2;
+  iDb = pOp->p3;
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( DbMaskTest(p->btreeMask, iDb) );
+  pDb = &db->aDb[iDb];
+  pX = pDb->pBt;
+  assert( pX!=0 );
+  if( pOp->opcode==OP_OpenWrite ){
+    wrFlag = 1;
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    if( pDb->pSchema->file_format < p->minWriteFileFormat ){
+      p->minWriteFileFormat = pDb->pSchema->file_format;
+    }
+  }else{
+    wrFlag = 0;
+  }
+  if( pOp->p5 & OPFLAG_P2ISREG ){
+    assert( p2>0 );
+    assert( p2<=(p->nMem-p->nCursor) );
+    pIn2 = &aMem[p2];
+    assert( memIsValid(pIn2) );
+    assert( (pIn2->flags & MEM_Int)!=0 );
+    sqlite3VdbeMemIntegerify(pIn2);
+    p2 = (int)pIn2->u.i;
+    /* The p2 value always comes from a prior OP_CreateTable opcode and
+    ** that opcode will always set the p2 value to 2 or more or else fail.
+    ** If there were a failure, the prepared statement would have halted
+    ** before reaching this instruction. */
+    if( NEVER(p2<2) ) {
+      rc = SQLITE_CORRUPT_BKPT;
+      goto abort_due_to_error;
+    }
+  }
+  if( pOp->p4type==P4_KEYINFO ){
+    pKeyInfo = pOp->p4.pKeyInfo;
+    assert( pKeyInfo->enc==ENC(db) );
+    assert( pKeyInfo->db==db );
+    nField = pKeyInfo->nField+pKeyInfo->nXField;
+  }else if( pOp->p4type==P4_INT32 ){
+    nField = pOp->p4.i;
+  }
+  assert( pOp->p1>=0 );
+  assert( nField>=0 );
+  testcase( nField==0 );  /* Table with INTEGER PRIMARY KEY and nothing else */
+  pCur = allocateCursor(p, pOp->p1, nField, iDb, 1);
+  if( pCur==0 ) goto no_mem;
+  pCur->nullRow = 1;
+  pCur->isOrdered = 1;
+  pCur->pgnoRoot = p2;
+  rc = sqlite3BtreeCursor(pX, p2, wrFlag, pKeyInfo, pCur->pCursor);
+  pCur->pKeyInfo = pKeyInfo;
+  assert( OPFLAG_BULKCSR==BTREE_BULKLOAD );
+  sqlite3BtreeCursorHints(pCur->pCursor, (pOp->p5 & OPFLAG_BULKCSR));
+
+  /* Set the VdbeCursor.isTable variable. Previous versions of
+  ** SQLite used to check if the root-page flags were sane at this point
+  ** and report database corruption if they were not, but this check has
+  ** since moved into the btree layer.  */  
+  pCur->isTable = pOp->p4type!=P4_KEYINFO;
+  break;
+}
+
+/* Opcode: OpenEphemeral P1 P2 * P4 P5
+** Synopsis: nColumn=P2
+**
+** Open a new cursor P1 to a transient table.
+** The cursor is always opened read/write even if 
+** the main database is read-only.  The ephemeral
+** table is deleted automatically when the cursor is closed.
+**
+** P2 is the number of columns in the ephemeral table.
+** The cursor points to a BTree table if P4==0 and to a BTree index
+** if P4 is not 0.  If P4 is not NULL, it points to a KeyInfo structure
+** that defines the format of keys in the index.
+**
+** The P5 parameter can be a mask of the BTREE_* flags defined
+** in btree.h.  These flags control aspects of the operation of
+** the btree.  The BTREE_OMIT_JOURNAL and BTREE_SINGLE flags are
+** added automatically.
+*/
+/* Opcode: OpenAutoindex P1 P2 * P4 *
+** Synopsis: nColumn=P2
+**
+** This opcode works the same as OP_OpenEphemeral.  It has a
+** different name to distinguish its use.  Tables created using
+** by this opcode will be used for automatically created transient
+** indices in joins.
+*/
+case OP_OpenAutoindex: 
+case OP_OpenEphemeral: {
+  VdbeCursor *pCx;
+  KeyInfo *pKeyInfo;
+
+  static const int vfsFlags = 
+      SQLITE_OPEN_READWRITE |
+      SQLITE_OPEN_CREATE |
+      SQLITE_OPEN_EXCLUSIVE |
+      SQLITE_OPEN_DELETEONCLOSE |
+      SQLITE_OPEN_TRANSIENT_DB;
+  assert( pOp->p1>=0 );
+  assert( pOp->p2>=0 );
+  pCx = allocateCursor(p, pOp->p1, pOp->p2, -1, 1);
+  if( pCx==0 ) goto no_mem;
+  pCx->nullRow = 1;
+  pCx->isEphemeral = 1;
+  rc = sqlite3BtreeOpen(db->pVfs, 0, db, &pCx->pBt, 
+                        BTREE_OMIT_JOURNAL | BTREE_SINGLE | pOp->p5, vfsFlags);
+  if( rc==SQLITE_OK ){
+    rc = sqlite3BtreeBeginTrans(pCx->pBt, 1);
+  }
+  if( rc==SQLITE_OK ){
+    /* If a transient index is required, create it by calling
+    ** sqlite3BtreeCreateTable() with the BTREE_BLOBKEY flag before
+    ** opening it. If a transient table is required, just use the
+    ** automatically created table with root-page 1 (an BLOB_INTKEY table).
+    */
+    if( (pKeyInfo = pOp->p4.pKeyInfo)!=0 ){
+      int pgno;
+      assert( pOp->p4type==P4_KEYINFO );
+      rc = sqlite3BtreeCreateTable(pCx->pBt, &pgno, BTREE_BLOBKEY | pOp->p5); 
+      if( rc==SQLITE_OK ){
+        assert( pgno==MASTER_ROOT+1 );
+        assert( pKeyInfo->db==db );
+        assert( pKeyInfo->enc==ENC(db) );
+        pCx->pKeyInfo = pKeyInfo;
+        rc = sqlite3BtreeCursor(pCx->pBt, pgno, 1, pKeyInfo, pCx->pCursor);
+      }
+      pCx->isTable = 0;
+    }else{
+      rc = sqlite3BtreeCursor(pCx->pBt, MASTER_ROOT, 1, 0, pCx->pCursor);
+      pCx->isTable = 1;
+    }
+  }
+  pCx->isOrdered = (pOp->p5!=BTREE_UNORDERED);
+  break;
+}
+
+/* Opcode: SorterOpen P1 P2 P3 P4 *
+**
+** This opcode works like OP_OpenEphemeral except that it opens
+** a transient index that is specifically designed to sort large
