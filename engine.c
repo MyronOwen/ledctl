@@ -73516,3 +73516,236 @@ case OP_OpenEphemeral: {
 **
 ** This opcode works like OP_OpenEphemeral except that it opens
 ** a transient index that is specifically designed to sort large
+** tables using an external merge-sort algorithm.
+**
+** If argument P3 is non-zero, then it indicates that the sorter may
+** assume that a stable sort considering the first P3 fields of each
+** key is sufficient to produce the required results.
+*/
+case OP_SorterOpen: {
+  VdbeCursor *pCx;
+
+  assert( pOp->p1>=0 );
+  assert( pOp->p2>=0 );
+  pCx = allocateCursor(p, pOp->p1, pOp->p2, -1, 1);
+  if( pCx==0 ) goto no_mem;
+  pCx->pKeyInfo = pOp->p4.pKeyInfo;
+  assert( pCx->pKeyInfo->db==db );
+  assert( pCx->pKeyInfo->enc==ENC(db) );
+  rc = sqlite3VdbeSorterInit(db, pOp->p3, pCx);
+  break;
+}
+
+/* Opcode: SequenceTest P1 P2 * * *
+** Synopsis: if( cursor[P1].ctr++ ) pc = P2
+**
+** P1 is a sorter cursor. If the sequence counter is currently zero, jump
+** to P2. Regardless of whether or not the jump is taken, increment the
+** the sequence value.
+*/
+case OP_SequenceTest: {
+  VdbeCursor *pC;
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC->pSorter );
+  if( (pC->seqCount++)==0 ){
+    pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: OpenPseudo P1 P2 P3 * *
+** Synopsis: P3 columns in r[P2]
+**
+** Open a new cursor that points to a fake table that contains a single
+** row of data.  The content of that one row is the content of memory
+** register P2.  In other words, cursor P1 becomes an alias for the 
+** MEM_Blob content contained in register P2.
+**
+** A pseudo-table created by this opcode is used to hold a single
+** row output from the sorter so that the row can be decomposed into
+** individual columns using the OP_Column opcode.  The OP_Column opcode
+** is the only cursor opcode that works with a pseudo-table.
+**
+** P3 is the number of fields in the records that will be stored by
+** the pseudo-table.
+*/
+case OP_OpenPseudo: {
+  VdbeCursor *pCx;
+
+  assert( pOp->p1>=0 );
+  assert( pOp->p3>=0 );
+  pCx = allocateCursor(p, pOp->p1, pOp->p3, -1, 0);
+  if( pCx==0 ) goto no_mem;
+  pCx->nullRow = 1;
+  pCx->pseudoTableReg = pOp->p2;
+  pCx->isTable = 1;
+  assert( pOp->p5==0 );
+  break;
+}
+
+/* Opcode: Close P1 * * * *
+**
+** Close a cursor previously opened as P1.  If P1 is not
+** currently open, this instruction is a no-op.
+*/
+case OP_Close: {
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  sqlite3VdbeFreeCursor(p, p->apCsr[pOp->p1]);
+  p->apCsr[pOp->p1] = 0;
+  break;
+}
+
+/* Opcode: SeekGE P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys), 
+** use the value in register P3 as the key.  If cursor P1 refers 
+** to an SQL index, then P3 is the first in an array of P4 registers 
+** that are used as an unpacked index key. 
+**
+** Reposition cursor P1 so that  it points to the smallest entry that 
+** is greater than or equal to the key value. If there are no records 
+** greater than or equal to the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in forward order,
+** from the beginning toward the end.  In other words, the cursor is
+** configured to use Next, not Prev.
+**
+** See also: Found, NotFound, SeekLt, SeekGt, SeekLe
+*/
+/* Opcode: SeekGT P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys), 
+** use the value in register P3 as a key. If cursor P1 refers 
+** to an SQL index, then P3 is the first in an array of P4 registers 
+** that are used as an unpacked index key. 
+**
+** Reposition cursor P1 so that  it points to the smallest entry that 
+** is greater than the key value. If there are no records greater than 
+** the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in forward order,
+** from the beginning toward the end.  In other words, the cursor is
+** configured to use Next, not Prev.
+**
+** See also: Found, NotFound, SeekLt, SeekGe, SeekLe
+*/
+/* Opcode: SeekLT P1 P2 P3 P4 * 
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys), 
+** use the value in register P3 as a key. If cursor P1 refers 
+** to an SQL index, then P3 is the first in an array of P4 registers 
+** that are used as an unpacked index key. 
+**
+** Reposition cursor P1 so that  it points to the largest entry that 
+** is less than the key value. If there are no records less than 
+** the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in reverse order,
+** from the end toward the beginning.  In other words, the cursor is
+** configured to use Prev, not Next.
+**
+** See also: Found, NotFound, SeekGt, SeekGe, SeekLe
+*/
+/* Opcode: SeekLE P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys), 
+** use the value in register P3 as a key. If cursor P1 refers 
+** to an SQL index, then P3 is the first in an array of P4 registers 
+** that are used as an unpacked index key. 
+**
+** Reposition cursor P1 so that it points to the largest entry that 
+** is less than or equal to the key value. If there are no records 
+** less than or equal to the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in reverse order,
+** from the end toward the beginning.  In other words, the cursor is
+** configured to use Prev, not Next.
+**
+** See also: Found, NotFound, SeekGt, SeekGe, SeekLt
+*/
+case OP_SeekLT:         /* jump, in3 */
+case OP_SeekLE:         /* jump, in3 */
+case OP_SeekGE:         /* jump, in3 */
+case OP_SeekGT: {       /* jump, in3 */
+  int res;
+  int oc;
+  VdbeCursor *pC;
+  UnpackedRecord r;
+  int nField;
+  i64 iKey;      /* The rowid we are to seek to */
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p2!=0 );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->pseudoTableReg==0 );
+  assert( OP_SeekLE == OP_SeekLT+1 );
+  assert( OP_SeekGE == OP_SeekLT+2 );
+  assert( OP_SeekGT == OP_SeekLT+3 );
+  assert( pC->isOrdered );
+  assert( pC->pCursor!=0 );
+  oc = pOp->opcode;
+  pC->nullRow = 0;
+#ifdef SQLITE_DEBUG
+  pC->seekOp = pOp->opcode;
+#endif
+  if( pC->isTable ){
+    /* The input value in P3 might be of any type: integer, real, string,
+    ** blob, or NULL.  But it needs to be an integer before we can do
+    ** the seek, so convert it. */
+    pIn3 = &aMem[pOp->p3];
+    if( (pIn3->flags & (MEM_Int|MEM_Real|MEM_Str))==MEM_Str ){
+      applyNumericAffinity(pIn3, 0);
+    }
+    iKey = sqlite3VdbeIntValue(pIn3);
+
+    /* If the P3 value could not be converted into an integer without
+    ** loss of information, then special processing is required... */
+    if( (pIn3->flags & MEM_Int)==0 ){
+      if( (pIn3->flags & MEM_Real)==0 ){
+        /* If the P3 value cannot be converted into any kind of a number,
+        ** then the seek is not possible, so jump to P2 */
+        pc = pOp->p2 - 1;  VdbeBranchTaken(1,2);
+        break;
+      }
+
+      /* If the approximation iKey is larger than the actual real search
+      ** term, substitute >= for > and < for <=. e.g. if the search term
+      ** is 4.9 and the integer approximation 5:
+      **
+      **        (x >  4.9)    ->     (x >= 5)
+      **        (x <= 4.9)    ->     (x <  5)
+      */
+      if( pIn3->u.r<(double)iKey ){
+        assert( OP_SeekGE==(OP_SeekGT-1) );
+        assert( OP_SeekLT==(OP_SeekLE-1) );
+        assert( (OP_SeekLE & 0x0001)==(OP_SeekGT & 0x0001) );
+        if( (oc & 0x0001)==(OP_SeekGT & 0x0001) ) oc--;
+      }
+
+      /* If the approximation iKey is smaller than the actual real search
+      ** term, substitute <= for < and > for >=.  */
+      else if( pIn3->u.r>(double)iKey ){
+        assert( OP_SeekLE==(OP_SeekLT+1) );
+        assert( OP_SeekGT==(OP_SeekGE+1) );
+        assert( (OP_SeekLT & 0x0001)==(OP_SeekGE & 0x0001) );
+        if( (oc & 0x0001)==(OP_SeekLT & 0x0001) ) oc++;
+      }
+    } 
+    rc = sqlite3BtreeMovetoUnpacked(pC->pCursor, 0, (u64)iKey, 0, &res);
+    pC->movetoTarget = iKey;  /* Used by OP_Delete */
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+  }else{
+    nField = pOp->p4.i;
+    assert( pOp->p4type==P4_INT32 );
+    assert( nField>0 );
+    r.pKeyInfo = pC->pKeyInfo;
+    r.nField = (u16)nField;
+
