@@ -73749,3 +73749,236 @@ case OP_SeekGT: {       /* jump, in3 */
     r.pKeyInfo = pC->pKeyInfo;
     r.nField = (u16)nField;
 
+    /* The next line of code computes as follows, only faster:
+    **   if( oc==OP_SeekGT || oc==OP_SeekLE ){
+    **     r.default_rc = -1;
+    **   }else{
+    **     r.default_rc = +1;
+    **   }
+    */
+    r.default_rc = ((1 & (oc - OP_SeekLT)) ? -1 : +1);
+    assert( oc!=OP_SeekGT || r.default_rc==-1 );
+    assert( oc!=OP_SeekLE || r.default_rc==-1 );
+    assert( oc!=OP_SeekGE || r.default_rc==+1 );
+    assert( oc!=OP_SeekLT || r.default_rc==+1 );
+
+    r.aMem = &aMem[pOp->p3];
+#ifdef SQLITE_DEBUG
+    { int i; for(i=0; i<r.nField; i++) assert( memIsValid(&r.aMem[i]) ); }
+#endif
+    ExpandBlob(r.aMem);
+    rc = sqlite3BtreeMovetoUnpacked(pC->pCursor, &r, 0, 0, &res);
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+  }
+  pC->deferredMoveto = 0;
+  pC->cacheStatus = CACHE_STALE;
+#ifdef SQLITE_TEST
+  sqlite3_search_count++;
+#endif
+  if( oc>=OP_SeekGE ){  assert( oc==OP_SeekGE || oc==OP_SeekGT );
+    if( res<0 || (res==0 && oc==OP_SeekGT) ){
+      res = 0;
+      rc = sqlite3BtreeNext(pC->pCursor, &res);
+      if( rc!=SQLITE_OK ) goto abort_due_to_error;
+    }else{
+      res = 0;
+    }
+  }else{
+    assert( oc==OP_SeekLT || oc==OP_SeekLE );
+    if( res>0 || (res==0 && oc==OP_SeekLT) ){
+      res = 0;
+      rc = sqlite3BtreePrevious(pC->pCursor, &res);
+      if( rc!=SQLITE_OK ) goto abort_due_to_error;
+    }else{
+      /* res might be negative because the table is empty.  Check to
+      ** see if this is the case.
+      */
+      res = sqlite3BtreeEof(pC->pCursor);
+    }
+  }
+  assert( pOp->p2>0 );
+  VdbeBranchTaken(res!=0,2);
+  if( res ){
+    pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: Seek P1 P2 * * *
+** Synopsis:  intkey=r[P2]
+**
+** P1 is an open table cursor and P2 is a rowid integer.  Arrange
+** for P1 to move so that it points to the rowid given by P2.
+**
+** This is actually a deferred seek.  Nothing actually happens until
+** the cursor is used to read a record.  That way, if no reads
+** occur, no unnecessary I/O happens.
+*/
+case OP_Seek: {    /* in2 */
+  VdbeCursor *pC;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->pCursor!=0 );
+  assert( pC->isTable );
+  pC->nullRow = 0;
+  pIn2 = &aMem[pOp->p2];
+  pC->movetoTarget = sqlite3VdbeIntValue(pIn2);
+  pC->deferredMoveto = 1;
+  break;
+}
+  
+
+/* Opcode: Found P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If P4==0 then register P3 holds a blob constructed by MakeRecord.  If
+** P4>0 then register P3 is the first of P4 registers that form an unpacked
+** record.
+**
+** Cursor P1 is on an index btree.  If the record identified by P3 and P4
+** is a prefix of any entry in P1 then a jump is made to P2 and
+** P1 is left pointing at the matching entry.
+**
+** This operation leaves the cursor in a state where it can be
+** advanced in the forward direction.  The Next instruction will work,
+** but not the Prev instruction.
+**
+** See also: NotFound, NoConflict, NotExists. SeekGe
+*/
+/* Opcode: NotFound P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If P4==0 then register P3 holds a blob constructed by MakeRecord.  If
+** P4>0 then register P3 is the first of P4 registers that form an unpacked
+** record.
+** 
+** Cursor P1 is on an index btree.  If the record identified by P3 and P4
+** is not the prefix of any entry in P1 then a jump is made to P2.  If P1 
+** does contain an entry whose prefix matches the P3/P4 record then control
+** falls through to the next instruction and P1 is left pointing at the
+** matching entry.
+**
+** This operation leaves the cursor in a state where it cannot be
+** advanced in either direction.  In other words, the Next and Prev
+** opcodes do not work after this operation.
+**
+** See also: Found, NotExists, NoConflict
+*/
+/* Opcode: NoConflict P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If P4==0 then register P3 holds a blob constructed by MakeRecord.  If
+** P4>0 then register P3 is the first of P4 registers that form an unpacked
+** record.
+** 
+** Cursor P1 is on an index btree.  If the record identified by P3 and P4
+** contains any NULL value, jump immediately to P2.  If all terms of the
+** record are not-NULL then a check is done to determine if any row in the
+** P1 index btree has a matching key prefix.  If there are no matches, jump
+** immediately to P2.  If there is a match, fall through and leave the P1
+** cursor pointing to the matching row.
+**
+** This opcode is similar to OP_NotFound with the exceptions that the
+** branch is always taken if any part of the search key input is NULL.
+**
+** This operation leaves the cursor in a state where it cannot be
+** advanced in either direction.  In other words, the Next and Prev
+** opcodes do not work after this operation.
+**
+** See also: NotFound, Found, NotExists
+*/
+case OP_NoConflict:     /* jump, in3 */
+case OP_NotFound:       /* jump, in3 */
+case OP_Found: {        /* jump, in3 */
+  int alreadyExists;
+  int ii;
+  VdbeCursor *pC;
+  int res;
+  char *pFree;
+  UnpackedRecord *pIdxKey;
+  UnpackedRecord r;
+  char aTempRec[ROUND8(sizeof(UnpackedRecord)) + sizeof(Mem)*4 + 7];
+
+#ifdef SQLITE_TEST
+  if( pOp->opcode!=OP_NoConflict ) sqlite3_found_count++;
+#endif
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p4type==P4_INT32 );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+#ifdef SQLITE_DEBUG
+  pC->seekOp = pOp->opcode;
+#endif
+  pIn3 = &aMem[pOp->p3];
+  assert( pC->pCursor!=0 );
+  assert( pC->isTable==0 );
+  pFree = 0;  /* Not needed.  Only used to suppress a compiler warning. */
+  if( pOp->p4.i>0 ){
+    r.pKeyInfo = pC->pKeyInfo;
+    r.nField = (u16)pOp->p4.i;
+    r.aMem = pIn3;
+    for(ii=0; ii<r.nField; ii++){
+      assert( memIsValid(&r.aMem[ii]) );
+      ExpandBlob(&r.aMem[ii]);
+#ifdef SQLITE_DEBUG
+      if( ii ) REGISTER_TRACE(pOp->p3+ii, &r.aMem[ii]);
+#endif
+    }
+    pIdxKey = &r;
+  }else{
+    pIdxKey = sqlite3VdbeAllocUnpackedRecord(
+        pC->pKeyInfo, aTempRec, sizeof(aTempRec), &pFree
+    );
+    if( pIdxKey==0 ) goto no_mem;
+    assert( pIn3->flags & MEM_Blob );
+    ExpandBlob(pIn3);
+    sqlite3VdbeRecordUnpack(pC->pKeyInfo, pIn3->n, pIn3->z, pIdxKey);
+  }
+  pIdxKey->default_rc = 0;
+  if( pOp->opcode==OP_NoConflict ){
+    /* For the OP_NoConflict opcode, take the jump if any of the
+    ** input fields are NULL, since any key with a NULL will not
+    ** conflict */
+    for(ii=0; ii<pIdxKey->nField; ii++){
+      if( pIdxKey->aMem[ii].flags & MEM_Null ){
+        pc = pOp->p2 - 1; VdbeBranchTaken(1,2);
+        break;
+      }
+    }
+  }
+  rc = sqlite3BtreeMovetoUnpacked(pC->pCursor, pIdxKey, 0, 0, &res);
+  if( pOp->p4.i==0 ){
+    sqlite3DbFree(db, pFree);
+  }
+  if( rc!=SQLITE_OK ){
+    break;
+  }
+  pC->seekResult = res;
+  alreadyExists = (res==0);
+  pC->nullRow = 1-alreadyExists;
+  pC->deferredMoveto = 0;
+  pC->cacheStatus = CACHE_STALE;
+  if( pOp->opcode==OP_Found ){
+    VdbeBranchTaken(alreadyExists!=0,2);
+    if( alreadyExists ) pc = pOp->p2 - 1;
+  }else{
+    VdbeBranchTaken(alreadyExists==0,2);
+    if( !alreadyExists ) pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: NotExists P1 P2 P3 * *
+** Synopsis: intkey=r[P3]
+**
+** P1 is the index of a cursor open on an SQL table btree (with integer
+** keys).  P3 is an integer rowid.  If P1 does not contain a record with
+** rowid P3 then jump immediately to P2.  If P1 does contain a record
+** with rowid P3 then leave the cursor pointing at that record and fall
+** through to the next instruction.
+**
