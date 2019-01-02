@@ -73045,3 +73045,241 @@ case OP_AutoCommit: {
     sqlite3SetString(&p->zErrMsg, db, "cannot rollback transaction - "
         "SQL statements in progress");
     rc = SQLITE_BUSY;
+  }else
+#endif
+  if( turnOnAC && !iRollback && db->nVdbeWrite>0 ){
+    /* If this instruction implements a COMMIT and other VMs are writing
+    ** return an error indicating that the other VMs must complete first. 
+    */
+    sqlite3SetString(&p->zErrMsg, db, "cannot commit transaction - "
+        "SQL statements in progress");
+    rc = SQLITE_BUSY;
+  }else if( desiredAutoCommit!=db->autoCommit ){
+    if( iRollback ){
+      assert( desiredAutoCommit==1 );
+      sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+      db->autoCommit = 1;
+    }else if( (rc = sqlite3VdbeCheckFk(p, 1))!=SQLITE_OK ){
+      goto vdbe_return;
+    }else{
+      db->autoCommit = (u8)desiredAutoCommit;
+      if( sqlite3VdbeHalt(p)==SQLITE_BUSY ){
+        p->pc = pc;
+        db->autoCommit = (u8)(1-desiredAutoCommit);
+        p->rc = rc = SQLITE_BUSY;
+        goto vdbe_return;
+      }
+    }
+    assert( db->nStatement==0 );
+    sqlite3CloseSavepoints(db);
+    if( p->rc==SQLITE_OK ){
+      rc = SQLITE_DONE;
+    }else{
+      rc = SQLITE_ERROR;
+    }
+    goto vdbe_return;
+  }else{
+    sqlite3SetString(&p->zErrMsg, db,
+        (!desiredAutoCommit)?"cannot start a transaction within a transaction":(
+        (iRollback)?"cannot rollback - no transaction is active":
+                   "cannot commit - no transaction is active"));
+         
+    rc = SQLITE_ERROR;
+  }
+  break;
+}
+
+/* Opcode: Transaction P1 P2 P3 P4 P5
+**
+** Begin a transaction on database P1 if a transaction is not already
+** active.
+** If P2 is non-zero, then a write-transaction is started, or if a 
+** read-transaction is already active, it is upgraded to a write-transaction.
+** If P2 is zero, then a read-transaction is started.
+**
+** P1 is the index of the database file on which the transaction is
+** started.  Index 0 is the main database file and index 1 is the
+** file used for temporary tables.  Indices of 2 or more are used for
+** attached databases.
+**
+** If a write-transaction is started and the Vdbe.usesStmtJournal flag is
+** true (this flag is set if the Vdbe may modify more than one row and may
+** throw an ABORT exception), a statement transaction may also be opened.
+** More specifically, a statement transaction is opened iff the database
+** connection is currently not in autocommit mode, or if there are other
+** active statements. A statement transaction allows the changes made by this
+** VDBE to be rolled back after an error without having to roll back the
+** entire transaction. If no error is encountered, the statement transaction
+** will automatically commit when the VDBE halts.
+**
+** If P5!=0 then this opcode also checks the schema cookie against P3
+** and the schema generation counter against P4.
+** The cookie changes its value whenever the database schema changes.
+** This operation is used to detect when that the cookie has changed
+** and that the current process needs to reread the schema.  If the schema
+** cookie in P3 differs from the schema cookie in the database header or
+** if the schema generation counter in P4 differs from the current
+** generation counter, then an SQLITE_SCHEMA error is raised and execution
+** halts.  The sqlite3_step() wrapper function might then reprepare the
+** statement and rerun it from the beginning.
+*/
+case OP_Transaction: {
+  Btree *pBt;
+  int iMeta;
+  int iGen;
+
+  assert( p->bIsReader );
+  assert( p->readOnly==0 || pOp->p2==0 );
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p1) );
+  if( pOp->p2 && (db->flags & SQLITE_QueryOnly)!=0 ){
+    rc = SQLITE_READONLY;
+    goto abort_due_to_error;
+  }
+  pBt = db->aDb[pOp->p1].pBt;
+
+  if( pBt ){
+    rc = sqlite3BtreeBeginTrans(pBt, pOp->p2);
+    if( rc==SQLITE_BUSY ){
+      p->pc = pc;
+      p->rc = rc = SQLITE_BUSY;
+      goto vdbe_return;
+    }
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+
+    if( pOp->p2 && p->usesStmtJournal 
+     && (db->autoCommit==0 || db->nVdbeRead>1) 
+    ){
+      assert( sqlite3BtreeIsInTrans(pBt) );
+      if( p->iStatement==0 ){
+        assert( db->nStatement>=0 && db->nSavepoint>=0 );
+        db->nStatement++; 
+        p->iStatement = db->nSavepoint + db->nStatement;
+      }
+
+      rc = sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, p->iStatement-1);
+      if( rc==SQLITE_OK ){
+        rc = sqlite3BtreeBeginStmt(pBt, p->iStatement);
+      }
+
+      /* Store the current value of the database handles deferred constraint
+      ** counter. If the statement transaction needs to be rolled back,
+      ** the value of this counter needs to be restored too.  */
+      p->nStmtDefCons = db->nDeferredCons;
+      p->nStmtDefImmCons = db->nDeferredImmCons;
+    }
+
+    /* Gather the schema version number for checking */
+    sqlite3BtreeGetMeta(pBt, BTREE_SCHEMA_VERSION, (u32 *)&iMeta);
+    iGen = db->aDb[pOp->p1].pSchema->iGeneration;
+  }else{
+    iGen = iMeta = 0;
+  }
+  assert( pOp->p5==0 || pOp->p4type==P4_INT32 );
+  if( pOp->p5 && (iMeta!=pOp->p3 || iGen!=pOp->p4.i) ){
+    sqlite3DbFree(db, p->zErrMsg);
+    p->zErrMsg = sqlite3DbStrDup(db, "database schema has changed");
+    /* If the schema-cookie from the database file matches the cookie 
+    ** stored with the in-memory representation of the schema, do
+    ** not reload the schema from the database file.
+    **
+    ** If virtual-tables are in use, this is not just an optimization.
+    ** Often, v-tables store their data in other SQLite tables, which
+    ** are queried from within xNext() and other v-table methods using
+    ** prepared queries. If such a query is out-of-date, we do not want to
+    ** discard the database schema, as the user code implementing the
+    ** v-table would have to be ready for the sqlite3_vtab structure itself
+    ** to be invalidated whenever sqlite3_step() is called from within 
+    ** a v-table method.
+    */
+    if( db->aDb[pOp->p1].pSchema->schema_cookie!=iMeta ){
+      sqlite3ResetOneSchema(db, pOp->p1);
+    }
+    p->expired = 1;
+    rc = SQLITE_SCHEMA;
+  }
+  break;
+}
+
+/* Opcode: ReadCookie P1 P2 P3 * *
+**
+** Read cookie number P3 from database P1 and write it into register P2.
+** P3==1 is the schema version.  P3==2 is the database format.
+** P3==3 is the recommended pager cache size, and so forth.  P1==0 is
+** the main database file and P1==1 is the database file used to store
+** temporary tables.
+**
+** There must be a read-lock on the database (either a transaction
+** must be started or there must be an open cursor) before
+** executing this instruction.
+*/
+case OP_ReadCookie: {               /* out2-prerelease */
+  int iMeta;
+  int iDb;
+  int iCookie;
+
+  assert( p->bIsReader );
+  iDb = pOp->p1;
+  iCookie = pOp->p3;
+  assert( pOp->p3<SQLITE_N_BTREE_META );
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( db->aDb[iDb].pBt!=0 );
+  assert( DbMaskTest(p->btreeMask, iDb) );
+
+  sqlite3BtreeGetMeta(db->aDb[iDb].pBt, iCookie, (u32 *)&iMeta);
+  pOut->u.i = iMeta;
+  break;
+}
+
+/* Opcode: SetCookie P1 P2 P3 * *
+**
+** Write the content of register P3 (interpreted as an integer)
+** into cookie number P2 of database P1.  P2==1 is the schema version.  
+** P2==2 is the database format. P2==3 is the recommended pager cache 
+** size, and so forth.  P1==0 is the main database file and P1==1 is the 
+** database file used to store temporary tables.
+**
+** A transaction must be started before executing this opcode.
+*/
+case OP_SetCookie: {       /* in3 */
+  Db *pDb;
+  assert( pOp->p2<SQLITE_N_BTREE_META );
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p1) );
+  assert( p->readOnly==0 );
+  pDb = &db->aDb[pOp->p1];
+  assert( pDb->pBt!=0 );
+  assert( sqlite3SchemaMutexHeld(db, pOp->p1, 0) );
+  pIn3 = &aMem[pOp->p3];
+  sqlite3VdbeMemIntegerify(pIn3);
+  /* See note about index shifting on OP_ReadCookie */
+  rc = sqlite3BtreeUpdateMeta(pDb->pBt, pOp->p2, (int)pIn3->u.i);
+  if( pOp->p2==BTREE_SCHEMA_VERSION ){
+    /* When the schema cookie changes, record the new cookie internally */
+    pDb->pSchema->schema_cookie = (int)pIn3->u.i;
+    db->flags |= SQLITE_InternChanges;
+  }else if( pOp->p2==BTREE_FILE_FORMAT ){
+    /* Record changes in the file format */
+    pDb->pSchema->file_format = (u8)pIn3->u.i;
+  }
+  if( pOp->p1==1 ){
+    /* Invalidate all prepared statements whenever the TEMP database
+    ** schema is changed.  Ticket #1644 */
+    sqlite3ExpirePreparedStatements(db);
+    p->expired = 0;
+  }
+  break;
+}
+
+/* Opcode: OpenRead P1 P2 P3 P4 P5
+** Synopsis: root=P2 iDb=P3
+**
+** Open a read-only cursor for the database table whose root page is
+** P2 in a database file.  The database file is determined by P3. 
+** P3==0 means the main database, P3==1 means the database used for 
+** temporary tables, and P3>1 means used the corresponding attached
+** database.  Give the new cursor an identifier of P1.  The P1
+** values need not be contiguous but all P1 values should be small integers.
+** It is an error for P1 to be negative.
