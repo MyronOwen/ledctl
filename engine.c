@@ -72134,3 +72134,221 @@ case OP_Compare: {
     for(k=0; k<n; k++) if( aPermute[k]>mx ) mx = aPermute[k];
     assert( p1>0 && p1+mx<=(p->nMem-p->nCursor)+1 );
     assert( p2>0 && p2+mx<=(p->nMem-p->nCursor)+1 );
+  }else{
+    assert( p1>0 && p1+n<=(p->nMem-p->nCursor)+1 );
+    assert( p2>0 && p2+n<=(p->nMem-p->nCursor)+1 );
+  }
+#endif /* SQLITE_DEBUG */
+  for(i=0; i<n; i++){
+    idx = aPermute ? aPermute[i] : i;
+    assert( memIsValid(&aMem[p1+idx]) );
+    assert( memIsValid(&aMem[p2+idx]) );
+    REGISTER_TRACE(p1+idx, &aMem[p1+idx]);
+    REGISTER_TRACE(p2+idx, &aMem[p2+idx]);
+    assert( i<pKeyInfo->nField );
+    pColl = pKeyInfo->aColl[i];
+    bRev = pKeyInfo->aSortOrder[i];
+    iCompare = sqlite3MemCompare(&aMem[p1+idx], &aMem[p2+idx], pColl);
+    if( iCompare ){
+      if( bRev ) iCompare = -iCompare;
+      break;
+    }
+  }
+  aPermute = 0;
+  break;
+}
+
+/* Opcode: Jump P1 P2 P3 * *
+**
+** Jump to the instruction at address P1, P2, or P3 depending on whether
+** in the most recent OP_Compare instruction the P1 vector was less than
+** equal to, or greater than the P2 vector, respectively.
+*/
+case OP_Jump: {             /* jump */
+  if( iCompare<0 ){
+    pc = pOp->p1 - 1;  VdbeBranchTaken(0,3);
+  }else if( iCompare==0 ){
+    pc = pOp->p2 - 1;  VdbeBranchTaken(1,3);
+  }else{
+    pc = pOp->p3 - 1;  VdbeBranchTaken(2,3);
+  }
+  break;
+}
+
+/* Opcode: And P1 P2 P3 * *
+** Synopsis: r[P3]=(r[P1] && r[P2])
+**
+** Take the logical AND of the values in registers P1 and P2 and
+** write the result into register P3.
+**
+** If either P1 or P2 is 0 (false) then the result is 0 even if
+** the other input is NULL.  A NULL and true or two NULLs give
+** a NULL output.
+*/
+/* Opcode: Or P1 P2 P3 * *
+** Synopsis: r[P3]=(r[P1] || r[P2])
+**
+** Take the logical OR of the values in register P1 and P2 and
+** store the answer in register P3.
+**
+** If either P1 or P2 is nonzero (true) then the result is 1 (true)
+** even if the other input is NULL.  A NULL and false or two NULLs
+** give a NULL output.
+*/
+case OP_And:              /* same as TK_AND, in1, in2, out3 */
+case OP_Or: {             /* same as TK_OR, in1, in2, out3 */
+  int v1;    /* Left operand:  0==FALSE, 1==TRUE, 2==UNKNOWN or NULL */
+  int v2;    /* Right operand: 0==FALSE, 1==TRUE, 2==UNKNOWN or NULL */
+
+  pIn1 = &aMem[pOp->p1];
+  if( pIn1->flags & MEM_Null ){
+    v1 = 2;
+  }else{
+    v1 = sqlite3VdbeIntValue(pIn1)!=0;
+  }
+  pIn2 = &aMem[pOp->p2];
+  if( pIn2->flags & MEM_Null ){
+    v2 = 2;
+  }else{
+    v2 = sqlite3VdbeIntValue(pIn2)!=0;
+  }
+  if( pOp->opcode==OP_And ){
+    static const unsigned char and_logic[] = { 0, 0, 0, 0, 1, 2, 0, 2, 2 };
+    v1 = and_logic[v1*3+v2];
+  }else{
+    static const unsigned char or_logic[] = { 0, 1, 2, 1, 1, 1, 2, 1, 2 };
+    v1 = or_logic[v1*3+v2];
+  }
+  pOut = &aMem[pOp->p3];
+  if( v1==2 ){
+    MemSetTypeFlag(pOut, MEM_Null);
+  }else{
+    pOut->u.i = v1;
+    MemSetTypeFlag(pOut, MEM_Int);
+  }
+  break;
+}
+
+/* Opcode: Not P1 P2 * * *
+** Synopsis: r[P2]= !r[P1]
+**
+** Interpret the value in register P1 as a boolean value.  Store the
+** boolean complement in register P2.  If the value in register P1 is 
+** NULL, then a NULL is stored in P2.
+*/
+case OP_Not: {                /* same as TK_NOT, in1, out2 */
+  pIn1 = &aMem[pOp->p1];
+  pOut = &aMem[pOp->p2];
+  sqlite3VdbeMemSetNull(pOut);
+  if( (pIn1->flags & MEM_Null)==0 ){
+    pOut->flags = MEM_Int;
+    pOut->u.i = !sqlite3VdbeIntValue(pIn1);
+  }
+  break;
+}
+
+/* Opcode: BitNot P1 P2 * * *
+** Synopsis: r[P1]= ~r[P1]
+**
+** Interpret the content of register P1 as an integer.  Store the
+** ones-complement of the P1 value into register P2.  If P1 holds
+** a NULL then store a NULL in P2.
+*/
+case OP_BitNot: {             /* same as TK_BITNOT, in1, out2 */
+  pIn1 = &aMem[pOp->p1];
+  pOut = &aMem[pOp->p2];
+  sqlite3VdbeMemSetNull(pOut);
+  if( (pIn1->flags & MEM_Null)==0 ){
+    pOut->flags = MEM_Int;
+    pOut->u.i = ~sqlite3VdbeIntValue(pIn1);
+  }
+  break;
+}
+
+/* Opcode: Once P1 P2 * * *
+**
+** Check the "once" flag number P1. If it is set, jump to instruction P2. 
+** Otherwise, set the flag and fall through to the next instruction.
+** In other words, this opcode causes all following opcodes up through P2
+** (but not including P2) to run just once and to be skipped on subsequent
+** times through the loop.
+**
+** All "once" flags are initially cleared whenever a prepared statement
+** first begins to run.
+*/
+case OP_Once: {             /* jump */
+  assert( pOp->p1<p->nOnceFlag );
+  VdbeBranchTaken(p->aOnceFlag[pOp->p1]!=0, 2);
+  if( p->aOnceFlag[pOp->p1] ){
+    pc = pOp->p2-1;
+  }else{
+    p->aOnceFlag[pOp->p1] = 1;
+  }
+  break;
+}
+
+/* Opcode: If P1 P2 P3 * *
+**
+** Jump to P2 if the value in register P1 is true.  The value
+** is considered true if it is numeric and non-zero.  If the value
+** in P1 is NULL then take the jump if and only if P3 is non-zero.
+*/
+/* Opcode: IfNot P1 P2 P3 * *
+**
+** Jump to P2 if the value in register P1 is False.  The value
+** is considered false if it has a numeric value of zero.  If the value
+** in P1 is NULL then take the jump if and only if P3 is non-zero.
+*/
+case OP_If:                 /* jump, in1 */
+case OP_IfNot: {            /* jump, in1 */
+  int c;
+  pIn1 = &aMem[pOp->p1];
+  if( pIn1->flags & MEM_Null ){
+    c = pOp->p3;
+  }else{
+#ifdef SQLITE_OMIT_FLOATING_POINT
+    c = sqlite3VdbeIntValue(pIn1)!=0;
+#else
+    c = sqlite3VdbeRealValue(pIn1)!=0.0;
+#endif
+    if( pOp->opcode==OP_IfNot ) c = !c;
+  }
+  VdbeBranchTaken(c!=0, 2);
+  if( c ){
+    pc = pOp->p2-1;
+  }
+  break;
+}
+
+/* Opcode: IsNull P1 P2 * * *
+** Synopsis:  if r[P1]==NULL goto P2
+**
+** Jump to P2 if the value in register P1 is NULL.
+*/
+case OP_IsNull: {            /* same as TK_ISNULL, jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  VdbeBranchTaken( (pIn1->flags & MEM_Null)!=0, 2);
+  if( (pIn1->flags & MEM_Null)!=0 ){
+    pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: NotNull P1 P2 * * *
+** Synopsis: if r[P1]!=NULL goto P2
+**
+** Jump to P2 if the value in register P1 is not NULL.  
+*/
+case OP_NotNull: {            /* same as TK_NOTNULL, jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  VdbeBranchTaken( (pIn1->flags & MEM_Null)==0, 2);
+  if( (pIn1->flags & MEM_Null)==0 ){
+    pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: Column P1 P2 P3 P4 P5
+** Synopsis:  r[P3]=PX
+**
+** Interpret the data that cursor P1 points to as a structure built using
