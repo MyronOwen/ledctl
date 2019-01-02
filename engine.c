@@ -71704,3 +71704,215 @@ case OP_Function: {
 
   REGISTER_TRACE(pOp->p3, ctx.pOut);
   UPDATE_MAX_BLOBSIZE(ctx.pOut);
+  break;
+}
+
+/* Opcode: BitAnd P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P1]&r[P2]
+**
+** Take the bit-wise AND of the values in register P1 and P2 and
+** store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+/* Opcode: BitOr P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P1]|r[P2]
+**
+** Take the bit-wise OR of the values in register P1 and P2 and
+** store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+/* Opcode: ShiftLeft P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P2]<<r[P1]
+**
+** Shift the integer value in register P2 to the left by the
+** number of bits specified by the integer in register P1.
+** Store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+/* Opcode: ShiftRight P1 P2 P3 * *
+** Synopsis:  r[P3]=r[P2]>>r[P1]
+**
+** Shift the integer value in register P2 to the right by the
+** number of bits specified by the integer in register P1.
+** Store the result in register P3.
+** If either input is NULL, the result is NULL.
+*/
+case OP_BitAnd:                 /* same as TK_BITAND, in1, in2, out3 */
+case OP_BitOr:                  /* same as TK_BITOR, in1, in2, out3 */
+case OP_ShiftLeft:              /* same as TK_LSHIFT, in1, in2, out3 */
+case OP_ShiftRight: {           /* same as TK_RSHIFT, in1, in2, out3 */
+  i64 iA;
+  u64 uA;
+  i64 iB;
+  u8 op;
+
+  pIn1 = &aMem[pOp->p1];
+  pIn2 = &aMem[pOp->p2];
+  pOut = &aMem[pOp->p3];
+  if( (pIn1->flags | pIn2->flags) & MEM_Null ){
+    sqlite3VdbeMemSetNull(pOut);
+    break;
+  }
+  iA = sqlite3VdbeIntValue(pIn2);
+  iB = sqlite3VdbeIntValue(pIn1);
+  op = pOp->opcode;
+  if( op==OP_BitAnd ){
+    iA &= iB;
+  }else if( op==OP_BitOr ){
+    iA |= iB;
+  }else if( iB!=0 ){
+    assert( op==OP_ShiftRight || op==OP_ShiftLeft );
+
+    /* If shifting by a negative amount, shift in the other direction */
+    if( iB<0 ){
+      assert( OP_ShiftRight==OP_ShiftLeft+1 );
+      op = 2*OP_ShiftLeft + 1 - op;
+      iB = iB>(-64) ? -iB : 64;
+    }
+
+    if( iB>=64 ){
+      iA = (iA>=0 || op==OP_ShiftLeft) ? 0 : -1;
+    }else{
+      memcpy(&uA, &iA, sizeof(uA));
+      if( op==OP_ShiftLeft ){
+        uA <<= iB;
+      }else{
+        uA >>= iB;
+        /* Sign-extend on a right shift of a negative number */
+        if( iA<0 ) uA |= ((((u64)0xffffffff)<<32)|0xffffffff) << (64-iB);
+      }
+      memcpy(&iA, &uA, sizeof(iA));
+    }
+  }
+  pOut->u.i = iA;
+  MemSetTypeFlag(pOut, MEM_Int);
+  break;
+}
+
+/* Opcode: AddImm  P1 P2 * * *
+** Synopsis:  r[P1]=r[P1]+P2
+** 
+** Add the constant P2 to the value in register P1.
+** The result is always an integer.
+**
+** To force any register to be an integer, just add 0.
+*/
+case OP_AddImm: {            /* in1 */
+  pIn1 = &aMem[pOp->p1];
+  memAboutToChange(p, pIn1);
+  sqlite3VdbeMemIntegerify(pIn1);
+  pIn1->u.i += pOp->p2;
+  break;
+}
+
+/* Opcode: MustBeInt P1 P2 * * *
+** 
+** Force the value in register P1 to be an integer.  If the value
+** in P1 is not an integer and cannot be converted into an integer
+** without data loss, then jump immediately to P2, or if P2==0
+** raise an SQLITE_MISMATCH exception.
+*/
+case OP_MustBeInt: {            /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  if( (pIn1->flags & MEM_Int)==0 ){
+    applyAffinity(pIn1, SQLITE_AFF_NUMERIC, encoding);
+    VdbeBranchTaken((pIn1->flags&MEM_Int)==0, 2);
+    if( (pIn1->flags & MEM_Int)==0 ){
+      if( pOp->p2==0 ){
+        rc = SQLITE_MISMATCH;
+        goto abort_due_to_error;
+      }else{
+        pc = pOp->p2 - 1;
+        break;
+      }
+    }
+  }
+  MemSetTypeFlag(pIn1, MEM_Int);
+  break;
+}
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/* Opcode: RealAffinity P1 * * * *
+**
+** If register P1 holds an integer convert it to a real value.
+**
+** This opcode is used when extracting information from a column that
+** has REAL affinity.  Such column values may still be stored as
+** integers, for space efficiency, but after extraction we want them
+** to have only a real value.
+*/
+case OP_RealAffinity: {                  /* in1 */
+  pIn1 = &aMem[pOp->p1];
+  if( pIn1->flags & MEM_Int ){
+    sqlite3VdbeMemRealify(pIn1);
+  }
+  break;
+}
+#endif
+
+#ifndef SQLITE_OMIT_CAST
+/* Opcode: Cast P1 P2 * * *
+** Synopsis: affinity(r[P1])
+**
+** Force the value in register P1 to be the type defined by P2.
+** 
+** <ul>
+** <li value="97"> TEXT
+** <li value="98"> BLOB
+** <li value="99"> NUMERIC
+** <li value="100"> INTEGER
+** <li value="101"> REAL
+** </ul>
+**
+** A NULL value is not changed by this routine.  It remains NULL.
+*/
+case OP_Cast: {                  /* in1 */
+  assert( pOp->p2>=SQLITE_AFF_NONE && pOp->p2<=SQLITE_AFF_REAL );
+  testcase( pOp->p2==SQLITE_AFF_TEXT );
+  testcase( pOp->p2==SQLITE_AFF_NONE );
+  testcase( pOp->p2==SQLITE_AFF_NUMERIC );
+  testcase( pOp->p2==SQLITE_AFF_INTEGER );
+  testcase( pOp->p2==SQLITE_AFF_REAL );
+  pIn1 = &aMem[pOp->p1];
+  memAboutToChange(p, pIn1);
+  rc = ExpandBlob(pIn1);
+  sqlite3VdbeMemCast(pIn1, pOp->p2, encoding);
+  UPDATE_MAX_BLOBSIZE(pIn1);
+  break;
+}
+#endif /* SQLITE_OMIT_CAST */
+
+/* Opcode: Lt P1 P2 P3 P4 P5
+** Synopsis: if r[P1]<r[P3] goto P2
+**
+** Compare the values in register P1 and P3.  If reg(P3)<reg(P1) then
+** jump to address P2.  
+**
+** If the SQLITE_JUMPIFNULL bit of P5 is set and either reg(P1) or
+** reg(P3) is NULL then take the jump.  If the SQLITE_JUMPIFNULL 
+** bit is clear then fall through if either operand is NULL.
+**
+** The SQLITE_AFF_MASK portion of P5 must be an affinity character -
+** SQLITE_AFF_TEXT, SQLITE_AFF_INTEGER, and so forth. An attempt is made 
+** to coerce both inputs according to this affinity before the
+** comparison is made. If the SQLITE_AFF_MASK is 0x00, then numeric
+** affinity is used. Note that the affinity conversions are stored
+** back into the input registers P1 and P3.  So this opcode can cause
+** persistent changes to registers P1 and P3.
+**
+** Once any conversions have taken place, and neither value is NULL, 
+** the values are compared. If both values are blobs then memcmp() is
+** used to determine the results of the comparison.  If both values
+** are text, then the appropriate collating function specified in
+** P4 is  used to do the comparison.  If P4 is not specified then
+** memcmp() is used to compare text string.  If both values are
+** numeric, then a numeric comparison is used. If the two values
+** are of different types, then numbers are considered less than
+** strings and strings are considered less than blobs.
+**
+** If the SQLITE_STOREP2 bit of P5 is set, then do not jump.  Instead,
+** store a boolean result (either 0, or 1, or NULL) in register P2.
+**
+** If the SQLITE_NULLEQ bit is set in P5, then NULL values are considered
+** equal to one another, provided that they do not have their MEM_Cleared
+** bit set.
