@@ -74951,3 +74951,202 @@ case OP_IdxRowid: {              /* out2-prerelease */
 ** the index that P1 is currently pointing to, ignoring the PRIMARY KEY or
 ** ROWID on the P1 index.
 **
+** If the P1 index entry is less than the key value then jump to P2.
+** Otherwise fall through to the next instruction.
+*/
+/* Opcode: IdxLE P1 P2 P3 P4 P5
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index 
+** key that omits the PRIMARY KEY or ROWID.  Compare this key value against
+** the index that P1 is currently pointing to, ignoring the PRIMARY KEY or
+** ROWID on the P1 index.
+**
+** If the P1 index entry is less than or equal to the key value then jump
+** to P2. Otherwise fall through to the next instruction.
+*/
+case OP_IdxLE:          /* jump */
+case OP_IdxGT:          /* jump */
+case OP_IdxLT:          /* jump */
+case OP_IdxGE:  {       /* jump */
+  VdbeCursor *pC;
+  int res;
+  UnpackedRecord r;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->isOrdered );
+  assert( pC->pCursor!=0);
+  assert( pC->deferredMoveto==0 );
+  assert( pOp->p5==0 || pOp->p5==1 );
+  assert( pOp->p4type==P4_INT32 );
+  r.pKeyInfo = pC->pKeyInfo;
+  r.nField = (u16)pOp->p4.i;
+  if( pOp->opcode<OP_IdxLT ){
+    assert( pOp->opcode==OP_IdxLE || pOp->opcode==OP_IdxGT );
+    r.default_rc = -1;
+  }else{
+    assert( pOp->opcode==OP_IdxGE || pOp->opcode==OP_IdxLT );
+    r.default_rc = 0;
+  }
+  r.aMem = &aMem[pOp->p3];
+#ifdef SQLITE_DEBUG
+  { int i; for(i=0; i<r.nField; i++) assert( memIsValid(&r.aMem[i]) ); }
+#endif
+  res = 0;  /* Not needed.  Only used to silence a warning. */
+  rc = sqlite3VdbeIdxKeyCompare(db, pC, &r, &res);
+  assert( (OP_IdxLE&1)==(OP_IdxLT&1) && (OP_IdxGE&1)==(OP_IdxGT&1) );
+  if( (pOp->opcode&1)==(OP_IdxLT&1) ){
+    assert( pOp->opcode==OP_IdxLE || pOp->opcode==OP_IdxLT );
+    res = -res;
+  }else{
+    assert( pOp->opcode==OP_IdxGE || pOp->opcode==OP_IdxGT );
+    res++;
+  }
+  VdbeBranchTaken(res>0,2);
+  if( res>0 ){
+    pc = pOp->p2 - 1 ;
+  }
+  break;
+}
+
+/* Opcode: Destroy P1 P2 P3 * *
+**
+** Delete an entire database table or index whose root page in the database
+** file is given by P1.
+**
+** The table being destroyed is in the main database file if P3==0.  If
+** P3==1 then the table to be clear is in the auxiliary database file
+** that is used to store tables create using CREATE TEMPORARY TABLE.
+**
+** If AUTOVACUUM is enabled then it is possible that another root page
+** might be moved into the newly deleted root page in order to keep all
+** root pages contiguous at the beginning of the database.  The former
+** value of the root page that moved - its value before the move occurred -
+** is stored in register P2.  If no page 
+** movement was required (because the table being dropped was already 
+** the last one in the database) then a zero is stored in register P2.
+** If AUTOVACUUM is disabled then a zero is stored in register P2.
+**
+** See also: Clear
+*/
+case OP_Destroy: {     /* out2-prerelease */
+  int iMoved;
+  int iCnt;
+  Vdbe *pVdbe;
+  int iDb;
+
+  assert( p->readOnly==0 );
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  iCnt = 0;
+  for(pVdbe=db->pVdbe; pVdbe; pVdbe = pVdbe->pNext){
+    if( pVdbe->magic==VDBE_MAGIC_RUN && pVdbe->bIsReader 
+     && pVdbe->inVtabMethod<2 && pVdbe->pc>=0 
+    ){
+      iCnt++;
+    }
+  }
+#else
+  iCnt = db->nVdbeRead;
+#endif
+  pOut->flags = MEM_Null;
+  if( iCnt>1 ){
+    rc = SQLITE_LOCKED;
+    p->errorAction = OE_Abort;
+  }else{
+    iDb = pOp->p3;
+    assert( iCnt==1 );
+    assert( DbMaskTest(p->btreeMask, iDb) );
+    iMoved = 0;  /* Not needed.  Only to silence a warning. */
+    rc = sqlite3BtreeDropTable(db->aDb[iDb].pBt, pOp->p1, &iMoved);
+    pOut->flags = MEM_Int;
+    pOut->u.i = iMoved;
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( rc==SQLITE_OK && iMoved!=0 ){
+      sqlite3RootPageMoved(db, iDb, iMoved, pOp->p1);
+      /* All OP_Destroy operations occur on the same btree */
+      assert( resetSchemaOnFault==0 || resetSchemaOnFault==iDb+1 );
+      resetSchemaOnFault = iDb+1;
+    }
+#endif
+  }
+  break;
+}
+
+/* Opcode: Clear P1 P2 P3
+**
+** Delete all contents of the database table or index whose root page
+** in the database file is given by P1.  But, unlike Destroy, do not
+** remove the table or index from the database file.
+**
+** The table being clear is in the main database file if P2==0.  If
+** P2==1 then the table to be clear is in the auxiliary database file
+** that is used to store tables create using CREATE TEMPORARY TABLE.
+**
+** If the P3 value is non-zero, then the table referred to must be an
+** intkey table (an SQL table, not an index). In this case the row change 
+** count is incremented by the number of rows in the table being cleared. 
+** If P3 is greater than zero, then the value stored in register P3 is
+** also incremented by the number of rows in the table being cleared.
+**
+** See also: Destroy
+*/
+case OP_Clear: {
+  int nChange;
+ 
+  nChange = 0;
+  assert( p->readOnly==0 );
+  assert( DbMaskTest(p->btreeMask, pOp->p2) );
+  rc = sqlite3BtreeClearTable(
+      db->aDb[pOp->p2].pBt, pOp->p1, (pOp->p3 ? &nChange : 0)
+  );
+  if( pOp->p3 ){
+    p->nChange += nChange;
+    if( pOp->p3>0 ){
+      assert( memIsValid(&aMem[pOp->p3]) );
+      memAboutToChange(p, &aMem[pOp->p3]);
+      aMem[pOp->p3].u.i += nChange;
+    }
+  }
+  break;
+}
+
+/* Opcode: ResetSorter P1 * * * *
+**
+** Delete all contents from the ephemeral table or sorter
+** that is open on cursor P1.
+**
+** This opcode only works for cursors used for sorting and
+** opened with OP_OpenEphemeral or OP_SorterOpen.
+*/
+case OP_ResetSorter: {
+  VdbeCursor *pC;
+ 
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  if( pC->pSorter ){
+    sqlite3VdbeSorterReset(db, pC->pSorter);
+  }else{
+    assert( pC->isEphemeral );
+    rc = sqlite3BtreeClearTableOfCursor(pC->pCursor);
+  }
+  break;
+}
+
+/* Opcode: CreateTable P1 P2 * * *
+** Synopsis: r[P2]=root iDb=P1
+**
+** Allocate a new table in the main database file if P1==0 or in the
+** auxiliary database file if P1==1 or in an attached database if
+** P1>1.  Write the root page number of the new table into
+** register P2
+**
+** The difference between a table and an index is this:  A table must
+** have a 4-byte integer key and can have arbitrary data.  An index
+** has an arbitrary key but no data.
+**
+** See also: CreateIndex
+*/
+/* Opcode: CreateIndex P1 P2 * * *
