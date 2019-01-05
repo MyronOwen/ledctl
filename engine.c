@@ -74263,3 +74263,218 @@ case OP_InsertInt: {
   seekResult = ((pOp->p5 & OPFLAG_USESEEKRESULT) ? pC->seekResult : 0);
   if( pData->flags & MEM_Zero ){
     nZero = pData->u.nZero;
+  }else{
+    nZero = 0;
+  }
+  rc = sqlite3BtreeInsert(pC->pCursor, 0, iKey,
+                          pData->z, pData->n, nZero,
+                          (pOp->p5 & OPFLAG_APPEND)!=0, seekResult
+  );
+  pC->deferredMoveto = 0;
+  pC->cacheStatus = CACHE_STALE;
+
+  /* Invoke the update-hook if required. */
+  if( rc==SQLITE_OK && db->xUpdateCallback && pOp->p4.z ){
+    zDb = db->aDb[pC->iDb].zName;
+    zTbl = pOp->p4.z;
+    op = ((pOp->p5 & OPFLAG_ISUPDATE) ? SQLITE_UPDATE : SQLITE_INSERT);
+    assert( pC->isTable );
+    db->xUpdateCallback(db->pUpdateArg, op, zDb, zTbl, iKey);
+    assert( pC->iDb>=0 );
+  }
+  break;
+}
+
+/* Opcode: Delete P1 P2 * P4 *
+**
+** Delete the record at which the P1 cursor is currently pointing.
+**
+** The cursor will be left pointing at either the next or the previous
+** record in the table. If it is left pointing at the next record, then
+** the next Next instruction will be a no-op.  Hence it is OK to delete
+** a record from within a Next loop.
+**
+** If the OPFLAG_NCHANGE flag of P2 is set, then the row change count is
+** incremented (otherwise not).
+**
+** P1 must not be pseudo-table.  It has to be a real table with
+** multiple rows.
+**
+** If P4 is not NULL, then it is the name of the table that P1 is
+** pointing to.  The update hook will be invoked, if it exists.
+** If P4 is not NULL then the P1 cursor must have been positioned
+** using OP_NotFound prior to invoking this opcode.
+*/
+case OP_Delete: {
+  VdbeCursor *pC;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->pCursor!=0 );  /* Only valid for real tables, no pseudotables */
+  assert( pC->deferredMoveto==0 );
+
+#ifdef SQLITE_DEBUG
+  /* The seek operation that positioned the cursor prior to OP_Delete will
+  ** have also set the pC->movetoTarget field to the rowid of the row that
+  ** is being deleted */
+  if( pOp->p4.z && pC->isTable ){
+    i64 iKey = 0;
+    sqlite3BtreeKeySize(pC->pCursor, &iKey);
+    assert( pC->movetoTarget==iKey ); 
+  }
+#endif
+ 
+  rc = sqlite3BtreeDelete(pC->pCursor);
+  pC->cacheStatus = CACHE_STALE;
+
+  /* Invoke the update-hook if required. */
+  if( rc==SQLITE_OK && db->xUpdateCallback && pOp->p4.z && pC->isTable ){
+    db->xUpdateCallback(db->pUpdateArg, SQLITE_DELETE,
+                        db->aDb[pC->iDb].zName, pOp->p4.z, pC->movetoTarget);
+    assert( pC->iDb>=0 );
+  }
+  if( pOp->p2 & OPFLAG_NCHANGE ) p->nChange++;
+  break;
+}
+/* Opcode: ResetCount * * * * *
+**
+** The value of the change counter is copied to the database handle
+** change counter (returned by subsequent calls to sqlite3_changes()).
+** Then the VMs internal change counter resets to 0.
+** This is used by trigger programs.
+*/
+case OP_ResetCount: {
+  sqlite3VdbeSetChanges(db, p->nChange);
+  p->nChange = 0;
+  break;
+}
+
+/* Opcode: SorterCompare P1 P2 P3 P4
+** Synopsis:  if key(P1)!=trim(r[P3],P4) goto P2
+**
+** P1 is a sorter cursor. This instruction compares a prefix of the
+** record blob in register P3 against a prefix of the entry that 
+** the sorter cursor currently points to.  Only the first P4 fields
+** of r[P3] and the sorter record are compared.
+**
+** If either P3 or the sorter contains a NULL in one of their significant
+** fields (not counting the P4 fields at the end which are ignored) then
+** the comparison is assumed to be equal.
+**
+** Fall through to next instruction if the two records compare equal to
+** each other.  Jump to P2 if they are different.
+*/
+case OP_SorterCompare: {
+  VdbeCursor *pC;
+  int res;
+  int nKeyCol;
+
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  assert( pOp->p4type==P4_INT32 );
+  pIn3 = &aMem[pOp->p3];
+  nKeyCol = pOp->p4.i;
+  res = 0;
+  rc = sqlite3VdbeSorterCompare(pC, pIn3, nKeyCol, &res);
+  VdbeBranchTaken(res!=0,2);
+  if( res ){
+    pc = pOp->p2-1;
+  }
+  break;
+};
+
+/* Opcode: SorterData P1 P2 P3 * *
+** Synopsis: r[P2]=data
+**
+** Write into register P2 the current sorter data for sorter cursor P1.
+** Then clear the column header cache on cursor P3.
+**
+** This opcode is normally use to move a record out of the sorter and into
+** a register that is the source for a pseudo-table cursor created using
+** OpenPseudo.  That pseudo-table cursor is the one that is identified by
+** parameter P3.  Clearing the P3 column cache as part of this opcode saves
+** us from having to issue a separate NullRow instruction to clear that cache.
+*/
+case OP_SorterData: {
+  VdbeCursor *pC;
+
+  pOut = &aMem[pOp->p2];
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  rc = sqlite3VdbeSorterRowkey(pC, pOut);
+  assert( rc!=SQLITE_OK || (pOut->flags & MEM_Blob) );
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  p->apCsr[pOp->p3]->cacheStatus = CACHE_STALE;
+  break;
+}
+
+/* Opcode: RowData P1 P2 * * *
+** Synopsis: r[P2]=data
+**
+** Write into register P2 the complete row data for cursor P1.
+** There is no interpretation of the data.  
+** It is just copied onto the P2 register exactly as 
+** it is found in the database file.
+**
+** If the P1 cursor must be pointing to a valid row (not a NULL row)
+** of a real table, not a pseudo-table.
+*/
+/* Opcode: RowKey P1 P2 * * *
+** Synopsis: r[P2]=key
+**
+** Write into register P2 the complete row key for cursor P1.
+** There is no interpretation of the data.  
+** The key is copied onto the P2 register exactly as 
+** it is found in the database file.
+**
+** If the P1 cursor must be pointing to a valid row (not a NULL row)
+** of a real table, not a pseudo-table.
+*/
+case OP_RowKey:
+case OP_RowData: {
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  u32 n;
+  i64 n64;
+
+  pOut = &aMem[pOp->p2];
+  memAboutToChange(p, pOut);
+
+  /* Note that RowKey and RowData are really exactly the same instruction */
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC)==0 );
+  assert( pC->isTable || pOp->opcode!=OP_RowData );
+  assert( pC->isTable==0 || pOp->opcode==OP_RowData );
+  assert( pC!=0 );
+  assert( pC->nullRow==0 );
+  assert( pC->pseudoTableReg==0 );
+  assert( pC->pCursor!=0 );
+  pCrsr = pC->pCursor;
+
+  /* The OP_RowKey and OP_RowData opcodes always follow OP_NotExists or
+  ** OP_Rewind/Op_Next with no intervening instructions that might invalidate
+  ** the cursor.  If this where not the case, on of the following assert()s
+  ** would fail.  Should this ever change (because of changes in the code
+  ** generator) then the fix would be to insert a call to
+  ** sqlite3VdbeCursorMoveto().
+  */
+  assert( pC->deferredMoveto==0 );
+  assert( sqlite3BtreeCursorIsValid(pCrsr) );
+#if 0  /* Not required due to the previous to assert() statements */
+  rc = sqlite3VdbeCursorMoveto(pC);
+  if( rc!=SQLITE_OK ) goto abort_due_to_error;
+#endif
+
+  if( pC->isTable==0 ){
+    assert( !pC->isTable );
+    VVA_ONLY(rc =) sqlite3BtreeKeySize(pCrsr, &n64);
+    assert( rc==SQLITE_OK );    /* True because of CursorMoveto() call above */
+    if( n64>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+      goto too_big;
+    }
+    n = (u32)n64;
+  }else{
+    VVA_ONLY(rc =) sqlite3BtreeDataSize(pCrsr, &n);
+    assert( rc==SQLITE_OK );    /* DataSize() cannot fail */
