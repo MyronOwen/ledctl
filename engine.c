@@ -74704,3 +74704,250 @@ case OP_Rewind: {        /* jump */
 /* Opcode: Prev P1 P2 P3 P4 P5
 **
 ** Back up cursor P1 so that it points to the previous key/data pair in its
+** table or index.  If there is no previous key/value pairs then fall through
+** to the following instruction.  But if the cursor backup was successful,
+** jump immediately to P2.
+**
+**
+** The Prev opcode is only valid following an SeekLT, SeekLE, or
+** OP_Last opcode used to position the cursor.  Prev is not allowed
+** to follow SeekGT, SeekGE, or OP_Rewind.
+**
+** The P1 cursor must be for a real table, not a pseudo-table.  If P1 is
+** not open then the behavior is undefined.
+**
+** The P3 value is a hint to the btree implementation. If P3==1, that
+** means P1 is an SQL index and that this instruction could have been
+** omitted if that index had been unique.  P3 is usually 0.  P3 is
+** always either 0 or 1.
+**
+** P4 is always of type P4_ADVANCE. The function pointer points to
+** sqlite3BtreePrevious().
+**
+** If P5 is positive and the jump is taken, then event counter
+** number P5-1 in the prepared statement is incremented.
+*/
+/* Opcode: PrevIfOpen P1 P2 P3 P4 P5
+**
+** This opcode works just like Prev except that if cursor P1 is not
+** open it behaves a no-op.
+*/
+case OP_SorterNext: {  /* jump */
+  VdbeCursor *pC;
+  int res;
+
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  res = 0;
+  rc = sqlite3VdbeSorterNext(db, pC, &res);
+  goto next_tail;
+case OP_PrevIfOpen:    /* jump */
+case OP_NextIfOpen:    /* jump */
+  if( p->apCsr[pOp->p1]==0 ) break;
+  /* Fall through */
+case OP_Prev:          /* jump */
+case OP_Next:          /* jump */
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p5<ArraySize(p->aCounter) );
+  pC = p->apCsr[pOp->p1];
+  res = pOp->p3;
+  assert( pC!=0 );
+  assert( pC->deferredMoveto==0 );
+  assert( pC->pCursor );
+  assert( res==0 || (res==1 && pC->isTable==0) );
+  testcase( res==1 );
+  assert( pOp->opcode!=OP_Next || pOp->p4.xAdvance==sqlite3BtreeNext );
+  assert( pOp->opcode!=OP_Prev || pOp->p4.xAdvance==sqlite3BtreePrevious );
+  assert( pOp->opcode!=OP_NextIfOpen || pOp->p4.xAdvance==sqlite3BtreeNext );
+  assert( pOp->opcode!=OP_PrevIfOpen || pOp->p4.xAdvance==sqlite3BtreePrevious);
+
+  /* The Next opcode is only used after SeekGT, SeekGE, and Rewind.
+  ** The Prev opcode is only used after SeekLT, SeekLE, and Last. */
+  assert( pOp->opcode!=OP_Next || pOp->opcode!=OP_NextIfOpen
+       || pC->seekOp==OP_SeekGT || pC->seekOp==OP_SeekGE
+       || pC->seekOp==OP_Rewind || pC->seekOp==OP_Found);
+  assert( pOp->opcode!=OP_Prev || pOp->opcode!=OP_PrevIfOpen
+       || pC->seekOp==OP_SeekLT || pC->seekOp==OP_SeekLE
+       || pC->seekOp==OP_Last );
+
+  rc = pOp->p4.xAdvance(pC->pCursor, &res);
+next_tail:
+  pC->cacheStatus = CACHE_STALE;
+  VdbeBranchTaken(res==0,2);
+  if( res==0 ){
+    pC->nullRow = 0;
+    pc = pOp->p2 - 1;
+    p->aCounter[pOp->p5]++;
+#ifdef SQLITE_TEST
+    sqlite3_search_count++;
+#endif
+  }else{
+    pC->nullRow = 1;
+  }
+  goto check_for_interrupt;
+}
+
+/* Opcode: IdxInsert P1 P2 P3 * P5
+** Synopsis: key=r[P2]
+**
+** Register P2 holds an SQL index key made using the
+** MakeRecord instructions.  This opcode writes that key
+** into the index P1.  Data for the entry is nil.
+**
+** P3 is a flag that provides a hint to the b-tree layer that this
+** insert is likely to be an append.
+**
+** If P5 has the OPFLAG_NCHANGE bit set, then the change counter is
+** incremented by this instruction.  If the OPFLAG_NCHANGE bit is clear,
+** then the change counter is unchanged.
+**
+** If P5 has the OPFLAG_USESEEKRESULT bit set, then the cursor must have
+** just done a seek to the spot where the new entry is to be inserted.
+** This flag avoids doing an extra seek.
+**
+** This instruction only works for indices.  The equivalent instruction
+** for tables is OP_Insert.
+*/
+case OP_SorterInsert:       /* in2 */
+case OP_IdxInsert: {        /* in2 */
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  int nKey;
+  const char *zKey;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( isSorter(pC)==(pOp->opcode==OP_SorterInsert) );
+  pIn2 = &aMem[pOp->p2];
+  assert( pIn2->flags & MEM_Blob );
+  pCrsr = pC->pCursor;
+  if( pOp->p5 & OPFLAG_NCHANGE ) p->nChange++;
+  assert( pCrsr!=0 );
+  assert( pC->isTable==0 );
+  rc = ExpandBlob(pIn2);
+  if( rc==SQLITE_OK ){
+    if( isSorter(pC) ){
+      rc = sqlite3VdbeSorterWrite(pC, pIn2);
+    }else{
+      nKey = pIn2->n;
+      zKey = pIn2->z;
+      rc = sqlite3BtreeInsert(pCrsr, zKey, nKey, "", 0, 0, pOp->p3, 
+          ((pOp->p5 & OPFLAG_USESEEKRESULT) ? pC->seekResult : 0)
+          );
+      assert( pC->deferredMoveto==0 );
+      pC->cacheStatus = CACHE_STALE;
+    }
+  }
+  break;
+}
+
+/* Opcode: IdxDelete P1 P2 P3 * *
+** Synopsis: key=r[P2@P3]
+**
+** The content of P3 registers starting at register P2 form
+** an unpacked index key. This opcode removes that entry from the 
+** index opened by cursor P1.
+*/
+case OP_IdxDelete: {
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  int res;
+  UnpackedRecord r;
+
+  assert( pOp->p3>0 );
+  assert( pOp->p2>0 && pOp->p2+pOp->p3<=(p->nMem-p->nCursor)+1 );
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  pCrsr = pC->pCursor;
+  assert( pCrsr!=0 );
+  assert( pOp->p5==0 );
+  r.pKeyInfo = pC->pKeyInfo;
+  r.nField = (u16)pOp->p3;
+  r.default_rc = 0;
+  r.aMem = &aMem[pOp->p2];
+#ifdef SQLITE_DEBUG
+  { int i; for(i=0; i<r.nField; i++) assert( memIsValid(&r.aMem[i]) ); }
+#endif
+  rc = sqlite3BtreeMovetoUnpacked(pCrsr, &r, 0, 0, &res);
+  if( rc==SQLITE_OK && res==0 ){
+    rc = sqlite3BtreeDelete(pCrsr);
+  }
+  assert( pC->deferredMoveto==0 );
+  pC->cacheStatus = CACHE_STALE;
+  break;
+}
+
+/* Opcode: IdxRowid P1 P2 * * *
+** Synopsis: r[P2]=rowid
+**
+** Write into register P2 an integer which is the last entry in the record at
+** the end of the index key pointed to by cursor P1.  This integer should be
+** the rowid of the table entry to which this index entry points.
+**
+** See also: Rowid, MakeRecord.
+*/
+case OP_IdxRowid: {              /* out2-prerelease */
+  BtCursor *pCrsr;
+  VdbeCursor *pC;
+  i64 rowid;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  pCrsr = pC->pCursor;
+  assert( pCrsr!=0 );
+  pOut->flags = MEM_Null;
+  assert( pC->isTable==0 );
+  assert( pC->deferredMoveto==0 );
+
+  /* sqlite3VbeCursorRestore() can only fail if the record has been deleted
+  ** out from under the cursor.  That will never happend for an IdxRowid
+  ** opcode, hence the NEVER() arround the check of the return value.
+  */
+  rc = sqlite3VdbeCursorRestore(pC);
+  if( NEVER(rc!=SQLITE_OK) ) goto abort_due_to_error;
+
+  if( !pC->nullRow ){
+    rowid = 0;  /* Not needed.  Only used to silence a warning. */
+    rc = sqlite3VdbeIdxRowid(db, pCrsr, &rowid);
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+    pOut->u.i = rowid;
+    pOut->flags = MEM_Int;
+  }
+  break;
+}
+
+/* Opcode: IdxGE P1 P2 P3 P4 P5
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index 
+** key that omits the PRIMARY KEY.  Compare this key value against the index 
+** that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID 
+** fields at the end.
+**
+** If the P1 index entry is greater than or equal to the key value
+** then jump to P2.  Otherwise fall through to the next instruction.
+*/
+/* Opcode: IdxGT P1 P2 P3 P4 P5
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index 
+** key that omits the PRIMARY KEY.  Compare this key value against the index 
+** that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID 
+** fields at the end.
+**
+** If the P1 index entry is greater than the key value
+** then jump to P2.  Otherwise fall through to the next instruction.
+*/
+/* Opcode: IdxLT P1 P2 P3 P4 P5
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index 
+** key that omits the PRIMARY KEY or ROWID.  Compare this key value against
+** the index that P1 is currently pointing to, ignoring the PRIMARY KEY or
+** ROWID on the P1 index.
+**
