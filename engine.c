@@ -74478,3 +74478,229 @@ case OP_RowData: {
   }else{
     VVA_ONLY(rc =) sqlite3BtreeDataSize(pCrsr, &n);
     assert( rc==SQLITE_OK );    /* DataSize() cannot fail */
+    if( n>(u32)db->aLimit[SQLITE_LIMIT_LENGTH] ){
+      goto too_big;
+    }
+  }
+  testcase( n==0 );
+  if( sqlite3VdbeMemClearAndResize(pOut, MAX(n,32)) ){
+    goto no_mem;
+  }
+  pOut->n = n;
+  MemSetTypeFlag(pOut, MEM_Blob);
+  if( pC->isTable==0 ){
+    rc = sqlite3BtreeKey(pCrsr, 0, n, pOut->z);
+  }else{
+    rc = sqlite3BtreeData(pCrsr, 0, n, pOut->z);
+  }
+  pOut->enc = SQLITE_UTF8;  /* In case the blob is ever cast to text */
+  UPDATE_MAX_BLOBSIZE(pOut);
+  REGISTER_TRACE(pOp->p2, pOut);
+  break;
+}
+
+/* Opcode: Rowid P1 P2 * * *
+** Synopsis: r[P2]=rowid
+**
+** Store in register P2 an integer which is the key of the table entry that
+** P1 is currently point to.
+**
+** P1 can be either an ordinary table or a virtual table.  There used to
+** be a separate OP_VRowid opcode for use with virtual tables, but this
+** one opcode now works for both table types.
+*/
+case OP_Rowid: {                 /* out2-prerelease */
+  VdbeCursor *pC;
+  i64 v;
+  sqlite3_vtab *pVtab;
+  const sqlite3_module *pModule;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->pseudoTableReg==0 || pC->nullRow );
+  if( pC->nullRow ){
+    pOut->flags = MEM_Null;
+    break;
+  }else if( pC->deferredMoveto ){
+    v = pC->movetoTarget;
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  }else if( pC->pVtabCursor ){
+    pVtab = pC->pVtabCursor->pVtab;
+    pModule = pVtab->pModule;
+    assert( pModule->xRowid );
+    rc = pModule->xRowid(pC->pVtabCursor, &v);
+    sqlite3VtabImportErrmsg(p, pVtab);
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+  }else{
+    assert( pC->pCursor!=0 );
+    rc = sqlite3VdbeCursorRestore(pC);
+    if( rc ) goto abort_due_to_error;
+    if( pC->nullRow ){
+      pOut->flags = MEM_Null;
+      break;
+    }
+    rc = sqlite3BtreeKeySize(pC->pCursor, &v);
+    assert( rc==SQLITE_OK );  /* Always so because of CursorRestore() above */
+  }
+  pOut->u.i = v;
+  break;
+}
+
+/* Opcode: NullRow P1 * * * *
+**
+** Move the cursor P1 to a null row.  Any OP_Column operations
+** that occur while the cursor is on the null row will always
+** write a NULL.
+*/
+case OP_NullRow: {
+  VdbeCursor *pC;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  pC->nullRow = 1;
+  pC->cacheStatus = CACHE_STALE;
+  if( pC->pCursor ){
+    sqlite3BtreeClearCursor(pC->pCursor);
+  }
+  break;
+}
+
+/* Opcode: Last P1 P2 * * *
+**
+** The next use of the Rowid or Column or Prev instruction for P1 
+** will refer to the last entry in the database table or index.
+** If the table or index is empty and P2>0, then jump immediately to P2.
+** If P2 is 0 or if the table or index is not empty, fall through
+** to the following instruction.
+**
+** This opcode leaves the cursor configured to move in reverse order,
+** from the end toward the beginning.  In other words, the cursor is
+** configured to use Prev, not Next.
+*/
+case OP_Last: {        /* jump */
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  int res;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  pCrsr = pC->pCursor;
+  res = 0;
+  assert( pCrsr!=0 );
+  rc = sqlite3BtreeLast(pCrsr, &res);
+  pC->nullRow = (u8)res;
+  pC->deferredMoveto = 0;
+  pC->cacheStatus = CACHE_STALE;
+#ifdef SQLITE_DEBUG
+  pC->seekOp = OP_Last;
+#endif
+  if( pOp->p2>0 ){
+    VdbeBranchTaken(res!=0,2);
+    if( res ) pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+
+/* Opcode: Sort P1 P2 * * *
+**
+** This opcode does exactly the same thing as OP_Rewind except that
+** it increments an undocumented global variable used for testing.
+**
+** Sorting is accomplished by writing records into a sorting index,
+** then rewinding that index and playing it back from beginning to
+** end.  We use the OP_Sort opcode instead of OP_Rewind to do the
+** rewinding so that the global variable will be incremented and
+** regression tests can determine whether or not the optimizer is
+** correctly optimizing out sorts.
+*/
+case OP_SorterSort:    /* jump */
+case OP_Sort: {        /* jump */
+#ifdef SQLITE_TEST
+  sqlite3_sort_count++;
+  sqlite3_search_count--;
+#endif
+  p->aCounter[SQLITE_STMTSTATUS_SORT]++;
+  /* Fall through into OP_Rewind */
+}
+/* Opcode: Rewind P1 P2 * * *
+**
+** The next use of the Rowid or Column or Next instruction for P1 
+** will refer to the first entry in the database table or index.
+** If the table or index is empty, jump immediately to P2.
+** If the table or index is not empty, fall through to the following 
+** instruction.
+**
+** This opcode leaves the cursor configured to move in forward order,
+** from the beginning toward the end.  In other words, the cursor is
+** configured to use Next, not Prev.
+*/
+case OP_Rewind: {        /* jump */
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  int res;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( isSorter(pC)==(pOp->opcode==OP_SorterSort) );
+  res = 1;
+#ifdef SQLITE_DEBUG
+  pC->seekOp = OP_Rewind;
+#endif
+  if( isSorter(pC) ){
+    rc = sqlite3VdbeSorterRewind(pC, &res);
+  }else{
+    pCrsr = pC->pCursor;
+    assert( pCrsr );
+    rc = sqlite3BtreeFirst(pCrsr, &res);
+    pC->deferredMoveto = 0;
+    pC->cacheStatus = CACHE_STALE;
+  }
+  pC->nullRow = (u8)res;
+  assert( pOp->p2>0 && pOp->p2<p->nOp );
+  VdbeBranchTaken(res!=0,2);
+  if( res ){
+    pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: Next P1 P2 P3 P4 P5
+**
+** Advance cursor P1 so that it points to the next key/data pair in its
+** table or index.  If there are no more key/value pairs then fall through
+** to the following instruction.  But if the cursor advance was successful,
+** jump immediately to P2.
+**
+** The Next opcode is only valid following an SeekGT, SeekGE, or
+** OP_Rewind opcode used to position the cursor.  Next is not allowed
+** to follow SeekLT, SeekLE, or OP_Last.
+**
+** The P1 cursor must be for a real table, not a pseudo-table.  P1 must have
+** been opened prior to this opcode or the program will segfault.
+**
+** The P3 value is a hint to the btree implementation. If P3==1, that
+** means P1 is an SQL index and that this instruction could have been
+** omitted if that index had been unique.  P3 is usually 0.  P3 is
+** always either 0 or 1.
+**
+** P4 is always of type P4_ADVANCE. The function pointer points to
+** sqlite3BtreeNext().
+**
+** If P5 is positive and the jump is taken, then event counter
+** number P5-1 in the prepared statement is incremented.
+**
+** See also: Prev, NextIfOpen
+*/
+/* Opcode: NextIfOpen P1 P2 P3 P4 P5
+**
+** This opcode works just like Next except that if cursor P1 is not
+** open it behaves a no-op.
+*/
+/* Opcode: Prev P1 P2 P3 P4 P5
+**
+** Back up cursor P1 so that it points to the previous key/data pair in its
