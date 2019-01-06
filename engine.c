@@ -75150,3 +75150,214 @@ case OP_ResetSorter: {
 ** See also: CreateIndex
 */
 /* Opcode: CreateIndex P1 P2 * * *
+** Synopsis: r[P2]=root iDb=P1
+**
+** Allocate a new index in the main database file if P1==0 or in the
+** auxiliary database file if P1==1 or in an attached database if
+** P1>1.  Write the root page number of the new table into
+** register P2.
+**
+** See documentation on OP_CreateTable for additional information.
+*/
+case OP_CreateIndex:            /* out2-prerelease */
+case OP_CreateTable: {          /* out2-prerelease */
+  int pgno;
+  int flags;
+  Db *pDb;
+
+  pgno = 0;
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p1) );
+  assert( p->readOnly==0 );
+  pDb = &db->aDb[pOp->p1];
+  assert( pDb->pBt!=0 );
+  if( pOp->opcode==OP_CreateTable ){
+    /* flags = BTREE_INTKEY; */
+    flags = BTREE_INTKEY;
+  }else{
+    flags = BTREE_BLOBKEY;
+  }
+  rc = sqlite3BtreeCreateTable(pDb->pBt, &pgno, flags);
+  pOut->u.i = pgno;
+  break;
+}
+
+/* Opcode: ParseSchema P1 * * P4 *
+**
+** Read and parse all entries from the SQLITE_MASTER table of database P1
+** that match the WHERE clause P4. 
+**
+** This opcode invokes the parser to create a new virtual machine,
+** then runs the new virtual machine.  It is thus a re-entrant opcode.
+*/
+case OP_ParseSchema: {
+  int iDb;
+  const char *zMaster;
+  char *zSql;
+  InitData initData;
+
+  /* Any prepared statement that invokes this opcode will hold mutexes
+  ** on every btree.  This is a prerequisite for invoking 
+  ** sqlite3InitCallback().
+  */
+#ifdef SQLITE_DEBUG
+  for(iDb=0; iDb<db->nDb; iDb++){
+    assert( iDb==1 || sqlite3BtreeHoldsMutex(db->aDb[iDb].pBt) );
+  }
+#endif
+
+  iDb = pOp->p1;
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( DbHasProperty(db, iDb, DB_SchemaLoaded) );
+  /* Used to be a conditional */ {
+    zMaster = SCHEMA_TABLE(iDb);
+    initData.db = db;
+    initData.iDb = pOp->p1;
+    initData.pzErrMsg = &p->zErrMsg;
+    zSql = sqlite3MPrintf(db,
+       "SELECT name, rootpage, sql FROM '%q'.%s WHERE %s ORDER BY rowid",
+       db->aDb[iDb].zName, zMaster, pOp->p4.z);
+    if( zSql==0 ){
+      rc = SQLITE_NOMEM;
+    }else{
+      assert( db->init.busy==0 );
+      db->init.busy = 1;
+      initData.rc = SQLITE_OK;
+      assert( !db->mallocFailed );
+      rc = sqlite3_exec(db, zSql, sqlite3InitCallback, &initData, 0);
+      if( rc==SQLITE_OK ) rc = initData.rc;
+      sqlite3DbFree(db, zSql);
+      db->init.busy = 0;
+    }
+  }
+  if( rc ) sqlite3ResetAllSchemasOfConnection(db);
+  if( rc==SQLITE_NOMEM ){
+    goto no_mem;
+  }
+  break;  
+}
+
+#if !defined(SQLITE_OMIT_ANALYZE)
+/* Opcode: LoadAnalysis P1 * * * *
+**
+** Read the sqlite_stat1 table for database P1 and load the content
+** of that table into the internal index hash table.  This will cause
+** the analysis to be used when preparing all subsequent queries.
+*/
+case OP_LoadAnalysis: {
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  rc = sqlite3AnalysisLoad(db, pOp->p1);
+  break;  
+}
+#endif /* !defined(SQLITE_OMIT_ANALYZE) */
+
+/* Opcode: DropTable P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the table named P4 in database P1.  This is called after a table
+** is dropped from disk (using the Destroy opcode) in order to keep 
+** the internal representation of the
+** schema consistent with what is on disk.
+*/
+case OP_DropTable: {
+  sqlite3UnlinkAndDeleteTable(db, pOp->p1, pOp->p4.z);
+  break;
+}
+
+/* Opcode: DropIndex P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the index named P4 in database P1.  This is called after an index
+** is dropped from disk (using the Destroy opcode)
+** in order to keep the internal representation of the
+** schema consistent with what is on disk.
+*/
+case OP_DropIndex: {
+  sqlite3UnlinkAndDeleteIndex(db, pOp->p1, pOp->p4.z);
+  break;
+}
+
+/* Opcode: DropTrigger P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the trigger named P4 in database P1.  This is called after a trigger
+** is dropped from disk (using the Destroy opcode) in order to keep 
+** the internal representation of the
+** schema consistent with what is on disk.
+*/
+case OP_DropTrigger: {
+  sqlite3UnlinkAndDeleteTrigger(db, pOp->p1, pOp->p4.z);
+  break;
+}
+
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+/* Opcode: IntegrityCk P1 P2 P3 * P5
+**
+** Do an analysis of the currently open database.  Store in
+** register P1 the text of an error message describing any problems.
+** If no problems are found, store a NULL in register P1.
+**
+** The register P3 contains the maximum number of allowed errors.
+** At most reg(P3) errors will be reported.
+** In other words, the analysis stops as soon as reg(P1) errors are 
+** seen.  Reg(P1) is updated with the number of errors remaining.
+**
+** The root page numbers of all tables in the database are integer
+** stored in reg(P1), reg(P1+1), reg(P1+2), ....  There are P2 tables
+** total.
+**
+** If P5 is not zero, the check is done on the auxiliary database
+** file, not the main database file.
+**
+** This opcode is used to implement the integrity_check pragma.
+*/
+case OP_IntegrityCk: {
+  int nRoot;      /* Number of tables to check.  (Number of root pages.) */
+  int *aRoot;     /* Array of rootpage numbers for tables to be checked */
+  int j;          /* Loop counter */
+  int nErr;       /* Number of errors reported */
+  char *z;        /* Text of the error report */
+  Mem *pnErr;     /* Register keeping track of errors remaining */
+
+  assert( p->bIsReader );
+  nRoot = pOp->p2;
+  assert( nRoot>0 );
+  aRoot = sqlite3DbMallocRaw(db, sizeof(int)*(nRoot+1) );
+  if( aRoot==0 ) goto no_mem;
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem-p->nCursor) );
+  pnErr = &aMem[pOp->p3];
+  assert( (pnErr->flags & MEM_Int)!=0 );
+  assert( (pnErr->flags & (MEM_Str|MEM_Blob))==0 );
+  pIn1 = &aMem[pOp->p1];
+  for(j=0; j<nRoot; j++){
+    aRoot[j] = (int)sqlite3VdbeIntValue(&pIn1[j]);
+  }
+  aRoot[j] = 0;
+  assert( pOp->p5<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p5) );
+  z = sqlite3BtreeIntegrityCheck(db->aDb[pOp->p5].pBt, aRoot, nRoot,
+                                 (int)pnErr->u.i, &nErr);
+  sqlite3DbFree(db, aRoot);
+  pnErr->u.i -= nErr;
+  sqlite3VdbeMemSetNull(pIn1);
+  if( nErr==0 ){
+    assert( z==0 );
+  }else if( z==0 ){
+    goto no_mem;
+  }else{
+    sqlite3VdbeMemSetStr(pIn1, z, -1, SQLITE_UTF8, sqlite3_free);
+  }
+  UPDATE_MAX_BLOBSIZE(pIn1);
+  sqlite3VdbeChangeEncoding(pIn1, encoding);
+  break;
+}
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+/* Opcode: RowSetAdd P1 P2 * * *
+** Synopsis:  rowset(P1)=r[P2]
+**
+** Insert the integer value held by register P2 into a boolean index
+** held in register P1.
+**
+** An assertion fails if P2 is not an integer.
