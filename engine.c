@@ -75361,3 +75361,243 @@ case OP_IntegrityCk: {
 ** held in register P1.
 **
 ** An assertion fails if P2 is not an integer.
+*/
+case OP_RowSetAdd: {       /* in1, in2 */
+  pIn1 = &aMem[pOp->p1];
+  pIn2 = &aMem[pOp->p2];
+  assert( (pIn2->flags & MEM_Int)!=0 );
+  if( (pIn1->flags & MEM_RowSet)==0 ){
+    sqlite3VdbeMemSetRowSet(pIn1);
+    if( (pIn1->flags & MEM_RowSet)==0 ) goto no_mem;
+  }
+  sqlite3RowSetInsert(pIn1->u.pRowSet, pIn2->u.i);
+  break;
+}
+
+/* Opcode: RowSetRead P1 P2 P3 * *
+** Synopsis:  r[P3]=rowset(P1)
+**
+** Extract the smallest value from boolean index P1 and put that value into
+** register P3.  Or, if boolean index P1 is initially empty, leave P3
+** unchanged and jump to instruction P2.
+*/
+case OP_RowSetRead: {       /* jump, in1, out3 */
+  i64 val;
+
+  pIn1 = &aMem[pOp->p1];
+  if( (pIn1->flags & MEM_RowSet)==0 
+   || sqlite3RowSetNext(pIn1->u.pRowSet, &val)==0
+  ){
+    /* The boolean index is empty */
+    sqlite3VdbeMemSetNull(pIn1);
+    pc = pOp->p2 - 1;
+    VdbeBranchTaken(1,2);
+  }else{
+    /* A value was pulled from the index */
+    sqlite3VdbeMemSetInt64(&aMem[pOp->p3], val);
+    VdbeBranchTaken(0,2);
+  }
+  goto check_for_interrupt;
+}
+
+/* Opcode: RowSetTest P1 P2 P3 P4
+** Synopsis: if r[P3] in rowset(P1) goto P2
+**
+** Register P3 is assumed to hold a 64-bit integer value. If register P1
+** contains a RowSet object and that RowSet object contains
+** the value held in P3, jump to register P2. Otherwise, insert the
+** integer in P3 into the RowSet and continue on to the
+** next opcode.
+**
+** The RowSet object is optimized for the case where successive sets
+** of integers, where each set contains no duplicates. Each set
+** of values is identified by a unique P4 value. The first set
+** must have P4==0, the final set P4=-1.  P4 must be either -1 or
+** non-negative.  For non-negative values of P4 only the lower 4
+** bits are significant.
+**
+** This allows optimizations: (a) when P4==0 there is no need to test
+** the rowset object for P3, as it is guaranteed not to contain it,
+** (b) when P4==-1 there is no need to insert the value, as it will
+** never be tested for, and (c) when a value that is part of set X is
+** inserted, there is no need to search to see if the same value was
+** previously inserted as part of set X (only if it was previously
+** inserted as part of some other set).
+*/
+case OP_RowSetTest: {                     /* jump, in1, in3 */
+  int iSet;
+  int exists;
+
+  pIn1 = &aMem[pOp->p1];
+  pIn3 = &aMem[pOp->p3];
+  iSet = pOp->p4.i;
+  assert( pIn3->flags&MEM_Int );
+
+  /* If there is anything other than a rowset object in memory cell P1,
+  ** delete it now and initialize P1 with an empty rowset
+  */
+  if( (pIn1->flags & MEM_RowSet)==0 ){
+    sqlite3VdbeMemSetRowSet(pIn1);
+    if( (pIn1->flags & MEM_RowSet)==0 ) goto no_mem;
+  }
+
+  assert( pOp->p4type==P4_INT32 );
+  assert( iSet==-1 || iSet>=0 );
+  if( iSet ){
+    exists = sqlite3RowSetTest(pIn1->u.pRowSet, iSet, pIn3->u.i);
+    VdbeBranchTaken(exists!=0,2);
+    if( exists ){
+      pc = pOp->p2 - 1;
+      break;
+    }
+  }
+  if( iSet>=0 ){
+    sqlite3RowSetInsert(pIn1->u.pRowSet, pIn3->u.i);
+  }
+  break;
+}
+
+
+#ifndef SQLITE_OMIT_TRIGGER
+
+/* Opcode: Program P1 P2 P3 P4 P5
+**
+** Execute the trigger program passed as P4 (type P4_SUBPROGRAM). 
+**
+** P1 contains the address of the memory cell that contains the first memory 
+** cell in an array of values used as arguments to the sub-program. P2 
+** contains the address to jump to if the sub-program throws an IGNORE 
+** exception using the RAISE() function. Register P3 contains the address 
+** of a memory cell in this (the parent) VM that is used to allocate the 
+** memory required by the sub-vdbe at runtime.
+**
+** P4 is a pointer to the VM containing the trigger program.
+**
+** If P5 is non-zero, then recursive program invocation is enabled.
+*/
+case OP_Program: {        /* jump */
+  int nMem;               /* Number of memory registers for sub-program */
+  int nByte;              /* Bytes of runtime space required for sub-program */
+  Mem *pRt;               /* Register to allocate runtime space */
+  Mem *pMem;              /* Used to iterate through memory cells */
+  Mem *pEnd;              /* Last memory cell in new array */
+  VdbeFrame *pFrame;      /* New vdbe frame to execute in */
+  SubProgram *pProgram;   /* Sub-program to execute */
+  void *t;                /* Token identifying trigger */
+
+  pProgram = pOp->p4.pProgram;
+  pRt = &aMem[pOp->p3];
+  assert( pProgram->nOp>0 );
+  
+  /* If the p5 flag is clear, then recursive invocation of triggers is 
+  ** disabled for backwards compatibility (p5 is set if this sub-program
+  ** is really a trigger, not a foreign key action, and the flag set
+  ** and cleared by the "PRAGMA recursive_triggers" command is clear).
+  ** 
+  ** It is recursive invocation of triggers, at the SQL level, that is 
+  ** disabled. In some cases a single trigger may generate more than one 
+  ** SubProgram (if the trigger may be executed with more than one different 
+  ** ON CONFLICT algorithm). SubProgram structures associated with a
+  ** single trigger all have the same value for the SubProgram.token 
+  ** variable.  */
+  if( pOp->p5 ){
+    t = pProgram->token;
+    for(pFrame=p->pFrame; pFrame && pFrame->token!=t; pFrame=pFrame->pParent);
+    if( pFrame ) break;
+  }
+
+  if( p->nFrame>=db->aLimit[SQLITE_LIMIT_TRIGGER_DEPTH] ){
+    rc = SQLITE_ERROR;
+    sqlite3SetString(&p->zErrMsg, db, "too many levels of trigger recursion");
+    break;
+  }
+
+  /* Register pRt is used to store the memory required to save the state
+  ** of the current program, and the memory required at runtime to execute
+  ** the trigger program. If this trigger has been fired before, then pRt 
+  ** is already allocated. Otherwise, it must be initialized.  */
+  if( (pRt->flags&MEM_Frame)==0 ){
+    /* SubProgram.nMem is set to the number of memory cells used by the 
+    ** program stored in SubProgram.aOp. As well as these, one memory
+    ** cell is required for each cursor used by the program. Set local
+    ** variable nMem (and later, VdbeFrame.nChildMem) to this value.
+    */
+    nMem = pProgram->nMem + pProgram->nCsr;
+    nByte = ROUND8(sizeof(VdbeFrame))
+              + nMem * sizeof(Mem)
+              + pProgram->nCsr * sizeof(VdbeCursor *)
+              + pProgram->nOnce * sizeof(u8);
+    pFrame = sqlite3DbMallocZero(db, nByte);
+    if( !pFrame ){
+      goto no_mem;
+    }
+    sqlite3VdbeMemRelease(pRt);
+    pRt->flags = MEM_Frame;
+    pRt->u.pFrame = pFrame;
+
+    pFrame->v = p;
+    pFrame->nChildMem = nMem;
+    pFrame->nChildCsr = pProgram->nCsr;
+    pFrame->pc = pc;
+    pFrame->aMem = p->aMem;
+    pFrame->nMem = p->nMem;
+    pFrame->apCsr = p->apCsr;
+    pFrame->nCursor = p->nCursor;
+    pFrame->aOp = p->aOp;
+    pFrame->nOp = p->nOp;
+    pFrame->token = pProgram->token;
+    pFrame->aOnceFlag = p->aOnceFlag;
+    pFrame->nOnceFlag = p->nOnceFlag;
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+    pFrame->anExec = p->anExec;
+#endif
+
+    pEnd = &VdbeFrameMem(pFrame)[pFrame->nChildMem];
+    for(pMem=VdbeFrameMem(pFrame); pMem!=pEnd; pMem++){
+      pMem->flags = MEM_Undefined;
+      pMem->db = db;
+    }
+  }else{
+    pFrame = pRt->u.pFrame;
+    assert( pProgram->nMem+pProgram->nCsr==pFrame->nChildMem );
+    assert( pProgram->nCsr==pFrame->nChildCsr );
+    assert( pc==pFrame->pc );
+  }
+
+  p->nFrame++;
+  pFrame->pParent = p->pFrame;
+  pFrame->lastRowid = lastRowid;
+  pFrame->nChange = p->nChange;
+  pFrame->nDbChange = p->db->nChange;
+  p->nChange = 0;
+  p->pFrame = pFrame;
+  p->aMem = aMem = &VdbeFrameMem(pFrame)[-1];
+  p->nMem = pFrame->nChildMem;
+  p->nCursor = (u16)pFrame->nChildCsr;
+  p->apCsr = (VdbeCursor **)&aMem[p->nMem+1];
+  p->aOp = aOp = pProgram->aOp;
+  p->nOp = pProgram->nOp;
+  p->aOnceFlag = (u8 *)&p->apCsr[p->nCursor];
+  p->nOnceFlag = pProgram->nOnce;
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  p->anExec = 0;
+#endif
+  pc = -1;
+  memset(p->aOnceFlag, 0, p->nOnceFlag);
+
+  break;
+}
+
+/* Opcode: Param P1 P2 * * *
+**
+** This opcode is only ever present in sub-programs called via the 
+** OP_Program instruction. Copy a value currently stored in a memory 
+** cell of the calling (parent) frame to cell P2 in the current frames 
+** address space. This is used by trigger programs to access the new.* 
+** and old.* values.
+**
+** The address of the cell in the parent frame is determined by adding
+** the value of the P1 argument to the value of the P1 argument to the
+** calling OP_Program instruction.
+*/
+case OP_Param: {           /* out2-prerelease */
