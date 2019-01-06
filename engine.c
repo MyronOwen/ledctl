@@ -75601,3 +75601,230 @@ case OP_Program: {        /* jump */
 ** calling OP_Program instruction.
 */
 case OP_Param: {           /* out2-prerelease */
+  VdbeFrame *pFrame;
+  Mem *pIn;
+  pFrame = p->pFrame;
+  pIn = &pFrame->aMem[pOp->p1 + pFrame->aOp[pFrame->pc].p1];   
+  sqlite3VdbeMemShallowCopy(pOut, pIn, MEM_Ephem);
+  break;
+}
+
+#endif /* #ifndef SQLITE_OMIT_TRIGGER */
+
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+/* Opcode: FkCounter P1 P2 * * *
+** Synopsis: fkctr[P1]+=P2
+**
+** Increment a "constraint counter" by P2 (P2 may be negative or positive).
+** If P1 is non-zero, the database constraint counter is incremented 
+** (deferred foreign key constraints). Otherwise, if P1 is zero, the 
+** statement counter is incremented (immediate foreign key constraints).
+*/
+case OP_FkCounter: {
+  if( db->flags & SQLITE_DeferFKs ){
+    db->nDeferredImmCons += pOp->p2;
+  }else if( pOp->p1 ){
+    db->nDeferredCons += pOp->p2;
+  }else{
+    p->nFkConstraint += pOp->p2;
+  }
+  break;
+}
+
+/* Opcode: FkIfZero P1 P2 * * *
+** Synopsis: if fkctr[P1]==0 goto P2
+**
+** This opcode tests if a foreign key constraint-counter is currently zero.
+** If so, jump to instruction P2. Otherwise, fall through to the next 
+** instruction.
+**
+** If P1 is non-zero, then the jump is taken if the database constraint-counter
+** is zero (the one that counts deferred constraint violations). If P1 is
+** zero, the jump is taken if the statement constraint-counter is zero
+** (immediate foreign key constraint violations).
+*/
+case OP_FkIfZero: {         /* jump */
+  if( pOp->p1 ){
+    VdbeBranchTaken(db->nDeferredCons==0 && db->nDeferredImmCons==0, 2);
+    if( db->nDeferredCons==0 && db->nDeferredImmCons==0 ) pc = pOp->p2-1;
+  }else{
+    VdbeBranchTaken(p->nFkConstraint==0 && db->nDeferredImmCons==0, 2);
+    if( p->nFkConstraint==0 && db->nDeferredImmCons==0 ) pc = pOp->p2-1;
+  }
+  break;
+}
+#endif /* #ifndef SQLITE_OMIT_FOREIGN_KEY */
+
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+/* Opcode: MemMax P1 P2 * * *
+** Synopsis: r[P1]=max(r[P1],r[P2])
+**
+** P1 is a register in the root frame of this VM (the root frame is
+** different from the current frame if this instruction is being executed
+** within a sub-program). Set the value of register P1 to the maximum of 
+** its current value and the value in register P2.
+**
+** This instruction throws an error if the memory cell is not initially
+** an integer.
+*/
+case OP_MemMax: {        /* in2 */
+  VdbeFrame *pFrame;
+  if( p->pFrame ){
+    for(pFrame=p->pFrame; pFrame->pParent; pFrame=pFrame->pParent);
+    pIn1 = &pFrame->aMem[pOp->p1];
+  }else{
+    pIn1 = &aMem[pOp->p1];
+  }
+  assert( memIsValid(pIn1) );
+  sqlite3VdbeMemIntegerify(pIn1);
+  pIn2 = &aMem[pOp->p2];
+  sqlite3VdbeMemIntegerify(pIn2);
+  if( pIn1->u.i<pIn2->u.i){
+    pIn1->u.i = pIn2->u.i;
+  }
+  break;
+}
+#endif /* SQLITE_OMIT_AUTOINCREMENT */
+
+/* Opcode: IfPos P1 P2 * * *
+** Synopsis: if r[P1]>0 goto P2
+**
+** If the value of register P1 is 1 or greater, jump to P2.
+**
+** It is illegal to use this instruction on a register that does
+** not contain an integer.  An assertion fault will result if you try.
+*/
+case OP_IfPos: {        /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  assert( pIn1->flags&MEM_Int );
+  VdbeBranchTaken( pIn1->u.i>0, 2);
+  if( pIn1->u.i>0 ){
+     pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: IfNeg P1 P2 P3 * *
+** Synopsis: r[P1]+=P3, if r[P1]<0 goto P2
+**
+** Register P1 must contain an integer.  Add literal P3 to the value in
+** register P1 then if the value of register P1 is less than zero, jump to P2. 
+*/
+case OP_IfNeg: {        /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  assert( pIn1->flags&MEM_Int );
+  pIn1->u.i += pOp->p3;
+  VdbeBranchTaken(pIn1->u.i<0, 2);
+  if( pIn1->u.i<0 ){
+     pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: IfZero P1 P2 P3 * *
+** Synopsis: r[P1]+=P3, if r[P1]==0 goto P2
+**
+** The register P1 must contain an integer.  Add literal P3 to the
+** value in register P1.  If the result is exactly 0, jump to P2. 
+*/
+case OP_IfZero: {        /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  assert( pIn1->flags&MEM_Int );
+  pIn1->u.i += pOp->p3;
+  VdbeBranchTaken(pIn1->u.i==0, 2);
+  if( pIn1->u.i==0 ){
+     pc = pOp->p2 - 1;
+  }
+  break;
+}
+
+/* Opcode: AggStep * P2 P3 P4 P5
+** Synopsis: accum=r[P3] step(r[P2@P5])
+**
+** Execute the step function for an aggregate.  The
+** function has P5 arguments.   P4 is a pointer to the FuncDef
+** structure that specifies the function.  Use register
+** P3 as the accumulator.
+**
+** The P5 arguments are taken from register P2 and its
+** successors.
+*/
+case OP_AggStep: {
+  int n;
+  int i;
+  Mem *pMem;
+  Mem *pRec;
+  Mem t;
+  sqlite3_context ctx;
+  sqlite3_value **apVal;
+
+  n = pOp->p5;
+  assert( n>=0 );
+  pRec = &aMem[pOp->p2];
+  apVal = p->apArg;
+  assert( apVal || n==0 );
+  for(i=0; i<n; i++, pRec++){
+    assert( memIsValid(pRec) );
+    apVal[i] = pRec;
+    memAboutToChange(p, pRec);
+  }
+  ctx.pFunc = pOp->p4.pFunc;
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem-p->nCursor) );
+  ctx.pMem = pMem = &aMem[pOp->p3];
+  pMem->n++;
+  sqlite3VdbeMemInit(&t, db, MEM_Null);
+  ctx.pOut = &t;
+  ctx.isError = 0;
+  ctx.pVdbe = p;
+  ctx.iOp = pc;
+  ctx.skipFlag = 0;
+  (ctx.pFunc->xStep)(&ctx, n, apVal); /* IMP: R-24505-23230 */
+  if( ctx.isError ){
+    sqlite3SetString(&p->zErrMsg, db, "%s", sqlite3_value_text(&t));
+    rc = ctx.isError;
+  }
+  if( ctx.skipFlag ){
+    assert( pOp[-1].opcode==OP_CollSeq );
+    i = pOp[-1].p1;
+    if( i ) sqlite3VdbeMemSetInt64(&aMem[i], 1);
+  }
+  sqlite3VdbeMemRelease(&t);
+  break;
+}
+
+/* Opcode: AggFinal P1 P2 * P4 *
+** Synopsis: accum=r[P1] N=P2
+**
+** Execute the finalizer function for an aggregate.  P1 is
+** the memory location that is the accumulator for the aggregate.
+**
+** P2 is the number of arguments that the step function takes and
+** P4 is a pointer to the FuncDef for this function.  The P2
+** argument is not used by this opcode.  It is only there to disambiguate
+** functions that can take varying numbers of arguments.  The
+** P4 argument is only needed for the degenerate case where
+** the step function was not previously called.
+*/
+case OP_AggFinal: {
+  Mem *pMem;
+  assert( pOp->p1>0 && pOp->p1<=(p->nMem-p->nCursor) );
+  pMem = &aMem[pOp->p1];
+  assert( (pMem->flags & ~(MEM_Null|MEM_Agg))==0 );
+  rc = sqlite3VdbeMemFinalize(pMem, pOp->p4.pFunc);
+  if( rc ){
+    sqlite3SetString(&p->zErrMsg, db, "%s", sqlite3_value_text(pMem));
+  }
+  sqlite3VdbeChangeEncoding(pMem, encoding);
+  UPDATE_MAX_BLOBSIZE(pMem);
+  if( sqlite3VdbeMemTooBig(pMem) ){
+    goto too_big;
+  }
+  break;
+}
+
+#ifndef SQLITE_OMIT_WAL
+/* Opcode: Checkpoint P1 P2 P3 * *
+**
+** Checkpoint database P1. This is a no-op if P1 is not currently in
+** WAL mode. Parameter P2 is one of SQLITE_CHECKPOINT_PASSIVE, FULL,
+** RESTART, or TRUNCATE.  Write 1 or 0 into mem[P3] if the checkpoint returns
