@@ -75828,3 +75828,239 @@ case OP_AggFinal: {
 ** Checkpoint database P1. This is a no-op if P1 is not currently in
 ** WAL mode. Parameter P2 is one of SQLITE_CHECKPOINT_PASSIVE, FULL,
 ** RESTART, or TRUNCATE.  Write 1 or 0 into mem[P3] if the checkpoint returns
+** SQLITE_BUSY or not, respectively.  Write the number of pages in the
+** WAL after the checkpoint into mem[P3+1] and the number of pages
+** in the WAL that have been checkpointed after the checkpoint
+** completes into mem[P3+2].  However on an error, mem[P3+1] and
+** mem[P3+2] are initialized to -1.
+*/
+case OP_Checkpoint: {
+  int i;                          /* Loop counter */
+  int aRes[3];                    /* Results */
+  Mem *pMem;                      /* Write results here */
+
+  assert( p->readOnly==0 );
+  aRes[0] = 0;
+  aRes[1] = aRes[2] = -1;
+  assert( pOp->p2==SQLITE_CHECKPOINT_PASSIVE
+       || pOp->p2==SQLITE_CHECKPOINT_FULL
+       || pOp->p2==SQLITE_CHECKPOINT_RESTART
+       || pOp->p2==SQLITE_CHECKPOINT_TRUNCATE
+  );
+  rc = sqlite3Checkpoint(db, pOp->p1, pOp->p2, &aRes[1], &aRes[2]);
+  if( rc==SQLITE_BUSY ){
+    rc = SQLITE_OK;
+    aRes[0] = 1;
+  }
+  for(i=0, pMem = &aMem[pOp->p3]; i<3; i++, pMem++){
+    sqlite3VdbeMemSetInt64(pMem, (i64)aRes[i]);
+  }    
+  break;
+};  
+#endif
+
+#ifndef SQLITE_OMIT_PRAGMA
+/* Opcode: JournalMode P1 P2 P3 * *
+**
+** Change the journal mode of database P1 to P3. P3 must be one of the
+** PAGER_JOURNALMODE_XXX values. If changing between the various rollback
+** modes (delete, truncate, persist, off and memory), this is a simple
+** operation. No IO is required.
+**
+** If changing into or out of WAL mode the procedure is more complicated.
+**
+** Write a string containing the final journal-mode to register P2.
+*/
+case OP_JournalMode: {    /* out2-prerelease */
+  Btree *pBt;                     /* Btree to change journal mode of */
+  Pager *pPager;                  /* Pager associated with pBt */
+  int eNew;                       /* New journal mode */
+  int eOld;                       /* The old journal mode */
+#ifndef SQLITE_OMIT_WAL
+  const char *zFilename;          /* Name of database file for pPager */
+#endif
+
+  eNew = pOp->p3;
+  assert( eNew==PAGER_JOURNALMODE_DELETE 
+       || eNew==PAGER_JOURNALMODE_TRUNCATE 
+       || eNew==PAGER_JOURNALMODE_PERSIST 
+       || eNew==PAGER_JOURNALMODE_OFF
+       || eNew==PAGER_JOURNALMODE_MEMORY
+       || eNew==PAGER_JOURNALMODE_WAL
+       || eNew==PAGER_JOURNALMODE_QUERY
+  );
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  assert( p->readOnly==0 );
+
+  pBt = db->aDb[pOp->p1].pBt;
+  pPager = sqlite3BtreePager(pBt);
+  eOld = sqlite3PagerGetJournalMode(pPager);
+  if( eNew==PAGER_JOURNALMODE_QUERY ) eNew = eOld;
+  if( !sqlite3PagerOkToChangeJournalMode(pPager) ) eNew = eOld;
+
+#ifndef SQLITE_OMIT_WAL
+  zFilename = sqlite3PagerFilename(pPager, 1);
+
+  /* Do not allow a transition to journal_mode=WAL for a database
+  ** in temporary storage or if the VFS does not support shared memory 
+  */
+  if( eNew==PAGER_JOURNALMODE_WAL
+   && (sqlite3Strlen30(zFilename)==0           /* Temp file */
+       || !sqlite3PagerWalSupported(pPager))   /* No shared-memory support */
+  ){
+    eNew = eOld;
+  }
+
+  if( (eNew!=eOld)
+   && (eOld==PAGER_JOURNALMODE_WAL || eNew==PAGER_JOURNALMODE_WAL)
+  ){
+    if( !db->autoCommit || db->nVdbeRead>1 ){
+      rc = SQLITE_ERROR;
+      sqlite3SetString(&p->zErrMsg, db, 
+          "cannot change %s wal mode from within a transaction",
+          (eNew==PAGER_JOURNALMODE_WAL ? "into" : "out of")
+      );
+      break;
+    }else{
+ 
+      if( eOld==PAGER_JOURNALMODE_WAL ){
+        /* If leaving WAL mode, close the log file. If successful, the call
+        ** to PagerCloseWal() checkpoints and deletes the write-ahead-log 
+        ** file. An EXCLUSIVE lock may still be held on the database file 
+        ** after a successful return. 
+        */
+        rc = sqlite3PagerCloseWal(pPager);
+        if( rc==SQLITE_OK ){
+          sqlite3PagerSetJournalMode(pPager, eNew);
+        }
+      }else if( eOld==PAGER_JOURNALMODE_MEMORY ){
+        /* Cannot transition directly from MEMORY to WAL.  Use mode OFF
+        ** as an intermediate */
+        sqlite3PagerSetJournalMode(pPager, PAGER_JOURNALMODE_OFF);
+      }
+  
+      /* Open a transaction on the database file. Regardless of the journal
+      ** mode, this transaction always uses a rollback journal.
+      */
+      assert( sqlite3BtreeIsInTrans(pBt)==0 );
+      if( rc==SQLITE_OK ){
+        rc = sqlite3BtreeSetVersion(pBt, (eNew==PAGER_JOURNALMODE_WAL ? 2 : 1));
+      }
+    }
+  }
+#endif /* ifndef SQLITE_OMIT_WAL */
+
+  if( rc ){
+    eNew = eOld;
+  }
+  eNew = sqlite3PagerSetJournalMode(pPager, eNew);
+
+  pOut = &aMem[pOp->p2];
+  pOut->flags = MEM_Str|MEM_Static|MEM_Term;
+  pOut->z = (char *)sqlite3JournalModename(eNew);
+  pOut->n = sqlite3Strlen30(pOut->z);
+  pOut->enc = SQLITE_UTF8;
+  sqlite3VdbeChangeEncoding(pOut, encoding);
+  break;
+};
+#endif /* SQLITE_OMIT_PRAGMA */
+
+#if !defined(SQLITE_OMIT_VACUUM) && !defined(SQLITE_OMIT_ATTACH)
+/* Opcode: Vacuum * * * * *
+**
+** Vacuum the entire database.  This opcode will cause other virtual
+** machines to be created and run.  It may not be called from within
+** a transaction.
+*/
+case OP_Vacuum: {
+  assert( p->readOnly==0 );
+  rc = sqlite3RunVacuum(&p->zErrMsg, db);
+  break;
+}
+#endif
+
+#if !defined(SQLITE_OMIT_AUTOVACUUM)
+/* Opcode: IncrVacuum P1 P2 * * *
+**
+** Perform a single step of the incremental vacuum procedure on
+** the P1 database. If the vacuum has finished, jump to instruction
+** P2. Otherwise, fall through to the next instruction.
+*/
+case OP_IncrVacuum: {        /* jump */
+  Btree *pBt;
+
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p1) );
+  assert( p->readOnly==0 );
+  pBt = db->aDb[pOp->p1].pBt;
+  rc = sqlite3BtreeIncrVacuum(pBt);
+  VdbeBranchTaken(rc==SQLITE_DONE,2);
+  if( rc==SQLITE_DONE ){
+    pc = pOp->p2 - 1;
+    rc = SQLITE_OK;
+  }
+  break;
+}
+#endif
+
+/* Opcode: Expire P1 * * * *
+**
+** Cause precompiled statements to expire.  When an expired statement
+** is executed using sqlite3_step() it will either automatically
+** reprepare itself (if it was originally created using sqlite3_prepare_v2())
+** or it will fail with SQLITE_SCHEMA.
+** 
+** If P1 is 0, then all SQL statements become expired. If P1 is non-zero,
+** then only the currently executing statement is expired.
+*/
+case OP_Expire: {
+  if( !pOp->p1 ){
+    sqlite3ExpirePreparedStatements(db);
+  }else{
+    p->expired = 1;
+  }
+  break;
+}
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+/* Opcode: TableLock P1 P2 P3 P4 *
+** Synopsis: iDb=P1 root=P2 write=P3
+**
+** Obtain a lock on a particular table. This instruction is only used when
+** the shared-cache feature is enabled. 
+**
+** P1 is the index of the database in sqlite3.aDb[] of the database
+** on which the lock is acquired.  A readlock is obtained if P3==0 or
+** a write lock if P3==1.
+**
+** P2 contains the root-page of the table to lock.
+**
+** P4 contains a pointer to the name of the table being locked. This is only
+** used to generate an error message if the lock cannot be obtained.
+*/
+case OP_TableLock: {
+  u8 isWriteLock = (u8)pOp->p3;
+  if( isWriteLock || 0==(db->flags&SQLITE_ReadUncommitted) ){
+    int p1 = pOp->p1; 
+    assert( p1>=0 && p1<db->nDb );
+    assert( DbMaskTest(p->btreeMask, p1) );
+    assert( isWriteLock==0 || isWriteLock==1 );
+    rc = sqlite3BtreeLockTable(db->aDb[p1].pBt, pOp->p2, isWriteLock);
+    if( (rc&0xFF)==SQLITE_LOCKED ){
+      const char *z = pOp->p4.z;
+      sqlite3SetString(&p->zErrMsg, db, "database table is locked: %s", z);
+    }
+  }
+  break;
+}
+#endif /* SQLITE_OMIT_SHARED_CACHE */
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/* Opcode: VBegin * * * P4 *
+**
+** P4 may be a pointer to an sqlite3_vtab structure. If so, call the 
+** xBegin method for that table.
+**
+** Also, whether or not P4 is set, check that this is not being called from
+** within a callback to a virtual table xSync() method. If it is, the error
+** code will be set to SQLITE_LOCKED.
