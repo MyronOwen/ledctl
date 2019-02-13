@@ -76496,3 +76496,233 @@ case OP_Init: {          /* jump */
   break;
 }
 
+
+/* Opcode: Noop * * * * *
+**
+** Do nothing.  This instruction is often useful as a jump
+** destination.
+*/
+/*
+** The magic Explain opcode are only inserted when explain==2 (which
+** is to say when the EXPLAIN QUERY PLAN syntax is used.)
+** This opcode records information from the optimizer.  It is the
+** the same as a no-op.  This opcodesnever appears in a real VM program.
+*/
+default: {          /* This is really OP_Noop and OP_Explain */
+  assert( pOp->opcode==OP_Noop || pOp->opcode==OP_Explain );
+  break;
+}
+
+/*****************************************************************************
+** The cases of the switch statement above this line should all be indented
+** by 6 spaces.  But the left-most 6 spaces have been removed to improve the
+** readability.  From this point on down, the normal indentation rules are
+** restored.
+*****************************************************************************/
+    }
+
+#ifdef VDBE_PROFILE
+    {
+      u64 endTime = sqlite3Hwtime();
+      if( endTime>start ) pOp->cycles += endTime - start;
+      pOp->cnt++;
+    }
+#endif
+
+    /* The following code adds nothing to the actual functionality
+    ** of the program.  It is only here for testing and debugging.
+    ** On the other hand, it does burn CPU cycles every time through
+    ** the evaluator loop.  So we can leave it out when NDEBUG is defined.
+    */
+#ifndef NDEBUG
+    assert( pc>=-1 && pc<p->nOp );
+
+#ifdef SQLITE_DEBUG
+    if( db->flags & SQLITE_VdbeTrace ){
+      if( rc!=0 ) printf("rc=%d\n",rc);
+      if( pOp->opflags & (OPFLG_OUT2_PRERELEASE|OPFLG_OUT2) ){
+        registerTrace(pOp->p2, &aMem[pOp->p2]);
+      }
+      if( pOp->opflags & OPFLG_OUT3 ){
+        registerTrace(pOp->p3, &aMem[pOp->p3]);
+      }
+    }
+#endif  /* SQLITE_DEBUG */
+#endif  /* NDEBUG */
+  }  /* The end of the for(;;) loop the loops through opcodes */
+
+  /* If we reach this point, it means that execution is finished with
+  ** an error of some kind.
+  */
+vdbe_error_halt:
+  assert( rc );
+  p->rc = rc;
+  testcase( sqlite3GlobalConfig.xLog!=0 );
+  sqlite3_log(rc, "statement aborts at %d: [%s] %s", 
+                   pc, p->zSql, p->zErrMsg);
+  sqlite3VdbeHalt(p);
+  if( rc==SQLITE_IOERR_NOMEM ) db->mallocFailed = 1;
+  rc = SQLITE_ERROR;
+  if( resetSchemaOnFault>0 ){
+    sqlite3ResetOneSchema(db, resetSchemaOnFault-1);
+  }
+
+  /* This is the only way out of this procedure.  We have to
+  ** release the mutexes on btrees that were acquired at the
+  ** top. */
+vdbe_return:
+  db->lastRowid = lastRowid;
+  testcase( nVmStep>0 );
+  p->aCounter[SQLITE_STMTSTATUS_VM_STEP] += (int)nVmStep;
+  sqlite3VdbeLeave(p);
+  return rc;
+
+  /* Jump to here if a string or blob larger than SQLITE_MAX_LENGTH
+  ** is encountered.
+  */
+too_big:
+  sqlite3SetString(&p->zErrMsg, db, "string or blob too big");
+  rc = SQLITE_TOOBIG;
+  goto vdbe_error_halt;
+
+  /* Jump to here if a malloc() fails.
+  */
+no_mem:
+  db->mallocFailed = 1;
+  sqlite3SetString(&p->zErrMsg, db, "out of memory");
+  rc = SQLITE_NOMEM;
+  goto vdbe_error_halt;
+
+  /* Jump to here for any other kind of fatal error.  The "rc" variable
+  ** should hold the error number.
+  */
+abort_due_to_error:
+  assert( p->zErrMsg==0 );
+  if( db->mallocFailed ) rc = SQLITE_NOMEM;
+  if( rc!=SQLITE_IOERR_NOMEM ){
+    sqlite3SetString(&p->zErrMsg, db, "%s", sqlite3ErrStr(rc));
+  }
+  goto vdbe_error_halt;
+
+  /* Jump to here if the sqlite3_interrupt() API sets the interrupt
+  ** flag.
+  */
+abort_due_to_interrupt:
+  assert( db->u1.isInterrupted );
+  rc = SQLITE_INTERRUPT;
+  p->rc = rc;
+  sqlite3SetString(&p->zErrMsg, db, "%s", sqlite3ErrStr(rc));
+  goto vdbe_error_halt;
+}
+
+
+/************** End of vdbe.c ************************************************/
+/************** Begin file vdbeblob.c ****************************************/
+/*
+** 2007 May 1
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code used to implement incremental BLOB I/O.
+*/
+
+
+#ifndef SQLITE_OMIT_INCRBLOB
+
+/*
+** Valid sqlite3_blob* handles point to Incrblob structures.
+*/
+typedef struct Incrblob Incrblob;
+struct Incrblob {
+  int flags;              /* Copy of "flags" passed to sqlite3_blob_open() */
+  int nByte;              /* Size of open blob, in bytes */
+  int iOffset;            /* Byte offset of blob in cursor data */
+  int iCol;               /* Table column this handle is open on */
+  BtCursor *pCsr;         /* Cursor pointing at blob row */
+  sqlite3_stmt *pStmt;    /* Statement holding cursor open */
+  sqlite3 *db;            /* The associated database */
+};
+
+
+/*
+** This function is used by both blob_open() and blob_reopen(). It seeks
+** the b-tree cursor associated with blob handle p to point to row iRow.
+** If successful, SQLITE_OK is returned and subsequent calls to
+** sqlite3_blob_read() or sqlite3_blob_write() access the specified row.
+**
+** If an error occurs, or if the specified row does not exist or does not
+** contain a value of type TEXT or BLOB in the column nominated when the
+** blob handle was opened, then an error code is returned and *pzErr may
+** be set to point to a buffer containing an error message. It is the
+** responsibility of the caller to free the error message buffer using
+** sqlite3DbFree().
+**
+** If an error does occur, then the b-tree cursor is closed. All subsequent
+** calls to sqlite3_blob_read(), blob_write() or blob_reopen() will 
+** immediately return SQLITE_ABORT.
+*/
+static int blobSeekToRow(Incrblob *p, sqlite3_int64 iRow, char **pzErr){
+  int rc;                         /* Error code */
+  char *zErr = 0;                 /* Error message */
+  Vdbe *v = (Vdbe *)p->pStmt;
+
+  /* Set the value of the SQL statements only variable to integer iRow. 
+  ** This is done directly instead of using sqlite3_bind_int64() to avoid 
+  ** triggering asserts related to mutexes.
+  */
+  assert( v->aVar[0].flags&MEM_Int );
+  v->aVar[0].u.i = iRow;
+
+  rc = sqlite3_step(p->pStmt);
+  if( rc==SQLITE_ROW ){
+    VdbeCursor *pC = v->apCsr[0];
+    u32 type = pC->aType[p->iCol];
+    if( type<12 ){
+      zErr = sqlite3MPrintf(p->db, "cannot open value of type %s",
+          type==0?"null": type==7?"real": "integer"
+      );
+      rc = SQLITE_ERROR;
+      sqlite3_finalize(p->pStmt);
+      p->pStmt = 0;
+    }else{
+      p->iOffset = pC->aType[p->iCol + pC->nField];
+      p->nByte = sqlite3VdbeSerialTypeLen(type);
+      p->pCsr =  pC->pCursor;
+      sqlite3BtreeIncrblobCursor(p->pCsr);
+    }
+  }
+
+  if( rc==SQLITE_ROW ){
+    rc = SQLITE_OK;
+  }else if( p->pStmt ){
+    rc = sqlite3_finalize(p->pStmt);
+    p->pStmt = 0;
+    if( rc==SQLITE_OK ){
+      zErr = sqlite3MPrintf(p->db, "no such rowid: %lld", iRow);
+      rc = SQLITE_ERROR;
+    }else{
+      zErr = sqlite3MPrintf(p->db, "%s", sqlite3_errmsg(p->db));
+    }
+  }
+
+  assert( rc!=SQLITE_OK || zErr==0 );
+  assert( rc!=SQLITE_ROW && rc!=SQLITE_DONE );
+
+  *pzErr = zErr;
+  return rc;
+}
+
+/*
+** Open a blob handle.
+*/
+SQLITE_API int sqlite3_blob_open(
+  sqlite3* db,            /* The database connection */
+  const char *zDb,        /* The attached database containing the blob */
+  const char *zTable,     /* The table containing the blob */
