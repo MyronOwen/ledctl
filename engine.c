@@ -76269,3 +76269,230 @@ case OP_VNext: {   /* jump */
   const sqlite3_module *pModule;
   int res;
   VdbeCursor *pCur;
+
+  res = 0;
+  pCur = p->apCsr[pOp->p1];
+  assert( pCur->pVtabCursor );
+  if( pCur->nullRow ){
+    break;
+  }
+  pVtab = pCur->pVtabCursor->pVtab;
+  pModule = pVtab->pModule;
+  assert( pModule->xNext );
+
+  /* Invoke the xNext() method of the module. There is no way for the
+  ** underlying implementation to return an error if one occurs during
+  ** xNext(). Instead, if an error occurs, true is returned (indicating that 
+  ** data is available) and the error code returned when xColumn or
+  ** some other method is next invoked on the save virtual table cursor.
+  */
+  p->inVtabMethod = 1;
+  rc = pModule->xNext(pCur->pVtabCursor);
+  p->inVtabMethod = 0;
+  sqlite3VtabImportErrmsg(p, pVtab);
+  if( rc==SQLITE_OK ){
+    res = pModule->xEof(pCur->pVtabCursor);
+  }
+  VdbeBranchTaken(!res,2);
+  if( !res ){
+    /* If there is data, jump to P2 */
+    pc = pOp->p2 - 1;
+  }
+  goto check_for_interrupt;
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/* Opcode: VRename P1 * * P4 *
+**
+** P4 is a pointer to a virtual table object, an sqlite3_vtab structure.
+** This opcode invokes the corresponding xRename method. The value
+** in register P1 is passed as the zName argument to the xRename method.
+*/
+case OP_VRename: {
+  sqlite3_vtab *pVtab;
+  Mem *pName;
+
+  pVtab = pOp->p4.pVtab->pVtab;
+  pName = &aMem[pOp->p1];
+  assert( pVtab->pModule->xRename );
+  assert( memIsValid(pName) );
+  assert( p->readOnly==0 );
+  REGISTER_TRACE(pOp->p1, pName);
+  assert( pName->flags & MEM_Str );
+  testcase( pName->enc==SQLITE_UTF8 );
+  testcase( pName->enc==SQLITE_UTF16BE );
+  testcase( pName->enc==SQLITE_UTF16LE );
+  rc = sqlite3VdbeChangeEncoding(pName, SQLITE_UTF8);
+  if( rc==SQLITE_OK ){
+    rc = pVtab->pModule->xRename(pVtab, pName->z);
+    sqlite3VtabImportErrmsg(p, pVtab);
+    p->expired = 0;
+  }
+  break;
+}
+#endif
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/* Opcode: VUpdate P1 P2 P3 P4 P5
+** Synopsis: data=r[P3@P2]
+**
+** P4 is a pointer to a virtual table object, an sqlite3_vtab structure.
+** This opcode invokes the corresponding xUpdate method. P2 values
+** are contiguous memory cells starting at P3 to pass to the xUpdate 
+** invocation. The value in register (P3+P2-1) corresponds to the 
+** p2th element of the argv array passed to xUpdate.
+**
+** The xUpdate method will do a DELETE or an INSERT or both.
+** The argv[0] element (which corresponds to memory cell P3)
+** is the rowid of a row to delete.  If argv[0] is NULL then no 
+** deletion occurs.  The argv[1] element is the rowid of the new 
+** row.  This can be NULL to have the virtual table select the new 
+** rowid for itself.  The subsequent elements in the array are 
+** the values of columns in the new row.
+**
+** If P2==1 then no insert is performed.  argv[0] is the rowid of
+** a row to delete.
+**
+** P1 is a boolean flag. If it is set to true and the xUpdate call
+** is successful, then the value returned by sqlite3_last_insert_rowid() 
+** is set to the value of the rowid for the row just inserted.
+**
+** P5 is the error actions (OE_Replace, OE_Fail, OE_Ignore, etc) to
+** apply in the case of a constraint failure on an insert or update.
+*/
+case OP_VUpdate: {
+  sqlite3_vtab *pVtab;
+  sqlite3_module *pModule;
+  int nArg;
+  int i;
+  sqlite_int64 rowid;
+  Mem **apArg;
+  Mem *pX;
+
+  assert( pOp->p2==1        || pOp->p5==OE_Fail   || pOp->p5==OE_Rollback 
+       || pOp->p5==OE_Abort || pOp->p5==OE_Ignore || pOp->p5==OE_Replace
+  );
+  assert( p->readOnly==0 );
+  pVtab = pOp->p4.pVtab->pVtab;
+  pModule = (sqlite3_module *)pVtab->pModule;
+  nArg = pOp->p2;
+  assert( pOp->p4type==P4_VTAB );
+  if( ALWAYS(pModule->xUpdate) ){
+    u8 vtabOnConflict = db->vtabOnConflict;
+    apArg = p->apArg;
+    pX = &aMem[pOp->p3];
+    for(i=0; i<nArg; i++){
+      assert( memIsValid(pX) );
+      memAboutToChange(p, pX);
+      apArg[i] = pX;
+      pX++;
+    }
+    db->vtabOnConflict = pOp->p5;
+    rc = pModule->xUpdate(pVtab, nArg, apArg, &rowid);
+    db->vtabOnConflict = vtabOnConflict;
+    sqlite3VtabImportErrmsg(p, pVtab);
+    if( rc==SQLITE_OK && pOp->p1 ){
+      assert( nArg>1 && apArg[0] && (apArg[0]->flags&MEM_Null) );
+      db->lastRowid = lastRowid = rowid;
+    }
+    if( (rc&0xff)==SQLITE_CONSTRAINT && pOp->p4.pVtab->bConstraint ){
+      if( pOp->p5==OE_Ignore ){
+        rc = SQLITE_OK;
+      }else{
+        p->errorAction = ((pOp->p5==OE_Replace) ? OE_Abort : pOp->p5);
+      }
+    }else{
+      p->nChange++;
+    }
+  }
+  break;
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+#ifndef  SQLITE_OMIT_PAGER_PRAGMAS
+/* Opcode: Pagecount P1 P2 * * *
+**
+** Write the current number of pages in database P1 to memory cell P2.
+*/
+case OP_Pagecount: {            /* out2-prerelease */
+  pOut->u.i = sqlite3BtreeLastPage(db->aDb[pOp->p1].pBt);
+  break;
+}
+#endif
+
+
+#ifndef  SQLITE_OMIT_PAGER_PRAGMAS
+/* Opcode: MaxPgcnt P1 P2 P3 * *
+**
+** Try to set the maximum page count for database P1 to the value in P3.
+** Do not let the maximum page count fall below the current page count and
+** do not change the maximum page count value if P3==0.
+**
+** Store the maximum page count after the change in register P2.
+*/
+case OP_MaxPgcnt: {            /* out2-prerelease */
+  unsigned int newMax;
+  Btree *pBt;
+
+  pBt = db->aDb[pOp->p1].pBt;
+  newMax = 0;
+  if( pOp->p3 ){
+    newMax = sqlite3BtreeLastPage(pBt);
+    if( newMax < (unsigned)pOp->p3 ) newMax = (unsigned)pOp->p3;
+  }
+  pOut->u.i = sqlite3BtreeMaxPageCount(pBt, newMax);
+  break;
+}
+#endif
+
+
+/* Opcode: Init * P2 * P4 *
+** Synopsis:  Start at P2
+**
+** Programs contain a single instance of this opcode as the very first
+** opcode.
+**
+** If tracing is enabled (by the sqlite3_trace()) interface, then
+** the UTF-8 string contained in P4 is emitted on the trace callback.
+** Or if P4 is blank, use the string returned by sqlite3_sql().
+**
+** If P2 is not zero, jump to instruction P2.
+*/
+case OP_Init: {          /* jump */
+  char *zTrace;
+  char *z;
+
+  if( pOp->p2 ){
+    pc = pOp->p2 - 1;
+  }
+#ifndef SQLITE_OMIT_TRACE
+  if( db->xTrace
+   && !p->doingRerun
+   && (zTrace = (pOp->p4.z ? pOp->p4.z : p->zSql))!=0
+  ){
+    z = sqlite3VdbeExpandSql(p, zTrace);
+    db->xTrace(db->pTraceArg, z);
+    sqlite3DbFree(db, z);
+  }
+#ifdef SQLITE_USE_FCNTL_TRACE
+  zTrace = (pOp->p4.z ? pOp->p4.z : p->zSql);
+  if( zTrace ){
+    int i;
+    for(i=0; i<db->nDb; i++){
+      if( DbMaskTest(p->btreeMask, i)==0 ) continue;
+      sqlite3_file_control(db, db->aDb[i].zName, SQLITE_FCNTL_TRACE, zTrace);
+    }
+  }
+#endif /* SQLITE_USE_FCNTL_TRACE */
+#ifdef SQLITE_DEBUG
+  if( (db->flags & SQLITE_SqlTrace)!=0
+   && (zTrace = (pOp->p4.z ? pOp->p4.z : p->zSql))!=0
+  ){
+    sqlite3DebugPrintf("SQL-trace: %s\n", zTrace);
+  }
+#endif /* SQLITE_DEBUG */
+#endif /* SQLITE_OMIT_TRACE */
+  break;
+}
+
