@@ -76726,3 +76726,236 @@ SQLITE_API int sqlite3_blob_open(
   sqlite3* db,            /* The database connection */
   const char *zDb,        /* The attached database containing the blob */
   const char *zTable,     /* The table containing the blob */
+  const char *zColumn,    /* The column containing the blob */
+  sqlite_int64 iRow,      /* The row containing the glob */
+  int flags,              /* True -> read/write access, false -> read-only */
+  sqlite3_blob **ppBlob   /* Handle for accessing the blob returned here */
+){
+  int nAttempt = 0;
+  int iCol;               /* Index of zColumn in row-record */
+
+  /* This VDBE program seeks a btree cursor to the identified 
+  ** db/table/row entry. The reason for using a vdbe program instead
+  ** of writing code to use the b-tree layer directly is that the
+  ** vdbe program will take advantage of the various transaction,
+  ** locking and error handling infrastructure built into the vdbe.
+  **
+  ** After seeking the cursor, the vdbe executes an OP_ResultRow.
+  ** Code external to the Vdbe then "borrows" the b-tree cursor and
+  ** uses it to implement the blob_read(), blob_write() and 
+  ** blob_bytes() functions.
+  **
+  ** The sqlite3_blob_close() function finalizes the vdbe program,
+  ** which closes the b-tree cursor and (possibly) commits the 
+  ** transaction.
+  */
+  static const int iLn = VDBE_OFFSET_LINENO(4);
+  static const VdbeOpList openBlob[] = {
+    /* {OP_Transaction, 0, 0, 0},  // 0: Inserted separately */
+    {OP_TableLock, 0, 0, 0},       /* 1: Acquire a read or write lock */
+    /* One of the following two instructions is replaced by an OP_Noop. */
+    {OP_OpenRead, 0, 0, 0},        /* 2: Open cursor 0 for reading */
+    {OP_OpenWrite, 0, 0, 0},       /* 3: Open cursor 0 for read/write */
+    {OP_Variable, 1, 1, 1},        /* 4: Push the rowid to the stack */
+    {OP_NotExists, 0, 10, 1},      /* 5: Seek the cursor */
+    {OP_Column, 0, 0, 1},          /* 6  */
+    {OP_ResultRow, 1, 0, 0},       /* 7  */
+    {OP_Goto, 0, 4, 0},            /* 8  */
+    {OP_Close, 0, 0, 0},           /* 9  */
+    {OP_Halt, 0, 0, 0},            /* 10 */
+  };
+
+  int rc = SQLITE_OK;
+  char *zErr = 0;
+  Table *pTab;
+  Parse *pParse = 0;
+  Incrblob *pBlob = 0;
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || ppBlob==0 || zTable==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  flags = !!flags;                /* flags = (flags ? 1 : 0); */
+  *ppBlob = 0;
+
+  sqlite3_mutex_enter(db->mutex);
+
+  pBlob = (Incrblob *)sqlite3DbMallocZero(db, sizeof(Incrblob));
+  if( !pBlob ) goto blob_open_out;
+  pParse = sqlite3StackAllocRaw(db, sizeof(*pParse));
+  if( !pParse ) goto blob_open_out;
+
+  do {
+    memset(pParse, 0, sizeof(Parse));
+    pParse->db = db;
+    sqlite3DbFree(db, zErr);
+    zErr = 0;
+
+    sqlite3BtreeEnterAll(db);
+    pTab = sqlite3LocateTable(pParse, 0, zTable, zDb);
+    if( pTab && IsVirtual(pTab) ){
+      pTab = 0;
+      sqlite3ErrorMsg(pParse, "cannot open virtual table: %s", zTable);
+    }
+    if( pTab && !HasRowid(pTab) ){
+      pTab = 0;
+      sqlite3ErrorMsg(pParse, "cannot open table without rowid: %s", zTable);
+    }
+#ifndef SQLITE_OMIT_VIEW
+    if( pTab && pTab->pSelect ){
+      pTab = 0;
+      sqlite3ErrorMsg(pParse, "cannot open view: %s", zTable);
+    }
+#endif
+    if( !pTab ){
+      if( pParse->zErrMsg ){
+        sqlite3DbFree(db, zErr);
+        zErr = pParse->zErrMsg;
+        pParse->zErrMsg = 0;
+      }
+      rc = SQLITE_ERROR;
+      sqlite3BtreeLeaveAll(db);
+      goto blob_open_out;
+    }
+
+    /* Now search pTab for the exact column. */
+    for(iCol=0; iCol<pTab->nCol; iCol++) {
+      if( sqlite3StrICmp(pTab->aCol[iCol].zName, zColumn)==0 ){
+        break;
+      }
+    }
+    if( iCol==pTab->nCol ){
+      sqlite3DbFree(db, zErr);
+      zErr = sqlite3MPrintf(db, "no such column: \"%s\"", zColumn);
+      rc = SQLITE_ERROR;
+      sqlite3BtreeLeaveAll(db);
+      goto blob_open_out;
+    }
+
+    /* If the value is being opened for writing, check that the
+    ** column is not indexed, and that it is not part of a foreign key. 
+    ** It is against the rules to open a column to which either of these
+    ** descriptions applies for writing.  */
+    if( flags ){
+      const char *zFault = 0;
+      Index *pIdx;
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+      if( db->flags&SQLITE_ForeignKeys ){
+        /* Check that the column is not part of an FK child key definition. It
+        ** is not necessary to check if it is part of a parent key, as parent
+        ** key columns must be indexed. The check below will pick up this 
+        ** case.  */
+        FKey *pFKey;
+        for(pFKey=pTab->pFKey; pFKey; pFKey=pFKey->pNextFrom){
+          int j;
+          for(j=0; j<pFKey->nCol; j++){
+            if( pFKey->aCol[j].iFrom==iCol ){
+              zFault = "foreign key";
+            }
+          }
+        }
+      }
+#endif
+      for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+        int j;
+        for(j=0; j<pIdx->nKeyCol; j++){
+          if( pIdx->aiColumn[j]==iCol ){
+            zFault = "indexed";
+          }
+        }
+      }
+      if( zFault ){
+        sqlite3DbFree(db, zErr);
+        zErr = sqlite3MPrintf(db, "cannot open %s column for writing", zFault);
+        rc = SQLITE_ERROR;
+        sqlite3BtreeLeaveAll(db);
+        goto blob_open_out;
+      }
+    }
+
+    pBlob->pStmt = (sqlite3_stmt *)sqlite3VdbeCreate(pParse);
+    assert( pBlob->pStmt || db->mallocFailed );
+    if( pBlob->pStmt ){
+      Vdbe *v = (Vdbe *)pBlob->pStmt;
+      int iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+
+
+      sqlite3VdbeAddOp4Int(v, OP_Transaction, iDb, flags, 
+                           pTab->pSchema->schema_cookie,
+                           pTab->pSchema->iGeneration);
+      sqlite3VdbeChangeP5(v, 1);     
+      sqlite3VdbeAddOpList(v, ArraySize(openBlob), openBlob, iLn);
+
+      /* Make sure a mutex is held on the table to be accessed */
+      sqlite3VdbeUsesBtree(v, iDb); 
+
+      /* Configure the OP_TableLock instruction */
+#ifdef SQLITE_OMIT_SHARED_CACHE
+      sqlite3VdbeChangeToNoop(v, 1);
+#else
+      sqlite3VdbeChangeP1(v, 1, iDb);
+      sqlite3VdbeChangeP2(v, 1, pTab->tnum);
+      sqlite3VdbeChangeP3(v, 1, flags);
+      sqlite3VdbeChangeP4(v, 1, pTab->zName, P4_TRANSIENT);
+#endif
+
+      /* Remove either the OP_OpenWrite or OpenRead. Set the P2 
+      ** parameter of the other to pTab->tnum.  */
+      sqlite3VdbeChangeToNoop(v, 3 - flags);
+      sqlite3VdbeChangeP2(v, 2 + flags, pTab->tnum);
+      sqlite3VdbeChangeP3(v, 2 + flags, iDb);
+
+      /* Configure the number of columns. Configure the cursor to
+      ** think that the table has one more column than it really
+      ** does. An OP_Column to retrieve this imaginary column will
+      ** always return an SQL NULL. This is useful because it means
+      ** we can invoke OP_Column to fill in the vdbe cursors type 
+      ** and offset cache without causing any IO.
+      */
+      sqlite3VdbeChangeP4(v, 2+flags, SQLITE_INT_TO_PTR(pTab->nCol+1),P4_INT32);
+      sqlite3VdbeChangeP2(v, 6, pTab->nCol);
+      if( !db->mallocFailed ){
+        pParse->nVar = 1;
+        pParse->nMem = 1;
+        pParse->nTab = 1;
+        sqlite3VdbeMakeReady(v, pParse);
+      }
+    }
+   
+    pBlob->flags = flags;
+    pBlob->iCol = iCol;
+    pBlob->db = db;
+    sqlite3BtreeLeaveAll(db);
+    if( db->mallocFailed ){
+      goto blob_open_out;
+    }
+    sqlite3_bind_int64(pBlob->pStmt, 1, iRow);
+    rc = blobSeekToRow(pBlob, iRow, &zErr);
+  } while( (++nAttempt)<SQLITE_MAX_SCHEMA_RETRY && rc==SQLITE_SCHEMA );
+
+blob_open_out:
+  if( rc==SQLITE_OK && db->mallocFailed==0 ){
+    *ppBlob = (sqlite3_blob *)pBlob;
+  }else{
+    if( pBlob && pBlob->pStmt ) sqlite3VdbeFinalize((Vdbe *)pBlob->pStmt);
+    sqlite3DbFree(db, pBlob);
+  }
+  sqlite3ErrorWithMsg(db, rc, (zErr ? "%s" : 0), zErr);
+  sqlite3DbFree(db, zErr);
+  sqlite3ParserReset(pParse);
+  sqlite3StackFree(db, pParse);
+  rc = sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+/*
+** Close a blob handle that was previously created using
+** sqlite3_blob_open().
+*/
+SQLITE_API int sqlite3_blob_close(sqlite3_blob *pBlob){
+  Incrblob *p = (Incrblob *)pBlob;
+  int rc;
+  sqlite3 *db;
+
