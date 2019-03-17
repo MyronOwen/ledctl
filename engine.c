@@ -77632,3 +77632,232 @@ static int vdbePmaReadBlob(
     memcpy(p->aAlloc, &p->aBuffer[iBuf], nAvail);
     p->iReadOff += nAvail;
     nRem = nByte - nAvail;
+
+    /* The following loop copies up to p->nBuffer bytes per iteration into
+    ** the p->aAlloc[] buffer.  */
+    while( nRem>0 ){
+      int rc;                     /* vdbePmaReadBlob() return code */
+      int nCopy;                  /* Number of bytes to copy */
+      u8 *aNext;                  /* Pointer to buffer to copy data from */
+
+      nCopy = nRem;
+      if( nRem>p->nBuffer ) nCopy = p->nBuffer;
+      rc = vdbePmaReadBlob(p, nCopy, &aNext);
+      if( rc!=SQLITE_OK ) return rc;
+      assert( aNext!=p->aAlloc );
+      memcpy(&p->aAlloc[nByte - nRem], aNext, nCopy);
+      nRem -= nCopy;
+    }
+
+    *ppOut = p->aAlloc;
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** Read a varint from the stream of data accessed by p. Set *pnOut to
+** the value read.
+*/
+static int vdbePmaReadVarint(PmaReader *p, u64 *pnOut){
+  int iBuf;
+
+  if( p->aMap ){
+    p->iReadOff += sqlite3GetVarint(&p->aMap[p->iReadOff], pnOut);
+  }else{
+    iBuf = p->iReadOff % p->nBuffer;
+    if( iBuf && (p->nBuffer-iBuf)>=9 ){
+      p->iReadOff += sqlite3GetVarint(&p->aBuffer[iBuf], pnOut);
+    }else{
+      u8 aVarint[16], *a;
+      int i = 0, rc;
+      do{
+        rc = vdbePmaReadBlob(p, 1, &a);
+        if( rc ) return rc;
+        aVarint[(i++)&0xf] = a[0];
+      }while( (a[0]&0x80)!=0 );
+      sqlite3GetVarint(aVarint, pnOut);
+    }
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** Attempt to memory map file pFile. If successful, set *pp to point to the
+** new mapping and return SQLITE_OK. If the mapping is not attempted 
+** (because the file is too large or the VFS layer is configured not to use
+** mmap), return SQLITE_OK and set *pp to NULL.
+**
+** Or, if an error occurs, return an SQLite error code. The final value of
+** *pp is undefined in this case.
+*/
+static int vdbeSorterMapFile(SortSubtask *pTask, SorterFile *pFile, u8 **pp){
+  int rc = SQLITE_OK;
+  if( pFile->iEof<=(i64)(pTask->pSorter->db->nMaxSorterMmap) ){
+    sqlite3_file *pFd = pFile->pFd;
+    if( pFd->pMethods->iVersion>=3 ){
+      rc = sqlite3OsFetch(pFd, 0, (int)pFile->iEof, (void**)pp);
+      testcase( rc!=SQLITE_OK );
+    }
+  }
+  return rc;
+}
+
+/*
+** Attach PmaReader pReadr to file pFile (if it is not already attached to
+** that file) and seek it to offset iOff within the file.  Return SQLITE_OK 
+** if successful, or an SQLite error code if an error occurs.
+*/
+static int vdbePmaReaderSeek(
+  SortSubtask *pTask,             /* Task context */
+  PmaReader *pReadr,              /* Reader whose cursor is to be moved */
+  SorterFile *pFile,              /* Sorter file to read from */
+  i64 iOff                        /* Offset in pFile */
+){
+  int rc = SQLITE_OK;
+
+  assert( pReadr->pIncr==0 || pReadr->pIncr->bEof==0 );
+
+  if( sqlite3FaultSim(201) ) return SQLITE_IOERR_READ;
+  if( pReadr->aMap ){
+    sqlite3OsUnfetch(pReadr->pFd, 0, pReadr->aMap);
+    pReadr->aMap = 0;
+  }
+  pReadr->iReadOff = iOff;
+  pReadr->iEof = pFile->iEof;
+  pReadr->pFd = pFile->pFd;
+
+  rc = vdbeSorterMapFile(pTask, pFile, &pReadr->aMap);
+  if( rc==SQLITE_OK && pReadr->aMap==0 ){
+    int pgsz = pTask->pSorter->pgsz;
+    int iBuf = pReadr->iReadOff % pgsz;
+    if( pReadr->aBuffer==0 ){
+      pReadr->aBuffer = (u8*)sqlite3Malloc(pgsz);
+      if( pReadr->aBuffer==0 ) rc = SQLITE_NOMEM;
+      pReadr->nBuffer = pgsz;
+    }
+    if( rc==SQLITE_OK && iBuf ){
+      int nRead = pgsz - iBuf;
+      if( (pReadr->iReadOff + nRead) > pReadr->iEof ){
+        nRead = (int)(pReadr->iEof - pReadr->iReadOff);
+      }
+      rc = sqlite3OsRead(
+          pReadr->pFd, &pReadr->aBuffer[iBuf], nRead, pReadr->iReadOff
+      );
+      testcase( rc!=SQLITE_OK );
+    }
+  }
+
+  return rc;
+}
+
+/*
+** Advance PmaReader pReadr to the next key in its PMA. Return SQLITE_OK if
+** no error occurs, or an SQLite error code if one does.
+*/
+static int vdbePmaReaderNext(PmaReader *pReadr){
+  int rc = SQLITE_OK;             /* Return Code */
+  u64 nRec = 0;                   /* Size of record in bytes */
+
+
+  if( pReadr->iReadOff>=pReadr->iEof ){
+    IncrMerger *pIncr = pReadr->pIncr;
+    int bEof = 1;
+    if( pIncr ){
+      rc = vdbeIncrSwap(pIncr);
+      if( rc==SQLITE_OK && pIncr->bEof==0 ){
+        rc = vdbePmaReaderSeek(
+            pIncr->pTask, pReadr, &pIncr->aFile[0], pIncr->iStartOff
+        );
+        bEof = 0;
+      }
+    }
+
+    if( bEof ){
+      /* This is an EOF condition */
+      vdbePmaReaderClear(pReadr);
+      testcase( rc!=SQLITE_OK );
+      return rc;
+    }
+  }
+
+  if( rc==SQLITE_OK ){
+    rc = vdbePmaReadVarint(pReadr, &nRec);
+  }
+  if( rc==SQLITE_OK ){
+    pReadr->nKey = (int)nRec;
+    rc = vdbePmaReadBlob(pReadr, (int)nRec, &pReadr->aKey);
+    testcase( rc!=SQLITE_OK );
+  }
+
+  return rc;
+}
+
+/*
+** Initialize PmaReader pReadr to scan through the PMA stored in file pFile
+** starting at offset iStart and ending at offset iEof-1. This function 
+** leaves the PmaReader pointing to the first key in the PMA (or EOF if the 
+** PMA is empty).
+**
+** If the pnByte parameter is NULL, then it is assumed that the file 
+** contains a single PMA, and that that PMA omits the initial length varint.
+*/
+static int vdbePmaReaderInit(
+  SortSubtask *pTask,             /* Task context */
+  SorterFile *pFile,              /* Sorter file to read from */
+  i64 iStart,                     /* Start offset in pFile */
+  PmaReader *pReadr,              /* PmaReader to populate */
+  i64 *pnByte                     /* IN/OUT: Increment this value by PMA size */
+){
+  int rc;
+
+  assert( pFile->iEof>iStart );
+  assert( pReadr->aAlloc==0 && pReadr->nAlloc==0 );
+  assert( pReadr->aBuffer==0 );
+  assert( pReadr->aMap==0 );
+
+  rc = vdbePmaReaderSeek(pTask, pReadr, pFile, iStart);
+  if( rc==SQLITE_OK ){
+    u64 nByte;                    /* Size of PMA in bytes */
+    rc = vdbePmaReadVarint(pReadr, &nByte);
+    pReadr->iEof = pReadr->iReadOff + nByte;
+    *pnByte += nByte;
+  }
+
+  if( rc==SQLITE_OK ){
+    rc = vdbePmaReaderNext(pReadr);
+  }
+  return rc;
+}
+
+
+/*
+** Compare key1 (buffer pKey1, size nKey1 bytes) with key2 (buffer pKey2, 
+** size nKey2 bytes). Use (pTask->pKeyInfo) for the collation sequences
+** used by the comparison. Return the result of the comparison.
+**
+** Before returning, object (pTask->pUnpacked) is populated with the
+** unpacked version of key2. Or, if pKey2 is passed a NULL pointer, then it 
+** is assumed that the (pTask->pUnpacked) structure already contains the 
+** unpacked key to use as key2.
+**
+** If an OOM error is encountered, (pTask->pUnpacked->error_rc) is set
+** to SQLITE_NOMEM.
+*/
+static int vdbeSorterCompare(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  UnpackedRecord *r2 = pTask->pUnpacked;
+  if( pKey2 ){
+    sqlite3VdbeRecordUnpack(pTask->pSorter->pKeyInfo, nKey2, pKey2, r2);
+  }
+  return sqlite3VdbeRecordCompare(nKey1, pKey1, r2);
+}
+
+/*
+** Initialize the temporary index cursor just opened as a sorter cursor.
+**
+** Usually, the sorter module uses the value of (pCsr->pKeyInfo->nField)
