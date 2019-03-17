@@ -77412,3 +77412,223 @@ struct VdbeSorter {
   UnpackedRecord *pUnpacked;      /* Used by VdbeSorterCompare() */
   SorterList list;                /* List of in-memory records */
   int iMemory;                    /* Offset of free space in list.aMemory */
+  int nMemory;                    /* Size of list.aMemory allocation in bytes */
+  u8 bUsePMA;                     /* True if one or more PMAs created */
+  u8 bUseThreads;                 /* True to use background threads */
+  u8 iPrev;                       /* Previous thread used to flush PMA */
+  u8 nTask;                       /* Size of aTask[] array */
+  SortSubtask aTask[1];           /* One or more subtasks */
+};
+
+/*
+** An instance of the following object is used to read records out of a
+** PMA, in sorted order.  The next key to be read is cached in nKey/aKey.
+** aKey might point into aMap or into aBuffer.  If neither of those locations
+** contain a contiguous representation of the key, then aAlloc is allocated
+** and the key is copied into aAlloc and aKey is made to poitn to aAlloc.
+**
+** pFd==0 at EOF.
+*/
+struct PmaReader {
+  i64 iReadOff;               /* Current read offset */
+  i64 iEof;                   /* 1 byte past EOF for this PmaReader */
+  int nAlloc;                 /* Bytes of space at aAlloc */
+  int nKey;                   /* Number of bytes in key */
+  sqlite3_file *pFd;          /* File handle we are reading from */
+  u8 *aAlloc;                 /* Space for aKey if aBuffer and pMap wont work */
+  u8 *aKey;                   /* Pointer to current key */
+  u8 *aBuffer;                /* Current read buffer */
+  int nBuffer;                /* Size of read buffer in bytes */
+  u8 *aMap;                   /* Pointer to mapping of entire file */
+  IncrMerger *pIncr;          /* Incremental merger */
+};
+
+/*
+** Normally, a PmaReader object iterates through an existing PMA stored 
+** within a temp file. However, if the PmaReader.pIncr variable points to
+** an object of the following type, it may be used to iterate/merge through
+** multiple PMAs simultaneously.
+**
+** There are two types of IncrMerger object - single (bUseThread==0) and 
+** multi-threaded (bUseThread==1). 
+**
+** A multi-threaded IncrMerger object uses two temporary files - aFile[0] 
+** and aFile[1]. Neither file is allowed to grow to more than mxSz bytes in 
+** size. When the IncrMerger is initialized, it reads enough data from 
+** pMerger to populate aFile[0]. It then sets variables within the 
+** corresponding PmaReader object to read from that file and kicks off 
+** a background thread to populate aFile[1] with the next mxSz bytes of 
+** sorted record data from pMerger. 
+**
+** When the PmaReader reaches the end of aFile[0], it blocks until the
+** background thread has finished populating aFile[1]. It then exchanges
+** the contents of the aFile[0] and aFile[1] variables within this structure,
+** sets the PmaReader fields to read from the new aFile[0] and kicks off
+** another background thread to populate the new aFile[1]. And so on, until
+** the contents of pMerger are exhausted.
+**
+** A single-threaded IncrMerger does not open any temporary files of its
+** own. Instead, it has exclusive access to mxSz bytes of space beginning
+** at offset iStartOff of file pTask->file2. And instead of using a 
+** background thread to prepare data for the PmaReader, with a single
+** threaded IncrMerger the allocate part of pTask->file2 is "refilled" with
+** keys from pMerger by the calling thread whenever the PmaReader runs out
+** of data.
+*/
+struct IncrMerger {
+  SortSubtask *pTask;             /* Task that owns this merger */
+  MergeEngine *pMerger;           /* Merge engine thread reads data from */
+  i64 iStartOff;                  /* Offset to start writing file at */
+  int mxSz;                       /* Maximum bytes of data to store */
+  int bEof;                       /* Set to true when merge is finished */
+  int bUseThread;                 /* True to use a bg thread for this object */
+  SorterFile aFile[2];            /* aFile[0] for reading, [1] for writing */
+};
+
+/*
+** An instance of this object is used for writing a PMA.
+**
+** The PMA is written one record at a time.  Each record is of an arbitrary
+** size.  But I/O is more efficient if it occurs in page-sized blocks where
+** each block is aligned on a page boundary.  This object caches writes to
+** the PMA so that aligned, page-size blocks are written.
+*/
+struct PmaWriter {
+  int eFWErr;                     /* Non-zero if in an error state */
+  u8 *aBuffer;                    /* Pointer to write buffer */
+  int nBuffer;                    /* Size of write buffer in bytes */
+  int iBufStart;                  /* First byte of buffer to write */
+  int iBufEnd;                    /* Last byte of buffer to write */
+  i64 iWriteOff;                  /* Offset of start of buffer in file */
+  sqlite3_file *pFd;              /* File handle to write to */
+};
+
+/*
+** This object is the header on a single record while that record is being
+** held in memory and prior to being written out as part of a PMA.
+**
+** How the linked list is connected depends on how memory is being managed
+** by this module. If using a separate allocation for each in-memory record
+** (VdbeSorter.list.aMemory==0), then the list is always connected using the
+** SorterRecord.u.pNext pointers.
+**
+** Or, if using the single large allocation method (VdbeSorter.list.aMemory!=0),
+** then while records are being accumulated the list is linked using the
+** SorterRecord.u.iNext offset. This is because the aMemory[] array may
+** be sqlite3Realloc()ed while records are being accumulated. Once the VM
+** has finished passing records to the sorter, or when the in-memory buffer
+** is full, the list is sorted. As part of the sorting process, it is
+** converted to use the SorterRecord.u.pNext pointers. See function
+** vdbeSorterSort() for details.
+*/
+struct SorterRecord {
+  int nVal;                       /* Size of the record in bytes */
+  union {
+    SorterRecord *pNext;          /* Pointer to next record in list */
+    int iNext;                    /* Offset within aMemory of next record */
+  } u;
+  /* The data for the record immediately follows this header */
+};
+
+/* Return a pointer to the buffer containing the record data for SorterRecord
+** object p. Should be used as if:
+**
+**   void *SRVAL(SorterRecord *p) { return (void*)&p[1]; }
+*/
+#define SRVAL(p) ((void*)((SorterRecord*)(p) + 1))
+
+
+/* Maximum number of PMAs that a single MergeEngine can merge */
+#define SORTER_MAX_MERGE_COUNT 16
+
+static int vdbeIncrSwap(IncrMerger*);
+static void vdbeIncrFree(IncrMerger *);
+
+/*
+** Free all memory belonging to the PmaReader object passed as the
+** argument. All structure fields are set to zero before returning.
+*/
+static void vdbePmaReaderClear(PmaReader *pReadr){
+  sqlite3_free(pReadr->aAlloc);
+  sqlite3_free(pReadr->aBuffer);
+  if( pReadr->aMap ) sqlite3OsUnfetch(pReadr->pFd, 0, pReadr->aMap);
+  vdbeIncrFree(pReadr->pIncr);
+  memset(pReadr, 0, sizeof(PmaReader));
+}
+
+/*
+** Read the next nByte bytes of data from the PMA p.
+** If successful, set *ppOut to point to a buffer containing the data
+** and return SQLITE_OK. Otherwise, if an error occurs, return an SQLite
+** error code.
+**
+** The buffer returned in *ppOut is only valid until the
+** next call to this function.
+*/
+static int vdbePmaReadBlob(
+  PmaReader *p,                   /* PmaReader from which to take the blob */
+  int nByte,                      /* Bytes of data to read */
+  u8 **ppOut                      /* OUT: Pointer to buffer containing data */
+){
+  int iBuf;                       /* Offset within buffer to read from */
+  int nAvail;                     /* Bytes of data available in buffer */
+
+  if( p->aMap ){
+    *ppOut = &p->aMap[p->iReadOff];
+    p->iReadOff += nByte;
+    return SQLITE_OK;
+  }
+
+  assert( p->aBuffer );
+
+  /* If there is no more data to be read from the buffer, read the next 
+  ** p->nBuffer bytes of data from the file into it. Or, if there are less
+  ** than p->nBuffer bytes remaining in the PMA, read all remaining data.  */
+  iBuf = p->iReadOff % p->nBuffer;
+  if( iBuf==0 ){
+    int nRead;                    /* Bytes to read from disk */
+    int rc;                       /* sqlite3OsRead() return code */
+
+    /* Determine how many bytes of data to read. */
+    if( (p->iEof - p->iReadOff) > (i64)p->nBuffer ){
+      nRead = p->nBuffer;
+    }else{
+      nRead = (int)(p->iEof - p->iReadOff);
+    }
+    assert( nRead>0 );
+
+    /* Readr data from the file. Return early if an error occurs. */
+    rc = sqlite3OsRead(p->pFd, p->aBuffer, nRead, p->iReadOff);
+    assert( rc!=SQLITE_IOERR_SHORT_READ );
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  nAvail = p->nBuffer - iBuf; 
+
+  if( nByte<=nAvail ){
+    /* The requested data is available in the in-memory buffer. In this
+    ** case there is no need to make a copy of the data, just return a 
+    ** pointer into the buffer to the caller.  */
+    *ppOut = &p->aBuffer[iBuf];
+    p->iReadOff += nByte;
+  }else{
+    /* The requested data is not all available in the in-memory buffer.
+    ** In this case, allocate space at p->aAlloc[] to copy the requested
+    ** range into. Then return a copy of pointer p->aAlloc to the caller.  */
+    int nRem;                     /* Bytes remaining to copy */
+
+    /* Extend the p->aAlloc[] allocation if required. */
+    if( p->nAlloc<nByte ){
+      u8 *aNew;
+      int nNew = MAX(128, p->nAlloc*2);
+      while( nByte>nNew ) nNew = nNew*2;
+      aNew = sqlite3Realloc(p->aAlloc, nNew);
+      if( !aNew ) return SQLITE_NOMEM;
+      p->nAlloc = nNew;
+      p->aAlloc = aNew;
+    }
+
+    /* Copy as much data as is available in the buffer into the start of
+    ** p->aAlloc[].  */
+    memcpy(p->aAlloc, &p->aBuffer[iBuf], nAvail);
+    p->iReadOff += nAvail;
+    nRem = nByte - nAvail;
