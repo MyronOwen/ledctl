@@ -78742,3 +78742,220 @@ SQLITE_PRIVATE int sqlite3VdbeSorterWrite(
       while( nNew < nMin ) nNew = nNew*2;
       if( nNew > pSorter->mxPmaSize ) nNew = pSorter->mxPmaSize;
       if( nNew < nMin ) nNew = nMin;
+
+      aNew = sqlite3Realloc(pSorter->list.aMemory, nNew);
+      if( !aNew ) return SQLITE_NOMEM;
+      pSorter->list.pList = (SorterRecord*)(
+          aNew + ((u8*)pSorter->list.pList - pSorter->list.aMemory)
+      );
+      pSorter->list.aMemory = aNew;
+      pSorter->nMemory = nNew;
+    }
+
+    pNew = (SorterRecord*)&pSorter->list.aMemory[pSorter->iMemory];
+    pSorter->iMemory += ROUND8(nReq);
+    pNew->u.iNext = (int)((u8*)(pSorter->list.pList) - pSorter->list.aMemory);
+  }else{
+    pNew = (SorterRecord *)sqlite3Malloc(nReq);
+    if( pNew==0 ){
+      return SQLITE_NOMEM;
+    }
+    pNew->u.pNext = pSorter->list.pList;
+  }
+
+  memcpy(SRVAL(pNew), pVal->z, pVal->n);
+  pNew->nVal = pVal->n;
+  pSorter->list.pList = pNew;
+
+  return rc;
+}
+
+/*
+** Read keys from pIncr->pMerger and populate pIncr->aFile[1]. The format
+** of the data stored in aFile[1] is the same as that used by regular PMAs,
+** except that the number-of-bytes varint is omitted from the start.
+*/
+static int vdbeIncrPopulate(IncrMerger *pIncr){
+  int rc = SQLITE_OK;
+  int rc2;
+  i64 iStart = pIncr->iStartOff;
+  SorterFile *pOut = &pIncr->aFile[1];
+  SortSubtask *pTask = pIncr->pTask;
+  MergeEngine *pMerger = pIncr->pMerger;
+  PmaWriter writer;
+  assert( pIncr->bEof==0 );
+
+  vdbeSorterPopulateDebug(pTask, "enter");
+
+  vdbePmaWriterInit(pOut->pFd, &writer, pTask->pSorter->pgsz, iStart);
+  while( rc==SQLITE_OK ){
+    int dummy;
+    PmaReader *pReader = &pMerger->aReadr[ pMerger->aTree[1] ];
+    int nKey = pReader->nKey;
+    i64 iEof = writer.iWriteOff + writer.iBufEnd;
+
+    /* Check if the output file is full or if the input has been exhausted.
+    ** In either case exit the loop. */
+    if( pReader->pFd==0 ) break;
+    if( (iEof + nKey + sqlite3VarintLen(nKey))>(iStart + pIncr->mxSz) ) break;
+
+    /* Write the next key to the output. */
+    vdbePmaWriteVarint(&writer, nKey);
+    vdbePmaWriteBlob(&writer, pReader->aKey, nKey);
+    assert( pIncr->pMerger->pTask==pTask );
+    rc = vdbeMergeEngineStep(pIncr->pMerger, &dummy);
+  }
+
+  rc2 = vdbePmaWriterFinish(&writer, &pOut->iEof);
+  if( rc==SQLITE_OK ) rc = rc2;
+  vdbeSorterPopulateDebug(pTask, "exit");
+  return rc;
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0
+/*
+** The main routine for background threads that populate aFile[1] of
+** multi-threaded IncrMerger objects.
+*/
+static void *vdbeIncrPopulateThread(void *pCtx){
+  IncrMerger *pIncr = (IncrMerger*)pCtx;
+  void *pRet = SQLITE_INT_TO_PTR( vdbeIncrPopulate(pIncr) );
+  pIncr->pTask->bDone = 1;
+  return pRet;
+}
+
+/*
+** Launch a background thread to populate aFile[1] of pIncr.
+*/
+static int vdbeIncrBgPopulate(IncrMerger *pIncr){
+  void *p = (void*)pIncr;
+  assert( pIncr->bUseThread );
+  return vdbeSorterCreateThread(pIncr->pTask, vdbeIncrPopulateThread, p);
+}
+#endif
+
+/*
+** This function is called when the PmaReader corresponding to pIncr has
+** finished reading the contents of aFile[0]. Its purpose is to "refill"
+** aFile[0] such that the PmaReader should start rereading it from the
+** beginning.
+**
+** For single-threaded objects, this is accomplished by literally reading 
+** keys from pIncr->pMerger and repopulating aFile[0]. 
+**
+** For multi-threaded objects, all that is required is to wait until the 
+** background thread is finished (if it is not already) and then swap 
+** aFile[0] and aFile[1] in place. If the contents of pMerger have not
+** been exhausted, this function also launches a new background thread
+** to populate the new aFile[1].
+**
+** SQLITE_OK is returned on success, or an SQLite error code otherwise.
+*/
+static int vdbeIncrSwap(IncrMerger *pIncr){
+  int rc = SQLITE_OK;
+
+#if SQLITE_MAX_WORKER_THREADS>0
+  if( pIncr->bUseThread ){
+    rc = vdbeSorterJoinThread(pIncr->pTask);
+
+    if( rc==SQLITE_OK ){
+      SorterFile f0 = pIncr->aFile[0];
+      pIncr->aFile[0] = pIncr->aFile[1];
+      pIncr->aFile[1] = f0;
+    }
+
+    if( rc==SQLITE_OK ){
+      if( pIncr->aFile[0].iEof==pIncr->iStartOff ){
+        pIncr->bEof = 1;
+      }else{
+        rc = vdbeIncrBgPopulate(pIncr);
+      }
+    }
+  }else
+#endif
+  {
+    rc = vdbeIncrPopulate(pIncr);
+    pIncr->aFile[0] = pIncr->aFile[1];
+    if( pIncr->aFile[0].iEof==pIncr->iStartOff ){
+      pIncr->bEof = 1;
+    }
+  }
+
+  return rc;
+}
+
+/*
+** Allocate and return a new IncrMerger object to read data from pMerger.
+**
+** If an OOM condition is encountered, return NULL. In this case free the
+** pMerger argument before returning.
+*/
+static int vdbeIncrMergerNew(
+  SortSubtask *pTask,     /* The thread that will be using the new IncrMerger */
+  MergeEngine *pMerger,   /* The MergeEngine that the IncrMerger will control */
+  IncrMerger **ppOut      /* Write the new IncrMerger here */
+){
+  int rc = SQLITE_OK;
+  IncrMerger *pIncr = *ppOut = (IncrMerger*)
+       (sqlite3FaultSim(100) ? 0 : sqlite3MallocZero(sizeof(*pIncr)));
+  if( pIncr ){
+    pIncr->pMerger = pMerger;
+    pIncr->pTask = pTask;
+    pIncr->mxSz = MAX(pTask->pSorter->mxKeysize+9,pTask->pSorter->mxPmaSize/2);
+    pTask->file2.iEof += pIncr->mxSz;
+  }else{
+    vdbeMergeEngineFree(pMerger);
+    rc = SQLITE_NOMEM;
+  }
+  return rc;
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0
+/*
+** Set the "use-threads" flag on object pIncr.
+*/
+static void vdbeIncrMergerSetThreads(IncrMerger *pIncr){
+  pIncr->bUseThread = 1;
+  pIncr->pTask->file2.iEof -= pIncr->mxSz;
+}
+#endif /* SQLITE_MAX_WORKER_THREADS>0 */
+
+
+
+/*
+** Recompute pMerger->aTree[iOut] by comparing the next keys on the
+** two PmaReaders that feed that entry.  Neither of the PmaReaders
+** are advanced.  This routine merely does the comparison.
+*/
+static void vdbeMergeEngineCompare(
+  MergeEngine *pMerger,  /* Merge engine containing PmaReaders to compare */
+  int iOut               /* Store the result in pMerger->aTree[iOut] */
+){
+  int i1;
+  int i2;
+  int iRes;
+  PmaReader *p1;
+  PmaReader *p2;
+
+  assert( iOut<pMerger->nTree && iOut>0 );
+
+  if( iOut>=(pMerger->nTree/2) ){
+    i1 = (iOut - pMerger->nTree/2) * 2;
+    i2 = i1 + 1;
+  }else{
+    i1 = pMerger->aTree[iOut*2];
+    i2 = pMerger->aTree[iOut*2+1];
+  }
+
+  p1 = &pMerger->aReadr[i1];
+  p2 = &pMerger->aReadr[i2];
+
+  if( p1->pFd==0 ){
+    iRes = i2;
+  }else if( p2->pFd==0 ){
+    iRes = i1;
+  }else{
+    int res;
+    assert( pMerger->pTask->pUnpacked!=0 );  /* from vdbeSortSubtaskMain() */
+    res = vdbeSorterCompare(
+        pMerger->pTask, p1->aKey, p1->nKey, p2->aKey, p2->nKey
