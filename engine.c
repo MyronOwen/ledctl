@@ -79184,3 +79184,247 @@ static int vdbeMergeEngineLevel0(
   i64 *piOffset,                  /* IN/OUT: Readr offset in pTask->file */
   MergeEngine **ppOut             /* OUT: New merge-engine */
 ){
+  MergeEngine *pNew;              /* Merge engine to return */
+  i64 iOff = *piOffset;
+  int i;
+  int rc = SQLITE_OK;
+
+  *ppOut = pNew = vdbeMergeEngineNew(nPMA);
+  if( pNew==0 ) rc = SQLITE_NOMEM;
+
+  for(i=0; i<nPMA && rc==SQLITE_OK; i++){
+    i64 nDummy;
+    PmaReader *pReadr = &pNew->aReadr[i];
+    rc = vdbePmaReaderInit(pTask, &pTask->file, iOff, pReadr, &nDummy);
+    iOff = pReadr->iEof;
+  }
+
+  if( rc!=SQLITE_OK ){
+    vdbeMergeEngineFree(pNew);
+    *ppOut = 0;
+  }
+  *piOffset = iOff;
+  return rc;
+}
+
+/*
+** Return the depth of a tree comprising nPMA PMAs, assuming a fanout of
+** SORTER_MAX_MERGE_COUNT. The returned value does not include leaf nodes.
+**
+** i.e.
+**
+**   nPMA<=16    -> TreeDepth() == 0
+**   nPMA<=256   -> TreeDepth() == 1
+**   nPMA<=65536 -> TreeDepth() == 2
+*/
+static int vdbeSorterTreeDepth(int nPMA){
+  int nDepth = 0;
+  i64 nDiv = SORTER_MAX_MERGE_COUNT;
+  while( nDiv < (i64)nPMA ){
+    nDiv = nDiv * SORTER_MAX_MERGE_COUNT;
+    nDepth++;
+  }
+  return nDepth;
+}
+
+/*
+** pRoot is the root of an incremental merge-tree with depth nDepth (according
+** to vdbeSorterTreeDepth()). pLeaf is the iSeq'th leaf to be added to the
+** tree, counting from zero. This function adds pLeaf to the tree.
+**
+** If successful, SQLITE_OK is returned. If an error occurs, an SQLite error
+** code is returned and pLeaf is freed.
+*/
+static int vdbeSorterAddToTree(
+  SortSubtask *pTask,             /* Task context */
+  int nDepth,                     /* Depth of tree according to TreeDepth() */
+  int iSeq,                       /* Sequence number of leaf within tree */
+  MergeEngine *pRoot,             /* Root of tree */
+  MergeEngine *pLeaf              /* Leaf to add to tree */
+){
+  int rc = SQLITE_OK;
+  int nDiv = 1;
+  int i;
+  MergeEngine *p = pRoot;
+  IncrMerger *pIncr;
+
+  rc = vdbeIncrMergerNew(pTask, pLeaf, &pIncr);
+
+  for(i=1; i<nDepth; i++){
+    nDiv = nDiv * SORTER_MAX_MERGE_COUNT;
+  }
+
+  for(i=1; i<nDepth && rc==SQLITE_OK; i++){
+    int iIter = (iSeq / nDiv) % SORTER_MAX_MERGE_COUNT;
+    PmaReader *pReadr = &p->aReadr[iIter];
+
+    if( pReadr->pIncr==0 ){
+      MergeEngine *pNew = vdbeMergeEngineNew(SORTER_MAX_MERGE_COUNT);
+      if( pNew==0 ){
+        rc = SQLITE_NOMEM;
+      }else{
+        rc = vdbeIncrMergerNew(pTask, pNew, &pReadr->pIncr);
+      }
+    }
+    if( rc==SQLITE_OK ){
+      p = pReadr->pIncr->pMerger;
+      nDiv = nDiv / SORTER_MAX_MERGE_COUNT;
+    }
+  }
+
+  if( rc==SQLITE_OK ){
+    p->aReadr[iSeq % SORTER_MAX_MERGE_COUNT].pIncr = pIncr;
+  }else{
+    vdbeIncrFree(pIncr);
+  }
+  return rc;
+}
+
+/*
+** This function is called as part of a SorterRewind() operation on a sorter
+** that has already written two or more level-0 PMAs to one or more temp
+** files. It builds a tree of MergeEngine/IncrMerger/PmaReader objects that 
+** can be used to incrementally merge all PMAs on disk.
+**
+** If successful, SQLITE_OK is returned and *ppOut set to point to the
+** MergeEngine object at the root of the tree before returning. Or, if an
+** error occurs, an SQLite error code is returned and the final value 
+** of *ppOut is undefined.
+*/
+static int vdbeSorterMergeTreeBuild(
+  VdbeSorter *pSorter,       /* The VDBE cursor that implements the sort */
+  MergeEngine **ppOut        /* Write the MergeEngine here */
+){
+  MergeEngine *pMain = 0;
+  int rc = SQLITE_OK;
+  int iTask;
+
+#if SQLITE_MAX_WORKER_THREADS>0
+  /* If the sorter uses more than one task, then create the top-level 
+  ** MergeEngine here. This MergeEngine will read data from exactly 
+  ** one PmaReader per sub-task.  */
+  assert( pSorter->bUseThreads || pSorter->nTask==1 );
+  if( pSorter->nTask>1 ){
+    pMain = vdbeMergeEngineNew(pSorter->nTask);
+    if( pMain==0 ) rc = SQLITE_NOMEM;
+  }
+#endif
+
+  for(iTask=0; rc==SQLITE_OK && iTask<pSorter->nTask; iTask++){
+    SortSubtask *pTask = &pSorter->aTask[iTask];
+    assert( pTask->nPMA>0 || SQLITE_MAX_WORKER_THREADS>0 );
+    if( SQLITE_MAX_WORKER_THREADS==0 || pTask->nPMA ){
+      MergeEngine *pRoot = 0;     /* Root node of tree for this task */
+      int nDepth = vdbeSorterTreeDepth(pTask->nPMA);
+      i64 iReadOff = 0;
+
+      if( pTask->nPMA<=SORTER_MAX_MERGE_COUNT ){
+        rc = vdbeMergeEngineLevel0(pTask, pTask->nPMA, &iReadOff, &pRoot);
+      }else{
+        int i;
+        int iSeq = 0;
+        pRoot = vdbeMergeEngineNew(SORTER_MAX_MERGE_COUNT);
+        if( pRoot==0 ) rc = SQLITE_NOMEM;
+        for(i=0; i<pTask->nPMA && rc==SQLITE_OK; i += SORTER_MAX_MERGE_COUNT){
+          MergeEngine *pMerger = 0; /* New level-0 PMA merger */
+          int nReader;              /* Number of level-0 PMAs to merge */
+
+          nReader = MIN(pTask->nPMA - i, SORTER_MAX_MERGE_COUNT);
+          rc = vdbeMergeEngineLevel0(pTask, nReader, &iReadOff, &pMerger);
+          if( rc==SQLITE_OK ){
+            rc = vdbeSorterAddToTree(pTask, nDepth, iSeq++, pRoot, pMerger);
+          }
+        }
+      }
+
+      if( rc==SQLITE_OK ){
+#if SQLITE_MAX_WORKER_THREADS>0
+        if( pMain!=0 ){
+          rc = vdbeIncrMergerNew(pTask, pRoot, &pMain->aReadr[iTask].pIncr);
+        }else
+#endif
+        {
+          assert( pMain==0 );
+          pMain = pRoot;
+        }
+      }else{
+        vdbeMergeEngineFree(pRoot);
+      }
+    }
+  }
+
+  if( rc!=SQLITE_OK ){
+    vdbeMergeEngineFree(pMain);
+    pMain = 0;
+  }
+  *ppOut = pMain;
+  return rc;
+}
+
+/*
+** This function is called as part of an sqlite3VdbeSorterRewind() operation
+** on a sorter that has written two or more PMAs to temporary files. It sets
+** up either VdbeSorter.pMerger (for single threaded sorters) or pReader
+** (for multi-threaded sorters) so that it can be used to iterate through
+** all records stored in the sorter.
+**
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+static int vdbeSorterSetupMerge(VdbeSorter *pSorter){
+  int rc;                         /* Return code */
+  SortSubtask *pTask0 = &pSorter->aTask[0];
+  MergeEngine *pMain = 0;
+#if SQLITE_MAX_WORKER_THREADS
+  sqlite3 *db = pTask0->pSorter->db;
+#endif
+
+  rc = vdbeSorterMergeTreeBuild(pSorter, &pMain);
+  if( rc==SQLITE_OK ){
+#if SQLITE_MAX_WORKER_THREADS
+    assert( pSorter->bUseThreads==0 || pSorter->nTask>1 );
+    if( pSorter->bUseThreads ){
+      int iTask;
+      PmaReader *pReadr = 0;
+      SortSubtask *pLast = &pSorter->aTask[pSorter->nTask-1];
+      rc = vdbeSortAllocUnpacked(pLast);
+      if( rc==SQLITE_OK ){
+        pReadr = (PmaReader*)sqlite3DbMallocZero(db, sizeof(PmaReader));
+        pSorter->pReader = pReadr;
+        if( pReadr==0 ) rc = SQLITE_NOMEM;
+      }
+      if( rc==SQLITE_OK ){
+        rc = vdbeIncrMergerNew(pLast, pMain, &pReadr->pIncr);
+        if( rc==SQLITE_OK ){
+          vdbeIncrMergerSetThreads(pReadr->pIncr);
+          for(iTask=0; iTask<(pSorter->nTask-1); iTask++){
+            IncrMerger *pIncr;
+            if( (pIncr = pMain->aReadr[iTask].pIncr) ){
+              vdbeIncrMergerSetThreads(pIncr);
+              assert( pIncr->pTask!=pLast );
+            }
+          }
+          for(iTask=0; rc==SQLITE_OK && iTask<pSorter->nTask; iTask++){
+            PmaReader *p = &pMain->aReadr[iTask];
+            assert( p->pIncr==0 || p->pIncr->pTask==&pSorter->aTask[iTask] );
+            if( p->pIncr ){ 
+              if( iTask==pSorter->nTask-1 ){
+                rc = vdbePmaReaderIncrMergeInit(p, INCRINIT_TASK);
+              }else{
+                rc = vdbePmaReaderBgIncrInit(p);
+              }
+            }
+          }
+        }
+        pMain = 0;
+      }
+      if( rc==SQLITE_OK ){
+        rc = vdbePmaReaderIncrMergeInit(pReadr, INCRINIT_ROOT);
+      }
+    }else
+#endif
+    {
+      rc = vdbeMergeEngineInit(pTask0, pMain, INCRINIT_NORMAL);
+      pSorter->pMerger = pMain;
+      pMain = 0;
+    }
+  }
