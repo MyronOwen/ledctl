@@ -80382,3 +80382,196 @@ static void resolveAlias(
 ){
   Expr *pOrig;           /* The iCol-th column of the result set */
   Expr *pDup;            /* Copy of pOrig */
+  sqlite3 *db;           /* The database connection */
+
+  assert( iCol>=0 && iCol<pEList->nExpr );
+  pOrig = pEList->a[iCol].pExpr;
+  assert( pOrig!=0 );
+  assert( pOrig->flags & EP_Resolved );
+  db = pParse->db;
+  pDup = sqlite3ExprDup(db, pOrig, 0);
+  if( pDup==0 ) return;
+  if( pOrig->op!=TK_COLUMN && zType[0]!='G' ){
+    incrAggFunctionDepth(pDup, nSubquery);
+    pDup = sqlite3PExpr(pParse, TK_AS, pDup, 0, 0);
+    if( pDup==0 ) return;
+    ExprSetProperty(pDup, EP_Skip);
+    if( pEList->a[iCol].u.x.iAlias==0 ){
+      pEList->a[iCol].u.x.iAlias = (u16)(++pParse->nAlias);
+    }
+    pDup->iTable = pEList->a[iCol].u.x.iAlias;
+  }
+  if( pExpr->op==TK_COLLATE ){
+    pDup = sqlite3ExprAddCollateString(pParse, pDup, pExpr->u.zToken);
+  }
+
+  /* Before calling sqlite3ExprDelete(), set the EP_Static flag. This 
+  ** prevents ExprDelete() from deleting the Expr structure itself,
+  ** allowing it to be repopulated by the memcpy() on the following line.
+  ** The pExpr->u.zToken might point into memory that will be freed by the
+  ** sqlite3DbFree(db, pDup) on the last line of this block, so be sure to
+  ** make a copy of the token before doing the sqlite3DbFree().
+  */
+  ExprSetProperty(pExpr, EP_Static);
+  sqlite3ExprDelete(db, pExpr);
+  memcpy(pExpr, pDup, sizeof(*pExpr));
+  if( !ExprHasProperty(pExpr, EP_IntValue) && pExpr->u.zToken!=0 ){
+    assert( (pExpr->flags & (EP_Reduced|EP_TokenOnly))==0 );
+    pExpr->u.zToken = sqlite3DbStrDup(db, pExpr->u.zToken);
+    pExpr->flags |= EP_MemToken;
+  }
+  sqlite3DbFree(db, pDup);
+}
+
+
+/*
+** Return TRUE if the name zCol occurs anywhere in the USING clause.
+**
+** Return FALSE if the USING clause is NULL or if it does not contain
+** zCol.
+*/
+static int nameInUsingClause(IdList *pUsing, const char *zCol){
+  if( pUsing ){
+    int k;
+    for(k=0; k<pUsing->nId; k++){
+      if( sqlite3StrICmp(pUsing->a[k].zName, zCol)==0 ) return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** Subqueries stores the original database, table and column names for their
+** result sets in ExprList.a[].zSpan, in the form "DATABASE.TABLE.COLUMN".
+** Check to see if the zSpan given to this routine matches the zDb, zTab,
+** and zCol.  If any of zDb, zTab, and zCol are NULL then those fields will
+** match anything.
+*/
+SQLITE_PRIVATE int sqlite3MatchSpanName(
+  const char *zSpan,
+  const char *zCol,
+  const char *zTab,
+  const char *zDb
+){
+  int n;
+  for(n=0; ALWAYS(zSpan[n]) && zSpan[n]!='.'; n++){}
+  if( zDb && (sqlite3StrNICmp(zSpan, zDb, n)!=0 || zDb[n]!=0) ){
+    return 0;
+  }
+  zSpan += n+1;
+  for(n=0; ALWAYS(zSpan[n]) && zSpan[n]!='.'; n++){}
+  if( zTab && (sqlite3StrNICmp(zSpan, zTab, n)!=0 || zTab[n]!=0) ){
+    return 0;
+  }
+  zSpan += n+1;
+  if( zCol && sqlite3StrICmp(zSpan, zCol)!=0 ){
+    return 0;
+  }
+  return 1;
+}
+
+/*
+** Given the name of a column of the form X.Y.Z or Y.Z or just Z, look up
+** that name in the set of source tables in pSrcList and make the pExpr 
+** expression node refer back to that source column.  The following changes
+** are made to pExpr:
+**
+**    pExpr->iDb           Set the index in db->aDb[] of the database X
+**                         (even if X is implied).
+**    pExpr->iTable        Set to the cursor number for the table obtained
+**                         from pSrcList.
+**    pExpr->pTab          Points to the Table structure of X.Y (even if
+**                         X and/or Y are implied.)
+**    pExpr->iColumn       Set to the column number within the table.
+**    pExpr->op            Set to TK_COLUMN.
+**    pExpr->pLeft         Any expression this points to is deleted
+**    pExpr->pRight        Any expression this points to is deleted.
+**
+** The zDb variable is the name of the database (the "X").  This value may be
+** NULL meaning that name is of the form Y.Z or Z.  Any available database
+** can be used.  The zTable variable is the name of the table (the "Y").  This
+** value can be NULL if zDb is also NULL.  If zTable is NULL it
+** means that the form of the name is Z and that columns from any table
+** can be used.
+**
+** If the name cannot be resolved unambiguously, leave an error message
+** in pParse and return WRC_Abort.  Return WRC_Prune on success.
+*/
+static int lookupName(
+  Parse *pParse,       /* The parsing context */
+  const char *zDb,     /* Name of the database containing table, or NULL */
+  const char *zTab,    /* Name of table containing column, or NULL */
+  const char *zCol,    /* Name of the column. */
+  NameContext *pNC,    /* The name context used to resolve the name */
+  Expr *pExpr          /* Make this EXPR node point to the selected column */
+){
+  int i, j;                         /* Loop counters */
+  int cnt = 0;                      /* Number of matching column names */
+  int cntTab = 0;                   /* Number of matching table names */
+  int nSubquery = 0;                /* How many levels of subquery */
+  sqlite3 *db = pParse->db;         /* The database connection */
+  struct SrcList_item *pItem;       /* Use for looping over pSrcList items */
+  struct SrcList_item *pMatch = 0;  /* The matching pSrcList item */
+  NameContext *pTopNC = pNC;        /* First namecontext in the list */
+  Schema *pSchema = 0;              /* Schema of the expression */
+  int isTrigger = 0;                /* True if resolved to a trigger column */
+  Table *pTab = 0;                  /* Table hold the row */
+  Column *pCol;                     /* A column of pTab */
+
+  assert( pNC );     /* the name context cannot be NULL. */
+  assert( zCol );    /* The Z in X.Y.Z cannot be NULL */
+  assert( !ExprHasProperty(pExpr, EP_TokenOnly|EP_Reduced) );
+
+  /* Initialize the node to no-match */
+  pExpr->iTable = -1;
+  pExpr->pTab = 0;
+  ExprSetVVAProperty(pExpr, EP_NoReduce);
+
+  /* Translate the schema name in zDb into a pointer to the corresponding
+  ** schema.  If not found, pSchema will remain NULL and nothing will match
+  ** resulting in an appropriate error message toward the end of this routine
+  */
+  if( zDb ){
+    testcase( pNC->ncFlags & NC_PartIdx );
+    testcase( pNC->ncFlags & NC_IsCheck );
+    if( (pNC->ncFlags & (NC_PartIdx|NC_IsCheck))!=0 ){
+      /* Silently ignore database qualifiers inside CHECK constraints and partial
+      ** indices.  Do not raise errors because that might break legacy and
+      ** because it does not hurt anything to just ignore the database name. */
+      zDb = 0;
+    }else{
+      for(i=0; i<db->nDb; i++){
+        assert( db->aDb[i].zName );
+        if( sqlite3StrICmp(db->aDb[i].zName,zDb)==0 ){
+          pSchema = db->aDb[i].pSchema;
+          break;
+        }
+      }
+    }
+  }
+
+  /* Start at the inner-most context and move outward until a match is found */
+  while( pNC && cnt==0 ){
+    ExprList *pEList;
+    SrcList *pSrcList = pNC->pSrcList;
+
+    if( pSrcList ){
+      for(i=0, pItem=pSrcList->a; i<pSrcList->nSrc; i++, pItem++){
+        pTab = pItem->pTab;
+        assert( pTab!=0 && pTab->zName!=0 );
+        assert( pTab->nCol>0 );
+        if( pItem->pSelect && (pItem->pSelect->selFlags & SF_NestedFrom)!=0 ){
+          int hit = 0;
+          pEList = pItem->pSelect->pEList;
+          for(j=0; j<pEList->nExpr; j++){
+            if( sqlite3MatchSpanName(pEList->a[j].zSpan, zCol, zTab, zDb) ){
+              cnt++;
+              cntTab = 2;
+              pMatch = pItem;
+              pExpr->iColumn = j;
+              hit = 1;
+            }
+          }
+          if( hit || zTab==0 ) continue;
+        }
+        if( zDb && pTab->pSchema!=pSchema ){
