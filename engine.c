@@ -80129,3 +80129,256 @@ SQLITE_PRIVATE int sqlite3MemJournalSize(void){
   return sizeof(MemJournal);
 }
 
+/************** End of memjournal.c ******************************************/
+/************** Begin file walker.c ******************************************/
+/*
+** 2008 August 16
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains routines used for walking the parser tree for
+** an SQL statement.
+*/
+/* #include <stdlib.h> */
+/* #include <string.h> */
+
+
+/*
+** Walk an expression tree.  Invoke the callback once for each node
+** of the expression, while descending.  (In other words, the callback
+** is invoked before visiting children.)
+**
+** The return value from the callback should be one of the WRC_*
+** constants to specify how to proceed with the walk.
+**
+**    WRC_Continue      Continue descending down the tree.
+**
+**    WRC_Prune         Do not descend into child nodes.  But allow
+**                      the walk to continue with sibling nodes.
+**
+**    WRC_Abort         Do no more callbacks.  Unwind the stack and
+**                      return the top-level walk call.
+**
+** The return value from this routine is WRC_Abort to abandon the tree walk
+** and WRC_Continue to continue.
+*/
+SQLITE_PRIVATE int sqlite3WalkExpr(Walker *pWalker, Expr *pExpr){
+  int rc;
+  if( pExpr==0 ) return WRC_Continue;
+  testcase( ExprHasProperty(pExpr, EP_TokenOnly) );
+  testcase( ExprHasProperty(pExpr, EP_Reduced) );
+  rc = pWalker->xExprCallback(pWalker, pExpr);
+  if( rc==WRC_Continue
+              && !ExprHasProperty(pExpr,EP_TokenOnly) ){
+    if( sqlite3WalkExpr(pWalker, pExpr->pLeft) ) return WRC_Abort;
+    if( sqlite3WalkExpr(pWalker, pExpr->pRight) ) return WRC_Abort;
+    if( ExprHasProperty(pExpr, EP_xIsSelect) ){
+      if( sqlite3WalkSelect(pWalker, pExpr->x.pSelect) ) return WRC_Abort;
+    }else{
+      if( sqlite3WalkExprList(pWalker, pExpr->x.pList) ) return WRC_Abort;
+    }
+  }
+  return rc & WRC_Abort;
+}
+
+/*
+** Call sqlite3WalkExpr() for every expression in list p or until
+** an abort request is seen.
+*/
+SQLITE_PRIVATE int sqlite3WalkExprList(Walker *pWalker, ExprList *p){
+  int i;
+  struct ExprList_item *pItem;
+  if( p ){
+    for(i=p->nExpr, pItem=p->a; i>0; i--, pItem++){
+      if( sqlite3WalkExpr(pWalker, pItem->pExpr) ) return WRC_Abort;
+    }
+  }
+  return WRC_Continue;
+}
+
+/*
+** Walk all expressions associated with SELECT statement p.  Do
+** not invoke the SELECT callback on p, but do (of course) invoke
+** any expr callbacks and SELECT callbacks that come from subqueries.
+** Return WRC_Abort or WRC_Continue.
+*/
+SQLITE_PRIVATE int sqlite3WalkSelectExpr(Walker *pWalker, Select *p){
+  if( sqlite3WalkExprList(pWalker, p->pEList) ) return WRC_Abort;
+  if( sqlite3WalkExpr(pWalker, p->pWhere) ) return WRC_Abort;
+  if( sqlite3WalkExprList(pWalker, p->pGroupBy) ) return WRC_Abort;
+  if( sqlite3WalkExpr(pWalker, p->pHaving) ) return WRC_Abort;
+  if( sqlite3WalkExprList(pWalker, p->pOrderBy) ) return WRC_Abort;
+  if( sqlite3WalkExpr(pWalker, p->pLimit) ) return WRC_Abort;
+  if( sqlite3WalkExpr(pWalker, p->pOffset) ) return WRC_Abort;
+  return WRC_Continue;
+}
+
+/*
+** Walk the parse trees associated with all subqueries in the
+** FROM clause of SELECT statement p.  Do not invoke the select
+** callback on p, but do invoke it on each FROM clause subquery
+** and on any subqueries further down in the tree.  Return 
+** WRC_Abort or WRC_Continue;
+*/
+SQLITE_PRIVATE int sqlite3WalkSelectFrom(Walker *pWalker, Select *p){
+  SrcList *pSrc;
+  int i;
+  struct SrcList_item *pItem;
+
+  pSrc = p->pSrc;
+  if( ALWAYS(pSrc) ){
+    for(i=pSrc->nSrc, pItem=pSrc->a; i>0; i--, pItem++){
+      if( sqlite3WalkSelect(pWalker, pItem->pSelect) ){
+        return WRC_Abort;
+      }
+    }
+  }
+  return WRC_Continue;
+} 
+
+/*
+** Call sqlite3WalkExpr() for every expression in Select statement p.
+** Invoke sqlite3WalkSelect() for subqueries in the FROM clause and
+** on the compound select chain, p->pPrior. 
+**
+** If it is not NULL, the xSelectCallback() callback is invoked before
+** the walk of the expressions and FROM clause. The xSelectCallback2()
+** method, if it is not NULL, is invoked following the walk of the 
+** expressions and FROM clause.
+**
+** Return WRC_Continue under normal conditions.  Return WRC_Abort if
+** there is an abort request.
+**
+** If the Walker does not have an xSelectCallback() then this routine
+** is a no-op returning WRC_Continue.
+*/
+SQLITE_PRIVATE int sqlite3WalkSelect(Walker *pWalker, Select *p){
+  int rc;
+  if( p==0 || (pWalker->xSelectCallback==0 && pWalker->xSelectCallback2==0) ){
+    return WRC_Continue;
+  }
+  rc = WRC_Continue;
+  pWalker->walkerDepth++;
+  while( p ){
+    if( pWalker->xSelectCallback ){
+       rc = pWalker->xSelectCallback(pWalker, p);
+       if( rc ) break;
+    }
+    if( sqlite3WalkSelectExpr(pWalker, p)
+     || sqlite3WalkSelectFrom(pWalker, p)
+    ){
+      pWalker->walkerDepth--;
+      return WRC_Abort;
+    }
+    if( pWalker->xSelectCallback2 ){
+      pWalker->xSelectCallback2(pWalker, p);
+    }
+    p = p->pPrior;
+  }
+  pWalker->walkerDepth--;
+  return rc & WRC_Abort;
+}
+
+/************** End of walker.c **********************************************/
+/************** Begin file resolve.c *****************************************/
+/*
+** 2008 August 18
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains routines used for walking the parser tree and
+** resolve all identifiers by associating them with a particular
+** table and column.
+*/
+/* #include <stdlib.h> */
+/* #include <string.h> */
+
+/*
+** Walk the expression tree pExpr and increase the aggregate function
+** depth (the Expr.op2 field) by N on every TK_AGG_FUNCTION node.
+** This needs to occur when copying a TK_AGG_FUNCTION node from an
+** outer query into an inner subquery.
+**
+** incrAggFunctionDepth(pExpr,n) is the main routine.  incrAggDepth(..)
+** is a helper function - a callback for the tree walker.
+*/
+static int incrAggDepth(Walker *pWalker, Expr *pExpr){
+  if( pExpr->op==TK_AGG_FUNCTION ) pExpr->op2 += pWalker->u.n;
+  return WRC_Continue;
+}
+static void incrAggFunctionDepth(Expr *pExpr, int N){
+  if( N>0 ){
+    Walker w;
+    memset(&w, 0, sizeof(w));
+    w.xExprCallback = incrAggDepth;
+    w.u.n = N;
+    sqlite3WalkExpr(&w, pExpr);
+  }
+}
+
+/*
+** Turn the pExpr expression into an alias for the iCol-th column of the
+** result set in pEList.
+**
+** If the result set column is a simple column reference, then this routine
+** makes an exact copy.  But for any other kind of expression, this
+** routine make a copy of the result set column as the argument to the
+** TK_AS operator.  The TK_AS operator causes the expression to be
+** evaluated just once and then reused for each alias.
+**
+** The reason for suppressing the TK_AS term when the expression is a simple
+** column reference is so that the column reference will be recognized as
+** usable by indices within the WHERE clause processing logic. 
+**
+** The TK_AS operator is inhibited if zType[0]=='G'.  This means
+** that in a GROUP BY clause, the expression is evaluated twice.  Hence:
+**
+**     SELECT random()%5 AS x, count(*) FROM tab GROUP BY x
+**
+** Is equivalent to:
+**
+**     SELECT random()%5 AS x, count(*) FROM tab GROUP BY random()%5
+**
+** The result of random()%5 in the GROUP BY clause is probably different
+** from the result in the result-set.  On the other hand Standard SQL does
+** not allow the GROUP BY clause to contain references to result-set columns.
+** So this should never come up in well-formed queries.
+**
+** If the reference is followed by a COLLATE operator, then make sure
+** the COLLATE operator is preserved.  For example:
+**
+**     SELECT a+b, c+d FROM t1 ORDER BY 1 COLLATE nocase;
+**
+** Should be transformed into:
+**
+**     SELECT a+b, c+d FROM t1 ORDER BY (a+b) COLLATE nocase;
+**
+** The nSubquery parameter specifies how many levels of subquery the
+** alias is removed from the original expression.  The usually value is
+** zero but it might be more if the alias is contained within a subquery
+** of the original expression.  The Expr.op2 field of TK_AGG_FUNCTION
+** structures must be increased by the nSubquery amount.
+*/
+static void resolveAlias(
+  Parse *pParse,         /* Parsing context */
+  ExprList *pEList,      /* A result set */
+  int iCol,              /* A column in the result set.  0..pEList->nExpr-1 */
+  Expr *pExpr,           /* Transform this into an alias to the result set */
+  const char *zType,     /* "GROUP" or "ORDER" or "" */
+  int nSubquery          /* Number of subqueries that the label is moving */
+){
+  Expr *pOrig;           /* The iCol-th column of the result set */
+  Expr *pDup;            /* Copy of pOrig */
