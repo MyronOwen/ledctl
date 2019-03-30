@@ -80575,3 +80575,229 @@ static int lookupName(
           if( hit || zTab==0 ) continue;
         }
         if( zDb && pTab->pSchema!=pSchema ){
+          continue;
+        }
+        if( zTab ){
+          const char *zTabName = pItem->zAlias ? pItem->zAlias : pTab->zName;
+          assert( zTabName!=0 );
+          if( sqlite3StrICmp(zTabName, zTab)!=0 ){
+            continue;
+          }
+        }
+        if( 0==(cntTab++) ){
+          pMatch = pItem;
+        }
+        for(j=0, pCol=pTab->aCol; j<pTab->nCol; j++, pCol++){
+          if( sqlite3StrICmp(pCol->zName, zCol)==0 ){
+            /* If there has been exactly one prior match and this match
+            ** is for the right-hand table of a NATURAL JOIN or is in a 
+            ** USING clause, then skip this match.
+            */
+            if( cnt==1 ){
+              if( pItem->jointype & JT_NATURAL ) continue;
+              if( nameInUsingClause(pItem->pUsing, zCol) ) continue;
+            }
+            cnt++;
+            pMatch = pItem;
+            /* Substitute the rowid (column -1) for the INTEGER PRIMARY KEY */
+            pExpr->iColumn = j==pTab->iPKey ? -1 : (i16)j;
+            break;
+          }
+        }
+      }
+      if( pMatch ){
+        pExpr->iTable = pMatch->iCursor;
+        pExpr->pTab = pMatch->pTab;
+        assert( (pMatch->jointype & JT_RIGHT)==0 ); /* RIGHT JOIN not (yet) supported */
+        if( (pMatch->jointype & JT_LEFT)!=0 ){
+          ExprSetProperty(pExpr, EP_CanBeNull);
+        }
+        pSchema = pExpr->pTab->pSchema;
+      }
+    } /* if( pSrcList ) */
+
+#ifndef SQLITE_OMIT_TRIGGER
+    /* If we have not already resolved the name, then maybe 
+    ** it is a new.* or old.* trigger argument reference
+    */
+    if( zDb==0 && zTab!=0 && cntTab==0 && pParse->pTriggerTab!=0 ){
+      int op = pParse->eTriggerOp;
+      assert( op==TK_DELETE || op==TK_UPDATE || op==TK_INSERT );
+      if( op!=TK_DELETE && sqlite3StrICmp("new",zTab) == 0 ){
+        pExpr->iTable = 1;
+        pTab = pParse->pTriggerTab;
+      }else if( op!=TK_INSERT && sqlite3StrICmp("old",zTab)==0 ){
+        pExpr->iTable = 0;
+        pTab = pParse->pTriggerTab;
+      }else{
+        pTab = 0;
+      }
+
+      if( pTab ){ 
+        int iCol;
+        pSchema = pTab->pSchema;
+        cntTab++;
+        for(iCol=0, pCol=pTab->aCol; iCol<pTab->nCol; iCol++, pCol++){
+          if( sqlite3StrICmp(pCol->zName, zCol)==0 ){
+            if( iCol==pTab->iPKey ){
+              iCol = -1;
+            }
+            break;
+          }
+        }
+        if( iCol>=pTab->nCol && sqlite3IsRowid(zCol) && HasRowid(pTab) ){
+          /* IMP: R-51414-32910 */
+          /* IMP: R-44911-55124 */
+          iCol = -1;
+        }
+        if( iCol<pTab->nCol ){
+          cnt++;
+          if( iCol<0 ){
+            pExpr->affinity = SQLITE_AFF_INTEGER;
+          }else if( pExpr->iTable==0 ){
+            testcase( iCol==31 );
+            testcase( iCol==32 );
+            pParse->oldmask |= (iCol>=32 ? 0xffffffff : (((u32)1)<<iCol));
+          }else{
+            testcase( iCol==31 );
+            testcase( iCol==32 );
+            pParse->newmask |= (iCol>=32 ? 0xffffffff : (((u32)1)<<iCol));
+          }
+          pExpr->iColumn = (i16)iCol;
+          pExpr->pTab = pTab;
+          isTrigger = 1;
+        }
+      }
+    }
+#endif /* !defined(SQLITE_OMIT_TRIGGER) */
+
+    /*
+    ** Perhaps the name is a reference to the ROWID
+    */
+    if( cnt==0 && cntTab==1 && pMatch && sqlite3IsRowid(zCol)
+     && HasRowid(pMatch->pTab) ){
+      cnt = 1;
+      pExpr->iColumn = -1;     /* IMP: R-44911-55124 */
+      pExpr->affinity = SQLITE_AFF_INTEGER;
+    }
+
+    /*
+    ** If the input is of the form Z (not Y.Z or X.Y.Z) then the name Z
+    ** might refer to an result-set alias.  This happens, for example, when
+    ** we are resolving names in the WHERE clause of the following command:
+    **
+    **     SELECT a+b AS x FROM table WHERE x<10;
+    **
+    ** In cases like this, replace pExpr with a copy of the expression that
+    ** forms the result set entry ("a+b" in the example) and return immediately.
+    ** Note that the expression in the result set should have already been
+    ** resolved by the time the WHERE clause is resolved.
+    **
+    ** The ability to use an output result-set column in the WHERE, GROUP BY,
+    ** or HAVING clauses, or as part of a larger expression in the ORDRE BY
+    ** clause is not standard SQL.  This is a (goofy) SQLite extension, that
+    ** is supported for backwards compatibility only.  TO DO: Issue a warning
+    ** on sqlite3_log() whenever the capability is used.
+    */
+    if( (pEList = pNC->pEList)!=0
+     && zTab==0
+     && cnt==0
+    ){
+      for(j=0; j<pEList->nExpr; j++){
+        char *zAs = pEList->a[j].zName;
+        if( zAs!=0 && sqlite3StrICmp(zAs, zCol)==0 ){
+          Expr *pOrig;
+          assert( pExpr->pLeft==0 && pExpr->pRight==0 );
+          assert( pExpr->x.pList==0 );
+          assert( pExpr->x.pSelect==0 );
+          pOrig = pEList->a[j].pExpr;
+          if( (pNC->ncFlags&NC_AllowAgg)==0 && ExprHasProperty(pOrig, EP_Agg) ){
+            sqlite3ErrorMsg(pParse, "misuse of aliased aggregate %s", zAs);
+            return WRC_Abort;
+          }
+          resolveAlias(pParse, pEList, j, pExpr, "", nSubquery);
+          cnt = 1;
+          pMatch = 0;
+          assert( zTab==0 && zDb==0 );
+          goto lookupname_end;
+        }
+      } 
+    }
+
+    /* Advance to the next name context.  The loop will exit when either
+    ** we have a match (cnt>0) or when we run out of name contexts.
+    */
+    if( cnt==0 ){
+      pNC = pNC->pNext;
+      nSubquery++;
+    }
+  }
+
+  /*
+  ** If X and Y are NULL (in other words if only the column name Z is
+  ** supplied) and the value of Z is enclosed in double-quotes, then
+  ** Z is a string literal if it doesn't match any column names.  In that
+  ** case, we need to return right away and not make any changes to
+  ** pExpr.
+  **
+  ** Because no reference was made to outer contexts, the pNC->nRef
+  ** fields are not changed in any context.
+  */
+  if( cnt==0 && zTab==0 && ExprHasProperty(pExpr,EP_DblQuoted) ){
+    pExpr->op = TK_STRING;
+    pExpr->pTab = 0;
+    return WRC_Prune;
+  }
+
+  /*
+  ** cnt==0 means there was not match.  cnt>1 means there were two or
+  ** more matches.  Either way, we have an error.
+  */
+  if( cnt!=1 ){
+    const char *zErr;
+    zErr = cnt==0 ? "no such column" : "ambiguous column name";
+    if( zDb ){
+      sqlite3ErrorMsg(pParse, "%s: %s.%s.%s", zErr, zDb, zTab, zCol);
+    }else if( zTab ){
+      sqlite3ErrorMsg(pParse, "%s: %s.%s", zErr, zTab, zCol);
+    }else{
+      sqlite3ErrorMsg(pParse, "%s: %s", zErr, zCol);
+    }
+    pParse->checkSchema = 1;
+    pTopNC->nErr++;
+  }
+
+  /* If a column from a table in pSrcList is referenced, then record
+  ** this fact in the pSrcList.a[].colUsed bitmask.  Column 0 causes
+  ** bit 0 to be set.  Column 1 sets bit 1.  And so forth.  If the
+  ** column number is greater than the number of bits in the bitmask
+  ** then set the high-order bit of the bitmask.
+  */
+  if( pExpr->iColumn>=0 && pMatch!=0 ){
+    int n = pExpr->iColumn;
+    testcase( n==BMS-1 );
+    if( n>=BMS ){
+      n = BMS-1;
+    }
+    assert( pMatch->iCursor==pExpr->iTable );
+    pMatch->colUsed |= ((Bitmask)1)<<n;
+  }
+
+  /* Clean up and return
+  */
+  sqlite3ExprDelete(db, pExpr->pLeft);
+  pExpr->pLeft = 0;
+  sqlite3ExprDelete(db, pExpr->pRight);
+  pExpr->pRight = 0;
+  pExpr->op = (isTrigger ? TK_TRIGGER : TK_COLUMN);
+lookupname_end:
+  if( cnt==1 ){
+    assert( pNC!=0 );
+    if( pExpr->op!=TK_AS ){
+      sqlite3AuthRead(pParse, pExpr, pSchema, pNC->pSrcList);
+    }
+    /* Increment the nRef value on all name contexts from TopNC up to
+    ** the point where the name matched. */
+    for(;;){
+      assert( pTopNC!=0 );
+      pTopNC->nRef++;
