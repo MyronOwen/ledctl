@@ -80801,3 +80801,247 @@ lookupname_end:
     for(;;){
       assert( pTopNC!=0 );
       pTopNC->nRef++;
+      if( pTopNC==pNC ) break;
+      pTopNC = pTopNC->pNext;
+    }
+    return WRC_Prune;
+  } else {
+    return WRC_Abort;
+  }
+}
+
+/*
+** Allocate and return a pointer to an expression to load the column iCol
+** from datasource iSrc in SrcList pSrc.
+*/
+SQLITE_PRIVATE Expr *sqlite3CreateColumnExpr(sqlite3 *db, SrcList *pSrc, int iSrc, int iCol){
+  Expr *p = sqlite3ExprAlloc(db, TK_COLUMN, 0, 0);
+  if( p ){
+    struct SrcList_item *pItem = &pSrc->a[iSrc];
+    p->pTab = pItem->pTab;
+    p->iTable = pItem->iCursor;
+    if( p->pTab->iPKey==iCol ){
+      p->iColumn = -1;
+    }else{
+      p->iColumn = (ynVar)iCol;
+      testcase( iCol==BMS );
+      testcase( iCol==BMS-1 );
+      pItem->colUsed |= ((Bitmask)1)<<(iCol>=BMS ? BMS-1 : iCol);
+    }
+    ExprSetProperty(p, EP_Resolved);
+  }
+  return p;
+}
+
+/*
+** Report an error that an expression is not valid for a partial index WHERE
+** clause.
+*/
+static void notValidPartIdxWhere(
+  Parse *pParse,       /* Leave error message here */
+  NameContext *pNC,    /* The name context */
+  const char *zMsg     /* Type of error */
+){
+  if( (pNC->ncFlags & NC_PartIdx)!=0 ){
+    sqlite3ErrorMsg(pParse, "%s prohibited in partial index WHERE clauses",
+                    zMsg);
+  }
+}
+
+#ifndef SQLITE_OMIT_CHECK
+/*
+** Report an error that an expression is not valid for a CHECK constraint.
+*/
+static void notValidCheckConstraint(
+  Parse *pParse,       /* Leave error message here */
+  NameContext *pNC,    /* The name context */
+  const char *zMsg     /* Type of error */
+){
+  if( (pNC->ncFlags & NC_IsCheck)!=0 ){
+    sqlite3ErrorMsg(pParse,"%s prohibited in CHECK constraints", zMsg);
+  }
+}
+#else
+# define notValidCheckConstraint(P,N,M)
+#endif
+
+/*
+** Expression p should encode a floating point value between 1.0 and 0.0.
+** Return 1024 times this value.  Or return -1 if p is not a floating point
+** value between 1.0 and 0.0.
+*/
+static int exprProbability(Expr *p){
+  double r = -1.0;
+  if( p->op!=TK_FLOAT ) return -1;
+  sqlite3AtoF(p->u.zToken, &r, sqlite3Strlen30(p->u.zToken), SQLITE_UTF8);
+  assert( r>=0.0 );
+  if( r>1.0 ) return -1;
+  return (int)(r*134217728.0);
+}
+
+/*
+** This routine is callback for sqlite3WalkExpr().
+**
+** Resolve symbolic names into TK_COLUMN operators for the current
+** node in the expression tree.  Return 0 to continue the search down
+** the tree or 2 to abort the tree walk.
+**
+** This routine also does error checking and name resolution for
+** function names.  The operator for aggregate functions is changed
+** to TK_AGG_FUNCTION.
+*/
+static int resolveExprStep(Walker *pWalker, Expr *pExpr){
+  NameContext *pNC;
+  Parse *pParse;
+
+  pNC = pWalker->u.pNC;
+  assert( pNC!=0 );
+  pParse = pNC->pParse;
+  assert( pParse==pWalker->pParse );
+
+  if( ExprHasProperty(pExpr, EP_Resolved) ) return WRC_Prune;
+  ExprSetProperty(pExpr, EP_Resolved);
+#ifndef NDEBUG
+  if( pNC->pSrcList && pNC->pSrcList->nAlloc>0 ){
+    SrcList *pSrcList = pNC->pSrcList;
+    int i;
+    for(i=0; i<pNC->pSrcList->nSrc; i++){
+      assert( pSrcList->a[i].iCursor>=0 && pSrcList->a[i].iCursor<pParse->nTab);
+    }
+  }
+#endif
+  switch( pExpr->op ){
+
+#if defined(SQLITE_ENABLE_UPDATE_DELETE_LIMIT) && !defined(SQLITE_OMIT_SUBQUERY)
+    /* The special operator TK_ROW means use the rowid for the first
+    ** column in the FROM clause.  This is used by the LIMIT and ORDER BY
+    ** clause processing on UPDATE and DELETE statements.
+    */
+    case TK_ROW: {
+      SrcList *pSrcList = pNC->pSrcList;
+      struct SrcList_item *pItem;
+      assert( pSrcList && pSrcList->nSrc==1 );
+      pItem = pSrcList->a; 
+      pExpr->op = TK_COLUMN;
+      pExpr->pTab = pItem->pTab;
+      pExpr->iTable = pItem->iCursor;
+      pExpr->iColumn = -1;
+      pExpr->affinity = SQLITE_AFF_INTEGER;
+      break;
+    }
+#endif /* defined(SQLITE_ENABLE_UPDATE_DELETE_LIMIT) && !defined(SQLITE_OMIT_SUBQUERY) */
+
+    /* A lone identifier is the name of a column.
+    */
+    case TK_ID: {
+      return lookupName(pParse, 0, 0, pExpr->u.zToken, pNC, pExpr);
+    }
+  
+    /* A table name and column name:     ID.ID
+    ** Or a database, table and column:  ID.ID.ID
+    */
+    case TK_DOT: {
+      const char *zColumn;
+      const char *zTable;
+      const char *zDb;
+      Expr *pRight;
+
+      /* if( pSrcList==0 ) break; */
+      pRight = pExpr->pRight;
+      if( pRight->op==TK_ID ){
+        zDb = 0;
+        zTable = pExpr->pLeft->u.zToken;
+        zColumn = pRight->u.zToken;
+      }else{
+        assert( pRight->op==TK_DOT );
+        zDb = pExpr->pLeft->u.zToken;
+        zTable = pRight->pLeft->u.zToken;
+        zColumn = pRight->pRight->u.zToken;
+      }
+      return lookupName(pParse, zDb, zTable, zColumn, pNC, pExpr);
+    }
+
+    /* Resolve function names
+    */
+    case TK_FUNCTION: {
+      ExprList *pList = pExpr->x.pList;    /* The argument list */
+      int n = pList ? pList->nExpr : 0;    /* Number of arguments */
+      int no_such_func = 0;       /* True if no such function exists */
+      int wrong_num_args = 0;     /* True if wrong number of arguments */
+      int is_agg = 0;             /* True if is an aggregate function */
+      int auth;                   /* Authorization to use the function */
+      int nId;                    /* Number of characters in function name */
+      const char *zId;            /* The function name. */
+      FuncDef *pDef;              /* Information about the function */
+      u8 enc = ENC(pParse->db);   /* The database encoding */
+
+      assert( !ExprHasProperty(pExpr, EP_xIsSelect) );
+      notValidPartIdxWhere(pParse, pNC, "functions");
+      zId = pExpr->u.zToken;
+      nId = sqlite3Strlen30(zId);
+      pDef = sqlite3FindFunction(pParse->db, zId, nId, n, enc, 0);
+      if( pDef==0 ){
+        pDef = sqlite3FindFunction(pParse->db, zId, nId, -2, enc, 0);
+        if( pDef==0 ){
+          no_such_func = 1;
+        }else{
+          wrong_num_args = 1;
+        }
+      }else{
+        is_agg = pDef->xFunc==0;
+        if( pDef->funcFlags & SQLITE_FUNC_UNLIKELY ){
+          ExprSetProperty(pExpr, EP_Unlikely|EP_Skip);
+          if( n==2 ){
+            pExpr->iTable = exprProbability(pList->a[1].pExpr);
+            if( pExpr->iTable<0 ){
+              sqlite3ErrorMsg(pParse, "second argument to likelihood() must be a "
+                                      "constant between 0.0 and 1.0");
+              pNC->nErr++;
+            }
+          }else{
+            /* EVIDENCE-OF: R-61304-29449 The unlikely(X) function is equivalent to
+            ** likelihood(X, 0.0625).
+            ** EVIDENCE-OF: R-01283-11636 The unlikely(X) function is short-hand for
+            ** likelihood(X,0.0625).
+            ** EVIDENCE-OF: R-36850-34127 The likely(X) function is short-hand for
+            ** likelihood(X,0.9375).
+            ** EVIDENCE-OF: R-53436-40973 The likely(X) function is equivalent to
+            ** likelihood(X,0.9375). */
+            /* TUNING: unlikely() probability is 0.0625.  likely() is 0.9375 */
+            pExpr->iTable = pDef->zName[0]=='u' ? 8388608 : 125829120;
+          }             
+        }
+#ifndef SQLITE_OMIT_AUTHORIZATION
+        auth = sqlite3AuthCheck(pParse, SQLITE_FUNCTION, 0, pDef->zName, 0);
+        if( auth!=SQLITE_OK ){
+          if( auth==SQLITE_DENY ){
+            sqlite3ErrorMsg(pParse, "not authorized to use function: %s",
+                                    pDef->zName);
+            pNC->nErr++;
+          }
+          pExpr->op = TK_NULL;
+          return WRC_Prune;
+        }
+#endif
+        if( pDef->funcFlags & SQLITE_FUNC_CONSTANT ) ExprSetProperty(pExpr,EP_Constant);
+      }
+      if( is_agg && (pNC->ncFlags & NC_AllowAgg)==0 ){
+        sqlite3ErrorMsg(pParse, "misuse of aggregate function %.*s()", nId,zId);
+        pNC->nErr++;
+        is_agg = 0;
+      }else if( no_such_func && pParse->db->init.busy==0 ){
+        sqlite3ErrorMsg(pParse, "no such function: %.*s", nId, zId);
+        pNC->nErr++;
+      }else if( wrong_num_args ){
+        sqlite3ErrorMsg(pParse,"wrong number of arguments to function %.*s()",
+             nId, zId);
+        pNC->nErr++;
+      }
+      if( is_agg ) pNC->ncFlags &= ~NC_AllowAgg;
+      sqlite3WalkExprList(pWalker, pList);
+      if( is_agg ){
+        NameContext *pNC2 = pNC;
+        pExpr->op = TK_AGG_FUNCTION;
+        pExpr->op2 = 0;
+        while( pNC2 && !sqlite3FunctionUsesThisSrc(pExpr, pNC2->pSrcList) ){
+          pExpr->op2++;
