@@ -81045,3 +81045,211 @@ static int resolveExprStep(Walker *pWalker, Expr *pExpr){
         pExpr->op2 = 0;
         while( pNC2 && !sqlite3FunctionUsesThisSrc(pExpr, pNC2->pSrcList) ){
           pExpr->op2++;
+          pNC2 = pNC2->pNext;
+        }
+        assert( pDef!=0 );
+        if( pNC2 ){
+          assert( SQLITE_FUNC_MINMAX==NC_MinMaxAgg );
+          testcase( (pDef->funcFlags & SQLITE_FUNC_MINMAX)!=0 );
+          pNC2->ncFlags |= NC_HasAgg | (pDef->funcFlags & SQLITE_FUNC_MINMAX);
+
+        }
+        pNC->ncFlags |= NC_AllowAgg;
+      }
+      /* FIX ME:  Compute pExpr->affinity based on the expected return
+      ** type of the function 
+      */
+      return WRC_Prune;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case TK_SELECT:
+    case TK_EXISTS:  testcase( pExpr->op==TK_EXISTS );
+#endif
+    case TK_IN: {
+      testcase( pExpr->op==TK_IN );
+      if( ExprHasProperty(pExpr, EP_xIsSelect) ){
+        int nRef = pNC->nRef;
+        notValidCheckConstraint(pParse, pNC, "subqueries");
+        notValidPartIdxWhere(pParse, pNC, "subqueries");
+        sqlite3WalkSelect(pWalker, pExpr->x.pSelect);
+        assert( pNC->nRef>=nRef );
+        if( nRef!=pNC->nRef ){
+          ExprSetProperty(pExpr, EP_VarSelect);
+        }
+      }
+      break;
+    }
+    case TK_VARIABLE: {
+      notValidCheckConstraint(pParse, pNC, "parameters");
+      notValidPartIdxWhere(pParse, pNC, "parameters");
+      break;
+    }
+  }
+  return (pParse->nErr || pParse->db->mallocFailed) ? WRC_Abort : WRC_Continue;
+}
+
+/*
+** pEList is a list of expressions which are really the result set of the
+** a SELECT statement.  pE is a term in an ORDER BY or GROUP BY clause.
+** This routine checks to see if pE is a simple identifier which corresponds
+** to the AS-name of one of the terms of the expression list.  If it is,
+** this routine return an integer between 1 and N where N is the number of
+** elements in pEList, corresponding to the matching entry.  If there is
+** no match, or if pE is not a simple identifier, then this routine
+** return 0.
+**
+** pEList has been resolved.  pE has not.
+*/
+static int resolveAsName(
+  Parse *pParse,     /* Parsing context for error messages */
+  ExprList *pEList,  /* List of expressions to scan */
+  Expr *pE           /* Expression we are trying to match */
+){
+  int i;             /* Loop counter */
+
+  UNUSED_PARAMETER(pParse);
+
+  if( pE->op==TK_ID ){
+    char *zCol = pE->u.zToken;
+    for(i=0; i<pEList->nExpr; i++){
+      char *zAs = pEList->a[i].zName;
+      if( zAs!=0 && sqlite3StrICmp(zAs, zCol)==0 ){
+        return i+1;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** pE is a pointer to an expression which is a single term in the
+** ORDER BY of a compound SELECT.  The expression has not been
+** name resolved.
+**
+** At the point this routine is called, we already know that the
+** ORDER BY term is not an integer index into the result set.  That
+** case is handled by the calling routine.
+**
+** Attempt to match pE against result set columns in the left-most
+** SELECT statement.  Return the index i of the matching column,
+** as an indication to the caller that it should sort by the i-th column.
+** The left-most column is 1.  In other words, the value returned is the
+** same integer value that would be used in the SQL statement to indicate
+** the column.
+**
+** If there is no match, return 0.  Return -1 if an error occurs.
+*/
+static int resolveOrderByTermToExprList(
+  Parse *pParse,     /* Parsing context for error messages */
+  Select *pSelect,   /* The SELECT statement with the ORDER BY clause */
+  Expr *pE           /* The specific ORDER BY term */
+){
+  int i;             /* Loop counter */
+  ExprList *pEList;  /* The columns of the result set */
+  NameContext nc;    /* Name context for resolving pE */
+  sqlite3 *db;       /* Database connection */
+  int rc;            /* Return code from subprocedures */
+  u8 savedSuppErr;   /* Saved value of db->suppressErr */
+
+  assert( sqlite3ExprIsInteger(pE, &i)==0 );
+  pEList = pSelect->pEList;
+
+  /* Resolve all names in the ORDER BY term expression
+  */
+  memset(&nc, 0, sizeof(nc));
+  nc.pParse = pParse;
+  nc.pSrcList = pSelect->pSrc;
+  nc.pEList = pEList;
+  nc.ncFlags = NC_AllowAgg;
+  nc.nErr = 0;
+  db = pParse->db;
+  savedSuppErr = db->suppressErr;
+  db->suppressErr = 1;
+  rc = sqlite3ResolveExprNames(&nc, pE);
+  db->suppressErr = savedSuppErr;
+  if( rc ) return 0;
+
+  /* Try to match the ORDER BY expression against an expression
+  ** in the result set.  Return an 1-based index of the matching
+  ** result-set entry.
+  */
+  for(i=0; i<pEList->nExpr; i++){
+    if( sqlite3ExprCompare(pEList->a[i].pExpr, pE, -1)<2 ){
+      return i+1;
+    }
+  }
+
+  /* If no match, return 0. */
+  return 0;
+}
+
+/*
+** Generate an ORDER BY or GROUP BY term out-of-range error.
+*/
+static void resolveOutOfRangeError(
+  Parse *pParse,         /* The error context into which to write the error */
+  const char *zType,     /* "ORDER" or "GROUP" */
+  int i,                 /* The index (1-based) of the term out of range */
+  int mx                 /* Largest permissible value of i */
+){
+  sqlite3ErrorMsg(pParse, 
+    "%r %s BY term out of range - should be "
+    "between 1 and %d", i, zType, mx);
+}
+
+/*
+** Analyze the ORDER BY clause in a compound SELECT statement.   Modify
+** each term of the ORDER BY clause is a constant integer between 1
+** and N where N is the number of columns in the compound SELECT.
+**
+** ORDER BY terms that are already an integer between 1 and N are
+** unmodified.  ORDER BY terms that are integers outside the range of
+** 1 through N generate an error.  ORDER BY terms that are expressions
+** are matched against result set expressions of compound SELECT
+** beginning with the left-most SELECT and working toward the right.
+** At the first match, the ORDER BY expression is transformed into
+** the integer column number.
+**
+** Return the number of errors seen.
+*/
+static int resolveCompoundOrderBy(
+  Parse *pParse,        /* Parsing context.  Leave error messages here */
+  Select *pSelect       /* The SELECT statement containing the ORDER BY */
+){
+  int i;
+  ExprList *pOrderBy;
+  ExprList *pEList;
+  sqlite3 *db;
+  int moreToDo = 1;
+
+  pOrderBy = pSelect->pOrderBy;
+  if( pOrderBy==0 ) return 0;
+  db = pParse->db;
+#if SQLITE_MAX_COLUMN
+  if( pOrderBy->nExpr>db->aLimit[SQLITE_LIMIT_COLUMN] ){
+    sqlite3ErrorMsg(pParse, "too many terms in ORDER BY clause");
+    return 1;
+  }
+#endif
+  for(i=0; i<pOrderBy->nExpr; i++){
+    pOrderBy->a[i].done = 0;
+  }
+  pSelect->pNext = 0;
+  while( pSelect->pPrior ){
+    pSelect->pPrior->pNext = pSelect;
+    pSelect = pSelect->pPrior;
+  }
+  while( pSelect && moreToDo ){
+    struct ExprList_item *pItem;
+    moreToDo = 0;
+    pEList = pSelect->pEList;
+    assert( pEList!=0 );
+    for(i=0, pItem=pOrderBy->a; i<pOrderBy->nExpr; i++, pItem++){
+      int iCol = -1;
+      Expr *pE, *pDup;
+      if( pItem->done ) continue;
+      pE = sqlite3ExprSkipCollate(pItem->pExpr);
+      if( sqlite3ExprIsInteger(pE, &iCol) ){
+        if( iCol<=0 || iCol>pEList->nExpr ){
+          resolveOutOfRangeError(pParse, "ORDER", i+1, pEList->nExpr);
+          return 1;
