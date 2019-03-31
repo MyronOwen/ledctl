@@ -81253,3 +81253,213 @@ static int resolveCompoundOrderBy(
         if( iCol<=0 || iCol>pEList->nExpr ){
           resolveOutOfRangeError(pParse, "ORDER", i+1, pEList->nExpr);
           return 1;
+        }
+      }else{
+        iCol = resolveAsName(pParse, pEList, pE);
+        if( iCol==0 ){
+          pDup = sqlite3ExprDup(db, pE, 0);
+          if( !db->mallocFailed ){
+            assert(pDup);
+            iCol = resolveOrderByTermToExprList(pParse, pSelect, pDup);
+          }
+          sqlite3ExprDelete(db, pDup);
+        }
+      }
+      if( iCol>0 ){
+        /* Convert the ORDER BY term into an integer column number iCol,
+        ** taking care to preserve the COLLATE clause if it exists */
+        Expr *pNew = sqlite3Expr(db, TK_INTEGER, 0);
+        if( pNew==0 ) return 1;
+        pNew->flags |= EP_IntValue;
+        pNew->u.iValue = iCol;
+        if( pItem->pExpr==pE ){
+          pItem->pExpr = pNew;
+        }else{
+          assert( pItem->pExpr->op==TK_COLLATE );
+          assert( pItem->pExpr->pLeft==pE );
+          pItem->pExpr->pLeft = pNew;
+        }
+        sqlite3ExprDelete(db, pE);
+        pItem->u.x.iOrderByCol = (u16)iCol;
+        pItem->done = 1;
+      }else{
+        moreToDo = 1;
+      }
+    }
+    pSelect = pSelect->pNext;
+  }
+  for(i=0; i<pOrderBy->nExpr; i++){
+    if( pOrderBy->a[i].done==0 ){
+      sqlite3ErrorMsg(pParse, "%r ORDER BY term does not match any "
+            "column in the result set", i+1);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** Check every term in the ORDER BY or GROUP BY clause pOrderBy of
+** the SELECT statement pSelect.  If any term is reference to a
+** result set expression (as determined by the ExprList.a.u.x.iOrderByCol
+** field) then convert that term into a copy of the corresponding result set
+** column.
+**
+** If any errors are detected, add an error message to pParse and
+** return non-zero.  Return zero if no errors are seen.
+*/
+SQLITE_PRIVATE int sqlite3ResolveOrderGroupBy(
+  Parse *pParse,        /* Parsing context.  Leave error messages here */
+  Select *pSelect,      /* The SELECT statement containing the clause */
+  ExprList *pOrderBy,   /* The ORDER BY or GROUP BY clause to be processed */
+  const char *zType     /* "ORDER" or "GROUP" */
+){
+  int i;
+  sqlite3 *db = pParse->db;
+  ExprList *pEList;
+  struct ExprList_item *pItem;
+
+  if( pOrderBy==0 || pParse->db->mallocFailed ) return 0;
+#if SQLITE_MAX_COLUMN
+  if( pOrderBy->nExpr>db->aLimit[SQLITE_LIMIT_COLUMN] ){
+    sqlite3ErrorMsg(pParse, "too many terms in %s BY clause", zType);
+    return 1;
+  }
+#endif
+  pEList = pSelect->pEList;
+  assert( pEList!=0 );  /* sqlite3SelectNew() guarantees this */
+  for(i=0, pItem=pOrderBy->a; i<pOrderBy->nExpr; i++, pItem++){
+    if( pItem->u.x.iOrderByCol ){
+      if( pItem->u.x.iOrderByCol>pEList->nExpr ){
+        resolveOutOfRangeError(pParse, zType, i+1, pEList->nExpr);
+        return 1;
+      }
+      resolveAlias(pParse, pEList, pItem->u.x.iOrderByCol-1, pItem->pExpr, zType,0);
+    }
+  }
+  return 0;
+}
+
+/*
+** pOrderBy is an ORDER BY or GROUP BY clause in SELECT statement pSelect.
+** The Name context of the SELECT statement is pNC.  zType is either
+** "ORDER" or "GROUP" depending on which type of clause pOrderBy is.
+**
+** This routine resolves each term of the clause into an expression.
+** If the order-by term is an integer I between 1 and N (where N is the
+** number of columns in the result set of the SELECT) then the expression
+** in the resolution is a copy of the I-th result-set expression.  If
+** the order-by term is an identifier that corresponds to the AS-name of
+** a result-set expression, then the term resolves to a copy of the
+** result-set expression.  Otherwise, the expression is resolved in
+** the usual way - using sqlite3ResolveExprNames().
+**
+** This routine returns the number of errors.  If errors occur, then
+** an appropriate error message might be left in pParse.  (OOM errors
+** excepted.)
+*/
+static int resolveOrderGroupBy(
+  NameContext *pNC,     /* The name context of the SELECT statement */
+  Select *pSelect,      /* The SELECT statement holding pOrderBy */
+  ExprList *pOrderBy,   /* An ORDER BY or GROUP BY clause to resolve */
+  const char *zType     /* Either "ORDER" or "GROUP", as appropriate */
+){
+  int i, j;                      /* Loop counters */
+  int iCol;                      /* Column number */
+  struct ExprList_item *pItem;   /* A term of the ORDER BY clause */
+  Parse *pParse;                 /* Parsing context */
+  int nResult;                   /* Number of terms in the result set */
+
+  if( pOrderBy==0 ) return 0;
+  nResult = pSelect->pEList->nExpr;
+  pParse = pNC->pParse;
+  for(i=0, pItem=pOrderBy->a; i<pOrderBy->nExpr; i++, pItem++){
+    Expr *pE = pItem->pExpr;
+    Expr *pE2 = sqlite3ExprSkipCollate(pE);
+    if( zType[0]!='G' ){
+      iCol = resolveAsName(pParse, pSelect->pEList, pE2);
+      if( iCol>0 ){
+        /* If an AS-name match is found, mark this ORDER BY column as being
+        ** a copy of the iCol-th result-set column.  The subsequent call to
+        ** sqlite3ResolveOrderGroupBy() will convert the expression to a
+        ** copy of the iCol-th result-set expression. */
+        pItem->u.x.iOrderByCol = (u16)iCol;
+        continue;
+      }
+    }
+    if( sqlite3ExprIsInteger(pE2, &iCol) ){
+      /* The ORDER BY term is an integer constant.  Again, set the column
+      ** number so that sqlite3ResolveOrderGroupBy() will convert the
+      ** order-by term to a copy of the result-set expression */
+      if( iCol<1 || iCol>0xffff ){
+        resolveOutOfRangeError(pParse, zType, i+1, nResult);
+        return 1;
+      }
+      pItem->u.x.iOrderByCol = (u16)iCol;
+      continue;
+    }
+
+    /* Otherwise, treat the ORDER BY term as an ordinary expression */
+    pItem->u.x.iOrderByCol = 0;
+    if( sqlite3ResolveExprNames(pNC, pE) ){
+      return 1;
+    }
+    for(j=0; j<pSelect->pEList->nExpr; j++){
+      if( sqlite3ExprCompare(pE, pSelect->pEList->a[j].pExpr, -1)==0 ){
+        pItem->u.x.iOrderByCol = j+1;
+      }
+    }
+  }
+  return sqlite3ResolveOrderGroupBy(pParse, pSelect, pOrderBy, zType);
+}
+
+/*
+** Resolve names in the SELECT statement p and all of its descendants.
+*/
+static int resolveSelectStep(Walker *pWalker, Select *p){
+  NameContext *pOuterNC;  /* Context that contains this SELECT */
+  NameContext sNC;        /* Name context of this SELECT */
+  int isCompound;         /* True if p is a compound select */
+  int nCompound;          /* Number of compound terms processed so far */
+  Parse *pParse;          /* Parsing context */
+  ExprList *pEList;       /* Result set expression list */
+  int i;                  /* Loop counter */
+  ExprList *pGroupBy;     /* The GROUP BY clause */
+  Select *pLeftmost;      /* Left-most of SELECT of a compound */
+  sqlite3 *db;            /* Database connection */
+  
+
+  assert( p!=0 );
+  if( p->selFlags & SF_Resolved ){
+    return WRC_Prune;
+  }
+  pOuterNC = pWalker->u.pNC;
+  pParse = pWalker->pParse;
+  db = pParse->db;
+
+  /* Normally sqlite3SelectExpand() will be called first and will have
+  ** already expanded this SELECT.  However, if this is a subquery within
+  ** an expression, sqlite3ResolveExprNames() will be called without a
+  ** prior call to sqlite3SelectExpand().  When that happens, let
+  ** sqlite3SelectPrep() do all of the processing for this SELECT.
+  ** sqlite3SelectPrep() will invoke both sqlite3SelectExpand() and
+  ** this routine in the correct order.
+  */
+  if( (p->selFlags & SF_Expanded)==0 ){
+    sqlite3SelectPrep(pParse, p, pOuterNC);
+    return (pParse->nErr || db->mallocFailed) ? WRC_Abort : WRC_Prune;
+  }
+
+  isCompound = p->pPrior!=0;
+  nCompound = 0;
+  pLeftmost = p;
+  while( p ){
+    assert( (p->selFlags & SF_Expanded)!=0 );
+    assert( (p->selFlags & SF_Resolved)==0 );
+    p->selFlags |= SF_Resolved;
+
+    /* Resolve the expressions in the LIMIT and OFFSET clauses. These
+    ** are not allowed to refer to any names, so pass an empty NameContext.
+    */
+    memset(&sNC, 0, sizeof(sNC));
+    sNC.pParse = pParse;
