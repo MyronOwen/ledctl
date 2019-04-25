@@ -81463,3 +81463,220 @@ static int resolveSelectStep(Walker *pWalker, Select *p){
     */
     memset(&sNC, 0, sizeof(sNC));
     sNC.pParse = pParse;
+    if( sqlite3ResolveExprNames(&sNC, p->pLimit) ||
+        sqlite3ResolveExprNames(&sNC, p->pOffset) ){
+      return WRC_Abort;
+    }
+  
+    /* Recursively resolve names in all subqueries
+    */
+    for(i=0; i<p->pSrc->nSrc; i++){
+      struct SrcList_item *pItem = &p->pSrc->a[i];
+      if( pItem->pSelect ){
+        NameContext *pNC;         /* Used to iterate name contexts */
+        int nRef = 0;             /* Refcount for pOuterNC and outer contexts */
+        const char *zSavedContext = pParse->zAuthContext;
+
+        /* Count the total number of references to pOuterNC and all of its
+        ** parent contexts. After resolving references to expressions in
+        ** pItem->pSelect, check if this value has changed. If so, then
+        ** SELECT statement pItem->pSelect must be correlated. Set the
+        ** pItem->isCorrelated flag if this is the case. */
+        for(pNC=pOuterNC; pNC; pNC=pNC->pNext) nRef += pNC->nRef;
+
+        if( pItem->zName ) pParse->zAuthContext = pItem->zName;
+        sqlite3ResolveSelectNames(pParse, pItem->pSelect, pOuterNC);
+        pParse->zAuthContext = zSavedContext;
+        if( pParse->nErr || db->mallocFailed ) return WRC_Abort;
+
+        for(pNC=pOuterNC; pNC; pNC=pNC->pNext) nRef -= pNC->nRef;
+        assert( pItem->isCorrelated==0 && nRef<=0 );
+        pItem->isCorrelated = (nRef!=0);
+      }
+    }
+  
+    /* Set up the local name-context to pass to sqlite3ResolveExprNames() to
+    ** resolve the result-set expression list.
+    */
+    sNC.ncFlags = NC_AllowAgg;
+    sNC.pSrcList = p->pSrc;
+    sNC.pNext = pOuterNC;
+  
+    /* Resolve names in the result set. */
+    pEList = p->pEList;
+    assert( pEList!=0 );
+    for(i=0; i<pEList->nExpr; i++){
+      Expr *pX = pEList->a[i].pExpr;
+      if( sqlite3ResolveExprNames(&sNC, pX) ){
+        return WRC_Abort;
+      }
+    }
+  
+    /* If there are no aggregate functions in the result-set, and no GROUP BY 
+    ** expression, do not allow aggregates in any of the other expressions.
+    */
+    assert( (p->selFlags & SF_Aggregate)==0 );
+    pGroupBy = p->pGroupBy;
+    if( pGroupBy || (sNC.ncFlags & NC_HasAgg)!=0 ){
+      assert( NC_MinMaxAgg==SF_MinMaxAgg );
+      p->selFlags |= SF_Aggregate | (sNC.ncFlags&NC_MinMaxAgg);
+    }else{
+      sNC.ncFlags &= ~NC_AllowAgg;
+    }
+  
+    /* If a HAVING clause is present, then there must be a GROUP BY clause.
+    */
+    if( p->pHaving && !pGroupBy ){
+      sqlite3ErrorMsg(pParse, "a GROUP BY clause is required before HAVING");
+      return WRC_Abort;
+    }
+  
+    /* Add the output column list to the name-context before parsing the
+    ** other expressions in the SELECT statement. This is so that
+    ** expressions in the WHERE clause (etc.) can refer to expressions by
+    ** aliases in the result set.
+    **
+    ** Minor point: If this is the case, then the expression will be
+    ** re-evaluated for each reference to it.
+    */
+    sNC.pEList = p->pEList;
+    if( sqlite3ResolveExprNames(&sNC, p->pHaving) ) return WRC_Abort;
+    if( sqlite3ResolveExprNames(&sNC, p->pWhere) ) return WRC_Abort;
+
+    /* The ORDER BY and GROUP BY clauses may not refer to terms in
+    ** outer queries 
+    */
+    sNC.pNext = 0;
+    sNC.ncFlags |= NC_AllowAgg;
+
+    /* Process the ORDER BY clause for singleton SELECT statements.
+    ** The ORDER BY clause for compounds SELECT statements is handled
+    ** below, after all of the result-sets for all of the elements of
+    ** the compound have been resolved.
+    */
+    if( !isCompound && resolveOrderGroupBy(&sNC, p, p->pOrderBy, "ORDER") ){
+      return WRC_Abort;
+    }
+    if( db->mallocFailed ){
+      return WRC_Abort;
+    }
+  
+    /* Resolve the GROUP BY clause.  At the same time, make sure 
+    ** the GROUP BY clause does not contain aggregate functions.
+    */
+    if( pGroupBy ){
+      struct ExprList_item *pItem;
+    
+      if( resolveOrderGroupBy(&sNC, p, pGroupBy, "GROUP") || db->mallocFailed ){
+        return WRC_Abort;
+      }
+      for(i=0, pItem=pGroupBy->a; i<pGroupBy->nExpr; i++, pItem++){
+        if( ExprHasProperty(pItem->pExpr, EP_Agg) ){
+          sqlite3ErrorMsg(pParse, "aggregate functions are not allowed in "
+              "the GROUP BY clause");
+          return WRC_Abort;
+        }
+      }
+    }
+
+    /* Advance to the next term of the compound
+    */
+    p = p->pPrior;
+    nCompound++;
+  }
+
+  /* Resolve the ORDER BY on a compound SELECT after all terms of
+  ** the compound have been resolved.
+  */
+  if( isCompound && resolveCompoundOrderBy(pParse, pLeftmost) ){
+    return WRC_Abort;
+  }
+
+  return WRC_Prune;
+}
+
+/*
+** This routine walks an expression tree and resolves references to
+** table columns and result-set columns.  At the same time, do error
+** checking on function usage and set a flag if any aggregate functions
+** are seen.
+**
+** To resolve table columns references we look for nodes (or subtrees) of the 
+** form X.Y.Z or Y.Z or just Z where
+**
+**      X:   The name of a database.  Ex:  "main" or "temp" or
+**           the symbolic name assigned to an ATTACH-ed database.
+**
+**      Y:   The name of a table in a FROM clause.  Or in a trigger
+**           one of the special names "old" or "new".
+**
+**      Z:   The name of a column in table Y.
+**
+** The node at the root of the subtree is modified as follows:
+**
+**    Expr.op        Changed to TK_COLUMN
+**    Expr.pTab      Points to the Table object for X.Y
+**    Expr.iColumn   The column index in X.Y.  -1 for the rowid.
+**    Expr.iTable    The VDBE cursor number for X.Y
+**
+**
+** To resolve result-set references, look for expression nodes of the
+** form Z (with no X and Y prefix) where the Z matches the right-hand
+** size of an AS clause in the result-set of a SELECT.  The Z expression
+** is replaced by a copy of the left-hand side of the result-set expression.
+** Table-name and function resolution occurs on the substituted expression
+** tree.  For example, in:
+**
+**      SELECT a+b AS x, c+d AS y FROM t1 ORDER BY x;
+**
+** The "x" term of the order by is replaced by "a+b" to render:
+**
+**      SELECT a+b AS x, c+d AS y FROM t1 ORDER BY a+b;
+**
+** Function calls are checked to make sure that the function is 
+** defined and that the correct number of arguments are specified.
+** If the function is an aggregate function, then the NC_HasAgg flag is
+** set and the opcode is changed from TK_FUNCTION to TK_AGG_FUNCTION.
+** If an expression contains aggregate functions then the EP_Agg
+** property on the expression is set.
+**
+** An error message is left in pParse if anything is amiss.  The number
+** if errors is returned.
+*/
+SQLITE_PRIVATE int sqlite3ResolveExprNames( 
+  NameContext *pNC,       /* Namespace to resolve expressions in. */
+  Expr *pExpr             /* The expression to be analyzed. */
+){
+  u16 savedHasAgg;
+  Walker w;
+
+  if( pExpr==0 ) return 0;
+#if SQLITE_MAX_EXPR_DEPTH>0
+  {
+    Parse *pParse = pNC->pParse;
+    if( sqlite3ExprCheckHeight(pParse, pExpr->nHeight+pNC->pParse->nHeight) ){
+      return 1;
+    }
+    pParse->nHeight += pExpr->nHeight;
+  }
+#endif
+  savedHasAgg = pNC->ncFlags & (NC_HasAgg|NC_MinMaxAgg);
+  pNC->ncFlags &= ~(NC_HasAgg|NC_MinMaxAgg);
+  memset(&w, 0, sizeof(w));
+  w.xExprCallback = resolveExprStep;
+  w.xSelectCallback = resolveSelectStep;
+  w.pParse = pNC->pParse;
+  w.u.pNC = pNC;
+  sqlite3WalkExpr(&w, pExpr);
+#if SQLITE_MAX_EXPR_DEPTH>0
+  pNC->pParse->nHeight -= pExpr->nHeight;
+#endif
+  if( pNC->nErr>0 || w.pParse->nErr>0 ){
+    ExprSetProperty(pExpr, EP_Error);
+  }
+  if( pNC->ncFlags & NC_HasAgg ){
+    ExprSetProperty(pExpr, EP_Agg);
+  }
+  pNC->ncFlags |= savedHasAgg;
+  return ExprHasProperty(pExpr, EP_Error);
+}
