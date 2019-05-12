@@ -81904,3 +81904,217 @@ SQLITE_PRIVATE CollSeq *sqlite3ExprCollSeq(Parse *pParse, Expr *pExpr){
       if( ALWAYS(p->pLeft) && (p->pLeft->flags & EP_Collate)!=0 ){
         p = p->pLeft;
       }else{
+        p = p->pRight;
+      }
+    }else{
+      break;
+    }
+  }
+  if( sqlite3CheckCollSeq(pParse, pColl) ){ 
+    pColl = 0;
+  }
+  return pColl;
+}
+
+/*
+** pExpr is an operand of a comparison operator.  aff2 is the
+** type affinity of the other operand.  This routine returns the
+** type affinity that should be used for the comparison operator.
+*/
+SQLITE_PRIVATE char sqlite3CompareAffinity(Expr *pExpr, char aff2){
+  char aff1 = sqlite3ExprAffinity(pExpr);
+  if( aff1 && aff2 ){
+    /* Both sides of the comparison are columns. If one has numeric
+    ** affinity, use that. Otherwise use no affinity.
+    */
+    if( sqlite3IsNumericAffinity(aff1) || sqlite3IsNumericAffinity(aff2) ){
+      return SQLITE_AFF_NUMERIC;
+    }else{
+      return SQLITE_AFF_NONE;
+    }
+  }else if( !aff1 && !aff2 ){
+    /* Neither side of the comparison is a column.  Compare the
+    ** results directly.
+    */
+    return SQLITE_AFF_NONE;
+  }else{
+    /* One side is a column, the other is not. Use the columns affinity. */
+    assert( aff1==0 || aff2==0 );
+    return (aff1 + aff2);
+  }
+}
+
+/*
+** pExpr is a comparison operator.  Return the type affinity that should
+** be applied to both operands prior to doing the comparison.
+*/
+static char comparisonAffinity(Expr *pExpr){
+  char aff;
+  assert( pExpr->op==TK_EQ || pExpr->op==TK_IN || pExpr->op==TK_LT ||
+          pExpr->op==TK_GT || pExpr->op==TK_GE || pExpr->op==TK_LE ||
+          pExpr->op==TK_NE || pExpr->op==TK_IS || pExpr->op==TK_ISNOT );
+  assert( pExpr->pLeft );
+  aff = sqlite3ExprAffinity(pExpr->pLeft);
+  if( pExpr->pRight ){
+    aff = sqlite3CompareAffinity(pExpr->pRight, aff);
+  }else if( ExprHasProperty(pExpr, EP_xIsSelect) ){
+    aff = sqlite3CompareAffinity(pExpr->x.pSelect->pEList->a[0].pExpr, aff);
+  }else if( !aff ){
+    aff = SQLITE_AFF_NONE;
+  }
+  return aff;
+}
+
+/*
+** pExpr is a comparison expression, eg. '=', '<', IN(...) etc.
+** idx_affinity is the affinity of an indexed column. Return true
+** if the index with affinity idx_affinity may be used to implement
+** the comparison in pExpr.
+*/
+SQLITE_PRIVATE int sqlite3IndexAffinityOk(Expr *pExpr, char idx_affinity){
+  char aff = comparisonAffinity(pExpr);
+  switch( aff ){
+    case SQLITE_AFF_NONE:
+      return 1;
+    case SQLITE_AFF_TEXT:
+      return idx_affinity==SQLITE_AFF_TEXT;
+    default:
+      return sqlite3IsNumericAffinity(idx_affinity);
+  }
+}
+
+/*
+** Return the P5 value that should be used for a binary comparison
+** opcode (OP_Eq, OP_Ge etc.) used to compare pExpr1 and pExpr2.
+*/
+static u8 binaryCompareP5(Expr *pExpr1, Expr *pExpr2, int jumpIfNull){
+  u8 aff = (char)sqlite3ExprAffinity(pExpr2);
+  aff = (u8)sqlite3CompareAffinity(pExpr1, aff) | (u8)jumpIfNull;
+  return aff;
+}
+
+/*
+** Return a pointer to the collation sequence that should be used by
+** a binary comparison operator comparing pLeft and pRight.
+**
+** If the left hand expression has a collating sequence type, then it is
+** used. Otherwise the collation sequence for the right hand expression
+** is used, or the default (BINARY) if neither expression has a collating
+** type.
+**
+** Argument pRight (but not pLeft) may be a null pointer. In this case,
+** it is not considered.
+*/
+SQLITE_PRIVATE CollSeq *sqlite3BinaryCompareCollSeq(
+  Parse *pParse, 
+  Expr *pLeft, 
+  Expr *pRight
+){
+  CollSeq *pColl;
+  assert( pLeft );
+  if( pLeft->flags & EP_Collate ){
+    pColl = sqlite3ExprCollSeq(pParse, pLeft);
+  }else if( pRight && (pRight->flags & EP_Collate)!=0 ){
+    pColl = sqlite3ExprCollSeq(pParse, pRight);
+  }else{
+    pColl = sqlite3ExprCollSeq(pParse, pLeft);
+    if( !pColl ){
+      pColl = sqlite3ExprCollSeq(pParse, pRight);
+    }
+  }
+  return pColl;
+}
+
+/*
+** Generate code for a comparison operator.
+*/
+static int codeCompare(
+  Parse *pParse,    /* The parsing (and code generating) context */
+  Expr *pLeft,      /* The left operand */
+  Expr *pRight,     /* The right operand */
+  int opcode,       /* The comparison opcode */
+  int in1, int in2, /* Register holding operands */
+  int dest,         /* Jump here if true.  */
+  int jumpIfNull    /* If true, jump if either operand is NULL */
+){
+  int p5;
+  int addr;
+  CollSeq *p4;
+
+  p4 = sqlite3BinaryCompareCollSeq(pParse, pLeft, pRight);
+  p5 = binaryCompareP5(pLeft, pRight, jumpIfNull);
+  addr = sqlite3VdbeAddOp4(pParse->pVdbe, opcode, in2, dest, in1,
+                           (void*)p4, P4_COLLSEQ);
+  sqlite3VdbeChangeP5(pParse->pVdbe, (u8)p5);
+  return addr;
+}
+
+#if SQLITE_MAX_EXPR_DEPTH>0
+/*
+** Check that argument nHeight is less than or equal to the maximum
+** expression depth allowed. If it is not, leave an error message in
+** pParse.
+*/
+SQLITE_PRIVATE int sqlite3ExprCheckHeight(Parse *pParse, int nHeight){
+  int rc = SQLITE_OK;
+  int mxHeight = pParse->db->aLimit[SQLITE_LIMIT_EXPR_DEPTH];
+  if( nHeight>mxHeight ){
+    sqlite3ErrorMsg(pParse, 
+       "Expression tree is too large (maximum depth %d)", mxHeight
+    );
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+
+/* The following three functions, heightOfExpr(), heightOfExprList()
+** and heightOfSelect(), are used to determine the maximum height
+** of any expression tree referenced by the structure passed as the
+** first argument.
+**
+** If this maximum height is greater than the current value pointed
+** to by pnHeight, the second parameter, then set *pnHeight to that
+** value.
+*/
+static void heightOfExpr(Expr *p, int *pnHeight){
+  if( p ){
+    if( p->nHeight>*pnHeight ){
+      *pnHeight = p->nHeight;
+    }
+  }
+}
+static void heightOfExprList(ExprList *p, int *pnHeight){
+  if( p ){
+    int i;
+    for(i=0; i<p->nExpr; i++){
+      heightOfExpr(p->a[i].pExpr, pnHeight);
+    }
+  }
+}
+static void heightOfSelect(Select *p, int *pnHeight){
+  if( p ){
+    heightOfExpr(p->pWhere, pnHeight);
+    heightOfExpr(p->pHaving, pnHeight);
+    heightOfExpr(p->pLimit, pnHeight);
+    heightOfExpr(p->pOffset, pnHeight);
+    heightOfExprList(p->pEList, pnHeight);
+    heightOfExprList(p->pGroupBy, pnHeight);
+    heightOfExprList(p->pOrderBy, pnHeight);
+    heightOfSelect(p->pPrior, pnHeight);
+  }
+}
+
+/*
+** Set the Expr.nHeight variable in the structure passed as an 
+** argument. An expression with no children, Expr.pList or 
+** Expr.pSelect member has a height of 1. Any other expression
+** has a height equal to the maximum height of any other 
+** referenced Expr plus one.
+*/
+static void exprSetHeight(Expr *p){
+  int nHeight = 0;
+  heightOfExpr(p->pLeft, &nHeight);
+  heightOfExpr(p->pRight, &nHeight);
+  if( ExprHasProperty(p, EP_xIsSelect) ){
+    heightOfSelect(p->x.pSelect, &nHeight);
+  }else{
