@@ -82118,3 +82118,239 @@ static void exprSetHeight(Expr *p){
   if( ExprHasProperty(p, EP_xIsSelect) ){
     heightOfSelect(p->x.pSelect, &nHeight);
   }else{
+    heightOfExprList(p->x.pList, &nHeight);
+  }
+  p->nHeight = nHeight + 1;
+}
+
+/*
+** Set the Expr.nHeight variable using the exprSetHeight() function. If
+** the height is greater than the maximum allowed expression depth,
+** leave an error in pParse.
+*/
+SQLITE_PRIVATE void sqlite3ExprSetHeight(Parse *pParse, Expr *p){
+  exprSetHeight(p);
+  sqlite3ExprCheckHeight(pParse, p->nHeight);
+}
+
+/*
+** Return the maximum height of any expression tree referenced
+** by the select statement passed as an argument.
+*/
+SQLITE_PRIVATE int sqlite3SelectExprHeight(Select *p){
+  int nHeight = 0;
+  heightOfSelect(p, &nHeight);
+  return nHeight;
+}
+#else
+  #define exprSetHeight(y)
+#endif /* SQLITE_MAX_EXPR_DEPTH>0 */
+
+/*
+** This routine is the core allocator for Expr nodes.
+**
+** Construct a new expression node and return a pointer to it.  Memory
+** for this node and for the pToken argument is a single allocation
+** obtained from sqlite3DbMalloc().  The calling function
+** is responsible for making sure the node eventually gets freed.
+**
+** If dequote is true, then the token (if it exists) is dequoted.
+** If dequote is false, no dequoting is performance.  The deQuote
+** parameter is ignored if pToken is NULL or if the token does not
+** appear to be quoted.  If the quotes were of the form "..." (double-quotes)
+** then the EP_DblQuoted flag is set on the expression node.
+**
+** Special case:  If op==TK_INTEGER and pToken points to a string that
+** can be translated into a 32-bit integer, then the token is not
+** stored in u.zToken.  Instead, the integer values is written
+** into u.iValue and the EP_IntValue flag is set.  No extra storage
+** is allocated to hold the integer text and the dequote flag is ignored.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprAlloc(
+  sqlite3 *db,            /* Handle for sqlite3DbMallocZero() (may be null) */
+  int op,                 /* Expression opcode */
+  const Token *pToken,    /* Token argument.  Might be NULL */
+  int dequote             /* True to dequote */
+){
+  Expr *pNew;
+  int nExtra = 0;
+  int iValue = 0;
+
+  if( pToken ){
+    if( op!=TK_INTEGER || pToken->z==0
+          || sqlite3GetInt32(pToken->z, &iValue)==0 ){
+      nExtra = pToken->n+1;
+      assert( iValue>=0 );
+    }
+  }
+  pNew = sqlite3DbMallocZero(db, sizeof(Expr)+nExtra);
+  if( pNew ){
+    pNew->op = (u8)op;
+    pNew->iAgg = -1;
+    if( pToken ){
+      if( nExtra==0 ){
+        pNew->flags |= EP_IntValue;
+        pNew->u.iValue = iValue;
+      }else{
+        int c;
+        pNew->u.zToken = (char*)&pNew[1];
+        assert( pToken->z!=0 || pToken->n==0 );
+        if( pToken->n ) memcpy(pNew->u.zToken, pToken->z, pToken->n);
+        pNew->u.zToken[pToken->n] = 0;
+        if( dequote && nExtra>=3 
+             && ((c = pToken->z[0])=='\'' || c=='"' || c=='[' || c=='`') ){
+          sqlite3Dequote(pNew->u.zToken);
+          if( c=='"' ) pNew->flags |= EP_DblQuoted;
+        }
+      }
+    }
+#if SQLITE_MAX_EXPR_DEPTH>0
+    pNew->nHeight = 1;
+#endif  
+  }
+  return pNew;
+}
+
+/*
+** Allocate a new expression node from a zero-terminated token that has
+** already been dequoted.
+*/
+SQLITE_PRIVATE Expr *sqlite3Expr(
+  sqlite3 *db,            /* Handle for sqlite3DbMallocZero() (may be null) */
+  int op,                 /* Expression opcode */
+  const char *zToken      /* Token argument.  Might be NULL */
+){
+  Token x;
+  x.z = zToken;
+  x.n = zToken ? sqlite3Strlen30(zToken) : 0;
+  return sqlite3ExprAlloc(db, op, &x, 0);
+}
+
+/*
+** Attach subtrees pLeft and pRight to the Expr node pRoot.
+**
+** If pRoot==NULL that means that a memory allocation error has occurred.
+** In that case, delete the subtrees pLeft and pRight.
+*/
+SQLITE_PRIVATE void sqlite3ExprAttachSubtrees(
+  sqlite3 *db,
+  Expr *pRoot,
+  Expr *pLeft,
+  Expr *pRight
+){
+  if( pRoot==0 ){
+    assert( db->mallocFailed );
+    sqlite3ExprDelete(db, pLeft);
+    sqlite3ExprDelete(db, pRight);
+  }else{
+    if( pRight ){
+      pRoot->pRight = pRight;
+      pRoot->flags |= EP_Collate & pRight->flags;
+    }
+    if( pLeft ){
+      pRoot->pLeft = pLeft;
+      pRoot->flags |= EP_Collate & pLeft->flags;
+    }
+    exprSetHeight(pRoot);
+  }
+}
+
+/*
+** Allocate an Expr node which joins as many as two subtrees.
+**
+** One or both of the subtrees can be NULL.  Return a pointer to the new
+** Expr node.  Or, if an OOM error occurs, set pParse->db->mallocFailed,
+** free the subtrees and return NULL.
+*/
+SQLITE_PRIVATE Expr *sqlite3PExpr(
+  Parse *pParse,          /* Parsing context */
+  int op,                 /* Expression opcode */
+  Expr *pLeft,            /* Left operand */
+  Expr *pRight,           /* Right operand */
+  const Token *pToken     /* Argument token */
+){
+  Expr *p;
+  if( op==TK_AND && pLeft && pRight && pParse->nErr==0 ){
+    /* Take advantage of short-circuit false optimization for AND */
+    p = sqlite3ExprAnd(pParse->db, pLeft, pRight);
+  }else{
+    p = sqlite3ExprAlloc(pParse->db, op, pToken, 1);
+    sqlite3ExprAttachSubtrees(pParse->db, p, pLeft, pRight);
+  }
+  if( p ) {
+    sqlite3ExprCheckHeight(pParse, p->nHeight);
+  }
+  return p;
+}
+
+/*
+** If the expression is always either TRUE or FALSE (respectively),
+** then return 1.  If one cannot determine the truth value of the
+** expression at compile-time return 0.
+**
+** This is an optimization.  If is OK to return 0 here even if
+** the expression really is always false or false (a false negative).
+** But it is a bug to return 1 if the expression might have different
+** boolean values in different circumstances (a false positive.)
+**
+** Note that if the expression is part of conditional for a
+** LEFT JOIN, then we cannot determine at compile-time whether or not
+** is it true or false, so always return 0.
+*/
+static int exprAlwaysTrue(Expr *p){
+  int v = 0;
+  if( ExprHasProperty(p, EP_FromJoin) ) return 0;
+  if( !sqlite3ExprIsInteger(p, &v) ) return 0;
+  return v!=0;
+}
+static int exprAlwaysFalse(Expr *p){
+  int v = 0;
+  if( ExprHasProperty(p, EP_FromJoin) ) return 0;
+  if( !sqlite3ExprIsInteger(p, &v) ) return 0;
+  return v==0;
+}
+
+/*
+** Join two expressions using an AND operator.  If either expression is
+** NULL, then just return the other expression.
+**
+** If one side or the other of the AND is known to be false, then instead
+** of returning an AND expression, just return a constant expression with
+** a value of false.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprAnd(sqlite3 *db, Expr *pLeft, Expr *pRight){
+  if( pLeft==0 ){
+    return pRight;
+  }else if( pRight==0 ){
+    return pLeft;
+  }else if( exprAlwaysFalse(pLeft) || exprAlwaysFalse(pRight) ){
+    sqlite3ExprDelete(db, pLeft);
+    sqlite3ExprDelete(db, pRight);
+    return sqlite3ExprAlloc(db, TK_INTEGER, &sqlite3IntTokens[0], 0);
+  }else{
+    Expr *pNew = sqlite3ExprAlloc(db, TK_AND, 0, 0);
+    sqlite3ExprAttachSubtrees(db, pNew, pLeft, pRight);
+    return pNew;
+  }
+}
+
+/*
+** Construct a new expression node for a function with multiple
+** arguments.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprFunction(Parse *pParse, ExprList *pList, Token *pToken){
+  Expr *pNew;
+  sqlite3 *db = pParse->db;
+  assert( pToken );
+  pNew = sqlite3ExprAlloc(db, TK_FUNCTION, pToken, 1);
+  if( pNew==0 ){
+    sqlite3ExprListDelete(db, pList); /* Avoid memory leak when malloc fails */
+    return 0;
+  }
+  pNew->x.pList = pList;
+  assert( !ExprHasProperty(pNew, EP_xIsSelect) );
+  sqlite3ExprSetHeight(pParse, pNew);
+  return pNew;
+}
+
+/*
