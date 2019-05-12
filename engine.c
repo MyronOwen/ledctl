@@ -81680,3 +81680,227 @@ SQLITE_PRIVATE int sqlite3ResolveExprNames(
   pNC->ncFlags |= savedHasAgg;
   return ExprHasProperty(pExpr, EP_Error);
 }
+
+
+/*
+** Resolve all names in all expressions of a SELECT and in all
+** decendents of the SELECT, including compounds off of p->pPrior,
+** subqueries in expressions, and subqueries used as FROM clause
+** terms.
+**
+** See sqlite3ResolveExprNames() for a description of the kinds of
+** transformations that occur.
+**
+** All SELECT statements should have been expanded using
+** sqlite3SelectExpand() prior to invoking this routine.
+*/
+SQLITE_PRIVATE void sqlite3ResolveSelectNames(
+  Parse *pParse,         /* The parser context */
+  Select *p,             /* The SELECT statement being coded. */
+  NameContext *pOuterNC  /* Name context for parent SELECT statement */
+){
+  Walker w;
+
+  assert( p!=0 );
+  memset(&w, 0, sizeof(w));
+  w.xExprCallback = resolveExprStep;
+  w.xSelectCallback = resolveSelectStep;
+  w.pParse = pParse;
+  w.u.pNC = pOuterNC;
+  sqlite3WalkSelect(&w, p);
+}
+
+/*
+** Resolve names in expressions that can only reference a single table:
+**
+**    *   CHECK constraints
+**    *   WHERE clauses on partial indices
+**
+** The Expr.iTable value for Expr.op==TK_COLUMN nodes of the expression
+** is set to -1 and the Expr.iColumn value is set to the column number.
+**
+** Any errors cause an error message to be set in pParse.
+*/
+SQLITE_PRIVATE void sqlite3ResolveSelfReference(
+  Parse *pParse,      /* Parsing context */
+  Table *pTab,        /* The table being referenced */
+  int type,           /* NC_IsCheck or NC_PartIdx */
+  Expr *pExpr,        /* Expression to resolve.  May be NULL. */
+  ExprList *pList     /* Expression list to resolve.  May be NUL. */
+){
+  SrcList sSrc;                   /* Fake SrcList for pParse->pNewTable */
+  NameContext sNC;                /* Name context for pParse->pNewTable */
+  int i;                          /* Loop counter */
+
+  assert( type==NC_IsCheck || type==NC_PartIdx );
+  memset(&sNC, 0, sizeof(sNC));
+  memset(&sSrc, 0, sizeof(sSrc));
+  sSrc.nSrc = 1;
+  sSrc.a[0].zName = pTab->zName;
+  sSrc.a[0].pTab = pTab;
+  sSrc.a[0].iCursor = -1;
+  sNC.pParse = pParse;
+  sNC.pSrcList = &sSrc;
+  sNC.ncFlags = type;
+  if( sqlite3ResolveExprNames(&sNC, pExpr) ) return;
+  if( pList ){
+    for(i=0; i<pList->nExpr; i++){
+      if( sqlite3ResolveExprNames(&sNC, pList->a[i].pExpr) ){
+        return;
+      }
+    }
+  }
+}
+
+/************** End of resolve.c *********************************************/
+/************** Begin file expr.c ********************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains routines used for analyzing expressions and
+** for generating VDBE code that evaluates expressions in SQLite.
+*/
+
+/*
+** Return the 'affinity' of the expression pExpr if any.
+**
+** If pExpr is a column, a reference to a column via an 'AS' alias,
+** or a sub-select with a column as the return value, then the 
+** affinity of that column is returned. Otherwise, 0x00 is returned,
+** indicating no affinity for the expression.
+**
+** i.e. the WHERE clause expressions in the following statements all
+** have an affinity:
+**
+** CREATE TABLE t1(a);
+** SELECT * FROM t1 WHERE a;
+** SELECT a AS b FROM t1 WHERE b;
+** SELECT * FROM t1 WHERE (select a from t1);
+*/
+SQLITE_PRIVATE char sqlite3ExprAffinity(Expr *pExpr){
+  int op;
+  pExpr = sqlite3ExprSkipCollate(pExpr);
+  if( pExpr->flags & EP_Generic ) return 0;
+  op = pExpr->op;
+  if( op==TK_SELECT ){
+    assert( pExpr->flags&EP_xIsSelect );
+    return sqlite3ExprAffinity(pExpr->x.pSelect->pEList->a[0].pExpr);
+  }
+#ifndef SQLITE_OMIT_CAST
+  if( op==TK_CAST ){
+    assert( !ExprHasProperty(pExpr, EP_IntValue) );
+    return sqlite3AffinityType(pExpr->u.zToken, 0);
+  }
+#endif
+  if( (op==TK_AGG_COLUMN || op==TK_COLUMN || op==TK_REGISTER) 
+   && pExpr->pTab!=0
+  ){
+    /* op==TK_REGISTER && pExpr->pTab!=0 happens when pExpr was originally
+    ** a TK_COLUMN but was previously evaluated and cached in a register */
+    int j = pExpr->iColumn;
+    if( j<0 ) return SQLITE_AFF_INTEGER;
+    assert( pExpr->pTab && j<pExpr->pTab->nCol );
+    return pExpr->pTab->aCol[j].affinity;
+  }
+  return pExpr->affinity;
+}
+
+/*
+** Set the collating sequence for expression pExpr to be the collating
+** sequence named by pToken.   Return a pointer to a new Expr node that
+** implements the COLLATE operator.
+**
+** If a memory allocation error occurs, that fact is recorded in pParse->db
+** and the pExpr parameter is returned unchanged.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprAddCollateToken(
+  Parse *pParse,           /* Parsing context */
+  Expr *pExpr,             /* Add the "COLLATE" clause to this expression */
+  const Token *pCollName   /* Name of collating sequence */
+){
+  if( pCollName->n>0 ){
+    Expr *pNew = sqlite3ExprAlloc(pParse->db, TK_COLLATE, pCollName, 1);
+    if( pNew ){
+      pNew->pLeft = pExpr;
+      pNew->flags |= EP_Collate|EP_Skip;
+      pExpr = pNew;
+    }
+  }
+  return pExpr;
+}
+SQLITE_PRIVATE Expr *sqlite3ExprAddCollateString(Parse *pParse, Expr *pExpr, const char *zC){
+  Token s;
+  assert( zC!=0 );
+  s.z = zC;
+  s.n = sqlite3Strlen30(s.z);
+  return sqlite3ExprAddCollateToken(pParse, pExpr, &s);
+}
+
+/*
+** Skip over any TK_COLLATE or TK_AS operators and any unlikely()
+** or likelihood() function at the root of an expression.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprSkipCollate(Expr *pExpr){
+  while( pExpr && ExprHasProperty(pExpr, EP_Skip) ){
+    if( ExprHasProperty(pExpr, EP_Unlikely) ){
+      assert( !ExprHasProperty(pExpr, EP_xIsSelect) );
+      assert( pExpr->x.pList->nExpr>0 );
+      assert( pExpr->op==TK_FUNCTION );
+      pExpr = pExpr->x.pList->a[0].pExpr;
+    }else{
+      assert( pExpr->op==TK_COLLATE || pExpr->op==TK_AS );
+      pExpr = pExpr->pLeft;
+    }
+  }   
+  return pExpr;
+}
+
+/*
+** Return the collation sequence for the expression pExpr. If
+** there is no defined collating sequence, return NULL.
+**
+** The collating sequence might be determined by a COLLATE operator
+** or by the presence of a column with a defined collating sequence.
+** COLLATE operators take first precedence.  Left operands take
+** precedence over right operands.
+*/
+SQLITE_PRIVATE CollSeq *sqlite3ExprCollSeq(Parse *pParse, Expr *pExpr){
+  sqlite3 *db = pParse->db;
+  CollSeq *pColl = 0;
+  Expr *p = pExpr;
+  while( p ){
+    int op = p->op;
+    if( p->flags & EP_Generic ) break;
+    if( op==TK_CAST || op==TK_UPLUS ){
+      p = p->pLeft;
+      continue;
+    }
+    if( op==TK_COLLATE || (op==TK_REGISTER && p->op2==TK_COLLATE) ){
+      pColl = sqlite3GetCollSeq(pParse, ENC(db), 0, p->u.zToken);
+      break;
+    }
+    if( p->pTab!=0
+     && (op==TK_AGG_COLUMN || op==TK_COLUMN
+          || op==TK_REGISTER || op==TK_TRIGGER)
+    ){
+      /* op==TK_REGISTER && p->pTab!=0 happens when pExpr was originally
+      ** a TK_COLUMN but was previously evaluated and cached in a register */
+      int j = p->iColumn;
+      if( j>=0 ){
+        const char *zColl = p->pTab->aCol[j].zColl;
+        pColl = sqlite3FindCollSeq(db, ENC(db), zColl, 0);
+      }
+      break;
+    }
+    if( p->flags & EP_Collate ){
+      if( ALWAYS(p->pLeft) && (p->pLeft->flags & EP_Collate)!=0 ){
+        p = p->pLeft;
+      }else{
