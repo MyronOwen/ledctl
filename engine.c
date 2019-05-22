@@ -82560,3 +82560,225 @@ static int dupedExprSize(Expr *p, int flags){
     nByte = dupedExprNodeSize(p, flags);
     if( flags&EXPRDUP_REDUCE ){
       nByte += dupedExprSize(p->pLeft, flags) + dupedExprSize(p->pRight, flags);
+    }
+  }
+  return nByte;
+}
+
+/*
+** This function is similar to sqlite3ExprDup(), except that if pzBuffer 
+** is not NULL then *pzBuffer is assumed to point to a buffer large enough 
+** to store the copy of expression p, the copies of p->u.zToken
+** (if applicable), and the copies of the p->pLeft and p->pRight expressions,
+** if any. Before returning, *pzBuffer is set to the first byte past the
+** portion of the buffer copied into by this function.
+*/
+static Expr *exprDup(sqlite3 *db, Expr *p, int flags, u8 **pzBuffer){
+  Expr *pNew = 0;                      /* Value to return */
+  if( p ){
+    const int isReduced = (flags&EXPRDUP_REDUCE);
+    u8 *zAlloc;
+    u32 staticFlag = 0;
+
+    assert( pzBuffer==0 || isReduced );
+
+    /* Figure out where to write the new Expr structure. */
+    if( pzBuffer ){
+      zAlloc = *pzBuffer;
+      staticFlag = EP_Static;
+    }else{
+      zAlloc = sqlite3DbMallocRaw(db, dupedExprSize(p, flags));
+    }
+    pNew = (Expr *)zAlloc;
+
+    if( pNew ){
+      /* Set nNewSize to the size allocated for the structure pointed to
+      ** by pNew. This is either EXPR_FULLSIZE, EXPR_REDUCEDSIZE or
+      ** EXPR_TOKENONLYSIZE. nToken is set to the number of bytes consumed
+      ** by the copy of the p->u.zToken string (if any).
+      */
+      const unsigned nStructSize = dupedExprStructSize(p, flags);
+      const int nNewSize = nStructSize & 0xfff;
+      int nToken;
+      if( !ExprHasProperty(p, EP_IntValue) && p->u.zToken ){
+        nToken = sqlite3Strlen30(p->u.zToken) + 1;
+      }else{
+        nToken = 0;
+      }
+      if( isReduced ){
+        assert( ExprHasProperty(p, EP_Reduced)==0 );
+        memcpy(zAlloc, p, nNewSize);
+      }else{
+        int nSize = exprStructSize(p);
+        memcpy(zAlloc, p, nSize);
+        memset(&zAlloc[nSize], 0, EXPR_FULLSIZE-nSize);
+      }
+
+      /* Set the EP_Reduced, EP_TokenOnly, and EP_Static flags appropriately. */
+      pNew->flags &= ~(EP_Reduced|EP_TokenOnly|EP_Static|EP_MemToken);
+      pNew->flags |= nStructSize & (EP_Reduced|EP_TokenOnly);
+      pNew->flags |= staticFlag;
+
+      /* Copy the p->u.zToken string, if any. */
+      if( nToken ){
+        char *zToken = pNew->u.zToken = (char*)&zAlloc[nNewSize];
+        memcpy(zToken, p->u.zToken, nToken);
+      }
+
+      if( 0==((p->flags|pNew->flags) & EP_TokenOnly) ){
+        /* Fill in the pNew->x.pSelect or pNew->x.pList member. */
+        if( ExprHasProperty(p, EP_xIsSelect) ){
+          pNew->x.pSelect = sqlite3SelectDup(db, p->x.pSelect, isReduced);
+        }else{
+          pNew->x.pList = sqlite3ExprListDup(db, p->x.pList, isReduced);
+        }
+      }
+
+      /* Fill in pNew->pLeft and pNew->pRight. */
+      if( ExprHasProperty(pNew, EP_Reduced|EP_TokenOnly) ){
+        zAlloc += dupedExprNodeSize(p, flags);
+        if( ExprHasProperty(pNew, EP_Reduced) ){
+          pNew->pLeft = exprDup(db, p->pLeft, EXPRDUP_REDUCE, &zAlloc);
+          pNew->pRight = exprDup(db, p->pRight, EXPRDUP_REDUCE, &zAlloc);
+        }
+        if( pzBuffer ){
+          *pzBuffer = zAlloc;
+        }
+      }else{
+        if( !ExprHasProperty(p, EP_TokenOnly) ){
+          pNew->pLeft = sqlite3ExprDup(db, p->pLeft, 0);
+          pNew->pRight = sqlite3ExprDup(db, p->pRight, 0);
+        }
+      }
+
+    }
+  }
+  return pNew;
+}
+
+/*
+** Create and return a deep copy of the object passed as the second 
+** argument. If an OOM condition is encountered, NULL is returned
+** and the db->mallocFailed flag set.
+*/
+#ifndef SQLITE_OMIT_CTE
+static With *withDup(sqlite3 *db, With *p){
+  With *pRet = 0;
+  if( p ){
+    int nByte = sizeof(*p) + sizeof(p->a[0]) * (p->nCte-1);
+    pRet = sqlite3DbMallocZero(db, nByte);
+    if( pRet ){
+      int i;
+      pRet->nCte = p->nCte;
+      for(i=0; i<p->nCte; i++){
+        pRet->a[i].pSelect = sqlite3SelectDup(db, p->a[i].pSelect, 0);
+        pRet->a[i].pCols = sqlite3ExprListDup(db, p->a[i].pCols, 0);
+        pRet->a[i].zName = sqlite3DbStrDup(db, p->a[i].zName);
+      }
+    }
+  }
+  return pRet;
+}
+#else
+# define withDup(x,y) 0
+#endif
+
+/*
+** The following group of routines make deep copies of expressions,
+** expression lists, ID lists, and select statements.  The copies can
+** be deleted (by being passed to their respective ...Delete() routines)
+** without effecting the originals.
+**
+** The expression list, ID, and source lists return by sqlite3ExprListDup(),
+** sqlite3IdListDup(), and sqlite3SrcListDup() can not be further expanded 
+** by subsequent calls to sqlite*ListAppend() routines.
+**
+** Any tables that the SrcList might point to are not duplicated.
+**
+** The flags parameter contains a combination of the EXPRDUP_XXX flags.
+** If the EXPRDUP_REDUCE flag is set, then the structure returned is a
+** truncated version of the usual Expr structure that will be stored as
+** part of the in-memory representation of the database schema.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprDup(sqlite3 *db, Expr *p, int flags){
+  return exprDup(db, p, flags, 0);
+}
+SQLITE_PRIVATE ExprList *sqlite3ExprListDup(sqlite3 *db, ExprList *p, int flags){
+  ExprList *pNew;
+  struct ExprList_item *pItem, *pOldItem;
+  int i;
+  if( p==0 ) return 0;
+  pNew = sqlite3DbMallocRaw(db, sizeof(*pNew) );
+  if( pNew==0 ) return 0;
+  pNew->nExpr = i = p->nExpr;
+  if( (flags & EXPRDUP_REDUCE)==0 ) for(i=1; i<p->nExpr; i+=i){}
+  pNew->a = pItem = sqlite3DbMallocRaw(db,  i*sizeof(p->a[0]) );
+  if( pItem==0 ){
+    sqlite3DbFree(db, pNew);
+    return 0;
+  } 
+  pOldItem = p->a;
+  for(i=0; i<p->nExpr; i++, pItem++, pOldItem++){
+    Expr *pOldExpr = pOldItem->pExpr;
+    pItem->pExpr = sqlite3ExprDup(db, pOldExpr, flags);
+    pItem->zName = sqlite3DbStrDup(db, pOldItem->zName);
+    pItem->zSpan = sqlite3DbStrDup(db, pOldItem->zSpan);
+    pItem->sortOrder = pOldItem->sortOrder;
+    pItem->done = 0;
+    pItem->bSpanIsTab = pOldItem->bSpanIsTab;
+    pItem->u = pOldItem->u;
+  }
+  return pNew;
+}
+
+/*
+** If cursors, triggers, views and subqueries are all omitted from
+** the build, then none of the following routines, except for 
+** sqlite3SelectDup(), can be called. sqlite3SelectDup() is sometimes
+** called with a NULL argument.
+*/
+#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_TRIGGER) \
+ || !defined(SQLITE_OMIT_SUBQUERY)
+SQLITE_PRIVATE SrcList *sqlite3SrcListDup(sqlite3 *db, SrcList *p, int flags){
+  SrcList *pNew;
+  int i;
+  int nByte;
+  if( p==0 ) return 0;
+  nByte = sizeof(*p) + (p->nSrc>0 ? sizeof(p->a[0]) * (p->nSrc-1) : 0);
+  pNew = sqlite3DbMallocRaw(db, nByte );
+  if( pNew==0 ) return 0;
+  pNew->nSrc = pNew->nAlloc = p->nSrc;
+  for(i=0; i<p->nSrc; i++){
+    struct SrcList_item *pNewItem = &pNew->a[i];
+    struct SrcList_item *pOldItem = &p->a[i];
+    Table *pTab;
+    pNewItem->pSchema = pOldItem->pSchema;
+    pNewItem->zDatabase = sqlite3DbStrDup(db, pOldItem->zDatabase);
+    pNewItem->zName = sqlite3DbStrDup(db, pOldItem->zName);
+    pNewItem->zAlias = sqlite3DbStrDup(db, pOldItem->zAlias);
+    pNewItem->jointype = pOldItem->jointype;
+    pNewItem->iCursor = pOldItem->iCursor;
+    pNewItem->addrFillSub = pOldItem->addrFillSub;
+    pNewItem->regReturn = pOldItem->regReturn;
+    pNewItem->isCorrelated = pOldItem->isCorrelated;
+    pNewItem->viaCoroutine = pOldItem->viaCoroutine;
+    pNewItem->isRecursive = pOldItem->isRecursive;
+    pNewItem->zIndex = sqlite3DbStrDup(db, pOldItem->zIndex);
+    pNewItem->notIndexed = pOldItem->notIndexed;
+    pNewItem->pIndex = pOldItem->pIndex;
+    pTab = pNewItem->pTab = pOldItem->pTab;
+    if( pTab ){
+      pTab->nRef++;
+    }
+    pNewItem->pSelect = sqlite3SelectDup(db, pOldItem->pSelect, flags);
+    pNewItem->pOn = sqlite3ExprDup(db, pOldItem->pOn, flags);
+    pNewItem->pUsing = sqlite3IdListDup(db, pOldItem->pUsing);
+    pNewItem->colUsed = pOldItem->colUsed;
+  }
+  return pNew;
+}
+SQLITE_PRIVATE IdList *sqlite3IdListDup(sqlite3 *db, IdList *p){
+  IdList *pNew;
+  int i;
+  if( p==0 ) return 0;
+  pNew = sqlite3DbMallocRaw(db, sizeof(*pNew) );
