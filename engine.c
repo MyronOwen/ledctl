@@ -82782,3 +82782,218 @@ SQLITE_PRIVATE IdList *sqlite3IdListDup(sqlite3 *db, IdList *p){
   int i;
   if( p==0 ) return 0;
   pNew = sqlite3DbMallocRaw(db, sizeof(*pNew) );
+  if( pNew==0 ) return 0;
+  pNew->nId = p->nId;
+  pNew->a = sqlite3DbMallocRaw(db, p->nId*sizeof(p->a[0]) );
+  if( pNew->a==0 ){
+    sqlite3DbFree(db, pNew);
+    return 0;
+  }
+  /* Note that because the size of the allocation for p->a[] is not
+  ** necessarily a power of two, sqlite3IdListAppend() may not be called
+  ** on the duplicate created by this function. */
+  for(i=0; i<p->nId; i++){
+    struct IdList_item *pNewItem = &pNew->a[i];
+    struct IdList_item *pOldItem = &p->a[i];
+    pNewItem->zName = sqlite3DbStrDup(db, pOldItem->zName);
+    pNewItem->idx = pOldItem->idx;
+  }
+  return pNew;
+}
+SQLITE_PRIVATE Select *sqlite3SelectDup(sqlite3 *db, Select *p, int flags){
+  Select *pNew, *pPrior;
+  if( p==0 ) return 0;
+  pNew = sqlite3DbMallocRaw(db, sizeof(*p) );
+  if( pNew==0 ) return 0;
+  pNew->pEList = sqlite3ExprListDup(db, p->pEList, flags);
+  pNew->pSrc = sqlite3SrcListDup(db, p->pSrc, flags);
+  pNew->pWhere = sqlite3ExprDup(db, p->pWhere, flags);
+  pNew->pGroupBy = sqlite3ExprListDup(db, p->pGroupBy, flags);
+  pNew->pHaving = sqlite3ExprDup(db, p->pHaving, flags);
+  pNew->pOrderBy = sqlite3ExprListDup(db, p->pOrderBy, flags);
+  pNew->op = p->op;
+  pNew->pPrior = pPrior = sqlite3SelectDup(db, p->pPrior, flags);
+  if( pPrior ) pPrior->pNext = pNew;
+  pNew->pNext = 0;
+  pNew->pLimit = sqlite3ExprDup(db, p->pLimit, flags);
+  pNew->pOffset = sqlite3ExprDup(db, p->pOffset, flags);
+  pNew->iLimit = 0;
+  pNew->iOffset = 0;
+  pNew->selFlags = p->selFlags & ~SF_UsesEphemeral;
+  pNew->addrOpenEphm[0] = -1;
+  pNew->addrOpenEphm[1] = -1;
+  pNew->nSelectRow = p->nSelectRow;
+  pNew->pWith = withDup(db, p->pWith);
+  sqlite3SelectSetName(pNew, p->zSelName);
+  return pNew;
+}
+#else
+SQLITE_PRIVATE Select *sqlite3SelectDup(sqlite3 *db, Select *p, int flags){
+  assert( p==0 );
+  return 0;
+}
+#endif
+
+
+/*
+** Add a new element to the end of an expression list.  If pList is
+** initially NULL, then create a new expression list.
+**
+** If a memory allocation error occurs, the entire list is freed and
+** NULL is returned.  If non-NULL is returned, then it is guaranteed
+** that the new entry was successfully appended.
+*/
+SQLITE_PRIVATE ExprList *sqlite3ExprListAppend(
+  Parse *pParse,          /* Parsing context */
+  ExprList *pList,        /* List to which to append. Might be NULL */
+  Expr *pExpr             /* Expression to be appended. Might be NULL */
+){
+  sqlite3 *db = pParse->db;
+  if( pList==0 ){
+    pList = sqlite3DbMallocZero(db, sizeof(ExprList) );
+    if( pList==0 ){
+      goto no_mem;
+    }
+    pList->a = sqlite3DbMallocRaw(db, sizeof(pList->a[0]));
+    if( pList->a==0 ) goto no_mem;
+  }else if( (pList->nExpr & (pList->nExpr-1))==0 ){
+    struct ExprList_item *a;
+    assert( pList->nExpr>0 );
+    a = sqlite3DbRealloc(db, pList->a, pList->nExpr*2*sizeof(pList->a[0]));
+    if( a==0 ){
+      goto no_mem;
+    }
+    pList->a = a;
+  }
+  assert( pList->a!=0 );
+  if( 1 ){
+    struct ExprList_item *pItem = &pList->a[pList->nExpr++];
+    memset(pItem, 0, sizeof(*pItem));
+    pItem->pExpr = pExpr;
+  }
+  return pList;
+
+no_mem:     
+  /* Avoid leaking memory if malloc has failed. */
+  sqlite3ExprDelete(db, pExpr);
+  sqlite3ExprListDelete(db, pList);
+  return 0;
+}
+
+/*
+** Set the ExprList.a[].zName element of the most recently added item
+** on the expression list.
+**
+** pList might be NULL following an OOM error.  But pName should never be
+** NULL.  If a memory allocation fails, the pParse->db->mallocFailed flag
+** is set.
+*/
+SQLITE_PRIVATE void sqlite3ExprListSetName(
+  Parse *pParse,          /* Parsing context */
+  ExprList *pList,        /* List to which to add the span. */
+  Token *pName,           /* Name to be added */
+  int dequote             /* True to cause the name to be dequoted */
+){
+  assert( pList!=0 || pParse->db->mallocFailed!=0 );
+  if( pList ){
+    struct ExprList_item *pItem;
+    assert( pList->nExpr>0 );
+    pItem = &pList->a[pList->nExpr-1];
+    assert( pItem->zName==0 );
+    pItem->zName = sqlite3DbStrNDup(pParse->db, pName->z, pName->n);
+    if( dequote && pItem->zName ) sqlite3Dequote(pItem->zName);
+  }
+}
+
+/*
+** Set the ExprList.a[].zSpan element of the most recently added item
+** on the expression list.
+**
+** pList might be NULL following an OOM error.  But pSpan should never be
+** NULL.  If a memory allocation fails, the pParse->db->mallocFailed flag
+** is set.
+*/
+SQLITE_PRIVATE void sqlite3ExprListSetSpan(
+  Parse *pParse,          /* Parsing context */
+  ExprList *pList,        /* List to which to add the span. */
+  ExprSpan *pSpan         /* The span to be added */
+){
+  sqlite3 *db = pParse->db;
+  assert( pList!=0 || db->mallocFailed!=0 );
+  if( pList ){
+    struct ExprList_item *pItem = &pList->a[pList->nExpr-1];
+    assert( pList->nExpr>0 );
+    assert( db->mallocFailed || pItem->pExpr==pSpan->pExpr );
+    sqlite3DbFree(db, pItem->zSpan);
+    pItem->zSpan = sqlite3DbStrNDup(db, (char*)pSpan->zStart,
+                                    (int)(pSpan->zEnd - pSpan->zStart));
+  }
+}
+
+/*
+** If the expression list pEList contains more than iLimit elements,
+** leave an error message in pParse.
+*/
+SQLITE_PRIVATE void sqlite3ExprListCheckLength(
+  Parse *pParse,
+  ExprList *pEList,
+  const char *zObject
+){
+  int mx = pParse->db->aLimit[SQLITE_LIMIT_COLUMN];
+  testcase( pEList && pEList->nExpr==mx );
+  testcase( pEList && pEList->nExpr==mx+1 );
+  if( pEList && pEList->nExpr>mx ){
+    sqlite3ErrorMsg(pParse, "too many columns in %s", zObject);
+  }
+}
+
+/*
+** Delete an entire expression list.
+*/
+SQLITE_PRIVATE void sqlite3ExprListDelete(sqlite3 *db, ExprList *pList){
+  int i;
+  struct ExprList_item *pItem;
+  if( pList==0 ) return;
+  assert( pList->a!=0 || pList->nExpr==0 );
+  for(pItem=pList->a, i=0; i<pList->nExpr; i++, pItem++){
+    sqlite3ExprDelete(db, pItem->pExpr);
+    sqlite3DbFree(db, pItem->zName);
+    sqlite3DbFree(db, pItem->zSpan);
+  }
+  sqlite3DbFree(db, pList->a);
+  sqlite3DbFree(db, pList);
+}
+
+/*
+** These routines are Walker callbacks used to check expressions to
+** see if they are "constant" for some definition of constant.  The
+** Walker.eCode value determines the type of "constant" we are looking
+** for.
+**
+** These callback routines are used to implement the following:
+**
+**     sqlite3ExprIsConstant()                  pWalker->eCode==1
+**     sqlite3ExprIsConstantNotJoin()           pWalker->eCode==2
+**     sqlite3ExprRefOneTableOnly()             pWalker->eCode==3
+**     sqlite3ExprIsConstantOrFunction()        pWalker->eCode==4 or 5
+**
+** In all cases, the callbacks set Walker.eCode=0 and abort if the expression
+** is found to not be a constant.
+**
+** The sqlite3ExprIsConstantOrFunction() is used for evaluating expressions
+** in a CREATE TABLE statement.  The Walker.eCode value is 5 when parsing
+** an existing schema and 4 when processing a new statement.  A bound
+** parameter raises an error for new statements, but is silently converted
+** to NULL for existing schemas.  This allows sqlite_master tables that 
+** contain a bound parameter because they were generated by older versions
+** of SQLite to be parsed by newer versions of SQLite without raising a
+** malformed schema error.
+*/
+static int exprNodeIsConstant(Walker *pWalker, Expr *pExpr){
+
+  /* If pWalker->eCode is 2 then any term of the expression that comes from
+  ** the ON or USING clauses of a left join disqualifies the expression
+  ** from being considered constant. */
+  if( pWalker->eCode==2 && ExprHasProperty(pExpr, EP_FromJoin) ){
+    pWalker->eCode = 0;
+    return WRC_Abort;
