@@ -82997,3 +82997,220 @@ static int exprNodeIsConstant(Walker *pWalker, Expr *pExpr){
   if( pWalker->eCode==2 && ExprHasProperty(pExpr, EP_FromJoin) ){
     pWalker->eCode = 0;
     return WRC_Abort;
+  }
+
+  switch( pExpr->op ){
+    /* Consider functions to be constant if all their arguments are constant
+    ** and either pWalker->eCode==4 or 5 or the function has the
+    ** SQLITE_FUNC_CONST flag. */
+    case TK_FUNCTION:
+      if( pWalker->eCode>=4 || ExprHasProperty(pExpr,EP_Constant) ){
+        return WRC_Continue;
+      }else{
+        pWalker->eCode = 0;
+        return WRC_Abort;
+      }
+    case TK_ID:
+    case TK_COLUMN:
+    case TK_AGG_FUNCTION:
+    case TK_AGG_COLUMN:
+      testcase( pExpr->op==TK_ID );
+      testcase( pExpr->op==TK_COLUMN );
+      testcase( pExpr->op==TK_AGG_FUNCTION );
+      testcase( pExpr->op==TK_AGG_COLUMN );
+      if( pWalker->eCode==3 && pExpr->iTable==pWalker->u.iCur ){
+        return WRC_Continue;
+      }else{
+        pWalker->eCode = 0;
+        return WRC_Abort;
+      }
+    case TK_VARIABLE:
+      if( pWalker->eCode==5 ){
+        /* Silently convert bound parameters that appear inside of CREATE
+        ** statements into a NULL when parsing the CREATE statement text out
+        ** of the sqlite_master table */
+        pExpr->op = TK_NULL;
+      }else if( pWalker->eCode==4 ){
+        /* A bound parameter in a CREATE statement that originates from
+        ** sqlite3_prepare() causes an error */
+        pWalker->eCode = 0;
+        return WRC_Abort;
+      }
+      /* Fall through */
+    default:
+      testcase( pExpr->op==TK_SELECT ); /* selectNodeIsConstant will disallow */
+      testcase( pExpr->op==TK_EXISTS ); /* selectNodeIsConstant will disallow */
+      return WRC_Continue;
+  }
+}
+static int selectNodeIsConstant(Walker *pWalker, Select *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  pWalker->eCode = 0;
+  return WRC_Abort;
+}
+static int exprIsConst(Expr *p, int initFlag, int iCur){
+  Walker w;
+  memset(&w, 0, sizeof(w));
+  w.eCode = initFlag;
+  w.xExprCallback = exprNodeIsConstant;
+  w.xSelectCallback = selectNodeIsConstant;
+  w.u.iCur = iCur;
+  sqlite3WalkExpr(&w, p);
+  return w.eCode;
+}
+
+/*
+** Walk an expression tree.  Return non-zero if the expression is constant
+** and 0 if it involves variables or function calls.
+**
+** For the purposes of this function, a double-quoted string (ex: "abc")
+** is considered a variable but a single-quoted string (ex: 'abc') is
+** a constant.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstant(Expr *p){
+  return exprIsConst(p, 1, 0);
+}
+
+/*
+** Walk an expression tree.  Return non-zero if the expression is constant
+** that does no originate from the ON or USING clauses of a join.
+** Return 0 if it involves variables or function calls or terms from
+** an ON or USING clause.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstantNotJoin(Expr *p){
+  return exprIsConst(p, 2, 0);
+}
+
+/*
+** Walk an expression tree.  Return non-zero if the expression constant
+** for any single row of the table with cursor iCur.  In other words, the
+** expression must not refer to any non-deterministic function nor any
+** table other than iCur.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsTableConstant(Expr *p, int iCur){
+  return exprIsConst(p, 3, iCur);
+}
+
+/*
+** Walk an expression tree.  Return non-zero if the expression is constant
+** or a function call with constant arguments.  Return and 0 if there
+** are any variables.
+**
+** For the purposes of this function, a double-quoted string (ex: "abc")
+** is considered a variable but a single-quoted string (ex: 'abc') is
+** a constant.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstantOrFunction(Expr *p, u8 isInit){
+  assert( isInit==0 || isInit==1 );
+  return exprIsConst(p, 4+isInit, 0);
+}
+
+/*
+** If the expression p codes a constant integer that is small enough
+** to fit in a 32-bit integer, return 1 and put the value of the integer
+** in *pValue.  If the expression is not an integer or if it is too big
+** to fit in a signed 32-bit integer, return 0 and leave *pValue unchanged.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsInteger(Expr *p, int *pValue){
+  int rc = 0;
+
+  /* If an expression is an integer literal that fits in a signed 32-bit
+  ** integer, then the EP_IntValue flag will have already been set */
+  assert( p->op!=TK_INTEGER || (p->flags & EP_IntValue)!=0
+           || sqlite3GetInt32(p->u.zToken, &rc)==0 );
+
+  if( p->flags & EP_IntValue ){
+    *pValue = p->u.iValue;
+    return 1;
+  }
+  switch( p->op ){
+    case TK_UPLUS: {
+      rc = sqlite3ExprIsInteger(p->pLeft, pValue);
+      break;
+    }
+    case TK_UMINUS: {
+      int v;
+      if( sqlite3ExprIsInteger(p->pLeft, &v) ){
+        assert( v!=(-2147483647-1) );
+        *pValue = -v;
+        rc = 1;
+      }
+      break;
+    }
+    default: break;
+  }
+  return rc;
+}
+
+/*
+** Return FALSE if there is no chance that the expression can be NULL.
+**
+** If the expression might be NULL or if the expression is too complex
+** to tell return TRUE.  
+**
+** This routine is used as an optimization, to skip OP_IsNull opcodes
+** when we know that a value cannot be NULL.  Hence, a false positive
+** (returning TRUE when in fact the expression can never be NULL) might
+** be a small performance hit but is otherwise harmless.  On the other
+** hand, a false negative (returning FALSE when the result could be NULL)
+** will likely result in an incorrect answer.  So when in doubt, return
+** TRUE.
+*/
+SQLITE_PRIVATE int sqlite3ExprCanBeNull(const Expr *p){
+  u8 op;
+  while( p->op==TK_UPLUS || p->op==TK_UMINUS ){ p = p->pLeft; }
+  op = p->op;
+  if( op==TK_REGISTER ) op = p->op2;
+  switch( op ){
+    case TK_INTEGER:
+    case TK_STRING:
+    case TK_FLOAT:
+    case TK_BLOB:
+      return 0;
+    case TK_COLUMN:
+      assert( p->pTab!=0 );
+      return ExprHasProperty(p, EP_CanBeNull) ||
+             (p->iColumn>=0 && p->pTab->aCol[p->iColumn].notNull==0);
+    default:
+      return 1;
+  }
+}
+
+/*
+** Return TRUE if the given expression is a constant which would be
+** unchanged by OP_Affinity with the affinity given in the second
+** argument.
+**
+** This routine is used to determine if the OP_Affinity operation
+** can be omitted.  When in doubt return FALSE.  A false negative
+** is harmless.  A false positive, however, can result in the wrong
+** answer.
+*/
+SQLITE_PRIVATE int sqlite3ExprNeedsNoAffinityChange(const Expr *p, char aff){
+  u8 op;
+  if( aff==SQLITE_AFF_NONE ) return 1;
+  while( p->op==TK_UPLUS || p->op==TK_UMINUS ){ p = p->pLeft; }
+  op = p->op;
+  if( op==TK_REGISTER ) op = p->op2;
+  switch( op ){
+    case TK_INTEGER: {
+      return aff==SQLITE_AFF_INTEGER || aff==SQLITE_AFF_NUMERIC;
+    }
+    case TK_FLOAT: {
+      return aff==SQLITE_AFF_REAL || aff==SQLITE_AFF_NUMERIC;
+    }
+    case TK_STRING: {
+      return aff==SQLITE_AFF_TEXT;
+    }
+    case TK_BLOB: {
+      return 1;
+    }
+    case TK_COLUMN: {
+      assert( p->iTable>=0 );  /* p cannot be part of a CHECK constraint */
+      return p->iColumn<0
+          && (aff==SQLITE_AFF_INTEGER || aff==SQLITE_AFF_NUMERIC);
+    }
+    default: {
+      return 0;
+    }
+  }
