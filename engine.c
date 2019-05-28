@@ -83214,3 +83214,213 @@ SQLITE_PRIVATE int sqlite3ExprNeedsNoAffinityChange(const Expr *p, char aff){
       return 0;
     }
   }
+}
+
+/*
+** Return TRUE if the given string is a row-id column name.
+*/
+SQLITE_PRIVATE int sqlite3IsRowid(const char *z){
+  if( sqlite3StrICmp(z, "_ROWID_")==0 ) return 1;
+  if( sqlite3StrICmp(z, "ROWID")==0 ) return 1;
+  if( sqlite3StrICmp(z, "OID")==0 ) return 1;
+  return 0;
+}
+
+/*
+** Return true if we are able to the IN operator optimization on a
+** query of the form
+**
+**       x IN (SELECT ...)
+**
+** Where the SELECT... clause is as specified by the parameter to this
+** routine.
+**
+** The Select object passed in has already been preprocessed and no
+** errors have been found.
+*/
+#ifndef SQLITE_OMIT_SUBQUERY
+static int isCandidateForInOpt(Select *p){
+  SrcList *pSrc;
+  ExprList *pEList;
+  Table *pTab;
+  if( p==0 ) return 0;                   /* right-hand side of IN is SELECT */
+  if( p->pPrior ) return 0;              /* Not a compound SELECT */
+  if( p->selFlags & (SF_Distinct|SF_Aggregate) ){
+    testcase( (p->selFlags & (SF_Distinct|SF_Aggregate))==SF_Distinct );
+    testcase( (p->selFlags & (SF_Distinct|SF_Aggregate))==SF_Aggregate );
+    return 0; /* No DISTINCT keyword and no aggregate functions */
+  }
+  assert( p->pGroupBy==0 );              /* Has no GROUP BY clause */
+  if( p->pLimit ) return 0;              /* Has no LIMIT clause */
+  assert( p->pOffset==0 );               /* No LIMIT means no OFFSET */
+  if( p->pWhere ) return 0;              /* Has no WHERE clause */
+  pSrc = p->pSrc;
+  assert( pSrc!=0 );
+  if( pSrc->nSrc!=1 ) return 0;          /* Single term in FROM clause */
+  if( pSrc->a[0].pSelect ) return 0;     /* FROM is not a subquery or view */
+  pTab = pSrc->a[0].pTab;
+  if( NEVER(pTab==0) ) return 0;
+  assert( pTab->pSelect==0 );            /* FROM clause is not a view */
+  if( IsVirtual(pTab) ) return 0;        /* FROM clause not a virtual table */
+  pEList = p->pEList;
+  if( pEList->nExpr!=1 ) return 0;       /* One column in the result set */
+  if( pEList->a[0].pExpr->op!=TK_COLUMN ) return 0; /* Result is a column */
+  return 1;
+}
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+/*
+** Code an OP_Once instruction and allocate space for its flag. Return the 
+** address of the new instruction.
+*/
+SQLITE_PRIVATE int sqlite3CodeOnce(Parse *pParse){
+  Vdbe *v = sqlite3GetVdbe(pParse);      /* Virtual machine being coded */
+  return sqlite3VdbeAddOp1(v, OP_Once, pParse->nOnce++);
+}
+
+/*
+** Generate code that checks the left-most column of index table iCur to see if
+** it contains any NULL entries.  Cause the register at regHasNull to be set
+** to a non-NULL value if iCur contains no NULLs.  Cause register regHasNull
+** to be set to NULL if iCur contains one or more NULL values.
+*/
+static void sqlite3SetHasNullFlag(Vdbe *v, int iCur, int regHasNull){
+  int j1;
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, regHasNull);
+  j1 = sqlite3VdbeAddOp1(v, OP_Rewind, iCur); VdbeCoverage(v);
+  sqlite3VdbeAddOp3(v, OP_Column, iCur, 0, regHasNull);
+  sqlite3VdbeChangeP5(v, OPFLAG_TYPEOFARG);
+  VdbeComment((v, "first_entry_in(%d)", iCur));
+  sqlite3VdbeJumpHere(v, j1);
+}
+
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** The argument is an IN operator with a list (not a subquery) on the 
+** right-hand side.  Return TRUE if that list is constant.
+*/
+static int sqlite3InRhsIsConstant(Expr *pIn){
+  Expr *pLHS;
+  int res;
+  assert( !ExprHasProperty(pIn, EP_xIsSelect) );
+  pLHS = pIn->pLeft;
+  pIn->pLeft = 0;
+  res = sqlite3ExprIsConstant(pIn);
+  pIn->pLeft = pLHS;
+  return res;
+}
+#endif
+
+/*
+** This function is used by the implementation of the IN (...) operator.
+** The pX parameter is the expression on the RHS of the IN operator, which
+** might be either a list of expressions or a subquery.
+**
+** The job of this routine is to find or create a b-tree object that can
+** be used either to test for membership in the RHS set or to iterate through
+** all members of the RHS set, skipping duplicates.
+**
+** A cursor is opened on the b-tree object that is the RHS of the IN operator
+** and pX->iTable is set to the index of that cursor.
+**
+** The returned value of this function indicates the b-tree type, as follows:
+**
+**   IN_INDEX_ROWID      - The cursor was opened on a database table.
+**   IN_INDEX_INDEX_ASC  - The cursor was opened on an ascending index.
+**   IN_INDEX_INDEX_DESC - The cursor was opened on a descending index.
+**   IN_INDEX_EPH        - The cursor was opened on a specially created and
+**                         populated epheremal table.
+**   IN_INDEX_NOOP       - No cursor was allocated.  The IN operator must be
+**                         implemented as a sequence of comparisons.
+**
+** An existing b-tree might be used if the RHS expression pX is a simple
+** subquery such as:
+**
+**     SELECT <column> FROM <table>
+**
+** If the RHS of the IN operator is a list or a more complex subquery, then
+** an ephemeral table might need to be generated from the RHS and then
+** pX->iTable made to point to the ephemeral table instead of an
+** existing table.
+**
+** The inFlags parameter must contain exactly one of the bits
+** IN_INDEX_MEMBERSHIP or IN_INDEX_LOOP.  If inFlags contains
+** IN_INDEX_MEMBERSHIP, then the generated table will be used for a
+** fast membership test.  When the IN_INDEX_LOOP bit is set, the
+** IN index will be used to loop over all values of the RHS of the
+** IN operator.
+**
+** When IN_INDEX_LOOP is used (and the b-tree will be used to iterate
+** through the set members) then the b-tree must not contain duplicates.
+** An epheremal table must be used unless the selected <column> is guaranteed
+** to be unique - either because it is an INTEGER PRIMARY KEY or it
+** has a UNIQUE constraint or UNIQUE index.
+**
+** When IN_INDEX_MEMBERSHIP is used (and the b-tree will be used 
+** for fast set membership tests) then an epheremal table must 
+** be used unless <column> is an INTEGER PRIMARY KEY or an index can 
+** be found with <column> as its left-most column.
+**
+** If the IN_INDEX_NOOP_OK and IN_INDEX_MEMBERSHIP are both set and
+** if the RHS of the IN operator is a list (not a subquery) then this
+** routine might decide that creating an ephemeral b-tree for membership
+** testing is too expensive and return IN_INDEX_NOOP.  In that case, the
+** calling routine should implement the IN operator using a sequence
+** of Eq or Ne comparison operations.
+**
+** When the b-tree is being used for membership tests, the calling function
+** might need to know whether or not the RHS side of the IN operator
+** contains a NULL.  If prRhsHasNull is not a NULL pointer and 
+** if there is any chance that the (...) might contain a NULL value at
+** runtime, then a register is allocated and the register number written
+** to *prRhsHasNull. If there is no chance that the (...) contains a
+** NULL value, then *prRhsHasNull is left unchanged.
+**
+** If a register is allocated and its location stored in *prRhsHasNull, then
+** the value in that register will be NULL if the b-tree contains one or more
+** NULL values, and it will be some non-NULL value if the b-tree contains no
+** NULL values.
+*/
+#ifndef SQLITE_OMIT_SUBQUERY
+SQLITE_PRIVATE int sqlite3FindInIndex(Parse *pParse, Expr *pX, u32 inFlags, int *prRhsHasNull){
+  Select *p;                            /* SELECT to the right of IN operator */
+  int eType = 0;                        /* Type of RHS table. IN_INDEX_* */
+  int iTab = pParse->nTab++;            /* Cursor of the RHS table */
+  int mustBeUnique;                     /* True if RHS must be unique */
+  Vdbe *v = sqlite3GetVdbe(pParse);     /* Virtual machine being coded */
+
+  assert( pX->op==TK_IN );
+  mustBeUnique = (inFlags & IN_INDEX_LOOP)!=0;
+
+  /* Check to see if an existing table or index can be used to
+  ** satisfy the query.  This is preferable to generating a new 
+  ** ephemeral table.
+  */
+  p = (ExprHasProperty(pX, EP_xIsSelect) ? pX->x.pSelect : 0);
+  if( ALWAYS(pParse->nErr==0) && isCandidateForInOpt(p) ){
+    sqlite3 *db = pParse->db;              /* Database connection */
+    Table *pTab;                           /* Table <table>. */
+    Expr *pExpr;                           /* Expression <column> */
+    i16 iCol;                              /* Index of column <column> */
+    i16 iDb;                               /* Database idx for pTab */
+
+    assert( p );                        /* Because of isCandidateForInOpt(p) */
+    assert( p->pEList!=0 );             /* Because of isCandidateForInOpt(p) */
+    assert( p->pEList->a[0].pExpr!=0 ); /* Because of isCandidateForInOpt(p) */
+    assert( p->pSrc!=0 );               /* Because of isCandidateForInOpt(p) */
+    pTab = p->pSrc->a[0].pTab;
+    pExpr = p->pEList->a[0].pExpr;
+    iCol = (i16)pExpr->iColumn;
+   
+    /* Code an OP_Transaction and OP_TableLock for <table>. */
+    iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+    sqlite3CodeVerifySchema(pParse, iDb);
+    sqlite3TableLock(pParse, iDb, pTab->tnum, 0, pTab->zName);
+
+    /* This function is only called from two places. In both cases the vdbe
+    ** has already been allocated. So assume sqlite3GetVdbe() is always
+    ** successful here.
+    */
+    assert(v);
+    if( iCol<0 ){
