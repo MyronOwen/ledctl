@@ -83424,3 +83424,237 @@ SQLITE_PRIVATE int sqlite3FindInIndex(Parse *pParse, Expr *pX, u32 inFlags, int 
     */
     assert(v);
     if( iCol<0 ){
+      int iAddr = sqlite3CodeOnce(pParse);
+      VdbeCoverage(v);
+
+      sqlite3OpenTable(pParse, iTab, iDb, pTab, OP_OpenRead);
+      eType = IN_INDEX_ROWID;
+
+      sqlite3VdbeJumpHere(v, iAddr);
+    }else{
+      Index *pIdx;                         /* Iterator variable */
+
+      /* The collation sequence used by the comparison. If an index is to
+      ** be used in place of a temp-table, it must be ordered according
+      ** to this collation sequence.  */
+      CollSeq *pReq = sqlite3BinaryCompareCollSeq(pParse, pX->pLeft, pExpr);
+
+      /* Check that the affinity that will be used to perform the 
+      ** comparison is the same as the affinity of the column. If
+      ** it is not, it is not possible to use any index.
+      */
+      int affinity_ok = sqlite3IndexAffinityOk(pX, pTab->aCol[iCol].affinity);
+
+      for(pIdx=pTab->pIndex; pIdx && eType==0 && affinity_ok; pIdx=pIdx->pNext){
+        if( (pIdx->aiColumn[0]==iCol)
+         && sqlite3FindCollSeq(db, ENC(db), pIdx->azColl[0], 0)==pReq
+         && (!mustBeUnique || (pIdx->nKeyCol==1 && IsUniqueIndex(pIdx)))
+        ){
+          int iAddr = sqlite3CodeOnce(pParse); VdbeCoverage(v);
+          sqlite3VdbeAddOp3(v, OP_OpenRead, iTab, pIdx->tnum, iDb);
+          sqlite3VdbeSetP4KeyInfo(pParse, pIdx);
+          VdbeComment((v, "%s", pIdx->zName));
+          assert( IN_INDEX_INDEX_DESC == IN_INDEX_INDEX_ASC+1 );
+          eType = IN_INDEX_INDEX_ASC + pIdx->aSortOrder[0];
+
+          if( prRhsHasNull && !pTab->aCol[iCol].notNull ){
+            *prRhsHasNull = ++pParse->nMem;
+            sqlite3SetHasNullFlag(v, iTab, *prRhsHasNull);
+          }
+          sqlite3VdbeJumpHere(v, iAddr);
+        }
+      }
+    }
+  }
+
+  /* If no preexisting index is available for the IN clause
+  ** and IN_INDEX_NOOP is an allowed reply
+  ** and the RHS of the IN operator is a list, not a subquery
+  ** and the RHS is not contant or has two or fewer terms,
+  ** then it is not worth creating an ephemeral table to evaluate
+  ** the IN operator so return IN_INDEX_NOOP.
+  */
+  if( eType==0
+   && (inFlags & IN_INDEX_NOOP_OK)
+   && !ExprHasProperty(pX, EP_xIsSelect)
+   && (!sqlite3InRhsIsConstant(pX) || pX->x.pList->nExpr<=2)
+  ){
+    eType = IN_INDEX_NOOP;
+  }
+     
+
+  if( eType==0 ){
+    /* Could not find an existing table or index to use as the RHS b-tree.
+    ** We will have to generate an ephemeral table to do the job.
+    */
+    u32 savedNQueryLoop = pParse->nQueryLoop;
+    int rMayHaveNull = 0;
+    eType = IN_INDEX_EPH;
+    if( inFlags & IN_INDEX_LOOP ){
+      pParse->nQueryLoop = 0;
+      if( pX->pLeft->iColumn<0 && !ExprHasProperty(pX, EP_xIsSelect) ){
+        eType = IN_INDEX_ROWID;
+      }
+    }else if( prRhsHasNull ){
+      *prRhsHasNull = rMayHaveNull = ++pParse->nMem;
+    }
+    sqlite3CodeSubselect(pParse, pX, rMayHaveNull, eType==IN_INDEX_ROWID);
+    pParse->nQueryLoop = savedNQueryLoop;
+  }else{
+    pX->iTable = iTab;
+  }
+  return eType;
+}
+#endif
+
+/*
+** Generate code for scalar subqueries used as a subquery expression, EXISTS,
+** or IN operators.  Examples:
+**
+**     (SELECT a FROM b)          -- subquery
+**     EXISTS (SELECT a FROM b)   -- EXISTS subquery
+**     x IN (4,5,11)              -- IN operator with list on right-hand side
+**     x IN (SELECT a FROM b)     -- IN operator with subquery on the right
+**
+** The pExpr parameter describes the expression that contains the IN
+** operator or subquery.
+**
+** If parameter isRowid is non-zero, then expression pExpr is guaranteed
+** to be of the form "<rowid> IN (?, ?, ?)", where <rowid> is a reference
+** to some integer key column of a table B-Tree. In this case, use an
+** intkey B-Tree to store the set of IN(...) values instead of the usual
+** (slower) variable length keys B-Tree.
+**
+** If rMayHaveNull is non-zero, that means that the operation is an IN
+** (not a SELECT or EXISTS) and that the RHS might contains NULLs.
+** All this routine does is initialize the register given by rMayHaveNull
+** to NULL.  Calling routines will take care of changing this register
+** value to non-NULL if the RHS is NULL-free.
+**
+** For a SELECT or EXISTS operator, return the register that holds the
+** result.  For IN operators or if an error occurs, the return value is 0.
+*/
+#ifndef SQLITE_OMIT_SUBQUERY
+SQLITE_PRIVATE int sqlite3CodeSubselect(
+  Parse *pParse,          /* Parsing context */
+  Expr *pExpr,            /* The IN, SELECT, or EXISTS operator */
+  int rHasNullFlag,       /* Register that records whether NULLs exist in RHS */
+  int isRowid             /* If true, LHS of IN operator is a rowid */
+){
+  int jmpIfDynamic = -1;                      /* One-time test address */
+  int rReg = 0;                           /* Register storing resulting */
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  if( NEVER(v==0) ) return 0;
+  sqlite3ExprCachePush(pParse);
+
+  /* This code must be run in its entirety every time it is encountered
+  ** if any of the following is true:
+  **
+  **    *  The right-hand side is a correlated subquery
+  **    *  The right-hand side is an expression list containing variables
+  **    *  We are inside a trigger
+  **
+  ** If all of the above are false, then we can run this code just once
+  ** save the results, and reuse the same result on subsequent invocations.
+  */
+  if( !ExprHasProperty(pExpr, EP_VarSelect) ){
+    jmpIfDynamic = sqlite3CodeOnce(pParse); VdbeCoverage(v);
+  }
+
+#ifndef SQLITE_OMIT_EXPLAIN
+  if( pParse->explain==2 ){
+    char *zMsg = sqlite3MPrintf(
+        pParse->db, "EXECUTE %s%s SUBQUERY %d", jmpIfDynamic>=0?"":"CORRELATED ",
+        pExpr->op==TK_IN?"LIST":"SCALAR", pParse->iNextSelectId
+    );
+    sqlite3VdbeAddOp4(v, OP_Explain, pParse->iSelectId, 0, 0, zMsg, P4_DYNAMIC);
+  }
+#endif
+
+  switch( pExpr->op ){
+    case TK_IN: {
+      char affinity;              /* Affinity of the LHS of the IN */
+      int addr;                   /* Address of OP_OpenEphemeral instruction */
+      Expr *pLeft = pExpr->pLeft; /* the LHS of the IN operator */
+      KeyInfo *pKeyInfo = 0;      /* Key information */
+
+      affinity = sqlite3ExprAffinity(pLeft);
+
+      /* Whether this is an 'x IN(SELECT...)' or an 'x IN(<exprlist>)'
+      ** expression it is handled the same way.  An ephemeral table is 
+      ** filled with single-field index keys representing the results
+      ** from the SELECT or the <exprlist>.
+      **
+      ** If the 'x' expression is a column value, or the SELECT...
+      ** statement returns a column value, then the affinity of that
+      ** column is used to build the index keys. If both 'x' and the
+      ** SELECT... statement are columns, then numeric affinity is used
+      ** if either column has NUMERIC or INTEGER affinity. If neither
+      ** 'x' nor the SELECT... statement are columns, then numeric affinity
+      ** is used.
+      */
+      pExpr->iTable = pParse->nTab++;
+      addr = sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pExpr->iTable, !isRowid);
+      pKeyInfo = isRowid ? 0 : sqlite3KeyInfoAlloc(pParse->db, 1, 1);
+
+      if( ExprHasProperty(pExpr, EP_xIsSelect) ){
+        /* Case 1:     expr IN (SELECT ...)
+        **
+        ** Generate code to write the results of the select into the temporary
+        ** table allocated and opened above.
+        */
+        Select *pSelect = pExpr->x.pSelect;
+        SelectDest dest;
+        ExprList *pEList;
+
+        assert( !isRowid );
+        sqlite3SelectDestInit(&dest, SRT_Set, pExpr->iTable);
+        dest.affSdst = (u8)affinity;
+        assert( (pExpr->iTable&0x0000FFFF)==pExpr->iTable );
+        pSelect->iLimit = 0;
+        testcase( pSelect->selFlags & SF_Distinct );
+        testcase( pKeyInfo==0 ); /* Caused by OOM in sqlite3KeyInfoAlloc() */
+        if( sqlite3Select(pParse, pSelect, &dest) ){
+          sqlite3KeyInfoUnref(pKeyInfo);
+          return 0;
+        }
+        pEList = pSelect->pEList;
+        assert( pKeyInfo!=0 ); /* OOM will cause exit after sqlite3Select() */
+        assert( pEList!=0 );
+        assert( pEList->nExpr>0 );
+        assert( sqlite3KeyInfoIsWriteable(pKeyInfo) );
+        pKeyInfo->aColl[0] = sqlite3BinaryCompareCollSeq(pParse, pExpr->pLeft,
+                                                         pEList->a[0].pExpr);
+      }else if( ALWAYS(pExpr->x.pList!=0) ){
+        /* Case 2:     expr IN (exprlist)
+        **
+        ** For each expression, build an index key from the evaluation and
+        ** store it in the temporary table. If <expr> is a column, then use
+        ** that columns affinity when building index keys. If <expr> is not
+        ** a column, use numeric affinity.
+        */
+        int i;
+        ExprList *pList = pExpr->x.pList;
+        struct ExprList_item *pItem;
+        int r1, r2, r3;
+
+        if( !affinity ){
+          affinity = SQLITE_AFF_NONE;
+        }
+        if( pKeyInfo ){
+          assert( sqlite3KeyInfoIsWriteable(pKeyInfo) );
+          pKeyInfo->aColl[0] = sqlite3ExprCollSeq(pParse, pExpr->pLeft);
+        }
+
+        /* Loop through each expression in <exprlist>. */
+        r1 = sqlite3GetTempReg(pParse);
+        r2 = sqlite3GetTempReg(pParse);
+        if( isRowid ) sqlite3VdbeAddOp2(v, OP_Null, 0, r2);
+        for(i=pList->nExpr, pItem=pList->a; i>0; i--, pItem++){
+          Expr *pE2 = pItem->pExpr;
+          int iValToIns;
+
+          /* If the expression is not constant then we will need to
+          ** disable the test that was generated above that makes sure
+          ** this code only executes once.  Because for a non-constant
+          ** expression we need to rerun this code each time.
