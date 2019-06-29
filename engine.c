@@ -83900,3 +83900,218 @@ static void sqlite3ExprCodeIN(
         */
         j1 = sqlite3VdbeAddOp4Int(v, OP_Found, pExpr->iTable, 0, r1, 1);
         VdbeCoverage(v);
+        sqlite3VdbeAddOp2(v, OP_IsNull, rRhsHasNull, destIfNull);
+        VdbeCoverage(v);
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfFalse);
+        sqlite3VdbeJumpHere(v, j1);
+      }
+    }
+  }
+  sqlite3ReleaseTempReg(pParse, r1);
+  sqlite3ExprCachePop(pParse);
+  VdbeComment((v, "end IN expr"));
+}
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+/*
+** Duplicate an 8-byte value
+*/
+static char *dup8bytes(Vdbe *v, const char *in){
+  char *out = sqlite3DbMallocRaw(sqlite3VdbeDb(v), 8);
+  if( out ){
+    memcpy(out, in, 8);
+  }
+  return out;
+}
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/*
+** Generate an instruction that will put the floating point
+** value described by z[0..n-1] into register iMem.
+**
+** The z[] string will probably not be zero-terminated.  But the 
+** z[n] character is guaranteed to be something that does not look
+** like the continuation of the number.
+*/
+static void codeReal(Vdbe *v, const char *z, int negateFlag, int iMem){
+  if( ALWAYS(z!=0) ){
+    double value;
+    char *zV;
+    sqlite3AtoF(z, &value, sqlite3Strlen30(z), SQLITE_UTF8);
+    assert( !sqlite3IsNaN(value) ); /* The new AtoF never returns NaN */
+    if( negateFlag ) value = -value;
+    zV = dup8bytes(v, (char*)&value);
+    sqlite3VdbeAddOp4(v, OP_Real, 0, iMem, 0, zV, P4_REAL);
+  }
+}
+#endif
+
+
+/*
+** Generate an instruction that will put the integer describe by
+** text z[0..n-1] into register iMem.
+**
+** Expr.u.zToken is always UTF8 and zero-terminated.
+*/
+static void codeInteger(Parse *pParse, Expr *pExpr, int negFlag, int iMem){
+  Vdbe *v = pParse->pVdbe;
+  if( pExpr->flags & EP_IntValue ){
+    int i = pExpr->u.iValue;
+    assert( i>=0 );
+    if( negFlag ) i = -i;
+    sqlite3VdbeAddOp2(v, OP_Integer, i, iMem);
+  }else{
+    int c;
+    i64 value;
+    const char *z = pExpr->u.zToken;
+    assert( z!=0 );
+    c = sqlite3DecOrHexToI64(z, &value);
+    if( c==0 || (c==2 && negFlag) ){
+      char *zV;
+      if( negFlag ){ value = c==2 ? SMALLEST_INT64 : -value; }
+      zV = dup8bytes(v, (char*)&value);
+      sqlite3VdbeAddOp4(v, OP_Int64, 0, iMem, 0, zV, P4_INT64);
+    }else{
+#ifdef SQLITE_OMIT_FLOATING_POINT
+      sqlite3ErrorMsg(pParse, "oversized integer: %s%s", negFlag ? "-" : "", z);
+#else
+#ifndef SQLITE_OMIT_HEX_INTEGER
+      if( sqlite3_strnicmp(z,"0x",2)==0 ){
+        sqlite3ErrorMsg(pParse, "hex literal too big: %s", z);
+      }else
+#endif
+      {
+        codeReal(v, z, negFlag, iMem);
+      }
+#endif
+    }
+  }
+}
+
+/*
+** Clear a cache entry.
+*/
+static void cacheEntryClear(Parse *pParse, struct yColCache *p){
+  if( p->tempReg ){
+    if( pParse->nTempReg<ArraySize(pParse->aTempReg) ){
+      pParse->aTempReg[pParse->nTempReg++] = p->iReg;
+    }
+    p->tempReg = 0;
+  }
+}
+
+
+/*
+** Record in the column cache that a particular column from a
+** particular table is stored in a particular register.
+*/
+SQLITE_PRIVATE void sqlite3ExprCacheStore(Parse *pParse, int iTab, int iCol, int iReg){
+  int i;
+  int minLru;
+  int idxLru;
+  struct yColCache *p;
+
+  assert( iReg>0 );  /* Register numbers are always positive */
+  assert( iCol>=-1 && iCol<32768 );  /* Finite column numbers */
+
+  /* The SQLITE_ColumnCache flag disables the column cache.  This is used
+  ** for testing only - to verify that SQLite always gets the same answer
+  ** with and without the column cache.
+  */
+  if( OptimizationDisabled(pParse->db, SQLITE_ColumnCache) ) return;
+
+  /* First replace any existing entry.
+  **
+  ** Actually, the way the column cache is currently used, we are guaranteed
+  ** that the object will never already be in cache.  Verify this guarantee.
+  */
+#ifndef NDEBUG
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    assert( p->iReg==0 || p->iTable!=iTab || p->iColumn!=iCol );
+  }
+#endif
+
+  /* Find an empty slot and replace it */
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    if( p->iReg==0 ){
+      p->iLevel = pParse->iCacheLevel;
+      p->iTable = iTab;
+      p->iColumn = iCol;
+      p->iReg = iReg;
+      p->tempReg = 0;
+      p->lru = pParse->iCacheCnt++;
+      return;
+    }
+  }
+
+  /* Replace the last recently used */
+  minLru = 0x7fffffff;
+  idxLru = -1;
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    if( p->lru<minLru ){
+      idxLru = i;
+      minLru = p->lru;
+    }
+  }
+  if( ALWAYS(idxLru>=0) ){
+    p = &pParse->aColCache[idxLru];
+    p->iLevel = pParse->iCacheLevel;
+    p->iTable = iTab;
+    p->iColumn = iCol;
+    p->iReg = iReg;
+    p->tempReg = 0;
+    p->lru = pParse->iCacheCnt++;
+    return;
+  }
+}
+
+/*
+** Indicate that registers between iReg..iReg+nReg-1 are being overwritten.
+** Purge the range of registers from the column cache.
+*/
+SQLITE_PRIVATE void sqlite3ExprCacheRemove(Parse *pParse, int iReg, int nReg){
+  int i;
+  int iLast = iReg + nReg - 1;
+  struct yColCache *p;
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    int r = p->iReg;
+    if( r>=iReg && r<=iLast ){
+      cacheEntryClear(pParse, p);
+      p->iReg = 0;
+    }
+  }
+}
+
+/*
+** Remember the current column cache context.  Any new entries added
+** added to the column cache after this call are removed when the
+** corresponding pop occurs.
+*/
+SQLITE_PRIVATE void sqlite3ExprCachePush(Parse *pParse){
+  pParse->iCacheLevel++;
+#ifdef SQLITE_DEBUG
+  if( pParse->db->flags & SQLITE_VdbeAddopTrace ){
+    printf("PUSH to %d\n", pParse->iCacheLevel);
+  }
+#endif
+}
+
+/*
+** Remove from the column cache any entries that were added since the
+** the previous sqlite3ExprCachePush operation.  In other words, restore
+** the cache to the state it was in prior the most recent Push.
+*/
+SQLITE_PRIVATE void sqlite3ExprCachePop(Parse *pParse){
+  int i;
+  struct yColCache *p;
+  assert( pParse->iCacheLevel>=1 );
+  pParse->iCacheLevel--;
+#ifdef SQLITE_DEBUG
+  if( pParse->db->flags & SQLITE_VdbeAddopTrace ){
+    printf("POP  to %d\n", pParse->iCacheLevel);
+  }
+#endif
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    if( p->iReg && p->iLevel>pParse->iCacheLevel ){
+      cacheEntryClear(pParse, p);
+      p->iReg = 0;
