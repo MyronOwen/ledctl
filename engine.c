@@ -84115,3 +84115,227 @@ SQLITE_PRIVATE void sqlite3ExprCachePop(Parse *pParse){
     if( p->iReg && p->iLevel>pParse->iCacheLevel ){
       cacheEntryClear(pParse, p);
       p->iReg = 0;
+    }
+  }
+}
+
+/*
+** When a cached column is reused, make sure that its register is
+** no longer available as a temp register.  ticket #3879:  that same
+** register might be in the cache in multiple places, so be sure to
+** get them all.
+*/
+static void sqlite3ExprCachePinRegister(Parse *pParse, int iReg){
+  int i;
+  struct yColCache *p;
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    if( p->iReg==iReg ){
+      p->tempReg = 0;
+    }
+  }
+}
+
+/*
+** Generate code to extract the value of the iCol-th column of a table.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeGetColumnOfTable(
+  Vdbe *v,        /* The VDBE under construction */
+  Table *pTab,    /* The table containing the value */
+  int iTabCur,    /* The table cursor.  Or the PK cursor for WITHOUT ROWID */
+  int iCol,       /* Index of the column to extract */
+  int regOut      /* Extract the value into this register */
+){
+  if( iCol<0 || iCol==pTab->iPKey ){
+    sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+  }else{
+    int op = IsVirtual(pTab) ? OP_VColumn : OP_Column;
+    int x = iCol;
+    if( !HasRowid(pTab) ){
+      x = sqlite3ColumnOfIndex(sqlite3PrimaryKeyIndex(pTab), iCol);
+    }
+    sqlite3VdbeAddOp3(v, op, iTabCur, x, regOut);
+  }
+  if( iCol>=0 ){
+    sqlite3ColumnDefault(v, pTab, iCol, regOut);
+  }
+}
+
+/*
+** Generate code that will extract the iColumn-th column from
+** table pTab and store the column value in a register.  An effort
+** is made to store the column value in register iReg, but this is
+** not guaranteed.  The location of the column value is returned.
+**
+** There must be an open cursor to pTab in iTable when this routine
+** is called.  If iColumn<0 then code is generated that extracts the rowid.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeGetColumn(
+  Parse *pParse,   /* Parsing and code generating context */
+  Table *pTab,     /* Description of the table we are reading from */
+  int iColumn,     /* Index of the table column */
+  int iTable,      /* The cursor pointing to the table */
+  int iReg,        /* Store results here */
+  u8 p5            /* P5 value for OP_Column */
+){
+  Vdbe *v = pParse->pVdbe;
+  int i;
+  struct yColCache *p;
+
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    if( p->iReg>0 && p->iTable==iTable && p->iColumn==iColumn ){
+      p->lru = pParse->iCacheCnt++;
+      sqlite3ExprCachePinRegister(pParse, p->iReg);
+      return p->iReg;
+    }
+  }  
+  assert( v!=0 );
+  sqlite3ExprCodeGetColumnOfTable(v, pTab, iTable, iColumn, iReg);
+  if( p5 ){
+    sqlite3VdbeChangeP5(v, p5);
+  }else{   
+    sqlite3ExprCacheStore(pParse, iTable, iColumn, iReg);
+  }
+  return iReg;
+}
+
+/*
+** Clear all column cache entries.
+*/
+SQLITE_PRIVATE void sqlite3ExprCacheClear(Parse *pParse){
+  int i;
+  struct yColCache *p;
+
+#if SQLITE_DEBUG
+  if( pParse->db->flags & SQLITE_VdbeAddopTrace ){
+    printf("CLEAR\n");
+  }
+#endif
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    if( p->iReg ){
+      cacheEntryClear(pParse, p);
+      p->iReg = 0;
+    }
+  }
+}
+
+/*
+** Record the fact that an affinity change has occurred on iCount
+** registers starting with iStart.
+*/
+SQLITE_PRIVATE void sqlite3ExprCacheAffinityChange(Parse *pParse, int iStart, int iCount){
+  sqlite3ExprCacheRemove(pParse, iStart, iCount);
+}
+
+/*
+** Generate code to move content from registers iFrom...iFrom+nReg-1
+** over to iTo..iTo+nReg-1. Keep the column cache up-to-date.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeMove(Parse *pParse, int iFrom, int iTo, int nReg){
+  assert( iFrom>=iTo+nReg || iFrom+nReg<=iTo );
+  sqlite3VdbeAddOp3(pParse->pVdbe, OP_Move, iFrom, iTo, nReg);
+  sqlite3ExprCacheRemove(pParse, iFrom, nReg);
+}
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_COVERAGE_TEST)
+/*
+** Return true if any register in the range iFrom..iTo (inclusive)
+** is used as part of the column cache.
+**
+** This routine is used within assert() and testcase() macros only
+** and does not appear in a normal build.
+*/
+static int usedAsColumnCache(Parse *pParse, int iFrom, int iTo){
+  int i;
+  struct yColCache *p;
+  for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+    int r = p->iReg;
+    if( r>=iFrom && r<=iTo ) return 1;    /*NO_TEST*/
+  }
+  return 0;
+}
+#endif /* SQLITE_DEBUG || SQLITE_COVERAGE_TEST */
+
+/*
+** Convert an expression node to a TK_REGISTER
+*/
+static void exprToRegister(Expr *p, int iReg){
+  p->op2 = p->op;
+  p->op = TK_REGISTER;
+  p->iTable = iReg;
+  ExprClearProperty(p, EP_Skip);
+}
+
+/*
+** Generate code into the current Vdbe to evaluate the given
+** expression.  Attempt to store the results in register "target".
+** Return the register where results are stored.
+**
+** With this routine, there is no guarantee that results will
+** be stored in target.  The result might be stored in some other
+** register if it is convenient to do so.  The calling function
+** must check the return code and move the results to the desired
+** register.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeTarget(Parse *pParse, Expr *pExpr, int target){
+  Vdbe *v = pParse->pVdbe;  /* The VM under construction */
+  int op;                   /* The opcode being coded */
+  int inReg = target;       /* Results stored in register inReg */
+  int regFree1 = 0;         /* If non-zero free this temporary register */
+  int regFree2 = 0;         /* If non-zero free this temporary register */
+  int r1, r2, r3, r4;       /* Various register numbers */
+  sqlite3 *db = pParse->db; /* The database connection */
+  Expr tempX;               /* Temporary expression node */
+
+  assert( target>0 && target<=pParse->nMem );
+  if( v==0 ){
+    assert( pParse->db->mallocFailed );
+    return 0;
+  }
+
+  if( pExpr==0 ){
+    op = TK_NULL;
+  }else{
+    op = pExpr->op;
+  }
+  switch( op ){
+    case TK_AGG_COLUMN: {
+      AggInfo *pAggInfo = pExpr->pAggInfo;
+      struct AggInfo_col *pCol = &pAggInfo->aCol[pExpr->iAgg];
+      if( !pAggInfo->directMode ){
+        assert( pCol->iMem>0 );
+        inReg = pCol->iMem;
+        break;
+      }else if( pAggInfo->useSortingIdx ){
+        sqlite3VdbeAddOp3(v, OP_Column, pAggInfo->sortingIdxPTab,
+                              pCol->iSorterColumn, target);
+        break;
+      }
+      /* Otherwise, fall thru into the TK_COLUMN case */
+    }
+    case TK_COLUMN: {
+      int iTab = pExpr->iTable;
+      if( iTab<0 ){
+        if( pParse->ckBase>0 ){
+          /* Generating CHECK constraints or inserting into partial index */
+          inReg = pExpr->iColumn + pParse->ckBase;
+          break;
+        }else{
+          /* Deleting from a partial index */
+          iTab = pParse->iPartIdxTab;
+        }
+      }
+      inReg = sqlite3ExprCodeGetColumn(pParse, pExpr->pTab,
+                               pExpr->iColumn, iTab, target,
+                               pExpr->op2);
+      break;
+    }
+    case TK_INTEGER: {
+      codeInteger(pParse, pExpr, 0, target);
+      break;
+    }
+#ifndef SQLITE_OMIT_FLOATING_POINT
+    case TK_FLOAT: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      codeReal(v, pExpr->u.zToken, 0, target);
+      break;
+    }
