@@ -84339,3 +84339,256 @@ SQLITE_PRIVATE int sqlite3ExprCodeTarget(Parse *pParse, Expr *pExpr, int target)
       codeReal(v, pExpr->u.zToken, 0, target);
       break;
     }
+#endif
+    case TK_STRING: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3VdbeAddOp4(v, OP_String8, 0, target, 0, pExpr->u.zToken, 0);
+      break;
+    }
+    case TK_NULL: {
+      sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      break;
+    }
+#ifndef SQLITE_OMIT_BLOB_LITERAL
+    case TK_BLOB: {
+      int n;
+      const char *z;
+      char *zBlob;
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      assert( pExpr->u.zToken[0]=='x' || pExpr->u.zToken[0]=='X' );
+      assert( pExpr->u.zToken[1]=='\'' );
+      z = &pExpr->u.zToken[2];
+      n = sqlite3Strlen30(z) - 1;
+      assert( z[n]=='\'' );
+      zBlob = sqlite3HexToBlob(sqlite3VdbeDb(v), z, n);
+      sqlite3VdbeAddOp4(v, OP_Blob, n/2, target, 0, zBlob, P4_DYNAMIC);
+      break;
+    }
+#endif
+    case TK_VARIABLE: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      assert( pExpr->u.zToken!=0 );
+      assert( pExpr->u.zToken[0]!=0 );
+      sqlite3VdbeAddOp2(v, OP_Variable, pExpr->iColumn, target);
+      if( pExpr->u.zToken[1]!=0 ){
+        assert( pExpr->u.zToken[0]=='?' 
+             || strcmp(pExpr->u.zToken, pParse->azVar[pExpr->iColumn-1])==0 );
+        sqlite3VdbeChangeP4(v, -1, pParse->azVar[pExpr->iColumn-1], P4_STATIC);
+      }
+      break;
+    }
+    case TK_REGISTER: {
+      inReg = pExpr->iTable;
+      break;
+    }
+    case TK_AS: {
+      inReg = sqlite3ExprCodeTarget(pParse, pExpr->pLeft, target);
+      break;
+    }
+#ifndef SQLITE_OMIT_CAST
+    case TK_CAST: {
+      /* Expressions of the form:   CAST(pLeft AS token) */
+      inReg = sqlite3ExprCodeTarget(pParse, pExpr->pLeft, target);
+      if( inReg!=target ){
+        sqlite3VdbeAddOp2(v, OP_SCopy, inReg, target);
+        inReg = target;
+      }
+      sqlite3VdbeAddOp2(v, OP_Cast, target,
+                        sqlite3AffinityType(pExpr->u.zToken, 0));
+      testcase( usedAsColumnCache(pParse, inReg, inReg) );
+      sqlite3ExprCacheAffinityChange(pParse, inReg, 1);
+      break;
+    }
+#endif /* SQLITE_OMIT_CAST */
+    case TK_LT:
+    case TK_LE:
+    case TK_GT:
+    case TK_GE:
+    case TK_NE:
+    case TK_EQ: {
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      r2 = sqlite3ExprCodeTemp(pParse, pExpr->pRight, &regFree2);
+      codeCompare(pParse, pExpr->pLeft, pExpr->pRight, op,
+                  r1, r2, inReg, SQLITE_STOREP2);
+      assert(TK_LT==OP_Lt); testcase(op==OP_Lt); VdbeCoverageIf(v,op==OP_Lt);
+      assert(TK_LE==OP_Le); testcase(op==OP_Le); VdbeCoverageIf(v,op==OP_Le);
+      assert(TK_GT==OP_Gt); testcase(op==OP_Gt); VdbeCoverageIf(v,op==OP_Gt);
+      assert(TK_GE==OP_Ge); testcase(op==OP_Ge); VdbeCoverageIf(v,op==OP_Ge);
+      assert(TK_EQ==OP_Eq); testcase(op==OP_Eq); VdbeCoverageIf(v,op==OP_Eq);
+      assert(TK_NE==OP_Ne); testcase(op==OP_Ne); VdbeCoverageIf(v,op==OP_Ne);
+      testcase( regFree1==0 );
+      testcase( regFree2==0 );
+      break;
+    }
+    case TK_IS:
+    case TK_ISNOT: {
+      testcase( op==TK_IS );
+      testcase( op==TK_ISNOT );
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      r2 = sqlite3ExprCodeTemp(pParse, pExpr->pRight, &regFree2);
+      op = (op==TK_IS) ? TK_EQ : TK_NE;
+      codeCompare(pParse, pExpr->pLeft, pExpr->pRight, op,
+                  r1, r2, inReg, SQLITE_STOREP2 | SQLITE_NULLEQ);
+      VdbeCoverageIf(v, op==TK_EQ);
+      VdbeCoverageIf(v, op==TK_NE);
+      testcase( regFree1==0 );
+      testcase( regFree2==0 );
+      break;
+    }
+    case TK_AND:
+    case TK_OR:
+    case TK_PLUS:
+    case TK_STAR:
+    case TK_MINUS:
+    case TK_REM:
+    case TK_BITAND:
+    case TK_BITOR:
+    case TK_SLASH:
+    case TK_LSHIFT:
+    case TK_RSHIFT: 
+    case TK_CONCAT: {
+      assert( TK_AND==OP_And );            testcase( op==TK_AND );
+      assert( TK_OR==OP_Or );              testcase( op==TK_OR );
+      assert( TK_PLUS==OP_Add );           testcase( op==TK_PLUS );
+      assert( TK_MINUS==OP_Subtract );     testcase( op==TK_MINUS );
+      assert( TK_REM==OP_Remainder );      testcase( op==TK_REM );
+      assert( TK_BITAND==OP_BitAnd );      testcase( op==TK_BITAND );
+      assert( TK_BITOR==OP_BitOr );        testcase( op==TK_BITOR );
+      assert( TK_SLASH==OP_Divide );       testcase( op==TK_SLASH );
+      assert( TK_LSHIFT==OP_ShiftLeft );   testcase( op==TK_LSHIFT );
+      assert( TK_RSHIFT==OP_ShiftRight );  testcase( op==TK_RSHIFT );
+      assert( TK_CONCAT==OP_Concat );      testcase( op==TK_CONCAT );
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      r2 = sqlite3ExprCodeTemp(pParse, pExpr->pRight, &regFree2);
+      sqlite3VdbeAddOp3(v, op, r2, r1, target);
+      testcase( regFree1==0 );
+      testcase( regFree2==0 );
+      break;
+    }
+    case TK_UMINUS: {
+      Expr *pLeft = pExpr->pLeft;
+      assert( pLeft );
+      if( pLeft->op==TK_INTEGER ){
+        codeInteger(pParse, pLeft, 1, target);
+#ifndef SQLITE_OMIT_FLOATING_POINT
+      }else if( pLeft->op==TK_FLOAT ){
+        assert( !ExprHasProperty(pExpr, EP_IntValue) );
+        codeReal(v, pLeft->u.zToken, 1, target);
+#endif
+      }else{
+        tempX.op = TK_INTEGER;
+        tempX.flags = EP_IntValue|EP_TokenOnly;
+        tempX.u.iValue = 0;
+        r1 = sqlite3ExprCodeTemp(pParse, &tempX, &regFree1);
+        r2 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree2);
+        sqlite3VdbeAddOp3(v, OP_Subtract, r2, r1, target);
+        testcase( regFree2==0 );
+      }
+      inReg = target;
+      break;
+    }
+    case TK_BITNOT:
+    case TK_NOT: {
+      assert( TK_BITNOT==OP_BitNot );   testcase( op==TK_BITNOT );
+      assert( TK_NOT==OP_Not );         testcase( op==TK_NOT );
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      testcase( regFree1==0 );
+      inReg = target;
+      sqlite3VdbeAddOp2(v, op, r1, inReg);
+      break;
+    }
+    case TK_ISNULL:
+    case TK_NOTNULL: {
+      int addr;
+      assert( TK_ISNULL==OP_IsNull );   testcase( op==TK_ISNULL );
+      assert( TK_NOTNULL==OP_NotNull ); testcase( op==TK_NOTNULL );
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, target);
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      testcase( regFree1==0 );
+      addr = sqlite3VdbeAddOp1(v, op, r1);
+      VdbeCoverageIf(v, op==TK_ISNULL);
+      VdbeCoverageIf(v, op==TK_NOTNULL);
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, target);
+      sqlite3VdbeJumpHere(v, addr);
+      break;
+    }
+    case TK_AGG_FUNCTION: {
+      AggInfo *pInfo = pExpr->pAggInfo;
+      if( pInfo==0 ){
+        assert( !ExprHasProperty(pExpr, EP_IntValue) );
+        sqlite3ErrorMsg(pParse, "misuse of aggregate: %s()", pExpr->u.zToken);
+      }else{
+        inReg = pInfo->aFunc[pExpr->iAgg].iMem;
+      }
+      break;
+    }
+    case TK_FUNCTION: {
+      ExprList *pFarg;       /* List of function arguments */
+      int nFarg;             /* Number of function arguments */
+      FuncDef *pDef;         /* The function definition object */
+      int nId;               /* Length of the function name in bytes */
+      const char *zId;       /* The function name */
+      u32 constMask = 0;     /* Mask of function arguments that are constant */
+      int i;                 /* Loop counter */
+      u8 enc = ENC(db);      /* The text encoding used by this database */
+      CollSeq *pColl = 0;    /* A collating sequence */
+
+      assert( !ExprHasProperty(pExpr, EP_xIsSelect) );
+      if( ExprHasProperty(pExpr, EP_TokenOnly) ){
+        pFarg = 0;
+      }else{
+        pFarg = pExpr->x.pList;
+      }
+      nFarg = pFarg ? pFarg->nExpr : 0;
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      zId = pExpr->u.zToken;
+      nId = sqlite3Strlen30(zId);
+      pDef = sqlite3FindFunction(db, zId, nId, nFarg, enc, 0);
+      if( pDef==0 || pDef->xFunc==0 ){
+        sqlite3ErrorMsg(pParse, "unknown function: %.*s()", nId, zId);
+        break;
+      }
+
+      /* Attempt a direct implementation of the built-in COALESCE() and
+      ** IFNULL() functions.  This avoids unnecessary evaluation of
+      ** arguments past the first non-NULL argument.
+      */
+      if( pDef->funcFlags & SQLITE_FUNC_COALESCE ){
+        int endCoalesce = sqlite3VdbeMakeLabel(v);
+        assert( nFarg>=2 );
+        sqlite3ExprCode(pParse, pFarg->a[0].pExpr, target);
+        for(i=1; i<nFarg; i++){
+          sqlite3VdbeAddOp2(v, OP_NotNull, target, endCoalesce);
+          VdbeCoverage(v);
+          sqlite3ExprCacheRemove(pParse, target, 1);
+          sqlite3ExprCachePush(pParse);
+          sqlite3ExprCode(pParse, pFarg->a[i].pExpr, target);
+          sqlite3ExprCachePop(pParse);
+        }
+        sqlite3VdbeResolveLabel(v, endCoalesce);
+        break;
+      }
+
+      /* The UNLIKELY() function is a no-op.  The result is the value
+      ** of the first argument.
+      */
+      if( pDef->funcFlags & SQLITE_FUNC_UNLIKELY ){
+        assert( nFarg>=1 );
+        sqlite3ExprCode(pParse, pFarg->a[0].pExpr, target);
+        break;
+      }
+
+      for(i=0; i<nFarg; i++){
+        if( i<32 && sqlite3ExprIsConstant(pFarg->a[i].pExpr) ){
+          testcase( i==31 );
+          constMask |= MASKBIT32(i);
+        }
+        if( (pDef->funcFlags & SQLITE_FUNC_NEEDCOLL)!=0 && !pColl ){
+          pColl = sqlite3ExprCollSeq(pParse, pFarg->a[i].pExpr);
+        }
+      }
+      if( pFarg ){
+        if( constMask ){
+          r1 = pParse->nMem+1;
+          pParse->nMem += nFarg;
+        }else{
