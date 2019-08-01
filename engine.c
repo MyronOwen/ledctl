@@ -84592,3 +84592,234 @@ SQLITE_PRIVATE int sqlite3ExprCodeTarget(Parse *pParse, Expr *pExpr, int target)
           r1 = pParse->nMem+1;
           pParse->nMem += nFarg;
         }else{
+          r1 = sqlite3GetTempRange(pParse, nFarg);
+        }
+
+        /* For length() and typeof() functions with a column argument,
+        ** set the P5 parameter to the OP_Column opcode to OPFLAG_LENGTHARG
+        ** or OPFLAG_TYPEOFARG respectively, to avoid unnecessary data
+        ** loading.
+        */
+        if( (pDef->funcFlags & (SQLITE_FUNC_LENGTH|SQLITE_FUNC_TYPEOF))!=0 ){
+          u8 exprOp;
+          assert( nFarg==1 );
+          assert( pFarg->a[0].pExpr!=0 );
+          exprOp = pFarg->a[0].pExpr->op;
+          if( exprOp==TK_COLUMN || exprOp==TK_AGG_COLUMN ){
+            assert( SQLITE_FUNC_LENGTH==OPFLAG_LENGTHARG );
+            assert( SQLITE_FUNC_TYPEOF==OPFLAG_TYPEOFARG );
+            testcase( pDef->funcFlags & OPFLAG_LENGTHARG );
+            pFarg->a[0].pExpr->op2 = 
+                  pDef->funcFlags & (OPFLAG_LENGTHARG|OPFLAG_TYPEOFARG);
+          }
+        }
+
+        sqlite3ExprCachePush(pParse);     /* Ticket 2ea2425d34be */
+        sqlite3ExprCodeExprList(pParse, pFarg, r1,
+                                SQLITE_ECEL_DUP|SQLITE_ECEL_FACTOR);
+        sqlite3ExprCachePop(pParse);      /* Ticket 2ea2425d34be */
+      }else{
+        r1 = 0;
+      }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+      /* Possibly overload the function if the first argument is
+      ** a virtual table column.
+      **
+      ** For infix functions (LIKE, GLOB, REGEXP, and MATCH) use the
+      ** second argument, not the first, as the argument to test to
+      ** see if it is a column in a virtual table.  This is done because
+      ** the left operand of infix functions (the operand we want to
+      ** control overloading) ends up as the second argument to the
+      ** function.  The expression "A glob B" is equivalent to 
+      ** "glob(B,A).  We want to use the A in "A glob B" to test
+      ** for function overloading.  But we use the B term in "glob(B,A)".
+      */
+      if( nFarg>=2 && (pExpr->flags & EP_InfixFunc) ){
+        pDef = sqlite3VtabOverloadFunction(db, pDef, nFarg, pFarg->a[1].pExpr);
+      }else if( nFarg>0 ){
+        pDef = sqlite3VtabOverloadFunction(db, pDef, nFarg, pFarg->a[0].pExpr);
+      }
+#endif
+      if( pDef->funcFlags & SQLITE_FUNC_NEEDCOLL ){
+        if( !pColl ) pColl = db->pDfltColl; 
+        sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0, (char *)pColl, P4_COLLSEQ);
+      }
+      sqlite3VdbeAddOp4(v, OP_Function, constMask, r1, target,
+                        (char*)pDef, P4_FUNCDEF);
+      sqlite3VdbeChangeP5(v, (u8)nFarg);
+      if( nFarg && constMask==0 ){
+        sqlite3ReleaseTempRange(pParse, r1, nFarg);
+      }
+      break;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case TK_EXISTS:
+    case TK_SELECT: {
+      testcase( op==TK_EXISTS );
+      testcase( op==TK_SELECT );
+      inReg = sqlite3CodeSubselect(pParse, pExpr, 0, 0);
+      break;
+    }
+    case TK_IN: {
+      int destIfFalse = sqlite3VdbeMakeLabel(v);
+      int destIfNull = sqlite3VdbeMakeLabel(v);
+      sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      sqlite3ExprCodeIN(pParse, pExpr, destIfFalse, destIfNull);
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, target);
+      sqlite3VdbeResolveLabel(v, destIfFalse);
+      sqlite3VdbeAddOp2(v, OP_AddImm, target, 0);
+      sqlite3VdbeResolveLabel(v, destIfNull);
+      break;
+    }
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+
+    /*
+    **    x BETWEEN y AND z
+    **
+    ** This is equivalent to
+    **
+    **    x>=y AND x<=z
+    **
+    ** X is stored in pExpr->pLeft.
+    ** Y is stored in pExpr->pList->a[0].pExpr.
+    ** Z is stored in pExpr->pList->a[1].pExpr.
+    */
+    case TK_BETWEEN: {
+      Expr *pLeft = pExpr->pLeft;
+      struct ExprList_item *pLItem = pExpr->x.pList->a;
+      Expr *pRight = pLItem->pExpr;
+
+      r1 = sqlite3ExprCodeTemp(pParse, pLeft, &regFree1);
+      r2 = sqlite3ExprCodeTemp(pParse, pRight, &regFree2);
+      testcase( regFree1==0 );
+      testcase( regFree2==0 );
+      r3 = sqlite3GetTempReg(pParse);
+      r4 = sqlite3GetTempReg(pParse);
+      codeCompare(pParse, pLeft, pRight, OP_Ge,
+                  r1, r2, r3, SQLITE_STOREP2);  VdbeCoverage(v);
+      pLItem++;
+      pRight = pLItem->pExpr;
+      sqlite3ReleaseTempReg(pParse, regFree2);
+      r2 = sqlite3ExprCodeTemp(pParse, pRight, &regFree2);
+      testcase( regFree2==0 );
+      codeCompare(pParse, pLeft, pRight, OP_Le, r1, r2, r4, SQLITE_STOREP2);
+      VdbeCoverage(v);
+      sqlite3VdbeAddOp3(v, OP_And, r3, r4, target);
+      sqlite3ReleaseTempReg(pParse, r3);
+      sqlite3ReleaseTempReg(pParse, r4);
+      break;
+    }
+    case TK_COLLATE: 
+    case TK_UPLUS: {
+      inReg = sqlite3ExprCodeTarget(pParse, pExpr->pLeft, target);
+      break;
+    }
+
+    case TK_TRIGGER: {
+      /* If the opcode is TK_TRIGGER, then the expression is a reference
+      ** to a column in the new.* or old.* pseudo-tables available to
+      ** trigger programs. In this case Expr.iTable is set to 1 for the
+      ** new.* pseudo-table, or 0 for the old.* pseudo-table. Expr.iColumn
+      ** is set to the column of the pseudo-table to read, or to -1 to
+      ** read the rowid field.
+      **
+      ** The expression is implemented using an OP_Param opcode. The p1
+      ** parameter is set to 0 for an old.rowid reference, or to (i+1)
+      ** to reference another column of the old.* pseudo-table, where 
+      ** i is the index of the column. For a new.rowid reference, p1 is
+      ** set to (n+1), where n is the number of columns in each pseudo-table.
+      ** For a reference to any other column in the new.* pseudo-table, p1
+      ** is set to (n+2+i), where n and i are as defined previously. For
+      ** example, if the table on which triggers are being fired is
+      ** declared as:
+      **
+      **   CREATE TABLE t1(a, b);
+      **
+      ** Then p1 is interpreted as follows:
+      **
+      **   p1==0   ->    old.rowid     p1==3   ->    new.rowid
+      **   p1==1   ->    old.a         p1==4   ->    new.a
+      **   p1==2   ->    old.b         p1==5   ->    new.b       
+      */
+      Table *pTab = pExpr->pTab;
+      int p1 = pExpr->iTable * (pTab->nCol+1) + 1 + pExpr->iColumn;
+
+      assert( pExpr->iTable==0 || pExpr->iTable==1 );
+      assert( pExpr->iColumn>=-1 && pExpr->iColumn<pTab->nCol );
+      assert( pTab->iPKey<0 || pExpr->iColumn!=pTab->iPKey );
+      assert( p1>=0 && p1<(pTab->nCol*2+2) );
+
+      sqlite3VdbeAddOp2(v, OP_Param, p1, target);
+      VdbeComment((v, "%s.%s -> $%d",
+        (pExpr->iTable ? "new" : "old"),
+        (pExpr->iColumn<0 ? "rowid" : pExpr->pTab->aCol[pExpr->iColumn].zName),
+        target
+      ));
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+      /* If the column has REAL affinity, it may currently be stored as an
+      ** integer. Use OP_RealAffinity to make sure it is really real.
+      **
+      ** EVIDENCE-OF: R-60985-57662 SQLite will convert the value back to
+      ** floating point when extracting it from the record.  */
+      if( pExpr->iColumn>=0 
+       && pTab->aCol[pExpr->iColumn].affinity==SQLITE_AFF_REAL
+      ){
+        sqlite3VdbeAddOp1(v, OP_RealAffinity, target);
+      }
+#endif
+      break;
+    }
+
+
+    /*
+    ** Form A:
+    **   CASE x WHEN e1 THEN r1 WHEN e2 THEN r2 ... WHEN eN THEN rN ELSE y END
+    **
+    ** Form B:
+    **   CASE WHEN e1 THEN r1 WHEN e2 THEN r2 ... WHEN eN THEN rN ELSE y END
+    **
+    ** Form A is can be transformed into the equivalent form B as follows:
+    **   CASE WHEN x=e1 THEN r1 WHEN x=e2 THEN r2 ...
+    **        WHEN x=eN THEN rN ELSE y END
+    **
+    ** X (if it exists) is in pExpr->pLeft.
+    ** Y is in the last element of pExpr->x.pList if pExpr->x.pList->nExpr is
+    ** odd.  The Y is also optional.  If the number of elements in x.pList
+    ** is even, then Y is omitted and the "otherwise" result is NULL.
+    ** Ei is in pExpr->pList->a[i*2] and Ri is pExpr->pList->a[i*2+1].
+    **
+    ** The result of the expression is the Ri for the first matching Ei,
+    ** or if there is no matching Ei, the ELSE term Y, or if there is
+    ** no ELSE term, NULL.
+    */
+    default: assert( op==TK_CASE ); {
+      int endLabel;                     /* GOTO label for end of CASE stmt */
+      int nextCase;                     /* GOTO label for next WHEN clause */
+      int nExpr;                        /* 2x number of WHEN terms */
+      int i;                            /* Loop counter */
+      ExprList *pEList;                 /* List of WHEN terms */
+      struct ExprList_item *aListelem;  /* Array of WHEN terms */
+      Expr opCompare;                   /* The X==Ei expression */
+      Expr *pX;                         /* The X expression */
+      Expr *pTest = 0;                  /* X==Ei (form A) or just Ei (form B) */
+      VVA_ONLY( int iCacheLevel = pParse->iCacheLevel; )
+
+      assert( !ExprHasProperty(pExpr, EP_xIsSelect) && pExpr->x.pList );
+      assert(pExpr->x.pList->nExpr > 0);
+      pEList = pExpr->x.pList;
+      aListelem = pEList->a;
+      nExpr = pEList->nExpr;
+      endLabel = sqlite3VdbeMakeLabel(v);
+      if( (pX = pExpr->pLeft)!=0 ){
+        tempX = *pX;
+        testcase( pX->op==TK_COLUMN );
+        exprToRegister(&tempX, sqlite3ExprCodeTemp(pParse, pX, &regFree1));
+        testcase( regFree1==0 );
+        opCompare.op = TK_EQ;
+        opCompare.pLeft = &tempX;
+        pTest = &opCompare;
+        /* Ticket b351d95f9cd5ef17e9d9dbae18f5ca8611190001:
+        ** The value in regFree1 might get SCopy-ed into the file result.
+        ** So make sure that the regFree1 register is not reused for other
