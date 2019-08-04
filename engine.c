@@ -84823,3 +84823,251 @@ SQLITE_PRIVATE int sqlite3ExprCodeTarget(Parse *pParse, Expr *pExpr, int target)
         /* Ticket b351d95f9cd5ef17e9d9dbae18f5ca8611190001:
         ** The value in regFree1 might get SCopy-ed into the file result.
         ** So make sure that the regFree1 register is not reused for other
+        ** purposes and possibly overwritten.  */
+        regFree1 = 0;
+      }
+      for(i=0; i<nExpr-1; i=i+2){
+        sqlite3ExprCachePush(pParse);
+        if( pX ){
+          assert( pTest!=0 );
+          opCompare.pRight = aListelem[i].pExpr;
+        }else{
+          pTest = aListelem[i].pExpr;
+        }
+        nextCase = sqlite3VdbeMakeLabel(v);
+        testcase( pTest->op==TK_COLUMN );
+        sqlite3ExprIfFalse(pParse, pTest, nextCase, SQLITE_JUMPIFNULL);
+        testcase( aListelem[i+1].pExpr->op==TK_COLUMN );
+        sqlite3ExprCode(pParse, aListelem[i+1].pExpr, target);
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, endLabel);
+        sqlite3ExprCachePop(pParse);
+        sqlite3VdbeResolveLabel(v, nextCase);
+      }
+      if( (nExpr&1)!=0 ){
+        sqlite3ExprCachePush(pParse);
+        sqlite3ExprCode(pParse, pEList->a[nExpr-1].pExpr, target);
+        sqlite3ExprCachePop(pParse);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      }
+      assert( db->mallocFailed || pParse->nErr>0 
+           || pParse->iCacheLevel==iCacheLevel );
+      sqlite3VdbeResolveLabel(v, endLabel);
+      break;
+    }
+#ifndef SQLITE_OMIT_TRIGGER
+    case TK_RAISE: {
+      assert( pExpr->affinity==OE_Rollback 
+           || pExpr->affinity==OE_Abort
+           || pExpr->affinity==OE_Fail
+           || pExpr->affinity==OE_Ignore
+      );
+      if( !pParse->pTriggerTab ){
+        sqlite3ErrorMsg(pParse,
+                       "RAISE() may only be used within a trigger-program");
+        return 0;
+      }
+      if( pExpr->affinity==OE_Abort ){
+        sqlite3MayAbort(pParse);
+      }
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      if( pExpr->affinity==OE_Ignore ){
+        sqlite3VdbeAddOp4(
+            v, OP_Halt, SQLITE_OK, OE_Ignore, 0, pExpr->u.zToken,0);
+        VdbeCoverage(v);
+      }else{
+        sqlite3HaltConstraint(pParse, SQLITE_CONSTRAINT_TRIGGER,
+                              pExpr->affinity, pExpr->u.zToken, 0, 0);
+      }
+
+      break;
+    }
+#endif
+  }
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3ReleaseTempReg(pParse, regFree2);
+  return inReg;
+}
+
+/*
+** Factor out the code of the given expression to initialization time.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeAtInit(
+  Parse *pParse,    /* Parsing context */
+  Expr *pExpr,      /* The expression to code when the VDBE initializes */
+  int regDest,      /* Store the value in this register */
+  u8 reusable       /* True if this expression is reusable */
+){
+  ExprList *p;
+  assert( ConstFactorOk(pParse) );
+  p = pParse->pConstExpr;
+  pExpr = sqlite3ExprDup(pParse->db, pExpr, 0);
+  p = sqlite3ExprListAppend(pParse, p, pExpr);
+  if( p ){
+     struct ExprList_item *pItem = &p->a[p->nExpr-1];
+     pItem->u.iConstExprReg = regDest;
+     pItem->reusable = reusable;
+  }
+  pParse->pConstExpr = p;
+}
+
+/*
+** Generate code to evaluate an expression and store the results
+** into a register.  Return the register number where the results
+** are stored.
+**
+** If the register is a temporary register that can be deallocated,
+** then write its number into *pReg.  If the result register is not
+** a temporary, then set *pReg to zero.
+**
+** If pExpr is a constant, then this routine might generate this
+** code to fill the register in the initialization section of the
+** VDBE program, in order to factor it out of the evaluation loop.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeTemp(Parse *pParse, Expr *pExpr, int *pReg){
+  int r2;
+  pExpr = sqlite3ExprSkipCollate(pExpr);
+  if( ConstFactorOk(pParse)
+   && pExpr->op!=TK_REGISTER
+   && sqlite3ExprIsConstantNotJoin(pExpr)
+  ){
+    ExprList *p = pParse->pConstExpr;
+    int i;
+    *pReg  = 0;
+    if( p ){
+      struct ExprList_item *pItem;
+      for(pItem=p->a, i=p->nExpr; i>0; pItem++, i--){
+        if( pItem->reusable && sqlite3ExprCompare(pItem->pExpr,pExpr,-1)==0 ){
+          return pItem->u.iConstExprReg;
+        }
+      }
+    }
+    r2 = ++pParse->nMem;
+    sqlite3ExprCodeAtInit(pParse, pExpr, r2, 1);
+  }else{
+    int r1 = sqlite3GetTempReg(pParse);
+    r2 = sqlite3ExprCodeTarget(pParse, pExpr, r1);
+    if( r2==r1 ){
+      *pReg = r1;
+    }else{
+      sqlite3ReleaseTempReg(pParse, r1);
+      *pReg = 0;
+    }
+  }
+  return r2;
+}
+
+/*
+** Generate code that will evaluate expression pExpr and store the
+** results in register target.  The results are guaranteed to appear
+** in register target.
+*/
+SQLITE_PRIVATE void sqlite3ExprCode(Parse *pParse, Expr *pExpr, int target){
+  int inReg;
+
+  assert( target>0 && target<=pParse->nMem );
+  if( pExpr && pExpr->op==TK_REGISTER ){
+    sqlite3VdbeAddOp2(pParse->pVdbe, OP_Copy, pExpr->iTable, target);
+  }else{
+    inReg = sqlite3ExprCodeTarget(pParse, pExpr, target);
+    assert( pParse->pVdbe || pParse->db->mallocFailed );
+    if( inReg!=target && pParse->pVdbe ){
+      sqlite3VdbeAddOp2(pParse->pVdbe, OP_SCopy, inReg, target);
+    }
+  }
+}
+
+/*
+** Generate code that will evaluate expression pExpr and store the
+** results in register target.  The results are guaranteed to appear
+** in register target.  If the expression is constant, then this routine
+** might choose to code the expression at initialization time.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeFactorable(Parse *pParse, Expr *pExpr, int target){
+  if( pParse->okConstFactor && sqlite3ExprIsConstant(pExpr) ){
+    sqlite3ExprCodeAtInit(pParse, pExpr, target, 0);
+  }else{
+    sqlite3ExprCode(pParse, pExpr, target);
+  }
+}
+
+/*
+** Generate code that evaluates the given expression and puts the result
+** in register target.
+**
+** Also make a copy of the expression results into another "cache" register
+** and modify the expression so that the next time it is evaluated,
+** the result is a copy of the cache register.
+**
+** This routine is used for expressions that are used multiple 
+** times.  They are evaluated once and the results of the expression
+** are reused.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeAndCache(Parse *pParse, Expr *pExpr, int target){
+  Vdbe *v = pParse->pVdbe;
+  int iMem;
+
+  assert( target>0 );
+  assert( pExpr->op!=TK_REGISTER );
+  sqlite3ExprCode(pParse, pExpr, target);
+  iMem = ++pParse->nMem;
+  sqlite3VdbeAddOp2(v, OP_Copy, target, iMem);
+  exprToRegister(pExpr, iMem);
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Generate a human-readable explanation of an expression tree.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewExpr(TreeView *pView, const Expr *pExpr, u8 moreToFollow){
+  const char *zBinOp = 0;   /* Binary operator */
+  const char *zUniOp = 0;   /* Unary operator */
+  pView = sqlite3TreeViewPush(pView, moreToFollow);
+  if( pExpr==0 ){
+    sqlite3TreeViewLine(pView, "nil");
+    sqlite3TreeViewPop(pView);
+    return;
+  }
+  switch( pExpr->op ){
+    case TK_AGG_COLUMN: {
+      sqlite3TreeViewLine(pView, "AGG{%d:%d}",
+            pExpr->iTable, pExpr->iColumn);
+      break;
+    }
+    case TK_COLUMN: {
+      if( pExpr->iTable<0 ){
+        /* This only happens when coding check constraints */
+        sqlite3TreeViewLine(pView, "COLUMN(%d)", pExpr->iColumn);
+      }else{
+        sqlite3TreeViewLine(pView, "{%d:%d}",
+                             pExpr->iTable, pExpr->iColumn);
+      }
+      break;
+    }
+    case TK_INTEGER: {
+      if( pExpr->flags & EP_IntValue ){
+        sqlite3TreeViewLine(pView, "%d", pExpr->u.iValue);
+      }else{
+        sqlite3TreeViewLine(pView, "%s", pExpr->u.zToken);
+      }
+      break;
+    }
+#ifndef SQLITE_OMIT_FLOATING_POINT
+    case TK_FLOAT: {
+      sqlite3TreeViewLine(pView,"%s", pExpr->u.zToken);
+      break;
+    }
+#endif
+    case TK_STRING: {
+      sqlite3TreeViewLine(pView,"%Q", pExpr->u.zToken);
+      break;
+    }
+    case TK_NULL: {
+      sqlite3TreeViewLine(pView,"NULL");
+      break;
+    }
+#ifndef SQLITE_OMIT_BLOB_LITERAL
+    case TK_BLOB: {
+      sqlite3TreeViewLine(pView,"%s", pExpr->u.zToken);
+      break;
+    }
