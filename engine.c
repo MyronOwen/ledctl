@@ -85979,3 +85979,222 @@ static int analyzeAggregate(Walker *pWalker, Expr *pExpr){
         ** function that is already in the pAggInfo structure
         */
         struct AggInfo_func *pItem = pAggInfo->aFunc;
+        for(i=0; i<pAggInfo->nFunc; i++, pItem++){
+          if( sqlite3ExprCompare(pItem->pExpr, pExpr, -1)==0 ){
+            break;
+          }
+        }
+        if( i>=pAggInfo->nFunc ){
+          /* pExpr is original.  Make a new entry in pAggInfo->aFunc[]
+          */
+          u8 enc = ENC(pParse->db);
+          i = addAggInfoFunc(pParse->db, pAggInfo);
+          if( i>=0 ){
+            assert( !ExprHasProperty(pExpr, EP_xIsSelect) );
+            pItem = &pAggInfo->aFunc[i];
+            pItem->pExpr = pExpr;
+            pItem->iMem = ++pParse->nMem;
+            assert( !ExprHasProperty(pExpr, EP_IntValue) );
+            pItem->pFunc = sqlite3FindFunction(pParse->db,
+                   pExpr->u.zToken, sqlite3Strlen30(pExpr->u.zToken),
+                   pExpr->x.pList ? pExpr->x.pList->nExpr : 0, enc, 0);
+            if( pExpr->flags & EP_Distinct ){
+              pItem->iDistinct = pParse->nTab++;
+            }else{
+              pItem->iDistinct = -1;
+            }
+          }
+        }
+        /* Make pExpr point to the appropriate pAggInfo->aFunc[] entry
+        */
+        assert( !ExprHasProperty(pExpr, EP_TokenOnly|EP_Reduced) );
+        ExprSetVVAProperty(pExpr, EP_NoReduce);
+        pExpr->iAgg = (i16)i;
+        pExpr->pAggInfo = pAggInfo;
+        return WRC_Prune;
+      }else{
+        return WRC_Continue;
+      }
+    }
+  }
+  return WRC_Continue;
+}
+static int analyzeAggregatesInSelect(Walker *pWalker, Select *pSelect){
+  UNUSED_PARAMETER(pWalker);
+  UNUSED_PARAMETER(pSelect);
+  return WRC_Continue;
+}
+
+/*
+** Analyze the pExpr expression looking for aggregate functions and
+** for variables that need to be added to AggInfo object that pNC->pAggInfo
+** points to.  Additional entries are made on the AggInfo object as
+** necessary.
+**
+** This routine should only be called after the expression has been
+** analyzed by sqlite3ResolveExprNames().
+*/
+SQLITE_PRIVATE void sqlite3ExprAnalyzeAggregates(NameContext *pNC, Expr *pExpr){
+  Walker w;
+  memset(&w, 0, sizeof(w));
+  w.xExprCallback = analyzeAggregate;
+  w.xSelectCallback = analyzeAggregatesInSelect;
+  w.u.pNC = pNC;
+  assert( pNC->pSrcList!=0 );
+  sqlite3WalkExpr(&w, pExpr);
+}
+
+/*
+** Call sqlite3ExprAnalyzeAggregates() for every expression in an
+** expression list.  Return the number of errors.
+**
+** If an error is found, the analysis is cut short.
+*/
+SQLITE_PRIVATE void sqlite3ExprAnalyzeAggList(NameContext *pNC, ExprList *pList){
+  struct ExprList_item *pItem;
+  int i;
+  if( pList ){
+    for(pItem=pList->a, i=0; i<pList->nExpr; i++, pItem++){
+      sqlite3ExprAnalyzeAggregates(pNC, pItem->pExpr);
+    }
+  }
+}
+
+/*
+** Allocate a single new register for use to hold some intermediate result.
+*/
+SQLITE_PRIVATE int sqlite3GetTempReg(Parse *pParse){
+  if( pParse->nTempReg==0 ){
+    return ++pParse->nMem;
+  }
+  return pParse->aTempReg[--pParse->nTempReg];
+}
+
+/*
+** Deallocate a register, making available for reuse for some other
+** purpose.
+**
+** If a register is currently being used by the column cache, then
+** the deallocation is deferred until the column cache line that uses
+** the register becomes stale.
+*/
+SQLITE_PRIVATE void sqlite3ReleaseTempReg(Parse *pParse, int iReg){
+  if( iReg && pParse->nTempReg<ArraySize(pParse->aTempReg) ){
+    int i;
+    struct yColCache *p;
+    for(i=0, p=pParse->aColCache; i<SQLITE_N_COLCACHE; i++, p++){
+      if( p->iReg==iReg ){
+        p->tempReg = 1;
+        return;
+      }
+    }
+    pParse->aTempReg[pParse->nTempReg++] = iReg;
+  }
+}
+
+/*
+** Allocate or deallocate a block of nReg consecutive registers
+*/
+SQLITE_PRIVATE int sqlite3GetTempRange(Parse *pParse, int nReg){
+  int i, n;
+  i = pParse->iRangeReg;
+  n = pParse->nRangeReg;
+  if( nReg<=n ){
+    assert( !usedAsColumnCache(pParse, i, i+n-1) );
+    pParse->iRangeReg += nReg;
+    pParse->nRangeReg -= nReg;
+  }else{
+    i = pParse->nMem+1;
+    pParse->nMem += nReg;
+  }
+  return i;
+}
+SQLITE_PRIVATE void sqlite3ReleaseTempRange(Parse *pParse, int iReg, int nReg){
+  sqlite3ExprCacheRemove(pParse, iReg, nReg);
+  if( nReg>pParse->nRangeReg ){
+    pParse->nRangeReg = nReg;
+    pParse->iRangeReg = iReg;
+  }
+}
+
+/*
+** Mark all temporary registers as being unavailable for reuse.
+*/
+SQLITE_PRIVATE void sqlite3ClearTempRegCache(Parse *pParse){
+  pParse->nTempReg = 0;
+  pParse->nRangeReg = 0;
+}
+
+/************** End of expr.c ************************************************/
+/************** Begin file alter.c *******************************************/
+/*
+** 2005 February 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains C code routines that used to generate VDBE code
+** that implements the ALTER TABLE command.
+*/
+
+/*
+** The code in this file only exists if we are not omitting the
+** ALTER TABLE logic from the build.
+*/
+#ifndef SQLITE_OMIT_ALTERTABLE
+
+
+/*
+** This function is used by SQL generated to implement the 
+** ALTER TABLE command. The first argument is the text of a CREATE TABLE or
+** CREATE INDEX command. The second is a table name. The table name in 
+** the CREATE TABLE or CREATE INDEX statement is replaced with the third
+** argument and the result returned. Examples:
+**
+** sqlite_rename_table('CREATE TABLE abc(a, b, c)', 'def')
+**     -> 'CREATE TABLE def(a, b, c)'
+**
+** sqlite_rename_table('CREATE INDEX i ON abc(a)', 'def')
+**     -> 'CREATE INDEX i ON def(a, b, c)'
+*/
+static void renameTableFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **argv
+){
+  unsigned char const *zSql = sqlite3_value_text(argv[0]);
+  unsigned char const *zTableName = sqlite3_value_text(argv[1]);
+
+  int token;
+  Token tname;
+  unsigned char const *zCsr = zSql;
+  int len = 0;
+  char *zRet;
+
+  sqlite3 *db = sqlite3_context_db_handle(context);
+
+  UNUSED_PARAMETER(NotUsed);
+
+  /* The principle used to locate the table name in the CREATE TABLE 
+  ** statement is that the table name is the first non-space token that
+  ** is immediately followed by a TK_LP or TK_USING token.
+  */
+  if( zSql ){
+    do {
+      if( !*zCsr ){
+        /* Ran out of input before finding an opening bracket. Return NULL. */
+        return;
+      }
+
+      /* Store the token that zCsr points to in tname. */
+      tname.z = (char*)zCsr;
+      tname.n = len;
+
+      /* Advance zCsr to the next token. Store that token type in 'token',
+      ** and its length in 'len' (to be used next iteration of this loop).
+      */
