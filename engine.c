@@ -85514,3 +85514,228 @@ SQLITE_PRIVATE void sqlite3ExprIfTrue(Parse *pParse, Expr *pExpr, int dest, int 
 
 /*
 ** Generate code for a boolean expression such that a jump is made
+** to the label "dest" if the expression is false but execution
+** continues straight thru if the expression is true.
+**
+** If the expression evaluates to NULL (neither true nor false) then
+** jump if jumpIfNull is SQLITE_JUMPIFNULL or fall through if jumpIfNull
+** is 0.
+*/
+SQLITE_PRIVATE void sqlite3ExprIfFalse(Parse *pParse, Expr *pExpr, int dest, int jumpIfNull){
+  Vdbe *v = pParse->pVdbe;
+  int op = 0;
+  int regFree1 = 0;
+  int regFree2 = 0;
+  int r1, r2;
+
+  assert( jumpIfNull==SQLITE_JUMPIFNULL || jumpIfNull==0 );
+  if( NEVER(v==0) ) return; /* Existence of VDBE checked by caller */
+  if( pExpr==0 )    return;
+
+  /* The value of pExpr->op and op are related as follows:
+  **
+  **       pExpr->op            op
+  **       ---------          ----------
+  **       TK_ISNULL          OP_NotNull
+  **       TK_NOTNULL         OP_IsNull
+  **       TK_NE              OP_Eq
+  **       TK_EQ              OP_Ne
+  **       TK_GT              OP_Le
+  **       TK_LE              OP_Gt
+  **       TK_GE              OP_Lt
+  **       TK_LT              OP_Ge
+  **
+  ** For other values of pExpr->op, op is undefined and unused.
+  ** The value of TK_ and OP_ constants are arranged such that we
+  ** can compute the mapping above using the following expression.
+  ** Assert()s verify that the computation is correct.
+  */
+  op = ((pExpr->op+(TK_ISNULL&1))^1)-(TK_ISNULL&1);
+
+  /* Verify correct alignment of TK_ and OP_ constants
+  */
+  assert( pExpr->op!=TK_ISNULL || op==OP_NotNull );
+  assert( pExpr->op!=TK_NOTNULL || op==OP_IsNull );
+  assert( pExpr->op!=TK_NE || op==OP_Eq );
+  assert( pExpr->op!=TK_EQ || op==OP_Ne );
+  assert( pExpr->op!=TK_LT || op==OP_Ge );
+  assert( pExpr->op!=TK_LE || op==OP_Gt );
+  assert( pExpr->op!=TK_GT || op==OP_Le );
+  assert( pExpr->op!=TK_GE || op==OP_Lt );
+
+  switch( pExpr->op ){
+    case TK_AND: {
+      testcase( jumpIfNull==0 );
+      sqlite3ExprIfFalse(pParse, pExpr->pLeft, dest, jumpIfNull);
+      sqlite3ExprCachePush(pParse);
+      sqlite3ExprIfFalse(pParse, pExpr->pRight, dest, jumpIfNull);
+      sqlite3ExprCachePop(pParse);
+      break;
+    }
+    case TK_OR: {
+      int d2 = sqlite3VdbeMakeLabel(v);
+      testcase( jumpIfNull==0 );
+      sqlite3ExprIfTrue(pParse, pExpr->pLeft, d2, jumpIfNull^SQLITE_JUMPIFNULL);
+      sqlite3ExprCachePush(pParse);
+      sqlite3ExprIfFalse(pParse, pExpr->pRight, dest, jumpIfNull);
+      sqlite3VdbeResolveLabel(v, d2);
+      sqlite3ExprCachePop(pParse);
+      break;
+    }
+    case TK_NOT: {
+      testcase( jumpIfNull==0 );
+      sqlite3ExprIfTrue(pParse, pExpr->pLeft, dest, jumpIfNull);
+      break;
+    }
+    case TK_LT:
+    case TK_LE:
+    case TK_GT:
+    case TK_GE:
+    case TK_NE:
+    case TK_EQ: {
+      testcase( jumpIfNull==0 );
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      r2 = sqlite3ExprCodeTemp(pParse, pExpr->pRight, &regFree2);
+      codeCompare(pParse, pExpr->pLeft, pExpr->pRight, op,
+                  r1, r2, dest, jumpIfNull);
+      assert(TK_LT==OP_Lt); testcase(op==OP_Lt); VdbeCoverageIf(v,op==OP_Lt);
+      assert(TK_LE==OP_Le); testcase(op==OP_Le); VdbeCoverageIf(v,op==OP_Le);
+      assert(TK_GT==OP_Gt); testcase(op==OP_Gt); VdbeCoverageIf(v,op==OP_Gt);
+      assert(TK_GE==OP_Ge); testcase(op==OP_Ge); VdbeCoverageIf(v,op==OP_Ge);
+      assert(TK_EQ==OP_Eq); testcase(op==OP_Eq); VdbeCoverageIf(v,op==OP_Eq);
+      assert(TK_NE==OP_Ne); testcase(op==OP_Ne); VdbeCoverageIf(v,op==OP_Ne);
+      testcase( regFree1==0 );
+      testcase( regFree2==0 );
+      break;
+    }
+    case TK_IS:
+    case TK_ISNOT: {
+      testcase( pExpr->op==TK_IS );
+      testcase( pExpr->op==TK_ISNOT );
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      r2 = sqlite3ExprCodeTemp(pParse, pExpr->pRight, &regFree2);
+      op = (pExpr->op==TK_IS) ? TK_NE : TK_EQ;
+      codeCompare(pParse, pExpr->pLeft, pExpr->pRight, op,
+                  r1, r2, dest, SQLITE_NULLEQ);
+      VdbeCoverageIf(v, op==TK_EQ);
+      VdbeCoverageIf(v, op==TK_NE);
+      testcase( regFree1==0 );
+      testcase( regFree2==0 );
+      break;
+    }
+    case TK_ISNULL:
+    case TK_NOTNULL: {
+      r1 = sqlite3ExprCodeTemp(pParse, pExpr->pLeft, &regFree1);
+      sqlite3VdbeAddOp2(v, op, r1, dest);
+      testcase( op==TK_ISNULL );   VdbeCoverageIf(v, op==TK_ISNULL);
+      testcase( op==TK_NOTNULL );  VdbeCoverageIf(v, op==TK_NOTNULL);
+      testcase( regFree1==0 );
+      break;
+    }
+    case TK_BETWEEN: {
+      testcase( jumpIfNull==0 );
+      exprCodeBetween(pParse, pExpr, dest, 0, jumpIfNull);
+      break;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case TK_IN: {
+      if( jumpIfNull ){
+        sqlite3ExprCodeIN(pParse, pExpr, dest, dest);
+      }else{
+        int destIfNull = sqlite3VdbeMakeLabel(v);
+        sqlite3ExprCodeIN(pParse, pExpr, dest, destIfNull);
+        sqlite3VdbeResolveLabel(v, destIfNull);
+      }
+      break;
+    }
+#endif
+    default: {
+      if( exprAlwaysFalse(pExpr) ){
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, dest);
+      }else if( exprAlwaysTrue(pExpr) ){
+        /* no-op */
+      }else{
+        r1 = sqlite3ExprCodeTemp(pParse, pExpr, &regFree1);
+        sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, jumpIfNull!=0);
+        VdbeCoverage(v);
+        testcase( regFree1==0 );
+        testcase( jumpIfNull==0 );
+      }
+      break;
+    }
+  }
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3ReleaseTempReg(pParse, regFree2);
+}
+
+/*
+** Do a deep comparison of two expression trees.  Return 0 if the two
+** expressions are completely identical.  Return 1 if they differ only
+** by a COLLATE operator at the top level.  Return 2 if there are differences
+** other than the top-level COLLATE operator.
+**
+** If any subelement of pB has Expr.iTable==(-1) then it is allowed
+** to compare equal to an equivalent element in pA with Expr.iTable==iTab.
+**
+** The pA side might be using TK_REGISTER.  If that is the case and pB is
+** not using TK_REGISTER but is otherwise equivalent, then still return 0.
+**
+** Sometimes this routine will return 2 even if the two expressions
+** really are equivalent.  If we cannot prove that the expressions are
+** identical, we return 2 just to be safe.  So if this routine
+** returns 2, then you do not really know for certain if the two
+** expressions are the same.  But if you get a 0 or 1 return, then you
+** can be sure the expressions are the same.  In the places where
+** this routine is used, it does not hurt to get an extra 2 - that
+** just might result in some slightly slower code.  But returning
+** an incorrect 0 or 1 could lead to a malfunction.
+*/
+SQLITE_PRIVATE int sqlite3ExprCompare(Expr *pA, Expr *pB, int iTab){
+  u32 combinedFlags;
+  if( pA==0 || pB==0 ){
+    return pB==pA ? 0 : 2;
+  }
+  combinedFlags = pA->flags | pB->flags;
+  if( combinedFlags & EP_IntValue ){
+    if( (pA->flags&pB->flags&EP_IntValue)!=0 && pA->u.iValue==pB->u.iValue ){
+      return 0;
+    }
+    return 2;
+  }
+  if( pA->op!=pB->op ){
+    if( pA->op==TK_COLLATE && sqlite3ExprCompare(pA->pLeft, pB, iTab)<2 ){
+      return 1;
+    }
+    if( pB->op==TK_COLLATE && sqlite3ExprCompare(pA, pB->pLeft, iTab)<2 ){
+      return 1;
+    }
+    return 2;
+  }
+  if( pA->op!=TK_COLUMN && ALWAYS(pA->op!=TK_AGG_COLUMN) && pA->u.zToken ){
+    if( strcmp(pA->u.zToken,pB->u.zToken)!=0 ){
+      return pA->op==TK_COLLATE ? 1 : 2;
+    }
+  }
+  if( (pA->flags & EP_Distinct)!=(pB->flags & EP_Distinct) ) return 2;
+  if( ALWAYS((combinedFlags & EP_TokenOnly)==0) ){
+    if( combinedFlags & EP_xIsSelect ) return 2;
+    if( sqlite3ExprCompare(pA->pLeft, pB->pLeft, iTab) ) return 2;
+    if( sqlite3ExprCompare(pA->pRight, pB->pRight, iTab) ) return 2;
+    if( sqlite3ExprListCompare(pA->x.pList, pB->x.pList, iTab) ) return 2;
+    if( ALWAYS((combinedFlags & EP_Reduced)==0) ){
+      if( pA->iColumn!=pB->iColumn ) return 2;
+      if( pA->iTable!=pB->iTable 
+       && (pA->iTable!=iTab || NEVER(pB->iTable>=0)) ) return 2;
+    }
+  }
+  return 0;
+}
+
+/*
+** Compare two ExprList objects.  Return 0 if they are identical and 
+** non-zero if they differ in any way.
+**
+** If any subelement of pB has Expr.iTable==(-1) then it is allowed
+** to compare equal to an equivalent element in pA with Expr.iTable==iTab.
+**
+** This routine might return non-zero for equivalent ExprLists.  The
