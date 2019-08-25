@@ -86437,3 +86437,212 @@ static char *whereTempTriggers(Parse *pParse, Table *pTab){
   if( pTab->pSchema!=pTempSchema ){
     sqlite3 *db = pParse->db;
     for(pTrig=sqlite3TriggerList(pParse, pTab); pTrig; pTrig=pTrig->pNext){
+      if( pTrig->pSchema==pTempSchema ){
+        zWhere = whereOrName(db, zWhere, pTrig->zName);
+      }
+    }
+  }
+  if( zWhere ){
+    char *zNew = sqlite3MPrintf(pParse->db, "type='trigger' AND (%s)", zWhere);
+    sqlite3DbFree(pParse->db, zWhere);
+    zWhere = zNew;
+  }
+  return zWhere;
+}
+
+/*
+** Generate code to drop and reload the internal representation of table
+** pTab from the database, including triggers and temporary triggers.
+** Argument zName is the name of the table in the database schema at
+** the time the generated code is executed. This can be different from
+** pTab->zName if this function is being called to code part of an 
+** "ALTER TABLE RENAME TO" statement.
+*/
+static void reloadTableSchema(Parse *pParse, Table *pTab, const char *zName){
+  Vdbe *v;
+  char *zWhere;
+  int iDb;                   /* Index of database containing pTab */
+#ifndef SQLITE_OMIT_TRIGGER
+  Trigger *pTrig;
+#endif
+
+  v = sqlite3GetVdbe(pParse);
+  if( NEVER(v==0) ) return;
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+  iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  assert( iDb>=0 );
+
+#ifndef SQLITE_OMIT_TRIGGER
+  /* Drop any table triggers from the internal schema. */
+  for(pTrig=sqlite3TriggerList(pParse, pTab); pTrig; pTrig=pTrig->pNext){
+    int iTrigDb = sqlite3SchemaToIndex(pParse->db, pTrig->pSchema);
+    assert( iTrigDb==iDb || iTrigDb==1 );
+    sqlite3VdbeAddOp4(v, OP_DropTrigger, iTrigDb, 0, 0, pTrig->zName, 0);
+  }
+#endif
+
+  /* Drop the table and index from the internal schema.  */
+  sqlite3VdbeAddOp4(v, OP_DropTable, iDb, 0, 0, pTab->zName, 0);
+
+  /* Reload the table, index and permanent trigger schemas. */
+  zWhere = sqlite3MPrintf(pParse->db, "tbl_name=%Q", zName);
+  if( !zWhere ) return;
+  sqlite3VdbeAddParseSchemaOp(v, iDb, zWhere);
+
+#ifndef SQLITE_OMIT_TRIGGER
+  /* Now, if the table is not stored in the temp database, reload any temp 
+  ** triggers. Don't use IN(...) in case SQLITE_OMIT_SUBQUERY is defined. 
+  */
+  if( (zWhere=whereTempTriggers(pParse, pTab))!=0 ){
+    sqlite3VdbeAddParseSchemaOp(v, 1, zWhere);
+  }
+#endif
+}
+
+/*
+** Parameter zName is the name of a table that is about to be altered
+** (either with ALTER TABLE ... RENAME TO or ALTER TABLE ... ADD COLUMN).
+** If the table is a system table, this function leaves an error message
+** in pParse->zErr (system tables may not be altered) and returns non-zero.
+**
+** Or, if zName is not a system table, zero is returned.
+*/
+static int isSystemTable(Parse *pParse, const char *zName){
+  if( sqlite3Strlen30(zName)>6 && 0==sqlite3StrNICmp(zName, "sqlite_", 7) ){
+    sqlite3ErrorMsg(pParse, "table %s may not be altered", zName);
+    return 1;
+  }
+  return 0;
+}
+
+/*
+** Generate code to implement the "ALTER TABLE xxx RENAME TO yyy" 
+** command. 
+*/
+SQLITE_PRIVATE void sqlite3AlterRenameTable(
+  Parse *pParse,            /* Parser context. */
+  SrcList *pSrc,            /* The table to rename. */
+  Token *pName              /* The new table name. */
+){
+  int iDb;                  /* Database that contains the table */
+  char *zDb;                /* Name of database iDb */
+  Table *pTab;              /* Table being renamed */
+  char *zName = 0;          /* NULL-terminated version of pName */ 
+  sqlite3 *db = pParse->db; /* Database connection */
+  int nTabName;             /* Number of UTF-8 characters in zTabName */
+  const char *zTabName;     /* Original name of the table */
+  Vdbe *v;
+#ifndef SQLITE_OMIT_TRIGGER
+  char *zWhere = 0;         /* Where clause to locate temp triggers */
+#endif
+  VTable *pVTab = 0;        /* Non-zero if this is a v-tab with an xRename() */
+  int savedDbFlags;         /* Saved value of db->flags */
+
+  savedDbFlags = db->flags;  
+  if( NEVER(db->mallocFailed) ) goto exit_rename_table;
+  assert( pSrc->nSrc==1 );
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+
+  pTab = sqlite3LocateTableItem(pParse, 0, &pSrc->a[0]);
+  if( !pTab ) goto exit_rename_table;
+  iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  zDb = db->aDb[iDb].zName;
+  db->flags |= SQLITE_PreferBuiltin;
+
+  /* Get a NULL terminated version of the new table name. */
+  zName = sqlite3NameFromToken(db, pName);
+  if( !zName ) goto exit_rename_table;
+
+  /* Check that a table or index named 'zName' does not already exist
+  ** in database iDb. If so, this is an error.
+  */
+  if( sqlite3FindTable(db, zName, zDb) || sqlite3FindIndex(db, zName, zDb) ){
+    sqlite3ErrorMsg(pParse, 
+        "there is already another table or index with this name: %s", zName);
+    goto exit_rename_table;
+  }
+
+  /* Make sure it is not a system table being altered, or a reserved name
+  ** that the table is being renamed to.
+  */
+  if( SQLITE_OK!=isSystemTable(pParse, pTab->zName) ){
+    goto exit_rename_table;
+  }
+  if( SQLITE_OK!=sqlite3CheckObjectName(pParse, zName) ){ goto
+    exit_rename_table;
+  }
+
+#ifndef SQLITE_OMIT_VIEW
+  if( pTab->pSelect ){
+    sqlite3ErrorMsg(pParse, "view %s may not be altered", pTab->zName);
+    goto exit_rename_table;
+  }
+#endif
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  /* Invoke the authorization callback. */
+  if( sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab->zName, 0) ){
+    goto exit_rename_table;
+  }
+#endif
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( sqlite3ViewGetColumnNames(pParse, pTab) ){
+    goto exit_rename_table;
+  }
+  if( IsVirtual(pTab) ){
+    pVTab = sqlite3GetVTable(db, pTab);
+    if( pVTab->pVtab->pModule->xRename==0 ){
+      pVTab = 0;
+    }
+  }
+#endif
+
+  /* Begin a transaction for database iDb. 
+  ** Then modify the schema cookie (since the ALTER TABLE modifies the
+  ** schema). Open a statement transaction if the table is a virtual
+  ** table.
+  */
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 ){
+    goto exit_rename_table;
+  }
+  sqlite3BeginWriteOperation(pParse, pVTab!=0, iDb);
+  sqlite3ChangeCookie(pParse, iDb);
+
+  /* If this is a virtual table, invoke the xRename() function if
+  ** one is defined. The xRename() callback will modify the names
+  ** of any resources used by the v-table implementation (including other
+  ** SQLite tables) that are identified by the name of the virtual table.
+  */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( pVTab ){
+    int i = ++pParse->nMem;
+    sqlite3VdbeAddOp4(v, OP_String8, 0, i, 0, zName, 0);
+    sqlite3VdbeAddOp4(v, OP_VRename, i, 0, 0,(const char*)pVTab, P4_VTAB);
+    sqlite3MayAbort(pParse);
+  }
+#endif
+
+  /* figure out how many UTF-8 characters are in zName */
+  zTabName = pTab->zName;
+  nTabName = sqlite3Utf8CharLen(zTabName, -1);
+
+#if !defined(SQLITE_OMIT_FOREIGN_KEY) && !defined(SQLITE_OMIT_TRIGGER)
+  if( db->flags&SQLITE_ForeignKeys ){
+    /* If foreign-key support is enabled, rewrite the CREATE TABLE 
+    ** statements corresponding to all child tables of foreign key constraints
+    ** for which the renamed table is the parent table.  */
+    if( (zWhere=whereForeignKeys(pParse, pTab))!=0 ){
+      sqlite3NestedParse(pParse, 
+          "UPDATE \"%w\".%s SET "
+              "sql = sqlite_rename_parent(sql, %Q, %Q) "
+              "WHERE %s;", zDb, SCHEMA_TABLE(iDb), zTabName, zName, zWhere);
+      sqlite3DbFree(db, zWhere);
+    }
+  }
+#endif
+
+  /* Modify the sqlite_master table to use the new table name. */
+  sqlite3NestedParse(pParse,
+      "UPDATE %Q.%s SET "
