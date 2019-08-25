@@ -86646,3 +86646,213 @@ SQLITE_PRIVATE void sqlite3AlterRenameTable(
   /* Modify the sqlite_master table to use the new table name. */
   sqlite3NestedParse(pParse,
       "UPDATE %Q.%s SET "
+#ifdef SQLITE_OMIT_TRIGGER
+          "sql = sqlite_rename_table(sql, %Q), "
+#else
+          "sql = CASE "
+            "WHEN type = 'trigger' THEN sqlite_rename_trigger(sql, %Q)"
+            "ELSE sqlite_rename_table(sql, %Q) END, "
+#endif
+          "tbl_name = %Q, "
+          "name = CASE "
+            "WHEN type='table' THEN %Q "
+            "WHEN name LIKE 'sqlite_autoindex%%' AND type='index' THEN "
+             "'sqlite_autoindex_' || %Q || substr(name,%d+18) "
+            "ELSE name END "
+      "WHERE tbl_name=%Q COLLATE nocase AND "
+          "(type='table' OR type='index' OR type='trigger');", 
+      zDb, SCHEMA_TABLE(iDb), zName, zName, zName, 
+#ifndef SQLITE_OMIT_TRIGGER
+      zName,
+#endif
+      zName, nTabName, zTabName
+  );
+
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+  /* If the sqlite_sequence table exists in this database, then update 
+  ** it with the new table name.
+  */
+  if( sqlite3FindTable(db, "sqlite_sequence", zDb) ){
+    sqlite3NestedParse(pParse,
+        "UPDATE \"%w\".sqlite_sequence set name = %Q WHERE name = %Q",
+        zDb, zName, pTab->zName);
+  }
+#endif
+
+#ifndef SQLITE_OMIT_TRIGGER
+  /* If there are TEMP triggers on this table, modify the sqlite_temp_master
+  ** table. Don't do this if the table being ALTERed is itself located in
+  ** the temp database.
+  */
+  if( (zWhere=whereTempTriggers(pParse, pTab))!=0 ){
+    sqlite3NestedParse(pParse, 
+        "UPDATE sqlite_temp_master SET "
+            "sql = sqlite_rename_trigger(sql, %Q), "
+            "tbl_name = %Q "
+            "WHERE %s;", zName, zName, zWhere);
+    sqlite3DbFree(db, zWhere);
+  }
+#endif
+
+#if !defined(SQLITE_OMIT_FOREIGN_KEY) && !defined(SQLITE_OMIT_TRIGGER)
+  if( db->flags&SQLITE_ForeignKeys ){
+    FKey *p;
+    for(p=sqlite3FkReferences(pTab); p; p=p->pNextTo){
+      Table *pFrom = p->pFrom;
+      if( pFrom!=pTab ){
+        reloadTableSchema(pParse, p->pFrom, pFrom->zName);
+      }
+    }
+  }
+#endif
+
+  /* Drop and reload the internal table schema. */
+  reloadTableSchema(pParse, pTab, zName);
+
+exit_rename_table:
+  sqlite3SrcListDelete(db, pSrc);
+  sqlite3DbFree(db, zName);
+  db->flags = savedDbFlags;
+}
+
+
+/*
+** Generate code to make sure the file format number is at least minFormat.
+** The generated code will increase the file format number if necessary.
+*/
+SQLITE_PRIVATE void sqlite3MinimumFileFormat(Parse *pParse, int iDb, int minFormat){
+  Vdbe *v;
+  v = sqlite3GetVdbe(pParse);
+  /* The VDBE should have been allocated before this routine is called.
+  ** If that allocation failed, we would have quit before reaching this
+  ** point */
+  if( ALWAYS(v) ){
+    int r1 = sqlite3GetTempReg(pParse);
+    int r2 = sqlite3GetTempReg(pParse);
+    int j1;
+    sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, r1, BTREE_FILE_FORMAT);
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp2(v, OP_Integer, minFormat, r2);
+    j1 = sqlite3VdbeAddOp3(v, OP_Ge, r2, 0, r1);
+    sqlite3VdbeChangeP5(v, SQLITE_NOTNULL); VdbeCoverage(v);
+    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_FILE_FORMAT, r2);
+    sqlite3VdbeJumpHere(v, j1);
+    sqlite3ReleaseTempReg(pParse, r1);
+    sqlite3ReleaseTempReg(pParse, r2);
+  }
+}
+
+/*
+** This function is called after an "ALTER TABLE ... ADD" statement
+** has been parsed. Argument pColDef contains the text of the new
+** column definition.
+**
+** The Table structure pParse->pNewTable was extended to include
+** the new column during parsing.
+*/
+SQLITE_PRIVATE void sqlite3AlterFinishAddColumn(Parse *pParse, Token *pColDef){
+  Table *pNew;              /* Copy of pParse->pNewTable */
+  Table *pTab;              /* Table being altered */
+  int iDb;                  /* Database number */
+  const char *zDb;          /* Database name */
+  const char *zTab;         /* Table name */
+  char *zCol;               /* Null-terminated column definition */
+  Column *pCol;             /* The new column */
+  Expr *pDflt;              /* Default value for the new column */
+  sqlite3 *db;              /* The database connection; */
+
+  db = pParse->db;
+  if( pParse->nErr || db->mallocFailed ) return;
+  pNew = pParse->pNewTable;
+  assert( pNew );
+
+  assert( sqlite3BtreeHoldsAllMutexes(db) );
+  iDb = sqlite3SchemaToIndex(db, pNew->pSchema);
+  zDb = db->aDb[iDb].zName;
+  zTab = &pNew->zName[16];  /* Skip the "sqlite_altertab_" prefix on the name */
+  pCol = &pNew->aCol[pNew->nCol-1];
+  pDflt = pCol->pDflt;
+  pTab = sqlite3FindTable(db, zTab, zDb);
+  assert( pTab );
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  /* Invoke the authorization callback. */
+  if( sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab->zName, 0) ){
+    return;
+  }
+#endif
+
+  /* If the default value for the new column was specified with a 
+  ** literal NULL, then set pDflt to 0. This simplifies checking
+  ** for an SQL NULL default below.
+  */
+  if( pDflt && pDflt->op==TK_NULL ){
+    pDflt = 0;
+  }
+
+  /* Check that the new column is not specified as PRIMARY KEY or UNIQUE.
+  ** If there is a NOT NULL constraint, then the default value for the
+  ** column must not be NULL.
+  */
+  if( pCol->colFlags & COLFLAG_PRIMKEY ){
+    sqlite3ErrorMsg(pParse, "Cannot add a PRIMARY KEY column");
+    return;
+  }
+  if( pNew->pIndex ){
+    sqlite3ErrorMsg(pParse, "Cannot add a UNIQUE column");
+    return;
+  }
+  if( (db->flags&SQLITE_ForeignKeys) && pNew->pFKey && pDflt ){
+    sqlite3ErrorMsg(pParse, 
+        "Cannot add a REFERENCES column with non-NULL default value");
+    return;
+  }
+  if( pCol->notNull && !pDflt ){
+    sqlite3ErrorMsg(pParse, 
+        "Cannot add a NOT NULL column with default value NULL");
+    return;
+  }
+
+  /* Ensure the default expression is something that sqlite3ValueFromExpr()
+  ** can handle (i.e. not CURRENT_TIME etc.)
+  */
+  if( pDflt ){
+    sqlite3_value *pVal = 0;
+    if( sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF8, SQLITE_AFF_NONE, &pVal) ){
+      db->mallocFailed = 1;
+      return;
+    }
+    if( !pVal ){
+      sqlite3ErrorMsg(pParse, "Cannot add a column with non-constant default");
+      return;
+    }
+    sqlite3ValueFree(pVal);
+  }
+
+  /* Modify the CREATE TABLE statement. */
+  zCol = sqlite3DbStrNDup(db, (char*)pColDef->z, pColDef->n);
+  if( zCol ){
+    char *zEnd = &zCol[pColDef->n-1];
+    int savedDbFlags = db->flags;
+    while( zEnd>zCol && (*zEnd==';' || sqlite3Isspace(*zEnd)) ){
+      *zEnd-- = '\0';
+    }
+    db->flags |= SQLITE_PreferBuiltin;
+    sqlite3NestedParse(pParse, 
+        "UPDATE \"%w\".%s SET "
+          "sql = substr(sql,1,%d) || ', ' || %Q || substr(sql,%d) "
+        "WHERE type = 'table' AND name = %Q", 
+      zDb, SCHEMA_TABLE(iDb), pNew->addColOffset, zCol, pNew->addColOffset+1,
+      zTab
+    );
+    sqlite3DbFree(db, zCol);
+    db->flags = savedDbFlags;
+  }
+
+  /* If the default value of the new column is NULL, then set the file
+  ** format to 2. If the default value of the new column is not NULL,
+  ** the file format becomes 3.
+  */
+  sqlite3MinimumFileFormat(pParse, iDb, pDflt ? 3 : 2);
+
+  /* Reload the schema of the modified table. */
