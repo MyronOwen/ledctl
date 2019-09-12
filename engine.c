@@ -86856,3 +86856,224 @@ SQLITE_PRIVATE void sqlite3AlterFinishAddColumn(Parse *pParse, Token *pColDef){
   sqlite3MinimumFileFormat(pParse, iDb, pDflt ? 3 : 2);
 
   /* Reload the schema of the modified table. */
+  reloadTableSchema(pParse, pTab, pTab->zName);
+}
+
+/*
+** This function is called by the parser after the table-name in
+** an "ALTER TABLE <table-name> ADD" statement is parsed. Argument 
+** pSrc is the full-name of the table being altered.
+**
+** This routine makes a (partial) copy of the Table structure
+** for the table being altered and sets Parse.pNewTable to point
+** to it. Routines called by the parser as the column definition
+** is parsed (i.e. sqlite3AddColumn()) add the new Column data to 
+** the copy. The copy of the Table structure is deleted by tokenize.c 
+** after parsing is finished.
+**
+** Routine sqlite3AlterFinishAddColumn() will be called to complete
+** coding the "ALTER TABLE ... ADD" statement.
+*/
+SQLITE_PRIVATE void sqlite3AlterBeginAddColumn(Parse *pParse, SrcList *pSrc){
+  Table *pNew;
+  Table *pTab;
+  Vdbe *v;
+  int iDb;
+  int i;
+  int nAlloc;
+  sqlite3 *db = pParse->db;
+
+  /* Look up the table being altered. */
+  assert( pParse->pNewTable==0 );
+  assert( sqlite3BtreeHoldsAllMutexes(db) );
+  if( db->mallocFailed ) goto exit_begin_add_column;
+  pTab = sqlite3LocateTableItem(pParse, 0, &pSrc->a[0]);
+  if( !pTab ) goto exit_begin_add_column;
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( IsVirtual(pTab) ){
+    sqlite3ErrorMsg(pParse, "virtual tables may not be altered");
+    goto exit_begin_add_column;
+  }
+#endif
+
+  /* Make sure this is not an attempt to ALTER a view. */
+  if( pTab->pSelect ){
+    sqlite3ErrorMsg(pParse, "Cannot add a column to a view");
+    goto exit_begin_add_column;
+  }
+  if( SQLITE_OK!=isSystemTable(pParse, pTab->zName) ){
+    goto exit_begin_add_column;
+  }
+
+  assert( pTab->addColOffset>0 );
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+
+  /* Put a copy of the Table struct in Parse.pNewTable for the
+  ** sqlite3AddColumn() function and friends to modify.  But modify
+  ** the name by adding an "sqlite_altertab_" prefix.  By adding this
+  ** prefix, we insure that the name will not collide with an existing
+  ** table because user table are not allowed to have the "sqlite_"
+  ** prefix on their name.
+  */
+  pNew = (Table*)sqlite3DbMallocZero(db, sizeof(Table));
+  if( !pNew ) goto exit_begin_add_column;
+  pParse->pNewTable = pNew;
+  pNew->nRef = 1;
+  pNew->nCol = pTab->nCol;
+  assert( pNew->nCol>0 );
+  nAlloc = (((pNew->nCol-1)/8)*8)+8;
+  assert( nAlloc>=pNew->nCol && nAlloc%8==0 && nAlloc-pNew->nCol<8 );
+  pNew->aCol = (Column*)sqlite3DbMallocZero(db, sizeof(Column)*nAlloc);
+  pNew->zName = sqlite3MPrintf(db, "sqlite_altertab_%s", pTab->zName);
+  if( !pNew->aCol || !pNew->zName ){
+    db->mallocFailed = 1;
+    goto exit_begin_add_column;
+  }
+  memcpy(pNew->aCol, pTab->aCol, sizeof(Column)*pNew->nCol);
+  for(i=0; i<pNew->nCol; i++){
+    Column *pCol = &pNew->aCol[i];
+    pCol->zName = sqlite3DbStrDup(db, pCol->zName);
+    pCol->zColl = 0;
+    pCol->zType = 0;
+    pCol->pDflt = 0;
+    pCol->zDflt = 0;
+  }
+  pNew->pSchema = db->aDb[iDb].pSchema;
+  pNew->addColOffset = pTab->addColOffset;
+  pNew->nRef = 1;
+
+  /* Begin a transaction and increment the schema cookie.  */
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  v = sqlite3GetVdbe(pParse);
+  if( !v ) goto exit_begin_add_column;
+  sqlite3ChangeCookie(pParse, iDb);
+
+exit_begin_add_column:
+  sqlite3SrcListDelete(db, pSrc);
+  return;
+}
+#endif  /* SQLITE_ALTER_TABLE */
+
+/************** End of alter.c ***********************************************/
+/************** Begin file analyze.c *****************************************/
+/*
+** 2005-07-08
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code associated with the ANALYZE command.
+**
+** The ANALYZE command gather statistics about the content of tables
+** and indices.  These statistics are made available to the query planner
+** to help it make better decisions about how to perform queries.
+**
+** The following system tables are or have been supported:
+**
+**    CREATE TABLE sqlite_stat1(tbl, idx, stat);
+**    CREATE TABLE sqlite_stat2(tbl, idx, sampleno, sample);
+**    CREATE TABLE sqlite_stat3(tbl, idx, nEq, nLt, nDLt, sample);
+**    CREATE TABLE sqlite_stat4(tbl, idx, nEq, nLt, nDLt, sample);
+**
+** Additional tables might be added in future releases of SQLite.
+** The sqlite_stat2 table is not created or used unless the SQLite version
+** is between 3.6.18 and 3.7.8, inclusive, and unless SQLite is compiled
+** with SQLITE_ENABLE_STAT2.  The sqlite_stat2 table is deprecated.
+** The sqlite_stat2 table is superseded by sqlite_stat3, which is only
+** created and used by SQLite versions 3.7.9 and later and with
+** SQLITE_ENABLE_STAT3 defined.  The functionality of sqlite_stat3
+** is a superset of sqlite_stat2.  The sqlite_stat4 is an enhanced
+** version of sqlite_stat3 and is only available when compiled with
+** SQLITE_ENABLE_STAT4 and in SQLite versions 3.8.1 and later.  It is
+** not possible to enable both STAT3 and STAT4 at the same time.  If they
+** are both enabled, then STAT4 takes precedence.
+**
+** For most applications, sqlite_stat1 provides all the statistics required
+** for the query planner to make good choices.
+**
+** Format of sqlite_stat1:
+**
+** There is normally one row per index, with the index identified by the
+** name in the idx column.  The tbl column is the name of the table to
+** which the index belongs.  In each such row, the stat column will be
+** a string consisting of a list of integers.  The first integer in this
+** list is the number of rows in the index.  (This is the same as the
+** number of rows in the table, except for partial indices.)  The second
+** integer is the average number of rows in the index that have the same
+** value in the first column of the index.  The third integer is the average
+** number of rows in the index that have the same value for the first two
+** columns.  The N-th integer (for N>1) is the average number of rows in 
+** the index which have the same value for the first N-1 columns.  For
+** a K-column index, there will be K+1 integers in the stat column.  If
+** the index is unique, then the last integer will be 1.
+**
+** The list of integers in the stat column can optionally be followed
+** by the keyword "unordered".  The "unordered" keyword, if it is present,
+** must be separated from the last integer by a single space.  If the
+** "unordered" keyword is present, then the query planner assumes that
+** the index is unordered and will not use the index for a range query.
+** 
+** If the sqlite_stat1.idx column is NULL, then the sqlite_stat1.stat
+** column contains a single integer which is the (estimated) number of
+** rows in the table identified by sqlite_stat1.tbl.
+**
+** Format of sqlite_stat2:
+**
+** The sqlite_stat2 is only created and is only used if SQLite is compiled
+** with SQLITE_ENABLE_STAT2 and if the SQLite version number is between
+** 3.6.18 and 3.7.8.  The "stat2" table contains additional information
+** about the distribution of keys within an index.  The index is identified by
+** the "idx" column and the "tbl" column is the name of the table to which
+** the index belongs.  There are usually 10 rows in the sqlite_stat2
+** table for each index.
+**
+** The sqlite_stat2 entries for an index that have sampleno between 0 and 9
+** inclusive are samples of the left-most key value in the index taken at
+** evenly spaced points along the index.  Let the number of samples be S
+** (10 in the standard build) and let C be the number of rows in the index.
+** Then the sampled rows are given by:
+**
+**     rownumber = (i*C*2 + C)/(S*2)
+**
+** For i between 0 and S-1.  Conceptually, the index space is divided into
+** S uniform buckets and the samples are the middle row from each bucket.
+**
+** The format for sqlite_stat2 is recorded here for legacy reference.  This
+** version of SQLite does not support sqlite_stat2.  It neither reads nor
+** writes the sqlite_stat2 table.  This version of SQLite only supports
+** sqlite_stat3.
+**
+** Format for sqlite_stat3:
+**
+** The sqlite_stat3 format is a subset of sqlite_stat4.  Hence, the
+** sqlite_stat4 format will be described first.  Further information
+** about sqlite_stat3 follows the sqlite_stat4 description.
+**
+** Format for sqlite_stat4:
+**
+** As with sqlite_stat2, the sqlite_stat4 table contains histogram data
+** to aid the query planner in choosing good indices based on the values
+** that indexed columns are compared against in the WHERE clauses of
+** queries.
+**
+** The sqlite_stat4 table contains multiple entries for each index.
+** The idx column names the index and the tbl column is the table of the
+** index.  If the idx and tbl columns are the same, then the sample is
+** of the INTEGER PRIMARY KEY.  The sample column is a blob which is the
+** binary encoding of a key from the index.  The nEq column is a
+** list of integers.  The first integer is the approximate number
+** of entries in the index whose left-most column exactly matches
+** the left-most column of the sample.  The second integer in nEq
+** is the approximate number of entries in the index where the
+** first two columns match the first two columns of the sample.
+** And so forth.  nLt is another list of integers that show the approximate
+** number of entries that are strictly less than the sample.  The first
+** integer in nLt contains the number of entries in the index where the
+** left-most column is less than the left-most column of the sample.
+** The K-th integer in the nLt entry is the number of index entries 
