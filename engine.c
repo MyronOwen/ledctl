@@ -87077,3 +87077,245 @@ exit_begin_add_column:
 ** integer in nLt contains the number of entries in the index where the
 ** left-most column is less than the left-most column of the sample.
 ** The K-th integer in the nLt entry is the number of index entries 
+** where the first K columns are less than the first K columns of the
+** sample.  The nDLt column is like nLt except that it contains the 
+** number of distinct entries in the index that are less than the
+** sample.
+**
+** There can be an arbitrary number of sqlite_stat4 entries per index.
+** The ANALYZE command will typically generate sqlite_stat4 tables
+** that contain between 10 and 40 samples which are distributed across
+** the key space, though not uniformly, and which include samples with
+** large nEq values.
+**
+** Format for sqlite_stat3 redux:
+**
+** The sqlite_stat3 table is like sqlite_stat4 except that it only
+** looks at the left-most column of the index.  The sqlite_stat3.sample
+** column contains the actual value of the left-most column instead
+** of a blob encoding of the complete index key as is found in
+** sqlite_stat4.sample.  The nEq, nLt, and nDLt entries of sqlite_stat3
+** all contain just a single integer which is the same as the first
+** integer in the equivalent columns in sqlite_stat4.
+*/
+#ifndef SQLITE_OMIT_ANALYZE
+
+#if defined(SQLITE_ENABLE_STAT4)
+# define IsStat4     1
+# define IsStat3     0
+#elif defined(SQLITE_ENABLE_STAT3)
+# define IsStat4     0
+# define IsStat3     1
+#else
+# define IsStat4     0
+# define IsStat3     0
+# undef SQLITE_STAT4_SAMPLES
+# define SQLITE_STAT4_SAMPLES 1
+#endif
+#define IsStat34    (IsStat3+IsStat4)  /* 1 for STAT3 or STAT4. 0 otherwise */
+
+/*
+** This routine generates code that opens the sqlite_statN tables.
+** The sqlite_stat1 table is always relevant.  sqlite_stat2 is now
+** obsolete.  sqlite_stat3 and sqlite_stat4 are only opened when
+** appropriate compile-time options are provided.
+**
+** If the sqlite_statN tables do not previously exist, it is created.
+**
+** Argument zWhere may be a pointer to a buffer containing a table name,
+** or it may be a NULL pointer. If it is not NULL, then all entries in
+** the sqlite_statN tables associated with the named table are deleted.
+** If zWhere==0, then code is generated to delete all stat table entries.
+*/
+static void openStatTable(
+  Parse *pParse,          /* Parsing context */
+  int iDb,                /* The database we are looking in */
+  int iStatCur,           /* Open the sqlite_stat1 table on this cursor */
+  const char *zWhere,     /* Delete entries for this table or index */
+  const char *zWhereType  /* Either "tbl" or "idx" */
+){
+  static const struct {
+    const char *zName;
+    const char *zCols;
+  } aTable[] = {
+    { "sqlite_stat1", "tbl,idx,stat" },
+#if defined(SQLITE_ENABLE_STAT4)
+    { "sqlite_stat4", "tbl,idx,neq,nlt,ndlt,sample" },
+    { "sqlite_stat3", 0 },
+#elif defined(SQLITE_ENABLE_STAT3)
+    { "sqlite_stat3", "tbl,idx,neq,nlt,ndlt,sample" },
+    { "sqlite_stat4", 0 },
+#else
+    { "sqlite_stat3", 0 },
+    { "sqlite_stat4", 0 },
+#endif
+  };
+  int i;
+  sqlite3 *db = pParse->db;
+  Db *pDb;
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  int aRoot[ArraySize(aTable)];
+  u8 aCreateTbl[ArraySize(aTable)];
+
+  if( v==0 ) return;
+  assert( sqlite3BtreeHoldsAllMutexes(db) );
+  assert( sqlite3VdbeDb(v)==db );
+  pDb = &db->aDb[iDb];
+
+  /* Create new statistic tables if they do not exist, or clear them
+  ** if they do already exist.
+  */
+  for(i=0; i<ArraySize(aTable); i++){
+    const char *zTab = aTable[i].zName;
+    Table *pStat;
+    if( (pStat = sqlite3FindTable(db, zTab, pDb->zName))==0 ){
+      if( aTable[i].zCols ){
+        /* The sqlite_statN table does not exist. Create it. Note that a 
+        ** side-effect of the CREATE TABLE statement is to leave the rootpage 
+        ** of the new table in register pParse->regRoot. This is important 
+        ** because the OpenWrite opcode below will be needing it. */
+        sqlite3NestedParse(pParse,
+            "CREATE TABLE %Q.%s(%s)", pDb->zName, zTab, aTable[i].zCols
+        );
+        aRoot[i] = pParse->regRoot;
+        aCreateTbl[i] = OPFLAG_P2ISREG;
+      }
+    }else{
+      /* The table already exists. If zWhere is not NULL, delete all entries 
+      ** associated with the table zWhere. If zWhere is NULL, delete the
+      ** entire contents of the table. */
+      aRoot[i] = pStat->tnum;
+      aCreateTbl[i] = 0;
+      sqlite3TableLock(pParse, iDb, aRoot[i], 1, zTab);
+      if( zWhere ){
+        sqlite3NestedParse(pParse,
+           "DELETE FROM %Q.%s WHERE %s=%Q",
+           pDb->zName, zTab, zWhereType, zWhere
+        );
+      }else{
+        /* The sqlite_stat[134] table already exists.  Delete all rows. */
+        sqlite3VdbeAddOp2(v, OP_Clear, aRoot[i], iDb);
+      }
+    }
+  }
+
+  /* Open the sqlite_stat[134] tables for writing. */
+  for(i=0; aTable[i].zCols; i++){
+    assert( i<ArraySize(aTable) );
+    sqlite3VdbeAddOp4Int(v, OP_OpenWrite, iStatCur+i, aRoot[i], iDb, 3);
+    sqlite3VdbeChangeP5(v, aCreateTbl[i]);
+    VdbeComment((v, aTable[i].zName));
+  }
+}
+
+/*
+** Recommended number of samples for sqlite_stat4
+*/
+#ifndef SQLITE_STAT4_SAMPLES
+# define SQLITE_STAT4_SAMPLES 24
+#endif
+
+/*
+** Three SQL functions - stat_init(), stat_push(), and stat_get() -
+** share an instance of the following structure to hold their state
+** information.
+*/
+typedef struct Stat4Accum Stat4Accum;
+typedef struct Stat4Sample Stat4Sample;
+struct Stat4Sample {
+  tRowcnt *anEq;                  /* sqlite_stat4.nEq */
+  tRowcnt *anDLt;                 /* sqlite_stat4.nDLt */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  tRowcnt *anLt;                  /* sqlite_stat4.nLt */
+  union {
+    i64 iRowid;                     /* Rowid in main table of the key */
+    u8 *aRowid;                     /* Key for WITHOUT ROWID tables */
+  } u;
+  u32 nRowid;                     /* Sizeof aRowid[] */
+  u8 isPSample;                   /* True if a periodic sample */
+  int iCol;                       /* If !isPSample, the reason for inclusion */
+  u32 iHash;                      /* Tiebreaker hash */
+#endif
+};                                                    
+struct Stat4Accum {
+  tRowcnt nRow;             /* Number of rows in the entire table */
+  tRowcnt nPSample;         /* How often to do a periodic sample */
+  int nCol;                 /* Number of columns in index + pk/rowid */
+  int nKeyCol;              /* Number of index columns w/o the pk/rowid */
+  int mxSample;             /* Maximum number of samples to accumulate */
+  Stat4Sample current;      /* Current row as a Stat4Sample */
+  u32 iPrn;                 /* Pseudo-random number used for sampling */
+  Stat4Sample *aBest;       /* Array of nCol best samples */
+  int iMin;                 /* Index in a[] of entry with minimum score */
+  int nSample;              /* Current number of samples */
+  int iGet;                 /* Index of current sample accessed by stat_get() */
+  Stat4Sample *a;           /* Array of mxSample Stat4Sample objects */
+  sqlite3 *db;              /* Database connection, for malloc() */
+};
+
+/* Reclaim memory used by a Stat4Sample
+*/
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+static void sampleClear(sqlite3 *db, Stat4Sample *p){
+  assert( db!=0 );
+  if( p->nRowid ){
+    sqlite3DbFree(db, p->u.aRowid);
+    p->nRowid = 0;
+  }
+}
+#endif
+
+/* Initialize the BLOB value of a ROWID
+*/
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+static void sampleSetRowid(sqlite3 *db, Stat4Sample *p, int n, const u8 *pData){
+  assert( db!=0 );
+  if( p->nRowid ) sqlite3DbFree(db, p->u.aRowid);
+  p->u.aRowid = sqlite3DbMallocRaw(db, n);
+  if( p->u.aRowid ){
+    p->nRowid = n;
+    memcpy(p->u.aRowid, pData, n);
+  }else{
+    p->nRowid = 0;
+  }
+}
+#endif
+
+/* Initialize the INTEGER value of a ROWID.
+*/
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+static void sampleSetRowidInt64(sqlite3 *db, Stat4Sample *p, i64 iRowid){
+  assert( db!=0 );
+  if( p->nRowid ) sqlite3DbFree(db, p->u.aRowid);
+  p->nRowid = 0;
+  p->u.iRowid = iRowid;
+}
+#endif
+
+
+/*
+** Copy the contents of object (*pFrom) into (*pTo).
+*/
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+static void sampleCopy(Stat4Accum *p, Stat4Sample *pTo, Stat4Sample *pFrom){
+  pTo->isPSample = pFrom->isPSample;
+  pTo->iCol = pFrom->iCol;
+  pTo->iHash = pFrom->iHash;
+  memcpy(pTo->anEq, pFrom->anEq, sizeof(tRowcnt)*p->nCol);
+  memcpy(pTo->anLt, pFrom->anLt, sizeof(tRowcnt)*p->nCol);
+  memcpy(pTo->anDLt, pFrom->anDLt, sizeof(tRowcnt)*p->nCol);
+  if( pFrom->nRowid ){
+    sampleSetRowid(p->db, pTo, pFrom->nRowid, pFrom->u.aRowid);
+  }else{
+    sampleSetRowidInt64(p->db, pTo, pFrom->u.iRowid);
+  }
+}
+#endif
+
+/*
+** Reclaim all memory of a Stat4Accum structure.
+*/
+static void stat4Destructor(void *pOld){
+  Stat4Accum *p = (Stat4Accum*)pOld;
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  int i;
