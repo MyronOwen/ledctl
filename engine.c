@@ -87319,3 +87319,239 @@ static void stat4Destructor(void *pOld){
   Stat4Accum *p = (Stat4Accum*)pOld;
 #ifdef SQLITE_ENABLE_STAT3_OR_STAT4
   int i;
+  for(i=0; i<p->nCol; i++) sampleClear(p->db, p->aBest+i);
+  for(i=0; i<p->mxSample; i++) sampleClear(p->db, p->a+i);
+  sampleClear(p->db, &p->current);
+#endif
+  sqlite3DbFree(p->db, p);
+}
+
+/*
+** Implementation of the stat_init(N,K,C) SQL function. The three parameters
+** are:
+**     N:    The number of columns in the index including the rowid/pk (note 1)
+**     K:    The number of columns in the index excluding the rowid/pk.
+**     C:    The number of rows in the index (note 2)
+**
+** Note 1:  In the special case of the covering index that implements a
+** WITHOUT ROWID table, N is the number of PRIMARY KEY columns, not the
+** total number of columns in the table.
+**
+** Note 2:  C is only used for STAT3 and STAT4.
+**
+** For indexes on ordinary rowid tables, N==K+1.  But for indexes on
+** WITHOUT ROWID tables, N=K+P where P is the number of columns in the
+** PRIMARY KEY of the table.  The covering index that implements the
+** original WITHOUT ROWID table as N==K as a special case.
+**
+** This routine allocates the Stat4Accum object in heap memory. The return 
+** value is a pointer to the Stat4Accum object.  The datatype of the
+** return value is BLOB, but it is really just a pointer to the Stat4Accum
+** object.
+*/
+static void statInit(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Stat4Accum *p;
+  int nCol;                       /* Number of columns in index being sampled */
+  int nKeyCol;                    /* Number of key columns */
+  int nColUp;                     /* nCol rounded up for alignment */
+  int n;                          /* Bytes of space to allocate */
+  sqlite3 *db;                    /* Database connection */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  int mxSample = SQLITE_STAT4_SAMPLES;
+#endif
+
+  /* Decode the three function arguments */
+  UNUSED_PARAMETER(argc);
+  nCol = sqlite3_value_int(argv[0]);
+  assert( nCol>0 );
+  nColUp = sizeof(tRowcnt)<8 ? (nCol+1)&~1 : nCol;
+  nKeyCol = sqlite3_value_int(argv[1]);
+  assert( nKeyCol<=nCol );
+  assert( nKeyCol>0 );
+
+  /* Allocate the space required for the Stat4Accum object */
+  n = sizeof(*p) 
+    + sizeof(tRowcnt)*nColUp                  /* Stat4Accum.anEq */
+    + sizeof(tRowcnt)*nColUp                  /* Stat4Accum.anDLt */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+    + sizeof(tRowcnt)*nColUp                  /* Stat4Accum.anLt */
+    + sizeof(Stat4Sample)*(nCol+mxSample)     /* Stat4Accum.aBest[], a[] */
+    + sizeof(tRowcnt)*3*nColUp*(nCol+mxSample)
+#endif
+  ;
+  db = sqlite3_context_db_handle(context);
+  p = sqlite3DbMallocZero(db, n);
+  if( p==0 ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+
+  p->db = db;
+  p->nRow = 0;
+  p->nCol = nCol;
+  p->nKeyCol = nKeyCol;
+  p->current.anDLt = (tRowcnt*)&p[1];
+  p->current.anEq = &p->current.anDLt[nColUp];
+
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  {
+    u8 *pSpace;                     /* Allocated space not yet assigned */
+    int i;                          /* Used to iterate through p->aSample[] */
+
+    p->iGet = -1;
+    p->mxSample = mxSample;
+    p->nPSample = (tRowcnt)(sqlite3_value_int64(argv[2])/(mxSample/3+1) + 1);
+    p->current.anLt = &p->current.anEq[nColUp];
+    p->iPrn = 0x689e962d*(u32)nCol ^ 0xd0944565*(u32)sqlite3_value_int(argv[2]);
+  
+    /* Set up the Stat4Accum.a[] and aBest[] arrays */
+    p->a = (struct Stat4Sample*)&p->current.anLt[nColUp];
+    p->aBest = &p->a[mxSample];
+    pSpace = (u8*)(&p->a[mxSample+nCol]);
+    for(i=0; i<(mxSample+nCol); i++){
+      p->a[i].anEq = (tRowcnt *)pSpace; pSpace += (sizeof(tRowcnt) * nColUp);
+      p->a[i].anLt = (tRowcnt *)pSpace; pSpace += (sizeof(tRowcnt) * nColUp);
+      p->a[i].anDLt = (tRowcnt *)pSpace; pSpace += (sizeof(tRowcnt) * nColUp);
+    }
+    assert( (pSpace - (u8*)p)==n );
+  
+    for(i=0; i<nCol; i++){
+      p->aBest[i].iCol = i;
+    }
+  }
+#endif
+
+  /* Return a pointer to the allocated object to the caller.  Note that
+  ** only the pointer (the 2nd parameter) matters.  The size of the object
+  ** (given by the 3rd parameter) is never used and can be any positive
+  ** value. */
+  sqlite3_result_blob(context, p, sizeof(*p), stat4Destructor);
+}
+static const FuncDef statInitFuncdef = {
+  2+IsStat34,      /* nArg */
+  SQLITE_UTF8,     /* funcFlags */
+  0,               /* pUserData */
+  0,               /* pNext */
+  statInit,        /* xFunc */
+  0,               /* xStep */
+  0,               /* xFinalize */
+  "stat_init",     /* zName */
+  0,               /* pHash */
+  0                /* pDestructor */
+};
+
+#ifdef SQLITE_ENABLE_STAT4
+/*
+** pNew and pOld are both candidate non-periodic samples selected for 
+** the same column (pNew->iCol==pOld->iCol). Ignoring this column and 
+** considering only any trailing columns and the sample hash value, this
+** function returns true if sample pNew is to be preferred over pOld.
+** In other words, if we assume that the cardinalities of the selected
+** column for pNew and pOld are equal, is pNew to be preferred over pOld.
+**
+** This function assumes that for each argument sample, the contents of
+** the anEq[] array from pSample->anEq[pSample->iCol+1] onwards are valid. 
+*/
+static int sampleIsBetterPost(
+  Stat4Accum *pAccum, 
+  Stat4Sample *pNew, 
+  Stat4Sample *pOld
+){
+  int nCol = pAccum->nCol;
+  int i;
+  assert( pNew->iCol==pOld->iCol );
+  for(i=pNew->iCol+1; i<nCol; i++){
+    if( pNew->anEq[i]>pOld->anEq[i] ) return 1;
+    if( pNew->anEq[i]<pOld->anEq[i] ) return 0;
+  }
+  if( pNew->iHash>pOld->iHash ) return 1;
+  return 0;
+}
+#endif
+
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+/*
+** Return true if pNew is to be preferred over pOld.
+**
+** This function assumes that for each argument sample, the contents of
+** the anEq[] array from pSample->anEq[pSample->iCol] onwards are valid. 
+*/
+static int sampleIsBetter(
+  Stat4Accum *pAccum, 
+  Stat4Sample *pNew, 
+  Stat4Sample *pOld
+){
+  tRowcnt nEqNew = pNew->anEq[pNew->iCol];
+  tRowcnt nEqOld = pOld->anEq[pOld->iCol];
+
+  assert( pOld->isPSample==0 && pNew->isPSample==0 );
+  assert( IsStat4 || (pNew->iCol==0 && pOld->iCol==0) );
+
+  if( (nEqNew>nEqOld) ) return 1;
+#ifdef SQLITE_ENABLE_STAT4
+  if( nEqNew==nEqOld ){
+    if( pNew->iCol<pOld->iCol ) return 1;
+    return (pNew->iCol==pOld->iCol && sampleIsBetterPost(pAccum, pNew, pOld));
+  }
+  return 0;
+#else
+  return (nEqNew==nEqOld && pNew->iHash>pOld->iHash);
+#endif
+}
+
+/*
+** Copy the contents of sample *pNew into the p->a[] array. If necessary,
+** remove the least desirable sample from p->a[] to make room.
+*/
+static void sampleInsert(Stat4Accum *p, Stat4Sample *pNew, int nEqZero){
+  Stat4Sample *pSample = 0;
+  int i;
+
+  assert( IsStat4 || nEqZero==0 );
+
+#ifdef SQLITE_ENABLE_STAT4
+  if( pNew->isPSample==0 ){
+    Stat4Sample *pUpgrade = 0;
+    assert( pNew->anEq[pNew->iCol]>0 );
+
+    /* This sample is being added because the prefix that ends in column 
+    ** iCol occurs many times in the table. However, if we have already
+    ** added a sample that shares this prefix, there is no need to add
+    ** this one. Instead, upgrade the priority of the highest priority
+    ** existing sample that shares this prefix.  */
+    for(i=p->nSample-1; i>=0; i--){
+      Stat4Sample *pOld = &p->a[i];
+      if( pOld->anEq[pNew->iCol]==0 ){
+        if( pOld->isPSample ) return;
+        assert( pOld->iCol>pNew->iCol );
+        assert( sampleIsBetter(p, pNew, pOld) );
+        if( pUpgrade==0 || sampleIsBetter(p, pOld, pUpgrade) ){
+          pUpgrade = pOld;
+        }
+      }
+    }
+    if( pUpgrade ){
+      pUpgrade->iCol = pNew->iCol;
+      pUpgrade->anEq[pUpgrade->iCol] = pNew->anEq[pUpgrade->iCol];
+      goto find_new_min;
+    }
+  }
+#endif
+
+  /* If necessary, remove sample iMin to make room for the new sample. */
+  if( p->nSample>=p->mxSample ){
+    Stat4Sample *pMin = &p->a[p->iMin];
+    tRowcnt *anEq = pMin->anEq;
+    tRowcnt *anLt = pMin->anLt;
+    tRowcnt *anDLt = pMin->anDLt;
+    sampleClear(p->db, pMin);
+    memmove(pMin, &pMin[1], sizeof(p->a[0])*(p->nSample-p->iMin-1));
+    pSample = &p->a[p->nSample-1];
+    pSample->nRowid = 0;
+    pSample->anEq = anEq;
+    pSample->anDLt = anDLt;
+    pSample->anLt = anLt;
