@@ -87801,3 +87801,243 @@ static void statGet(
     **
     ** If D is the count of distinct values and K is the total number of 
     ** rows, then each estimate is computed as:
+    **
+    **        I = (K+D-1)/D
+    */
+    char *z;
+    int i;
+
+    char *zRet = sqlite3MallocZero( (p->nKeyCol+1)*25 );
+    if( zRet==0 ){
+      sqlite3_result_error_nomem(context);
+      return;
+    }
+
+    sqlite3_snprintf(24, zRet, "%llu", (u64)p->nRow);
+    z = zRet + sqlite3Strlen30(zRet);
+    for(i=0; i<p->nKeyCol; i++){
+      u64 nDistinct = p->current.anDLt[i] + 1;
+      u64 iVal = (p->nRow + nDistinct - 1) / nDistinct;
+      sqlite3_snprintf(24, z, " %llu", iVal);
+      z += sqlite3Strlen30(z);
+      assert( p->current.anEq[i] );
+    }
+    assert( z[0]=='\0' && z>zRet );
+
+    sqlite3_result_text(context, zRet, -1, sqlite3_free);
+  }
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  else if( eCall==STAT_GET_ROWID ){
+    if( p->iGet<0 ){
+      samplePushPrevious(p, 0);
+      p->iGet = 0;
+    }
+    if( p->iGet<p->nSample ){
+      Stat4Sample *pS = p->a + p->iGet;
+      if( pS->nRowid==0 ){
+        sqlite3_result_int64(context, pS->u.iRowid);
+      }else{
+        sqlite3_result_blob(context, pS->u.aRowid, pS->nRowid,
+                            SQLITE_TRANSIENT);
+      }
+    }
+  }else{
+    tRowcnt *aCnt = 0;
+
+    assert( p->iGet<p->nSample );
+    switch( eCall ){
+      case STAT_GET_NEQ:  aCnt = p->a[p->iGet].anEq; break;
+      case STAT_GET_NLT:  aCnt = p->a[p->iGet].anLt; break;
+      default: {
+        aCnt = p->a[p->iGet].anDLt; 
+        p->iGet++;
+        break;
+      }
+    }
+
+    if( IsStat3 ){
+      sqlite3_result_int64(context, (i64)aCnt[0]);
+    }else{
+      char *zRet = sqlite3MallocZero(p->nCol * 25);
+      if( zRet==0 ){
+        sqlite3_result_error_nomem(context);
+      }else{
+        int i;
+        char *z = zRet;
+        for(i=0; i<p->nCol; i++){
+          sqlite3_snprintf(24, z, "%llu ", (u64)aCnt[i]);
+          z += sqlite3Strlen30(z);
+        }
+        assert( z[0]=='\0' && z>zRet );
+        z[-1] = '\0';
+        sqlite3_result_text(context, zRet, -1, sqlite3_free);
+      }
+    }
+  }
+#endif /* SQLITE_ENABLE_STAT3_OR_STAT4 */
+#ifndef SQLITE_DEBUG
+  UNUSED_PARAMETER( argc );
+#endif
+}
+static const FuncDef statGetFuncdef = {
+  1+IsStat34,      /* nArg */
+  SQLITE_UTF8,     /* funcFlags */
+  0,               /* pUserData */
+  0,               /* pNext */
+  statGet,         /* xFunc */
+  0,               /* xStep */
+  0,               /* xFinalize */
+  "stat_get",      /* zName */
+  0,               /* pHash */
+  0                /* pDestructor */
+};
+
+static void callStatGet(Vdbe *v, int regStat4, int iParam, int regOut){
+  assert( regOut!=regStat4 && regOut!=regStat4+1 );
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  sqlite3VdbeAddOp2(v, OP_Integer, iParam, regStat4+1);
+#elif SQLITE_DEBUG
+  assert( iParam==STAT_GET_STAT1 );
+#else
+  UNUSED_PARAMETER( iParam );
+#endif
+  sqlite3VdbeAddOp3(v, OP_Function, 0, regStat4, regOut);
+  sqlite3VdbeChangeP4(v, -1, (char*)&statGetFuncdef, P4_FUNCDEF);
+  sqlite3VdbeChangeP5(v, 1 + IsStat34);
+}
+
+/*
+** Generate code to do an analysis of all indices associated with
+** a single table.
+*/
+static void analyzeOneTable(
+  Parse *pParse,   /* Parser context */
+  Table *pTab,     /* Table whose indices are to be analyzed */
+  Index *pOnlyIdx, /* If not NULL, only analyze this one index */
+  int iStatCur,    /* Index of VdbeCursor that writes the sqlite_stat1 table */
+  int iMem,        /* Available memory locations begin here */
+  int iTab         /* Next available cursor */
+){
+  sqlite3 *db = pParse->db;    /* Database handle */
+  Index *pIdx;                 /* An index to being analyzed */
+  int iIdxCur;                 /* Cursor open on index being analyzed */
+  int iTabCur;                 /* Table cursor */
+  Vdbe *v;                     /* The virtual machine being built up */
+  int i;                       /* Loop counter */
+  int jZeroRows = -1;          /* Jump from here if number of rows is zero */
+  int iDb;                     /* Index of database containing pTab */
+  u8 needTableCnt = 1;         /* True to count the table */
+  int regNewRowid = iMem++;    /* Rowid for the inserted record */
+  int regStat4 = iMem++;       /* Register to hold Stat4Accum object */
+  int regChng = iMem++;        /* Index of changed index field */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  int regRowid = iMem++;       /* Rowid argument passed to stat_push() */
+#endif
+  int regTemp = iMem++;        /* Temporary use register */
+  int regTabname = iMem++;     /* Register containing table name */
+  int regIdxname = iMem++;     /* Register containing index name */
+  int regStat1 = iMem++;       /* Value for the stat column of sqlite_stat1 */
+  int regPrev = iMem;          /* MUST BE LAST (see below) */
+
+  pParse->nMem = MAX(pParse->nMem, iMem);
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 || NEVER(pTab==0) ){
+    return;
+  }
+  if( pTab->tnum==0 ){
+    /* Do not gather statistics on views or virtual tables */
+    return;
+  }
+  if( sqlite3_strnicmp(pTab->zName, "sqlite_", 7)==0 ){
+    /* Do not gather statistics on system tables */
+    return;
+  }
+  assert( sqlite3BtreeHoldsAllMutexes(db) );
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  assert( iDb>=0 );
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  if( sqlite3AuthCheck(pParse, SQLITE_ANALYZE, pTab->zName, 0,
+      db->aDb[iDb].zName ) ){
+    return;
+  }
+#endif
+
+  /* Establish a read-lock on the table at the shared-cache level. 
+  ** Open a read-only cursor on the table. Also allocate a cursor number
+  ** to use for scanning indexes (iIdxCur). No index cursor is opened at
+  ** this time though.  */
+  sqlite3TableLock(pParse, iDb, pTab->tnum, 0, pTab->zName);
+  iTabCur = iTab++;
+  iIdxCur = iTab++;
+  pParse->nTab = MAX(pParse->nTab, iTab);
+  sqlite3OpenTable(pParse, iTabCur, iDb, pTab, OP_OpenRead);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regTabname, 0, pTab->zName, 0);
+
+  for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+    int nCol;                     /* Number of columns in pIdx. "N" */
+    int addrRewind;               /* Address of "OP_Rewind iIdxCur" */
+    int addrNextRow;              /* Address of "next_row:" */
+    const char *zIdxName;         /* Name of the index */
+    int nColTest;                 /* Number of columns to test for changes */
+
+    if( pOnlyIdx && pOnlyIdx!=pIdx ) continue;
+    if( pIdx->pPartIdxWhere==0 ) needTableCnt = 0;
+    if( !HasRowid(pTab) && IsPrimaryKeyIndex(pIdx) ){
+      nCol = pIdx->nKeyCol;
+      zIdxName = pTab->zName;
+      nColTest = nCol - 1;
+    }else{
+      nCol = pIdx->nColumn;
+      zIdxName = pIdx->zName;
+      nColTest = pIdx->uniqNotNull ? pIdx->nKeyCol-1 : nCol-1;
+    }
+
+    /* Populate the register containing the index name. */
+    sqlite3VdbeAddOp4(v, OP_String8, 0, regIdxname, 0, zIdxName, 0);
+    VdbeComment((v, "Analysis for %s.%s", pTab->zName, zIdxName));
+
+    /*
+    ** Pseudo-code for loop that calls stat_push():
+    **
+    **   Rewind csr
+    **   if eof(csr) goto end_of_scan;
+    **   regChng = 0
+    **   goto chng_addr_0;
+    **
+    **  next_row:
+    **   regChng = 0
+    **   if( idx(0) != regPrev(0) ) goto chng_addr_0
+    **   regChng = 1
+    **   if( idx(1) != regPrev(1) ) goto chng_addr_1
+    **   ...
+    **   regChng = N
+    **   goto chng_addr_N
+    **
+    **  chng_addr_0:
+    **   regPrev(0) = idx(0)
+    **  chng_addr_1:
+    **   regPrev(1) = idx(1)
+    **  ...
+    **
+    **  endDistinctTest:
+    **   regRowid = idx(rowid)
+    **   stat_push(P, regChng, regRowid)
+    **   Next csr
+    **   if !eof(csr) goto next_row;
+    **
+    **  end_of_scan:
+    */
+
+    /* Make sure there are enough memory cells allocated to accommodate 
+    ** the regPrev array and a trailing rowid (the rowid slot is required
+    ** when building a record to insert into the sample column of 
+    ** the sqlite_stat4 table.  */
+    pParse->nMem = MAX(pParse->nMem, regPrev+nColTest);
+
+    /* Open a read-only cursor on the index being analyzed. */
+    assert( iDb==sqlite3SchemaToIndex(db, pIdx->pSchema) );
+    sqlite3VdbeAddOp3(v, OP_OpenRead, iIdxCur, pIdx->tnum, iDb);
+    sqlite3VdbeSetP4KeyInfo(pParse, pIdx);
+    VdbeComment((v, "%s", pIdx->zName));
+
