@@ -87555,3 +87555,249 @@ static void sampleInsert(Stat4Accum *p, Stat4Sample *pNew, int nEqZero){
     pSample->anEq = anEq;
     pSample->anDLt = anDLt;
     pSample->anLt = anLt;
+    p->nSample = p->mxSample-1;
+  }
+
+  /* The "rows less-than" for the rowid column must be greater than that
+  ** for the last sample in the p->a[] array. Otherwise, the samples would
+  ** be out of order. */
+#ifdef SQLITE_ENABLE_STAT4
+  assert( p->nSample==0 
+       || pNew->anLt[p->nCol-1] > p->a[p->nSample-1].anLt[p->nCol-1] );
+#endif
+
+  /* Insert the new sample */
+  pSample = &p->a[p->nSample];
+  sampleCopy(p, pSample, pNew);
+  p->nSample++;
+
+  /* Zero the first nEqZero entries in the anEq[] array. */
+  memset(pSample->anEq, 0, sizeof(tRowcnt)*nEqZero);
+
+#ifdef SQLITE_ENABLE_STAT4
+ find_new_min:
+#endif
+  if( p->nSample>=p->mxSample ){
+    int iMin = -1;
+    for(i=0; i<p->mxSample; i++){
+      if( p->a[i].isPSample ) continue;
+      if( iMin<0 || sampleIsBetter(p, &p->a[iMin], &p->a[i]) ){
+        iMin = i;
+      }
+    }
+    assert( iMin>=0 );
+    p->iMin = iMin;
+  }
+}
+#endif /* SQLITE_ENABLE_STAT3_OR_STAT4 */
+
+/*
+** Field iChng of the index being scanned has changed. So at this point
+** p->current contains a sample that reflects the previous row of the
+** index. The value of anEq[iChng] and subsequent anEq[] elements are
+** correct at this point.
+*/
+static void samplePushPrevious(Stat4Accum *p, int iChng){
+#ifdef SQLITE_ENABLE_STAT4
+  int i;
+
+  /* Check if any samples from the aBest[] array should be pushed
+  ** into IndexSample.a[] at this point.  */
+  for(i=(p->nCol-2); i>=iChng; i--){
+    Stat4Sample *pBest = &p->aBest[i];
+    pBest->anEq[i] = p->current.anEq[i];
+    if( p->nSample<p->mxSample || sampleIsBetter(p, pBest, &p->a[p->iMin]) ){
+      sampleInsert(p, pBest, i);
+    }
+  }
+
+  /* Update the anEq[] fields of any samples already collected. */
+  for(i=p->nSample-1; i>=0; i--){
+    int j;
+    for(j=iChng; j<p->nCol; j++){
+      if( p->a[i].anEq[j]==0 ) p->a[i].anEq[j] = p->current.anEq[j];
+    }
+  }
+#endif
+
+#if defined(SQLITE_ENABLE_STAT3) && !defined(SQLITE_ENABLE_STAT4)
+  if( iChng==0 ){
+    tRowcnt nLt = p->current.anLt[0];
+    tRowcnt nEq = p->current.anEq[0];
+
+    /* Check if this is to be a periodic sample. If so, add it. */
+    if( (nLt/p->nPSample)!=(nLt+nEq)/p->nPSample ){
+      p->current.isPSample = 1;
+      sampleInsert(p, &p->current, 0);
+      p->current.isPSample = 0;
+    }else 
+
+    /* Or if it is a non-periodic sample. Add it in this case too. */
+    if( p->nSample<p->mxSample 
+     || sampleIsBetter(p, &p->current, &p->a[p->iMin]) 
+    ){
+      sampleInsert(p, &p->current, 0);
+    }
+  }
+#endif
+
+#ifndef SQLITE_ENABLE_STAT3_OR_STAT4
+  UNUSED_PARAMETER( p );
+  UNUSED_PARAMETER( iChng );
+#endif
+}
+
+/*
+** Implementation of the stat_push SQL function:  stat_push(P,C,R)
+** Arguments:
+**
+**    P     Pointer to the Stat4Accum object created by stat_init()
+**    C     Index of left-most column to differ from previous row
+**    R     Rowid for the current row.  Might be a key record for
+**          WITHOUT ROWID tables.
+**
+** This SQL function always returns NULL.  It's purpose it to accumulate
+** statistical data and/or samples in the Stat4Accum object about the
+** index being analyzed.  The stat_get() SQL function will later be used to
+** extract relevant information for constructing the sqlite_statN tables.
+**
+** The R parameter is only used for STAT3 and STAT4
+*/
+static void statPush(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int i;
+
+  /* The three function arguments */
+  Stat4Accum *p = (Stat4Accum*)sqlite3_value_blob(argv[0]);
+  int iChng = sqlite3_value_int(argv[1]);
+
+  UNUSED_PARAMETER( argc );
+  UNUSED_PARAMETER( context );
+  assert( p->nCol>0 );
+  assert( iChng<p->nCol );
+
+  if( p->nRow==0 ){
+    /* This is the first call to this function. Do initialization. */
+    for(i=0; i<p->nCol; i++) p->current.anEq[i] = 1;
+  }else{
+    /* Second and subsequent calls get processed here */
+    samplePushPrevious(p, iChng);
+
+    /* Update anDLt[], anLt[] and anEq[] to reflect the values that apply
+    ** to the current row of the index. */
+    for(i=0; i<iChng; i++){
+      p->current.anEq[i]++;
+    }
+    for(i=iChng; i<p->nCol; i++){
+      p->current.anDLt[i]++;
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+      p->current.anLt[i] += p->current.anEq[i];
+#endif
+      p->current.anEq[i] = 1;
+    }
+  }
+  p->nRow++;
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  if( sqlite3_value_type(argv[2])==SQLITE_INTEGER ){
+    sampleSetRowidInt64(p->db, &p->current, sqlite3_value_int64(argv[2]));
+  }else{
+    sampleSetRowid(p->db, &p->current, sqlite3_value_bytes(argv[2]),
+                                       sqlite3_value_blob(argv[2]));
+  }
+  p->current.iHash = p->iPrn = p->iPrn*1103515245 + 12345;
+#endif
+
+#ifdef SQLITE_ENABLE_STAT4
+  {
+    tRowcnt nLt = p->current.anLt[p->nCol-1];
+
+    /* Check if this is to be a periodic sample. If so, add it. */
+    if( (nLt/p->nPSample)!=(nLt+1)/p->nPSample ){
+      p->current.isPSample = 1;
+      p->current.iCol = 0;
+      sampleInsert(p, &p->current, p->nCol-1);
+      p->current.isPSample = 0;
+    }
+
+    /* Update the aBest[] array. */
+    for(i=0; i<(p->nCol-1); i++){
+      p->current.iCol = i;
+      if( i>=iChng || sampleIsBetterPost(p, &p->current, &p->aBest[i]) ){
+        sampleCopy(p, &p->aBest[i], &p->current);
+      }
+    }
+  }
+#endif
+}
+static const FuncDef statPushFuncdef = {
+  2+IsStat34,      /* nArg */
+  SQLITE_UTF8,     /* funcFlags */
+  0,               /* pUserData */
+  0,               /* pNext */
+  statPush,        /* xFunc */
+  0,               /* xStep */
+  0,               /* xFinalize */
+  "stat_push",     /* zName */
+  0,               /* pHash */
+  0                /* pDestructor */
+};
+
+#define STAT_GET_STAT1 0          /* "stat" column of stat1 table */
+#define STAT_GET_ROWID 1          /* "rowid" column of stat[34] entry */
+#define STAT_GET_NEQ   2          /* "neq" column of stat[34] entry */
+#define STAT_GET_NLT   3          /* "nlt" column of stat[34] entry */
+#define STAT_GET_NDLT  4          /* "ndlt" column of stat[34] entry */
+
+/*
+** Implementation of the stat_get(P,J) SQL function.  This routine is
+** used to query statistical information that has been gathered into
+** the Stat4Accum object by prior calls to stat_push().  The P parameter
+** has type BLOB but it is really just a pointer to the Stat4Accum object.
+** The content to returned is determined by the parameter J
+** which is one of the STAT_GET_xxxx values defined above.
+**
+** If neither STAT3 nor STAT4 are enabled, then J is always
+** STAT_GET_STAT1 and is hence omitted and this routine becomes
+** a one-parameter function, stat_get(P), that always returns the
+** stat1 table entry information.
+*/
+static void statGet(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Stat4Accum *p = (Stat4Accum*)sqlite3_value_blob(argv[0]);
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  /* STAT3 and STAT4 have a parameter on this routine. */
+  int eCall = sqlite3_value_int(argv[1]);
+  assert( argc==2 );
+  assert( eCall==STAT_GET_STAT1 || eCall==STAT_GET_NEQ 
+       || eCall==STAT_GET_ROWID || eCall==STAT_GET_NLT
+       || eCall==STAT_GET_NDLT 
+  );
+  if( eCall==STAT_GET_STAT1 )
+#else
+  assert( argc==1 );
+#endif
+  {
+    /* Return the value to store in the "stat" column of the sqlite_stat1
+    ** table for this index.
+    **
+    ** The value is a string composed of a list of integers describing 
+    ** the index. The first integer in the list is the total number of 
+    ** entries in the index. There is one additional integer in the list 
+    ** for each indexed column. This additional integer is an estimate of
+    ** the number of rows matched by a stabbing query on the index using
+    ** a key with the corresponding number of fields. In other words,
+    ** if the index is on columns (a,b) and the sqlite_stat1 value is 
+    ** "100 10 2", then SQLite estimates that:
+    **
+    **   * the index contains 100 rows,
+    **   * "WHERE a=?" matches 10 rows, and
+    **   * "WHERE a=? AND b=?" matches 2 rows.
+    **
+    ** If D is the count of distinct values and K is the total number of 
+    ** rows, then each estimate is computed as:
