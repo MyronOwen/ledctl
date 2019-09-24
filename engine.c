@@ -88041,3 +88041,233 @@ static void analyzeOneTable(
     sqlite3VdbeSetP4KeyInfo(pParse, pIdx);
     VdbeComment((v, "%s", pIdx->zName));
 
+    /* Invoke the stat_init() function. The arguments are:
+    ** 
+    **    (1) the number of columns in the index including the rowid
+    **        (or for a WITHOUT ROWID table, the number of PK columns),
+    **    (2) the number of columns in the key without the rowid/pk
+    **    (3) the number of rows in the index,
+    **
+    **
+    ** The third argument is only used for STAT3 and STAT4
+    */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+    sqlite3VdbeAddOp2(v, OP_Count, iIdxCur, regStat4+3);
+#endif
+    sqlite3VdbeAddOp2(v, OP_Integer, nCol, regStat4+1);
+    sqlite3VdbeAddOp2(v, OP_Integer, pIdx->nKeyCol, regStat4+2);
+    sqlite3VdbeAddOp3(v, OP_Function, 0, regStat4+1, regStat4);
+    sqlite3VdbeChangeP4(v, -1, (char*)&statInitFuncdef, P4_FUNCDEF);
+    sqlite3VdbeChangeP5(v, 2+IsStat34);
+
+    /* Implementation of the following:
+    **
+    **   Rewind csr
+    **   if eof(csr) goto end_of_scan;
+    **   regChng = 0
+    **   goto next_push_0;
+    **
+    */
+    addrRewind = sqlite3VdbeAddOp1(v, OP_Rewind, iIdxCur);
+    VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regChng);
+    addrNextRow = sqlite3VdbeCurrentAddr(v);
+
+    if( nColTest>0 ){
+      int endDistinctTest = sqlite3VdbeMakeLabel(v);
+      int *aGotoChng;               /* Array of jump instruction addresses */
+      aGotoChng = sqlite3DbMallocRaw(db, sizeof(int)*nColTest);
+      if( aGotoChng==0 ) continue;
+
+      /*
+      **  next_row:
+      **   regChng = 0
+      **   if( idx(0) != regPrev(0) ) goto chng_addr_0
+      **   regChng = 1
+      **   if( idx(1) != regPrev(1) ) goto chng_addr_1
+      **   ...
+      **   regChng = N
+      **   goto endDistinctTest
+      */
+      sqlite3VdbeAddOp0(v, OP_Goto);
+      addrNextRow = sqlite3VdbeCurrentAddr(v);
+      if( nColTest==1 && pIdx->nKeyCol==1 && IsUniqueIndex(pIdx) ){
+        /* For a single-column UNIQUE index, once we have found a non-NULL
+        ** row, we know that all the rest will be distinct, so skip 
+        ** subsequent distinctness tests. */
+        sqlite3VdbeAddOp2(v, OP_NotNull, regPrev, endDistinctTest);
+        VdbeCoverage(v);
+      }
+      for(i=0; i<nColTest; i++){
+        char *pColl = (char*)sqlite3LocateCollSeq(pParse, pIdx->azColl[i]);
+        sqlite3VdbeAddOp2(v, OP_Integer, i, regChng);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, i, regTemp);
+        aGotoChng[i] = 
+        sqlite3VdbeAddOp4(v, OP_Ne, regTemp, 0, regPrev+i, pColl, P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+        VdbeCoverage(v);
+      }
+      sqlite3VdbeAddOp2(v, OP_Integer, nColTest, regChng);
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, endDistinctTest);
+  
+  
+      /*
+      **  chng_addr_0:
+      **   regPrev(0) = idx(0)
+      **  chng_addr_1:
+      **   regPrev(1) = idx(1)
+      **  ...
+      */
+      sqlite3VdbeJumpHere(v, addrNextRow-1);
+      for(i=0; i<nColTest; i++){
+        sqlite3VdbeJumpHere(v, aGotoChng[i]);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, i, regPrev+i);
+      }
+      sqlite3VdbeResolveLabel(v, endDistinctTest);
+      sqlite3DbFree(db, aGotoChng);
+    }
+  
+    /*
+    **  chng_addr_N:
+    **   regRowid = idx(rowid)            // STAT34 only
+    **   stat_push(P, regChng, regRowid)  // 3rd parameter STAT34 only
+    **   Next csr
+    **   if !eof(csr) goto next_row;
+    */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+    assert( regRowid==(regStat4+2) );
+    if( HasRowid(pTab) ){
+      sqlite3VdbeAddOp2(v, OP_IdxRowid, iIdxCur, regRowid);
+    }else{
+      Index *pPk = sqlite3PrimaryKeyIndex(pIdx->pTable);
+      int j, k, regKey;
+      regKey = sqlite3GetTempRange(pParse, pPk->nKeyCol);
+      for(j=0; j<pPk->nKeyCol; j++){
+        k = sqlite3ColumnOfIndex(pIdx, pPk->aiColumn[j]);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, k, regKey+j);
+        VdbeComment((v, "%s", pTab->aCol[pPk->aiColumn[j]].zName));
+      }
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regKey, pPk->nKeyCol, regRowid);
+      sqlite3ReleaseTempRange(pParse, regKey, pPk->nKeyCol);
+    }
+#endif
+    assert( regChng==(regStat4+1) );
+    sqlite3VdbeAddOp3(v, OP_Function, 1, regStat4, regTemp);
+    sqlite3VdbeChangeP4(v, -1, (char*)&statPushFuncdef, P4_FUNCDEF);
+    sqlite3VdbeChangeP5(v, 2+IsStat34);
+    sqlite3VdbeAddOp2(v, OP_Next, iIdxCur, addrNextRow); VdbeCoverage(v);
+
+    /* Add the entry to the stat1 table. */
+    callStatGet(v, regStat4, STAT_GET_STAT1, regStat1);
+    assert( "BBB"[0]==SQLITE_AFF_TEXT );
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, regTabname, 3, regTemp, "BBB", 0);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur, regNewRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+
+    /* Add the entries to the stat3 or stat4 table. */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+    {
+      int regEq = regStat1;
+      int regLt = regStat1+1;
+      int regDLt = regStat1+2;
+      int regSample = regStat1+3;
+      int regCol = regStat1+4;
+      int regSampleRowid = regCol + nCol;
+      int addrNext;
+      int addrIsNull;
+      u8 seekOp = HasRowid(pTab) ? OP_NotExists : OP_NotFound;
+
+      pParse->nMem = MAX(pParse->nMem, regCol+nCol);
+
+      addrNext = sqlite3VdbeCurrentAddr(v);
+      callStatGet(v, regStat4, STAT_GET_ROWID, regSampleRowid);
+      addrIsNull = sqlite3VdbeAddOp1(v, OP_IsNull, regSampleRowid);
+      VdbeCoverage(v);
+      callStatGet(v, regStat4, STAT_GET_NEQ, regEq);
+      callStatGet(v, regStat4, STAT_GET_NLT, regLt);
+      callStatGet(v, regStat4, STAT_GET_NDLT, regDLt);
+      sqlite3VdbeAddOp4Int(v, seekOp, iTabCur, addrNext, regSampleRowid, 0);
+      /* We know that the regSampleRowid row exists because it was read by
+      ** the previous loop.  Thus the not-found jump of seekOp will never
+      ** be taken */
+      VdbeCoverageNeverTaken(v);
+#ifdef SQLITE_ENABLE_STAT3
+      sqlite3ExprCodeGetColumnOfTable(v, pTab, iTabCur, 
+                                      pIdx->aiColumn[0], regSample);
+#else
+      for(i=0; i<nCol; i++){
+        i16 iCol = pIdx->aiColumn[i];
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iTabCur, iCol, regCol+i);
+      }
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regCol, nCol, regSample);
+#endif
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regTabname, 6, regTemp);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur+1, regNewRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, iStatCur+1, regTemp, regNewRowid);
+      sqlite3VdbeAddOp2(v, OP_Goto, 1, addrNext); /* P1==1 for end-of-loop */
+      sqlite3VdbeJumpHere(v, addrIsNull);
+    }
+#endif /* SQLITE_ENABLE_STAT3_OR_STAT4 */
+
+    /* End of analysis */
+    sqlite3VdbeJumpHere(v, addrRewind);
+  }
+
+
+  /* Create a single sqlite_stat1 entry containing NULL as the index
+  ** name and the row count as the content.
+  */
+  if( pOnlyIdx==0 && needTableCnt ){
+    VdbeComment((v, "%s", pTab->zName));
+    sqlite3VdbeAddOp2(v, OP_Count, iTabCur, regStat1);
+    jZeroRows = sqlite3VdbeAddOp1(v, OP_IfNot, regStat1); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Null, 0, regIdxname);
+    assert( "BBB"[0]==SQLITE_AFF_TEXT );
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, regTabname, 3, regTemp, "BBB", 0);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur, regNewRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+    sqlite3VdbeJumpHere(v, jZeroRows);
+  }
+}
+
+
+/*
+** Generate code that will cause the most recent index analysis to
+** be loaded into internal hash tables where is can be used.
+*/
+static void loadAnalysis(Parse *pParse, int iDb){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  if( v ){
+    sqlite3VdbeAddOp1(v, OP_LoadAnalysis, iDb);
+  }
+}
+
+/*
+** Generate code that will do an analysis of an entire database
+*/
+static void analyzeDatabase(Parse *pParse, int iDb){
+  sqlite3 *db = pParse->db;
+  Schema *pSchema = db->aDb[iDb].pSchema;    /* Schema of database iDb */
+  HashElem *k;
+  int iStatCur;
+  int iMem;
+  int iTab;
+
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  iStatCur = pParse->nTab;
+  pParse->nTab += 3;
+  openStatTable(pParse, iDb, iStatCur, 0, 0);
+  iMem = pParse->nMem+1;
+  iTab = pParse->nTab;
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  for(k=sqliteHashFirst(&pSchema->tblHash); k; k=sqliteHashNext(k)){
+    Table *pTab = (Table*)sqliteHashData(k);
+    analyzeOneTable(pParse, pTab, 0, iStatCur, iMem, iTab);
+  }
+  loadAnalysis(pParse, iDb);
+}
+
+/*
+** Generate code that will do an analysis of a single table in
