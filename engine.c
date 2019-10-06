@@ -88271,3 +88271,235 @@ static void analyzeDatabase(Parse *pParse, int iDb){
 
 /*
 ** Generate code that will do an analysis of a single table in
+** a database.  If pOnlyIdx is not NULL then it is a single index
+** in pTab that should be analyzed.
+*/
+static void analyzeTable(Parse *pParse, Table *pTab, Index *pOnlyIdx){
+  int iDb;
+  int iStatCur;
+
+  assert( pTab!=0 );
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+  iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  iStatCur = pParse->nTab;
+  pParse->nTab += 3;
+  if( pOnlyIdx ){
+    openStatTable(pParse, iDb, iStatCur, pOnlyIdx->zName, "idx");
+  }else{
+    openStatTable(pParse, iDb, iStatCur, pTab->zName, "tbl");
+  }
+  analyzeOneTable(pParse, pTab, pOnlyIdx, iStatCur,pParse->nMem+1,pParse->nTab);
+  loadAnalysis(pParse, iDb);
+}
+
+/*
+** Generate code for the ANALYZE command.  The parser calls this routine
+** when it recognizes an ANALYZE command.
+**
+**        ANALYZE                            -- 1
+**        ANALYZE  <database>                -- 2
+**        ANALYZE  ?<database>.?<tablename>  -- 3
+**
+** Form 1 causes all indices in all attached databases to be analyzed.
+** Form 2 analyzes all indices the single database named.
+** Form 3 analyzes all indices associated with the named table.
+*/
+SQLITE_PRIVATE void sqlite3Analyze(Parse *pParse, Token *pName1, Token *pName2){
+  sqlite3 *db = pParse->db;
+  int iDb;
+  int i;
+  char *z, *zDb;
+  Table *pTab;
+  Index *pIdx;
+  Token *pTableName;
+  Vdbe *v;
+
+  /* Read the database schema. If an error occurs, leave an error message
+  ** and code in pParse and return NULL. */
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    return;
+  }
+
+  assert( pName2!=0 || pName1==0 );
+  if( pName1==0 ){
+    /* Form 1:  Analyze everything */
+    for(i=0; i<db->nDb; i++){
+      if( i==1 ) continue;  /* Do not analyze the TEMP database */
+      analyzeDatabase(pParse, i);
+    }
+  }else if( pName2->n==0 ){
+    /* Form 2:  Analyze the database or table named */
+    iDb = sqlite3FindDb(db, pName1);
+    if( iDb>=0 ){
+      analyzeDatabase(pParse, iDb);
+    }else{
+      z = sqlite3NameFromToken(db, pName1);
+      if( z ){
+        if( (pIdx = sqlite3FindIndex(db, z, 0))!=0 ){
+          analyzeTable(pParse, pIdx->pTable, pIdx);
+        }else if( (pTab = sqlite3LocateTable(pParse, 0, z, 0))!=0 ){
+          analyzeTable(pParse, pTab, 0);
+        }
+        sqlite3DbFree(db, z);
+      }
+    }
+  }else{
+    /* Form 3: Analyze the fully qualified table name */
+    iDb = sqlite3TwoPartName(pParse, pName1, pName2, &pTableName);
+    if( iDb>=0 ){
+      zDb = db->aDb[iDb].zName;
+      z = sqlite3NameFromToken(db, pTableName);
+      if( z ){
+        if( (pIdx = sqlite3FindIndex(db, z, zDb))!=0 ){
+          analyzeTable(pParse, pIdx->pTable, pIdx);
+        }else if( (pTab = sqlite3LocateTable(pParse, 0, z, zDb))!=0 ){
+          analyzeTable(pParse, pTab, 0);
+        }
+        sqlite3DbFree(db, z);
+      }
+    }   
+  }
+  v = sqlite3GetVdbe(pParse);
+  if( v ) sqlite3VdbeAddOp0(v, OP_Expire);
+}
+
+/*
+** Used to pass information from the analyzer reader through to the
+** callback routine.
+*/
+typedef struct analysisInfo analysisInfo;
+struct analysisInfo {
+  sqlite3 *db;
+  const char *zDatabase;
+};
+
+/*
+** The first argument points to a nul-terminated string containing a
+** list of space separated integers. Read the first nOut of these into
+** the array aOut[].
+*/
+static void decodeIntArray(
+  char *zIntArray,       /* String containing int array to decode */
+  int nOut,              /* Number of slots in aOut[] */
+  tRowcnt *aOut,         /* Store integers here */
+  LogEst *aLog,          /* Or, if aOut==0, here */
+  Index *pIndex          /* Handle extra flags for this index, if not NULL */
+){
+  char *z = zIntArray;
+  int c;
+  int i;
+  tRowcnt v;
+
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  if( z==0 ) z = "";
+#else
+  assert( z!=0 );
+#endif
+  for(i=0; *z && i<nOut; i++){
+    v = 0;
+    while( (c=z[0])>='0' && c<='9' ){
+      v = v*10 + c - '0';
+      z++;
+    }
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+    if( aOut ) aOut[i] = v;
+    if( aLog ) aLog[i] = sqlite3LogEst(v);
+#else
+    assert( aOut==0 );
+    UNUSED_PARAMETER(aOut);
+    assert( aLog!=0 );
+    aLog[i] = sqlite3LogEst(v);
+#endif
+    if( *z==' ' ) z++;
+  }
+#ifndef SQLITE_ENABLE_STAT3_OR_STAT4
+  assert( pIndex!=0 ); {
+#else
+  if( pIndex ){
+#endif
+    pIndex->bUnordered = 0;
+    pIndex->noSkipScan = 0;
+    while( z[0] ){
+      if( sqlite3_strglob("unordered*", z)==0 ){
+        pIndex->bUnordered = 1;
+      }else if( sqlite3_strglob("sz=[0-9]*", z)==0 ){
+        pIndex->szIdxRow = sqlite3LogEst(sqlite3Atoi(z+3));
+      }else if( sqlite3_strglob("noskipscan*", z)==0 ){
+        pIndex->noSkipScan = 1;
+      }
+#ifdef SQLITE_ENABLE_COSTMULT
+      else if( sqlite3_strglob("costmult=[0-9]*",z)==0 ){
+        pIndex->pTable->costMult = sqlite3LogEst(sqlite3Atoi(z+9));
+      }
+#endif
+      while( z[0]!=0 && z[0]!=' ' ) z++;
+      while( z[0]==' ' ) z++;
+    }
+  }
+}
+
+/*
+** This callback is invoked once for each index when reading the
+** sqlite_stat1 table.  
+**
+**     argv[0] = name of the table
+**     argv[1] = name of the index (might be NULL)
+**     argv[2] = results of analysis - on integer for each column
+**
+** Entries for which argv[1]==NULL simply record the number of rows in
+** the table.
+*/
+static int analysisLoader(void *pData, int argc, char **argv, char **NotUsed){
+  analysisInfo *pInfo = (analysisInfo*)pData;
+  Index *pIndex;
+  Table *pTable;
+  const char *z;
+
+  assert( argc==3 );
+  UNUSED_PARAMETER2(NotUsed, argc);
+
+  if( argv==0 || argv[0]==0 || argv[2]==0 ){
+    return 0;
+  }
+  pTable = sqlite3FindTable(pInfo->db, argv[0], pInfo->zDatabase);
+  if( pTable==0 ){
+    return 0;
+  }
+  if( argv[1]==0 ){
+    pIndex = 0;
+  }else if( sqlite3_stricmp(argv[0],argv[1])==0 ){
+    pIndex = sqlite3PrimaryKeyIndex(pTable);
+  }else{
+    pIndex = sqlite3FindIndex(pInfo->db, argv[1], pInfo->zDatabase);
+  }
+  z = argv[2];
+
+  if( pIndex ){
+    int nCol = pIndex->nKeyCol+1;
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+    tRowcnt * const aiRowEst = pIndex->aiRowEst = (tRowcnt*)sqlite3MallocZero(
+        sizeof(tRowcnt) * nCol
+    );
+    if( aiRowEst==0 ) pInfo->db->mallocFailed = 1;
+#else
+    tRowcnt * const aiRowEst = 0;
+#endif
+    pIndex->bUnordered = 0;
+    decodeIntArray((char*)z, nCol, aiRowEst, pIndex->aiRowLogEst, pIndex);
+    if( pIndex->pPartIdxWhere==0 ) pTable->nRowLogEst = pIndex->aiRowLogEst[0];
+  }else{
+    Index fakeIdx;
+    fakeIdx.szIdxRow = pTable->szTabRow;
+#ifdef SQLITE_ENABLE_COSTMULT
+    fakeIdx.pTable = pTable;
+#endif
+    decodeIntArray((char*)z, 1, 0, &pTable->nRowLogEst, &fakeIdx);
+    pTable->szTabRow = fakeIdx.szIdxRow;
+  }
+
+  return 0;
+}
+
+/*
