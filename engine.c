@@ -88503,3 +88503,250 @@ static int analysisLoader(void *pData, int argc, char **argv, char **NotUsed){
 }
 
 /*
+** If the Index.aSample variable is not NULL, delete the aSample[] array
+** and its contents.
+*/
+SQLITE_PRIVATE void sqlite3DeleteIndexSamples(sqlite3 *db, Index *pIdx){
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  if( pIdx->aSample ){
+    int j;
+    for(j=0; j<pIdx->nSample; j++){
+      IndexSample *p = &pIdx->aSample[j];
+      sqlite3DbFree(db, p->p);
+    }
+    sqlite3DbFree(db, pIdx->aSample);
+  }
+  if( db && db->pnBytesFreed==0 ){
+    pIdx->nSample = 0;
+    pIdx->aSample = 0;
+  }
+#else
+  UNUSED_PARAMETER(db);
+  UNUSED_PARAMETER(pIdx);
+#endif /* SQLITE_ENABLE_STAT3_OR_STAT4 */
+}
+
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+/*
+** Populate the pIdx->aAvgEq[] array based on the samples currently
+** stored in pIdx->aSample[]. 
+*/
+static void initAvgEq(Index *pIdx){
+  if( pIdx ){
+    IndexSample *aSample = pIdx->aSample;
+    IndexSample *pFinal = &aSample[pIdx->nSample-1];
+    int iCol;
+    int nCol = 1;
+    if( pIdx->nSampleCol>1 ){
+      /* If this is stat4 data, then calculate aAvgEq[] values for all
+      ** sample columns except the last. The last is always set to 1, as
+      ** once the trailing PK fields are considered all index keys are
+      ** unique.  */
+      nCol = pIdx->nSampleCol-1;
+      pIdx->aAvgEq[nCol] = 1;
+    }
+    for(iCol=0; iCol<nCol; iCol++){
+      int nSample = pIdx->nSample;
+      int i;                    /* Used to iterate through samples */
+      tRowcnt sumEq = 0;        /* Sum of the nEq values */
+      tRowcnt avgEq = 0;
+      tRowcnt nRow;             /* Number of rows in index */
+      i64 nSum100 = 0;          /* Number of terms contributing to sumEq */
+      i64 nDist100;             /* Number of distinct values in index */
+
+      if( !pIdx->aiRowEst || iCol>=pIdx->nKeyCol || pIdx->aiRowEst[iCol+1]==0 ){
+        nRow = pFinal->anLt[iCol];
+        nDist100 = (i64)100 * pFinal->anDLt[iCol];
+        nSample--;
+      }else{
+        nRow = pIdx->aiRowEst[0];
+        nDist100 = ((i64)100 * pIdx->aiRowEst[0]) / pIdx->aiRowEst[iCol+1];
+      }
+      pIdx->nRowEst0 = nRow;
+
+      /* Set nSum to the number of distinct (iCol+1) field prefixes that
+      ** occur in the stat4 table for this index. Set sumEq to the sum of 
+      ** the nEq values for column iCol for the same set (adding the value 
+      ** only once where there exist duplicate prefixes).  */
+      for(i=0; i<nSample; i++){
+        if( i==(pIdx->nSample-1)
+         || aSample[i].anDLt[iCol]!=aSample[i+1].anDLt[iCol] 
+        ){
+          sumEq += aSample[i].anEq[iCol];
+          nSum100 += 100;
+        }
+      }
+
+      if( nDist100>nSum100 ){
+        avgEq = ((i64)100 * (nRow - sumEq))/(nDist100 - nSum100);
+      }
+      if( avgEq==0 ) avgEq = 1;
+      pIdx->aAvgEq[iCol] = avgEq;
+    }
+  }
+}
+
+/*
+** Look up an index by name.  Or, if the name of a WITHOUT ROWID table
+** is supplied instead, find the PRIMARY KEY index for that table.
+*/
+static Index *findIndexOrPrimaryKey(
+  sqlite3 *db,
+  const char *zName,
+  const char *zDb
+){
+  Index *pIdx = sqlite3FindIndex(db, zName, zDb);
+  if( pIdx==0 ){
+    Table *pTab = sqlite3FindTable(db, zName, zDb);
+    if( pTab && !HasRowid(pTab) ) pIdx = sqlite3PrimaryKeyIndex(pTab);
+  }
+  return pIdx;
+}
+
+/*
+** Load the content from either the sqlite_stat4 or sqlite_stat3 table 
+** into the relevant Index.aSample[] arrays.
+**
+** Arguments zSql1 and zSql2 must point to SQL statements that return
+** data equivalent to the following (statements are different for stat3,
+** see the caller of this function for details):
+**
+**    zSql1: SELECT idx,count(*) FROM %Q.sqlite_stat4 GROUP BY idx
+**    zSql2: SELECT idx,neq,nlt,ndlt,sample FROM %Q.sqlite_stat4
+**
+** where %Q is replaced with the database name before the SQL is executed.
+*/
+static int loadStatTbl(
+  sqlite3 *db,                  /* Database handle */
+  int bStat3,                   /* Assume single column records only */
+  const char *zSql1,            /* SQL statement 1 (see above) */
+  const char *zSql2,            /* SQL statement 2 (see above) */
+  const char *zDb               /* Database name (e.g. "main") */
+){
+  int rc;                       /* Result codes from subroutines */
+  sqlite3_stmt *pStmt = 0;      /* An SQL statement being run */
+  char *zSql;                   /* Text of the SQL statement */
+  Index *pPrevIdx = 0;          /* Previous index in the loop */
+  IndexSample *pSample;         /* A slot in pIdx->aSample[] */
+
+  assert( db->lookaside.bEnabled==0 );
+  zSql = sqlite3MPrintf(db, zSql1, zDb);
+  if( !zSql ){
+    return SQLITE_NOMEM;
+  }
+  rc = sqlite3_prepare(db, zSql, -1, &pStmt, 0);
+  sqlite3DbFree(db, zSql);
+  if( rc ) return rc;
+
+  while( sqlite3_step(pStmt)==SQLITE_ROW ){
+    int nIdxCol = 1;              /* Number of columns in stat4 records */
+
+    char *zIndex;   /* Index name */
+    Index *pIdx;    /* Pointer to the index object */
+    int nSample;    /* Number of samples */
+    int nByte;      /* Bytes of space required */
+    int i;          /* Bytes of space required */
+    tRowcnt *pSpace;
+
+    zIndex = (char *)sqlite3_column_text(pStmt, 0);
+    if( zIndex==0 ) continue;
+    nSample = sqlite3_column_int(pStmt, 1);
+    pIdx = findIndexOrPrimaryKey(db, zIndex, zDb);
+    assert( pIdx==0 || bStat3 || pIdx->nSample==0 );
+    /* Index.nSample is non-zero at this point if data has already been
+    ** loaded from the stat4 table. In this case ignore stat3 data.  */
+    if( pIdx==0 || pIdx->nSample ) continue;
+    if( bStat3==0 ){
+      assert( !HasRowid(pIdx->pTable) || pIdx->nColumn==pIdx->nKeyCol+1 );
+      if( !HasRowid(pIdx->pTable) && IsPrimaryKeyIndex(pIdx) ){
+        nIdxCol = pIdx->nKeyCol;
+      }else{
+        nIdxCol = pIdx->nColumn;
+      }
+    }
+    pIdx->nSampleCol = nIdxCol;
+    nByte = sizeof(IndexSample) * nSample;
+    nByte += sizeof(tRowcnt) * nIdxCol * 3 * nSample;
+    nByte += nIdxCol * sizeof(tRowcnt);     /* Space for Index.aAvgEq[] */
+
+    pIdx->aSample = sqlite3DbMallocZero(db, nByte);
+    if( pIdx->aSample==0 ){
+      sqlite3_finalize(pStmt);
+      return SQLITE_NOMEM;
+    }
+    pSpace = (tRowcnt*)&pIdx->aSample[nSample];
+    pIdx->aAvgEq = pSpace; pSpace += nIdxCol;
+    for(i=0; i<nSample; i++){
+      pIdx->aSample[i].anEq = pSpace; pSpace += nIdxCol;
+      pIdx->aSample[i].anLt = pSpace; pSpace += nIdxCol;
+      pIdx->aSample[i].anDLt = pSpace; pSpace += nIdxCol;
+    }
+    assert( ((u8*)pSpace)-nByte==(u8*)(pIdx->aSample) );
+  }
+  rc = sqlite3_finalize(pStmt);
+  if( rc ) return rc;
+
+  zSql = sqlite3MPrintf(db, zSql2, zDb);
+  if( !zSql ){
+    return SQLITE_NOMEM;
+  }
+  rc = sqlite3_prepare(db, zSql, -1, &pStmt, 0);
+  sqlite3DbFree(db, zSql);
+  if( rc ) return rc;
+
+  while( sqlite3_step(pStmt)==SQLITE_ROW ){
+    char *zIndex;                 /* Index name */
+    Index *pIdx;                  /* Pointer to the index object */
+    int nCol = 1;                 /* Number of columns in index */
+
+    zIndex = (char *)sqlite3_column_text(pStmt, 0);
+    if( zIndex==0 ) continue;
+    pIdx = findIndexOrPrimaryKey(db, zIndex, zDb);
+    if( pIdx==0 ) continue;
+    /* This next condition is true if data has already been loaded from 
+    ** the sqlite_stat4 table. In this case ignore stat3 data.  */
+    nCol = pIdx->nSampleCol;
+    if( bStat3 && nCol>1 ) continue;
+    if( pIdx!=pPrevIdx ){
+      initAvgEq(pPrevIdx);
+      pPrevIdx = pIdx;
+    }
+    pSample = &pIdx->aSample[pIdx->nSample];
+    decodeIntArray((char*)sqlite3_column_text(pStmt,1),nCol,pSample->anEq,0,0);
+    decodeIntArray((char*)sqlite3_column_text(pStmt,2),nCol,pSample->anLt,0,0);
+    decodeIntArray((char*)sqlite3_column_text(pStmt,3),nCol,pSample->anDLt,0,0);
+
+    /* Take a copy of the sample. Add two 0x00 bytes the end of the buffer.
+    ** This is in case the sample record is corrupted. In that case, the
+    ** sqlite3VdbeRecordCompare() may read up to two varints past the
+    ** end of the allocated buffer before it realizes it is dealing with
+    ** a corrupt record. Adding the two 0x00 bytes prevents this from causing
+    ** a buffer overread.  */
+    pSample->n = sqlite3_column_bytes(pStmt, 4);
+    pSample->p = sqlite3DbMallocZero(db, pSample->n + 2);
+    if( pSample->p==0 ){
+      sqlite3_finalize(pStmt);
+      return SQLITE_NOMEM;
+    }
+    memcpy(pSample->p, sqlite3_column_blob(pStmt, 4), pSample->n);
+    pIdx->nSample++;
+  }
+  rc = sqlite3_finalize(pStmt);
+  if( rc==SQLITE_OK ) initAvgEq(pPrevIdx);
+  return rc;
+}
+
+/*
+** Load content from the sqlite_stat4 and sqlite_stat3 tables into 
+** the Index.aSample[] arrays of all indices.
+*/
+static int loadStat4(sqlite3 *db, const char *zDb){
+  int rc = SQLITE_OK;             /* Result codes from subroutines */
+
+  assert( db->lookaside.bEnabled==0 );
+  if( sqlite3FindTable(db, "sqlite_stat4", zDb) ){
+    rc = loadStatTbl(db, 0,
+      "SELECT idx,count(*) FROM %Q.sqlite_stat4 GROUP BY idx", 
+      "SELECT idx,neq,nlt,ndlt,sample FROM %Q.sqlite_stat4",
+      zDb
+    );
