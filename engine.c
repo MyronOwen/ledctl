@@ -89894,3 +89894,221 @@ SQLITE_PRIVATE void sqlite3FinishCoding(Parse *pParse){
         char *vtab = (char *)sqlite3GetVTable(db, pParse->apVtabLock[i]);
         sqlite3VdbeAddOp4(v, OP_VBegin, 0, 0, 0, vtab, P4_VTAB);
       }
+      pParse->nVtabLock = 0;
+#endif
+
+      /* Once all the cookies have been verified and transactions opened, 
+      ** obtain the required table-locks. This is a no-op unless the 
+      ** shared-cache feature is enabled.
+      */
+      codeTableLocks(pParse);
+
+      /* Initialize any AUTOINCREMENT data structures required.
+      */
+      sqlite3AutoincrementBegin(pParse);
+
+      /* Code constant expressions that where factored out of inner loops */
+      if( pParse->pConstExpr ){
+        ExprList *pEL = pParse->pConstExpr;
+        pParse->okConstFactor = 0;
+        for(i=0; i<pEL->nExpr; i++){
+          sqlite3ExprCode(pParse, pEL->a[i].pExpr, pEL->a[i].u.iConstExprReg);
+        }
+      }
+
+      /* Finally, jump back to the beginning of the executable code. */
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, 1);
+    }
+  }
+
+
+  /* Get the VDBE program ready for execution
+  */
+  if( v && ALWAYS(pParse->nErr==0) && !db->mallocFailed ){
+    assert( pParse->iCacheLevel==0 );  /* Disables and re-enables match */
+    /* A minimum of one cursor is required if autoincrement is used
+    *  See ticket [a696379c1f08866] */
+    if( pParse->pAinc!=0 && pParse->nTab==0 ) pParse->nTab = 1;
+    sqlite3VdbeMakeReady(v, pParse);
+    pParse->rc = SQLITE_DONE;
+    pParse->colNamesSet = 0;
+  }else{
+    pParse->rc = SQLITE_ERROR;
+  }
+  pParse->nTab = 0;
+  pParse->nMem = 0;
+  pParse->nSet = 0;
+  pParse->nVar = 0;
+  DbMaskZero(pParse->cookieMask);
+}
+
+/*
+** Run the parser and code generator recursively in order to generate
+** code for the SQL statement given onto the end of the pParse context
+** currently under construction.  When the parser is run recursively
+** this way, the final OP_Halt is not appended and other initialization
+** and finalization steps are omitted because those are handling by the
+** outermost parser.
+**
+** Not everything is nestable.  This facility is designed to permit
+** INSERT, UPDATE, and DELETE operations against SQLITE_MASTER.  Use
+** care if you decide to try to use this routine for some other purposes.
+*/
+SQLITE_PRIVATE void sqlite3NestedParse(Parse *pParse, const char *zFormat, ...){
+  va_list ap;
+  char *zSql;
+  char *zErrMsg = 0;
+  sqlite3 *db = pParse->db;
+# define SAVE_SZ  (sizeof(Parse) - offsetof(Parse,nVar))
+  char saveBuf[SAVE_SZ];
+
+  if( pParse->nErr ) return;
+  assert( pParse->nested<10 );  /* Nesting should only be of limited depth */
+  va_start(ap, zFormat);
+  zSql = sqlite3VMPrintf(db, zFormat, ap);
+  va_end(ap);
+  if( zSql==0 ){
+    return;   /* A malloc must have failed */
+  }
+  pParse->nested++;
+  memcpy(saveBuf, &pParse->nVar, SAVE_SZ);
+  memset(&pParse->nVar, 0, SAVE_SZ);
+  sqlite3RunParser(pParse, zSql, &zErrMsg);
+  sqlite3DbFree(db, zErrMsg);
+  sqlite3DbFree(db, zSql);
+  memcpy(&pParse->nVar, saveBuf, SAVE_SZ);
+  pParse->nested--;
+}
+
+#if SQLITE_USER_AUTHENTICATION
+/*
+** Return TRUE if zTable is the name of the system table that stores the
+** list of users and their access credentials.
+*/
+SQLITE_PRIVATE int sqlite3UserAuthTable(const char *zTable){
+  return sqlite3_stricmp(zTable, "sqlite_user")==0;
+}
+#endif
+
+/*
+** Locate the in-memory structure that describes a particular database
+** table given the name of that table and (optionally) the name of the
+** database containing the table.  Return NULL if not found.
+**
+** If zDatabase is 0, all databases are searched for the table and the
+** first matching table is returned.  (No checking for duplicate table
+** names is done.)  The search order is TEMP first, then MAIN, then any
+** auxiliary databases added using the ATTACH command.
+**
+** See also sqlite3LocateTable().
+*/
+SQLITE_PRIVATE Table *sqlite3FindTable(sqlite3 *db, const char *zName, const char *zDatabase){
+  Table *p = 0;
+  int i;
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || zName==0 ) return 0;
+#endif
+
+  /* All mutexes are required for schema access.  Make sure we hold them. */
+  assert( zDatabase!=0 || sqlite3BtreeHoldsAllMutexes(db) );
+#if SQLITE_USER_AUTHENTICATION
+  /* Only the admin user is allowed to know that the sqlite_user table
+  ** exists */
+  if( db->auth.authLevel<UAUTH_Admin && sqlite3UserAuthTable(zName)!=0 ){
+    return 0;
+  }
+#endif
+  for(i=OMIT_TEMPDB; i<db->nDb; i++){
+    int j = (i<2) ? i^1 : i;   /* Search TEMP before MAIN */
+    if( zDatabase!=0 && sqlite3StrICmp(zDatabase, db->aDb[j].zName) ) continue;
+    assert( sqlite3SchemaMutexHeld(db, j, 0) );
+    p = sqlite3HashFind(&db->aDb[j].pSchema->tblHash, zName);
+    if( p ) break;
+  }
+  return p;
+}
+
+/*
+** Locate the in-memory structure that describes a particular database
+** table given the name of that table and (optionally) the name of the
+** database containing the table.  Return NULL if not found.  Also leave an
+** error message in pParse->zErrMsg.
+**
+** The difference between this routine and sqlite3FindTable() is that this
+** routine leaves an error message in pParse->zErrMsg where
+** sqlite3FindTable() does not.
+*/
+SQLITE_PRIVATE Table *sqlite3LocateTable(
+  Parse *pParse,         /* context in which to report errors */
+  int isView,            /* True if looking for a VIEW rather than a TABLE */
+  const char *zName,     /* Name of the table we are looking for */
+  const char *zDbase     /* Name of the database.  Might be NULL */
+){
+  Table *p;
+
+  /* Read the database schema. If an error occurs, leave an error message
+  ** and code in pParse and return NULL. */
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    return 0;
+  }
+
+  p = sqlite3FindTable(pParse->db, zName, zDbase);
+  if( p==0 ){
+    const char *zMsg = isView ? "no such view" : "no such table";
+    if( zDbase ){
+      sqlite3ErrorMsg(pParse, "%s: %s.%s", zMsg, zDbase, zName);
+    }else{
+      sqlite3ErrorMsg(pParse, "%s: %s", zMsg, zName);
+    }
+    pParse->checkSchema = 1;
+  }
+#if SQLITE_USER_AUTHENICATION
+  else if( pParse->db->auth.authLevel<UAUTH_User ){
+    sqlite3ErrorMsg(pParse, "user not authenticated");
+    p = 0;
+  }
+#endif
+  return p;
+}
+
+/*
+** Locate the table identified by *p.
+**
+** This is a wrapper around sqlite3LocateTable(). The difference between
+** sqlite3LocateTable() and this function is that this function restricts
+** the search to schema (p->pSchema) if it is not NULL. p->pSchema may be
+** non-NULL if it is part of a view or trigger program definition. See
+** sqlite3FixSrcList() for details.
+*/
+SQLITE_PRIVATE Table *sqlite3LocateTableItem(
+  Parse *pParse, 
+  int isView, 
+  struct SrcList_item *p
+){
+  const char *zDb;
+  assert( p->pSchema==0 || p->zDatabase==0 );
+  if( p->pSchema ){
+    int iDb = sqlite3SchemaToIndex(pParse->db, p->pSchema);
+    zDb = pParse->db->aDb[iDb].zName;
+  }else{
+    zDb = p->zDatabase;
+  }
+  return sqlite3LocateTable(pParse, isView, p->zName, zDb);
+}
+
+/*
+** Locate the in-memory structure that describes 
+** a particular index given the name of that index
+** and the name of the database that contains the index.
+** Return NULL if not found.
+**
+** If zDatabase is 0, all databases are searched for the
+** table and the first matching index is returned.  (No checking
+** for duplicate index names is done.)  The search order is
+** TEMP first, then MAIN, then any auxiliary databases added
+** using the ATTACH command.
+*/
+SQLITE_PRIVATE Index *sqlite3FindIndex(sqlite3 *db, const char *zName, const char *zDb){
+  Index *p = 0;
+  int i;
