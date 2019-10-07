@@ -90342,3 +90342,246 @@ SQLITE_PRIVATE void sqlite3DeleteTable(sqlite3 *db, Table *pTable){
   /* Verify that no lookaside memory was used by schema tables */
   assert( nLookaside==0 || nLookaside==db->lookaside.nOut );
 }
+
+/*
+** Unlink the given table from the hash tables and the delete the
+** table structure with all its indices and foreign keys.
+*/
+SQLITE_PRIVATE void sqlite3UnlinkAndDeleteTable(sqlite3 *db, int iDb, const char *zTabName){
+  Table *p;
+  Db *pDb;
+
+  assert( db!=0 );
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( zTabName );
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  testcase( zTabName[0]==0 );  /* Zero-length table names are allowed */
+  pDb = &db->aDb[iDb];
+  p = sqlite3HashInsert(&pDb->pSchema->tblHash, zTabName, 0);
+  sqlite3DeleteTable(db, p);
+  db->flags |= SQLITE_InternChanges;
+}
+
+/*
+** Given a token, return a string that consists of the text of that
+** token.  Space to hold the returned string
+** is obtained from sqliteMalloc() and must be freed by the calling
+** function.
+**
+** Any quotation marks (ex:  "name", 'name', [name], or `name`) that
+** surround the body of the token are removed.
+**
+** Tokens are often just pointers into the original SQL text and so
+** are not \000 terminated and are not persistent.  The returned string
+** is \000 terminated and is persistent.
+*/
+SQLITE_PRIVATE char *sqlite3NameFromToken(sqlite3 *db, Token *pName){
+  char *zName;
+  if( pName ){
+    zName = sqlite3DbStrNDup(db, (char*)pName->z, pName->n);
+    sqlite3Dequote(zName);
+  }else{
+    zName = 0;
+  }
+  return zName;
+}
+
+/*
+** Open the sqlite_master table stored in database number iDb for
+** writing. The table is opened using cursor 0.
+*/
+SQLITE_PRIVATE void sqlite3OpenMasterTable(Parse *p, int iDb){
+  Vdbe *v = sqlite3GetVdbe(p);
+  sqlite3TableLock(p, iDb, MASTER_ROOT, 1, SCHEMA_TABLE(iDb));
+  sqlite3VdbeAddOp4Int(v, OP_OpenWrite, 0, MASTER_ROOT, iDb, 5);
+  if( p->nTab==0 ){
+    p->nTab = 1;
+  }
+}
+
+/*
+** Parameter zName points to a nul-terminated buffer containing the name
+** of a database ("main", "temp" or the name of an attached db). This
+** function returns the index of the named database in db->aDb[], or
+** -1 if the named db cannot be found.
+*/
+SQLITE_PRIVATE int sqlite3FindDbName(sqlite3 *db, const char *zName){
+  int i = -1;         /* Database number */
+  if( zName ){
+    Db *pDb;
+    int n = sqlite3Strlen30(zName);
+    for(i=(db->nDb-1), pDb=&db->aDb[i]; i>=0; i--, pDb--){
+      if( (!OMIT_TEMPDB || i!=1 ) && n==sqlite3Strlen30(pDb->zName) && 
+          0==sqlite3StrICmp(pDb->zName, zName) ){
+        break;
+      }
+    }
+  }
+  return i;
+}
+
+/*
+** The token *pName contains the name of a database (either "main" or
+** "temp" or the name of an attached db). This routine returns the
+** index of the named database in db->aDb[], or -1 if the named db 
+** does not exist.
+*/
+SQLITE_PRIVATE int sqlite3FindDb(sqlite3 *db, Token *pName){
+  int i;                               /* Database number */
+  char *zName;                         /* Name we are searching for */
+  zName = sqlite3NameFromToken(db, pName);
+  i = sqlite3FindDbName(db, zName);
+  sqlite3DbFree(db, zName);
+  return i;
+}
+
+/* The table or view or trigger name is passed to this routine via tokens
+** pName1 and pName2. If the table name was fully qualified, for example:
+**
+** CREATE TABLE xxx.yyy (...);
+** 
+** Then pName1 is set to "xxx" and pName2 "yyy". On the other hand if
+** the table name is not fully qualified, i.e.:
+**
+** CREATE TABLE yyy(...);
+**
+** Then pName1 is set to "yyy" and pName2 is "".
+**
+** This routine sets the *ppUnqual pointer to point at the token (pName1 or
+** pName2) that stores the unqualified table name.  The index of the
+** database "xxx" is returned.
+*/
+SQLITE_PRIVATE int sqlite3TwoPartName(
+  Parse *pParse,      /* Parsing and code generating context */
+  Token *pName1,      /* The "xxx" in the name "xxx.yyy" or "xxx" */
+  Token *pName2,      /* The "yyy" in the name "xxx.yyy" */
+  Token **pUnqual     /* Write the unqualified object name here */
+){
+  int iDb;                    /* Database holding the object */
+  sqlite3 *db = pParse->db;
+
+  if( ALWAYS(pName2!=0) && pName2->n>0 ){
+    if( db->init.busy ) {
+      sqlite3ErrorMsg(pParse, "corrupt database");
+      pParse->nErr++;
+      return -1;
+    }
+    *pUnqual = pName2;
+    iDb = sqlite3FindDb(db, pName1);
+    if( iDb<0 ){
+      sqlite3ErrorMsg(pParse, "unknown database %T", pName1);
+      pParse->nErr++;
+      return -1;
+    }
+  }else{
+    assert( db->init.iDb==0 || db->init.busy );
+    iDb = db->init.iDb;
+    *pUnqual = pName1;
+  }
+  return iDb;
+}
+
+/*
+** This routine is used to check if the UTF-8 string zName is a legal
+** unqualified name for a new schema object (table, index, view or
+** trigger). All names are legal except those that begin with the string
+** "sqlite_" (in upper, lower or mixed case). This portion of the namespace
+** is reserved for internal use.
+*/
+SQLITE_PRIVATE int sqlite3CheckObjectName(Parse *pParse, const char *zName){
+  if( !pParse->db->init.busy && pParse->nested==0 
+          && (pParse->db->flags & SQLITE_WriteSchema)==0
+          && 0==sqlite3StrNICmp(zName, "sqlite_", 7) ){
+    sqlite3ErrorMsg(pParse, "object name reserved for internal use: %s", zName);
+    return SQLITE_ERROR;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Return the PRIMARY KEY index of a table
+*/
+SQLITE_PRIVATE Index *sqlite3PrimaryKeyIndex(Table *pTab){
+  Index *p;
+  for(p=pTab->pIndex; p && !IsPrimaryKeyIndex(p); p=p->pNext){}
+  return p;
+}
+
+/*
+** Return the column of index pIdx that corresponds to table
+** column iCol.  Return -1 if not found.
+*/
+SQLITE_PRIVATE i16 sqlite3ColumnOfIndex(Index *pIdx, i16 iCol){
+  int i;
+  for(i=0; i<pIdx->nColumn; i++){
+    if( iCol==pIdx->aiColumn[i] ) return i;
+  }
+  return -1;
+}
+
+/*
+** Begin constructing a new table representation in memory.  This is
+** the first of several action routines that get called in response
+** to a CREATE TABLE statement.  In particular, this routine is called
+** after seeing tokens "CREATE" and "TABLE" and the table name. The isTemp
+** flag is true if the table should be stored in the auxiliary database
+** file instead of in the main database file.  This is normally the case
+** when the "TEMP" or "TEMPORARY" keyword occurs in between
+** CREATE and TABLE.
+**
+** The new table record is initialized and put in pParse->pNewTable.
+** As more of the CREATE TABLE statement is parsed, additional action
+** routines will be called to add more information to this record.
+** At the end of the CREATE TABLE statement, the sqlite3EndTable() routine
+** is called to complete the construction of the new table record.
+*/
+SQLITE_PRIVATE void sqlite3StartTable(
+  Parse *pParse,   /* Parser context */
+  Token *pName1,   /* First part of the name of the table or view */
+  Token *pName2,   /* Second part of the name of the table or view */
+  int isTemp,      /* True if this is a TEMP table */
+  int isView,      /* True if this is a VIEW */
+  int isVirtual,   /* True if this is a VIRTUAL table */
+  int noErr        /* Do nothing if table already exists */
+){
+  Table *pTable;
+  char *zName = 0; /* The name of the new table */
+  sqlite3 *db = pParse->db;
+  Vdbe *v;
+  int iDb;         /* Database number to create the table in */
+  Token *pName;    /* Unqualified name of the table to create */
+
+  /* The table or view name to create is passed to this routine via tokens
+  ** pName1 and pName2. If the table name was fully qualified, for example:
+  **
+  ** CREATE TABLE xxx.yyy (...);
+  ** 
+  ** Then pName1 is set to "xxx" and pName2 "yyy". On the other hand if
+  ** the table name is not fully qualified, i.e.:
+  **
+  ** CREATE TABLE yyy(...);
+  **
+  ** Then pName1 is set to "yyy" and pName2 is "".
+  **
+  ** The call below sets the pName pointer to point at the token (pName1 or
+  ** pName2) that stores the unqualified table name. The variable iDb is
+  ** set to the index of the database that the table or view is to be
+  ** created in.
+  */
+  iDb = sqlite3TwoPartName(pParse, pName1, pName2, &pName);
+  if( iDb<0 ) return;
+  if( !OMIT_TEMPDB && isTemp && pName2->n>0 && iDb!=1 ){
+    /* If creating a temp table, the name may not be qualified. Unless 
+    ** the database name is "temp" anyway.  */
+    sqlite3ErrorMsg(pParse, "temporary table name must be unqualified");
+    return;
+  }
+  if( !OMIT_TEMPDB && isTemp ) iDb = 1;
+
+  pParse->sNameToken = *pName;
+  zName = sqlite3NameFromToken(db, pName);
+  if( zName==0 ) return;
+  if( SQLITE_OK!=sqlite3CheckObjectName(pParse, zName) ){
+    goto begin_table_error;
+  }
+  if( db->init.iDb==1 ) isTemp = 1;
