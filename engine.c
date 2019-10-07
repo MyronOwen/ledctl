@@ -90112,3 +90112,233 @@ SQLITE_PRIVATE Table *sqlite3LocateTableItem(
 SQLITE_PRIVATE Index *sqlite3FindIndex(sqlite3 *db, const char *zName, const char *zDb){
   Index *p = 0;
   int i;
+  /* All mutexes are required for schema access.  Make sure we hold them. */
+  assert( zDb!=0 || sqlite3BtreeHoldsAllMutexes(db) );
+  for(i=OMIT_TEMPDB; i<db->nDb; i++){
+    int j = (i<2) ? i^1 : i;  /* Search TEMP before MAIN */
+    Schema *pSchema = db->aDb[j].pSchema;
+    assert( pSchema );
+    if( zDb && sqlite3StrICmp(zDb, db->aDb[j].zName) ) continue;
+    assert( sqlite3SchemaMutexHeld(db, j, 0) );
+    p = sqlite3HashFind(&pSchema->idxHash, zName);
+    if( p ) break;
+  }
+  return p;
+}
+
+/*
+** Reclaim the memory used by an index
+*/
+static void freeIndex(sqlite3 *db, Index *p){
+#ifndef SQLITE_OMIT_ANALYZE
+  sqlite3DeleteIndexSamples(db, p);
+#endif
+  sqlite3ExprDelete(db, p->pPartIdxWhere);
+  sqlite3DbFree(db, p->zColAff);
+  if( p->isResized ) sqlite3DbFree(db, p->azColl);
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  sqlite3_free(p->aiRowEst);
+#endif
+  sqlite3DbFree(db, p);
+}
+
+/*
+** For the index called zIdxName which is found in the database iDb,
+** unlike that index from its Table then remove the index from
+** the index hash table and free all memory structures associated
+** with the index.
+*/
+SQLITE_PRIVATE void sqlite3UnlinkAndDeleteIndex(sqlite3 *db, int iDb, const char *zIdxName){
+  Index *pIndex;
+  Hash *pHash;
+
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  pHash = &db->aDb[iDb].pSchema->idxHash;
+  pIndex = sqlite3HashInsert(pHash, zIdxName, 0);
+  if( ALWAYS(pIndex) ){
+    if( pIndex->pTable->pIndex==pIndex ){
+      pIndex->pTable->pIndex = pIndex->pNext;
+    }else{
+      Index *p;
+      /* Justification of ALWAYS();  The index must be on the list of
+      ** indices. */
+      p = pIndex->pTable->pIndex;
+      while( ALWAYS(p) && p->pNext!=pIndex ){ p = p->pNext; }
+      if( ALWAYS(p && p->pNext==pIndex) ){
+        p->pNext = pIndex->pNext;
+      }
+    }
+    freeIndex(db, pIndex);
+  }
+  db->flags |= SQLITE_InternChanges;
+}
+
+/*
+** Look through the list of open database files in db->aDb[] and if
+** any have been closed, remove them from the list.  Reallocate the
+** db->aDb[] structure to a smaller size, if possible.
+**
+** Entry 0 (the "main" database) and entry 1 (the "temp" database)
+** are never candidates for being collapsed.
+*/
+SQLITE_PRIVATE void sqlite3CollapseDatabaseArray(sqlite3 *db){
+  int i, j;
+  for(i=j=2; i<db->nDb; i++){
+    struct Db *pDb = &db->aDb[i];
+    if( pDb->pBt==0 ){
+      sqlite3DbFree(db, pDb->zName);
+      pDb->zName = 0;
+      continue;
+    }
+    if( j<i ){
+      db->aDb[j] = db->aDb[i];
+    }
+    j++;
+  }
+  memset(&db->aDb[j], 0, (db->nDb-j)*sizeof(db->aDb[j]));
+  db->nDb = j;
+  if( db->nDb<=2 && db->aDb!=db->aDbStatic ){
+    memcpy(db->aDbStatic, db->aDb, 2*sizeof(db->aDb[0]));
+    sqlite3DbFree(db, db->aDb);
+    db->aDb = db->aDbStatic;
+  }
+}
+
+/*
+** Reset the schema for the database at index iDb.  Also reset the
+** TEMP schema.
+*/
+SQLITE_PRIVATE void sqlite3ResetOneSchema(sqlite3 *db, int iDb){
+  Db *pDb;
+  assert( iDb<db->nDb );
+
+  /* Case 1:  Reset the single schema identified by iDb */
+  pDb = &db->aDb[iDb];
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  assert( pDb->pSchema!=0 );
+  sqlite3SchemaClear(pDb->pSchema);
+
+  /* If any database other than TEMP is reset, then also reset TEMP
+  ** since TEMP might be holding triggers that reference tables in the
+  ** other database.
+  */
+  if( iDb!=1 ){
+    pDb = &db->aDb[1];
+    assert( pDb->pSchema!=0 );
+    sqlite3SchemaClear(pDb->pSchema);
+  }
+  return;
+}
+
+/*
+** Erase all schema information from all attached databases (including
+** "main" and "temp") for a single database connection.
+*/
+SQLITE_PRIVATE void sqlite3ResetAllSchemasOfConnection(sqlite3 *db){
+  int i;
+  sqlite3BtreeEnterAll(db);
+  for(i=0; i<db->nDb; i++){
+    Db *pDb = &db->aDb[i];
+    if( pDb->pSchema ){
+      sqlite3SchemaClear(pDb->pSchema);
+    }
+  }
+  db->flags &= ~SQLITE_InternChanges;
+  sqlite3VtabUnlockList(db);
+  sqlite3BtreeLeaveAll(db);
+  sqlite3CollapseDatabaseArray(db);
+}
+
+/*
+** This routine is called when a commit occurs.
+*/
+SQLITE_PRIVATE void sqlite3CommitInternalChanges(sqlite3 *db){
+  db->flags &= ~SQLITE_InternChanges;
+}
+
+/*
+** Delete memory allocated for the column names of a table or view (the
+** Table.aCol[] array).
+*/
+static void sqliteDeleteColumnNames(sqlite3 *db, Table *pTable){
+  int i;
+  Column *pCol;
+  assert( pTable!=0 );
+  if( (pCol = pTable->aCol)!=0 ){
+    for(i=0; i<pTable->nCol; i++, pCol++){
+      sqlite3DbFree(db, pCol->zName);
+      sqlite3ExprDelete(db, pCol->pDflt);
+      sqlite3DbFree(db, pCol->zDflt);
+      sqlite3DbFree(db, pCol->zType);
+      sqlite3DbFree(db, pCol->zColl);
+    }
+    sqlite3DbFree(db, pTable->aCol);
+  }
+}
+
+/*
+** Remove the memory data structures associated with the given
+** Table.  No changes are made to disk by this routine.
+**
+** This routine just deletes the data structure.  It does not unlink
+** the table data structure from the hash table.  But it does destroy
+** memory structures of the indices and foreign keys associated with 
+** the table.
+**
+** The db parameter is optional.  It is needed if the Table object 
+** contains lookaside memory.  (Table objects in the schema do not use
+** lookaside memory, but some ephemeral Table objects do.)  Or the
+** db parameter can be used with db->pnBytesFreed to measure the memory
+** used by the Table object.
+*/
+SQLITE_PRIVATE void sqlite3DeleteTable(sqlite3 *db, Table *pTable){
+  Index *pIndex, *pNext;
+  TESTONLY( int nLookaside; ) /* Used to verify lookaside not used for schema */
+
+  assert( !pTable || pTable->nRef>0 );
+
+  /* Do not delete the table until the reference count reaches zero. */
+  if( !pTable ) return;
+  if( ((!db || db->pnBytesFreed==0) && (--pTable->nRef)>0) ) return;
+
+  /* Record the number of outstanding lookaside allocations in schema Tables
+  ** prior to doing any free() operations.  Since schema Tables do not use
+  ** lookaside, this number should not change. */
+  TESTONLY( nLookaside = (db && (pTable->tabFlags & TF_Ephemeral)==0) ?
+                         db->lookaside.nOut : 0 );
+
+  /* Delete all indices associated with this table. */
+  for(pIndex = pTable->pIndex; pIndex; pIndex=pNext){
+    pNext = pIndex->pNext;
+    assert( pIndex->pSchema==pTable->pSchema );
+    if( !db || db->pnBytesFreed==0 ){
+      char *zName = pIndex->zName; 
+      TESTONLY ( Index *pOld = ) sqlite3HashInsert(
+         &pIndex->pSchema->idxHash, zName, 0
+      );
+      assert( db==0 || sqlite3SchemaMutexHeld(db, 0, pIndex->pSchema) );
+      assert( pOld==pIndex || pOld==0 );
+    }
+    freeIndex(db, pIndex);
+  }
+
+  /* Delete any foreign keys attached to this table. */
+  sqlite3FkDelete(db, pTable);
+
+  /* Delete the Table structure itself.
+  */
+  sqliteDeleteColumnNames(db, pTable);
+  sqlite3DbFree(db, pTable->zName);
+  sqlite3DbFree(db, pTable->zColAff);
+  sqlite3SelectDelete(db, pTable->pSelect);
+#ifndef SQLITE_OMIT_CHECK
+  sqlite3ExprListDelete(db, pTable->pCheck);
+#endif
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  sqlite3VtabClear(db, pTable);
+#endif
+  sqlite3DbFree(db, pTable);
+
+  /* Verify that no lookaside memory was used by schema tables */
+  assert( nLookaside==0 || nLookaside==db->lookaside.nOut );
+}
