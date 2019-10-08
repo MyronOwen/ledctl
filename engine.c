@@ -90831,3 +90831,254 @@ SQLITE_PRIVATE void sqlite3AddNotNull(Parse *pParse, int onError){
 ** 'INT'         | SQLITE_AFF_INTEGER
 ** 'CHAR'        | SQLITE_AFF_TEXT
 ** 'CLOB'        | SQLITE_AFF_TEXT
+** 'TEXT'        | SQLITE_AFF_TEXT
+** 'BLOB'        | SQLITE_AFF_NONE
+** 'REAL'        | SQLITE_AFF_REAL
+** 'FLOA'        | SQLITE_AFF_REAL
+** 'DOUB'        | SQLITE_AFF_REAL
+**
+** If none of the substrings in the above table are found,
+** SQLITE_AFF_NUMERIC is returned.
+*/
+SQLITE_PRIVATE char sqlite3AffinityType(const char *zIn, u8 *pszEst){
+  u32 h = 0;
+  char aff = SQLITE_AFF_NUMERIC;
+  const char *zChar = 0;
+
+  if( zIn==0 ) return aff;
+  while( zIn[0] ){
+    h = (h<<8) + sqlite3UpperToLower[(*zIn)&0xff];
+    zIn++;
+    if( h==(('c'<<24)+('h'<<16)+('a'<<8)+'r') ){             /* CHAR */
+      aff = SQLITE_AFF_TEXT;
+      zChar = zIn;
+    }else if( h==(('c'<<24)+('l'<<16)+('o'<<8)+'b') ){       /* CLOB */
+      aff = SQLITE_AFF_TEXT;
+    }else if( h==(('t'<<24)+('e'<<16)+('x'<<8)+'t') ){       /* TEXT */
+      aff = SQLITE_AFF_TEXT;
+    }else if( h==(('b'<<24)+('l'<<16)+('o'<<8)+'b')          /* BLOB */
+        && (aff==SQLITE_AFF_NUMERIC || aff==SQLITE_AFF_REAL) ){
+      aff = SQLITE_AFF_NONE;
+      if( zIn[0]=='(' ) zChar = zIn;
+#ifndef SQLITE_OMIT_FLOATING_POINT
+    }else if( h==(('r'<<24)+('e'<<16)+('a'<<8)+'l')          /* REAL */
+        && aff==SQLITE_AFF_NUMERIC ){
+      aff = SQLITE_AFF_REAL;
+    }else if( h==(('f'<<24)+('l'<<16)+('o'<<8)+'a')          /* FLOA */
+        && aff==SQLITE_AFF_NUMERIC ){
+      aff = SQLITE_AFF_REAL;
+    }else if( h==(('d'<<24)+('o'<<16)+('u'<<8)+'b')          /* DOUB */
+        && aff==SQLITE_AFF_NUMERIC ){
+      aff = SQLITE_AFF_REAL;
+#endif
+    }else if( (h&0x00FFFFFF)==(('i'<<16)+('n'<<8)+'t') ){    /* INT */
+      aff = SQLITE_AFF_INTEGER;
+      break;
+    }
+  }
+
+  /* If pszEst is not NULL, store an estimate of the field size.  The
+  ** estimate is scaled so that the size of an integer is 1.  */
+  if( pszEst ){
+    *pszEst = 1;   /* default size is approx 4 bytes */
+    if( aff<SQLITE_AFF_NUMERIC ){
+      if( zChar ){
+        while( zChar[0] ){
+          if( sqlite3Isdigit(zChar[0]) ){
+            int v = 0;
+            sqlite3GetInt32(zChar, &v);
+            v = v/4 + 1;
+            if( v>255 ) v = 255;
+            *pszEst = v; /* BLOB(k), VARCHAR(k), CHAR(k) -> r=(k/4+1) */
+            break;
+          }
+          zChar++;
+        }
+      }else{
+        *pszEst = 5;   /* BLOB, TEXT, CLOB -> r=5  (approx 20 bytes)*/
+      }
+    }
+  }
+  return aff;
+}
+
+/*
+** This routine is called by the parser while in the middle of
+** parsing a CREATE TABLE statement.  The pFirst token is the first
+** token in the sequence of tokens that describe the type of the
+** column currently under construction.   pLast is the last token
+** in the sequence.  Use this information to construct a string
+** that contains the typename of the column and store that string
+** in zType.
+*/ 
+SQLITE_PRIVATE void sqlite3AddColumnType(Parse *pParse, Token *pType){
+  Table *p;
+  Column *pCol;
+
+  p = pParse->pNewTable;
+  if( p==0 || NEVER(p->nCol<1) ) return;
+  pCol = &p->aCol[p->nCol-1];
+  assert( pCol->zType==0 );
+  pCol->zType = sqlite3NameFromToken(pParse->db, pType);
+  pCol->affinity = sqlite3AffinityType(pCol->zType, &pCol->szEst);
+}
+
+/*
+** The expression is the default value for the most recently added column
+** of the table currently under construction.
+**
+** Default value expressions must be constant.  Raise an exception if this
+** is not the case.
+**
+** This routine is called by the parser while in the middle of
+** parsing a CREATE TABLE statement.
+*/
+SQLITE_PRIVATE void sqlite3AddDefaultValue(Parse *pParse, ExprSpan *pSpan){
+  Table *p;
+  Column *pCol;
+  sqlite3 *db = pParse->db;
+  p = pParse->pNewTable;
+  if( p!=0 ){
+    pCol = &(p->aCol[p->nCol-1]);
+    if( !sqlite3ExprIsConstantOrFunction(pSpan->pExpr, db->init.busy) ){
+      sqlite3ErrorMsg(pParse, "default value of column [%s] is not constant",
+          pCol->zName);
+    }else{
+      /* A copy of pExpr is used instead of the original, as pExpr contains
+      ** tokens that point to volatile memory. The 'span' of the expression
+      ** is required by pragma table_info.
+      */
+      sqlite3ExprDelete(db, pCol->pDflt);
+      pCol->pDflt = sqlite3ExprDup(db, pSpan->pExpr, EXPRDUP_REDUCE);
+      sqlite3DbFree(db, pCol->zDflt);
+      pCol->zDflt = sqlite3DbStrNDup(db, (char*)pSpan->zStart,
+                                     (int)(pSpan->zEnd - pSpan->zStart));
+    }
+  }
+  sqlite3ExprDelete(db, pSpan->pExpr);
+}
+
+/*
+** Designate the PRIMARY KEY for the table.  pList is a list of names 
+** of columns that form the primary key.  If pList is NULL, then the
+** most recently added column of the table is the primary key.
+**
+** A table can have at most one primary key.  If the table already has
+** a primary key (and this is the second primary key) then create an
+** error.
+**
+** If the PRIMARY KEY is on a single column whose datatype is INTEGER,
+** then we will try to use that column as the rowid.  Set the Table.iPKey
+** field of the table under construction to be the index of the
+** INTEGER PRIMARY KEY column.  Table.iPKey is set to -1 if there is
+** no INTEGER PRIMARY KEY.
+**
+** If the key is not an INTEGER PRIMARY KEY, then create a unique
+** index for the key.  No index is created for INTEGER PRIMARY KEYs.
+*/
+SQLITE_PRIVATE void sqlite3AddPrimaryKey(
+  Parse *pParse,    /* Parsing context */
+  ExprList *pList,  /* List of field names to be indexed */
+  int onError,      /* What to do with a uniqueness conflict */
+  int autoInc,      /* True if the AUTOINCREMENT keyword is present */
+  int sortOrder     /* SQLITE_SO_ASC or SQLITE_SO_DESC */
+){
+  Table *pTab = pParse->pNewTable;
+  char *zType = 0;
+  int iCol = -1, i;
+  int nTerm;
+  if( pTab==0 || IN_DECLARE_VTAB ) goto primary_key_exit;
+  if( pTab->tabFlags & TF_HasPrimaryKey ){
+    sqlite3ErrorMsg(pParse, 
+      "table \"%s\" has more than one primary key", pTab->zName);
+    goto primary_key_exit;
+  }
+  pTab->tabFlags |= TF_HasPrimaryKey;
+  if( pList==0 ){
+    iCol = pTab->nCol - 1;
+    pTab->aCol[iCol].colFlags |= COLFLAG_PRIMKEY;
+    zType = pTab->aCol[iCol].zType;
+    nTerm = 1;
+  }else{
+    nTerm = pList->nExpr;
+    for(i=0; i<nTerm; i++){
+      for(iCol=0; iCol<pTab->nCol; iCol++){
+        if( sqlite3StrICmp(pList->a[i].zName, pTab->aCol[iCol].zName)==0 ){
+          pTab->aCol[iCol].colFlags |= COLFLAG_PRIMKEY;
+          zType = pTab->aCol[iCol].zType;
+          break;
+        }
+      }
+    }
+  }
+  if( nTerm==1
+   && zType && sqlite3StrICmp(zType, "INTEGER")==0
+   && sortOrder==SQLITE_SO_ASC
+  ){
+    pTab->iPKey = iCol;
+    pTab->keyConf = (u8)onError;
+    assert( autoInc==0 || autoInc==1 );
+    pTab->tabFlags |= autoInc*TF_Autoincrement;
+    if( pList ) pParse->iPkSortOrder = pList->a[0].sortOrder;
+  }else if( autoInc ){
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+    sqlite3ErrorMsg(pParse, "AUTOINCREMENT is only allowed on an "
+       "INTEGER PRIMARY KEY");
+#endif
+  }else{
+    Vdbe *v = pParse->pVdbe;
+    Index *p;
+    if( v ) pParse->addrSkipPK = sqlite3VdbeAddOp0(v, OP_Noop);
+    p = sqlite3CreateIndex(pParse, 0, 0, 0, pList, onError, 0,
+                           0, sortOrder, 0);
+    if( p ){
+      p->idxType = SQLITE_IDXTYPE_PRIMARYKEY;
+      if( v ) sqlite3VdbeJumpHere(v, pParse->addrSkipPK);
+    }
+    pList = 0;
+  }
+
+primary_key_exit:
+  sqlite3ExprListDelete(pParse->db, pList);
+  return;
+}
+
+/*
+** Add a new CHECK constraint to the table currently under construction.
+*/
+SQLITE_PRIVATE void sqlite3AddCheckConstraint(
+  Parse *pParse,    /* Parsing context */
+  Expr *pCheckExpr  /* The check expression */
+){
+#ifndef SQLITE_OMIT_CHECK
+  Table *pTab = pParse->pNewTable;
+  sqlite3 *db = pParse->db;
+  if( pTab && !IN_DECLARE_VTAB
+   && !sqlite3BtreeIsReadonly(db->aDb[db->init.iDb].pBt)
+  ){
+    pTab->pCheck = sqlite3ExprListAppend(pParse, pTab->pCheck, pCheckExpr);
+    if( pParse->constraintName.n ){
+      sqlite3ExprListSetName(pParse, pTab->pCheck, &pParse->constraintName, 1);
+    }
+  }else
+#endif
+  {
+    sqlite3ExprDelete(pParse->db, pCheckExpr);
+  }
+}
+
+/*
+** Set the collation function of the most recently parsed table column
+** to the CollSeq given.
+*/
+SQLITE_PRIVATE void sqlite3AddCollateType(Parse *pParse, Token *pToken){
+  Table *p;
+  int i;
+  char *zColl;              /* Dequoted name of collation sequence */
+  sqlite3 *db;
+
+  if( (p = pParse->pNewTable)==0 ) return;
+  i = p->nCol-1;
+  db = pParse->db;
+  zColl = sqlite3NameFromToken(db, pToken);
+  if( !zColl ) return;
