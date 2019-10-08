@@ -90585,3 +90585,249 @@ SQLITE_PRIVATE void sqlite3StartTable(
     goto begin_table_error;
   }
   if( db->init.iDb==1 ) isTemp = 1;
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  assert( (isTemp & 1)==isTemp );
+  {
+    int code;
+    char *zDb = db->aDb[iDb].zName;
+    if( sqlite3AuthCheck(pParse, SQLITE_INSERT, SCHEMA_TABLE(isTemp), 0, zDb) ){
+      goto begin_table_error;
+    }
+    if( isView ){
+      if( !OMIT_TEMPDB && isTemp ){
+        code = SQLITE_CREATE_TEMP_VIEW;
+      }else{
+        code = SQLITE_CREATE_VIEW;
+      }
+    }else{
+      if( !OMIT_TEMPDB && isTemp ){
+        code = SQLITE_CREATE_TEMP_TABLE;
+      }else{
+        code = SQLITE_CREATE_TABLE;
+      }
+    }
+    if( !isVirtual && sqlite3AuthCheck(pParse, code, zName, 0, zDb) ){
+      goto begin_table_error;
+    }
+  }
+#endif
+
+  /* Make sure the new table name does not collide with an existing
+  ** index or table name in the same database.  Issue an error message if
+  ** it does. The exception is if the statement being parsed was passed
+  ** to an sqlite3_declare_vtab() call. In that case only the column names
+  ** and types will be used, so there is no need to test for namespace
+  ** collisions.
+  */
+  if( !IN_DECLARE_VTAB ){
+    char *zDb = db->aDb[iDb].zName;
+    if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+      goto begin_table_error;
+    }
+    pTable = sqlite3FindTable(db, zName, zDb);
+    if( pTable ){
+      if( !noErr ){
+        sqlite3ErrorMsg(pParse, "table %T already exists", pName);
+      }else{
+        assert( !db->init.busy );
+        sqlite3CodeVerifySchema(pParse, iDb);
+      }
+      goto begin_table_error;
+    }
+    if( sqlite3FindIndex(db, zName, zDb)!=0 ){
+      sqlite3ErrorMsg(pParse, "there is already an index named %s", zName);
+      goto begin_table_error;
+    }
+  }
+
+  pTable = sqlite3DbMallocZero(db, sizeof(Table));
+  if( pTable==0 ){
+    db->mallocFailed = 1;
+    pParse->rc = SQLITE_NOMEM;
+    pParse->nErr++;
+    goto begin_table_error;
+  }
+  pTable->zName = zName;
+  pTable->iPKey = -1;
+  pTable->pSchema = db->aDb[iDb].pSchema;
+  pTable->nRef = 1;
+  pTable->nRowLogEst = 200; assert( 200==sqlite3LogEst(1048576) );
+  assert( pParse->pNewTable==0 );
+  pParse->pNewTable = pTable;
+
+  /* If this is the magic sqlite_sequence table used by autoincrement,
+  ** then record a pointer to this table in the main database structure
+  ** so that INSERT can find the table easily.
+  */
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+  if( !pParse->nested && strcmp(zName, "sqlite_sequence")==0 ){
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    pTable->pSchema->pSeqTab = pTable;
+  }
+#endif
+
+  /* Begin generating the code that will insert the table record into
+  ** the SQLITE_MASTER table.  Note in particular that we must go ahead
+  ** and allocate the record number for the table entry now.  Before any
+  ** PRIMARY KEY or UNIQUE keywords are parsed.  Those keywords will cause
+  ** indices to be created and the table record must come before the 
+  ** indices.  Hence, the record number for the table must be allocated
+  ** now.
+  */
+  if( !db->init.busy && (v = sqlite3GetVdbe(pParse))!=0 ){
+    int j1;
+    int fileFormat;
+    int reg1, reg2, reg3;
+    sqlite3BeginWriteOperation(pParse, 0, iDb);
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    if( isVirtual ){
+      sqlite3VdbeAddOp0(v, OP_VBegin);
+    }
+#endif
+
+    /* If the file format and encoding in the database have not been set, 
+    ** set them now.
+    */
+    reg1 = pParse->regRowid = ++pParse->nMem;
+    reg2 = pParse->regRoot = ++pParse->nMem;
+    reg3 = ++pParse->nMem;
+    sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, reg3, BTREE_FILE_FORMAT);
+    sqlite3VdbeUsesBtree(v, iDb);
+    j1 = sqlite3VdbeAddOp1(v, OP_If, reg3); VdbeCoverage(v);
+    fileFormat = (db->flags & SQLITE_LegacyFileFmt)!=0 ?
+                  1 : SQLITE_MAX_FILE_FORMAT;
+    sqlite3VdbeAddOp2(v, OP_Integer, fileFormat, reg3);
+    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_FILE_FORMAT, reg3);
+    sqlite3VdbeAddOp2(v, OP_Integer, ENC(db), reg3);
+    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_TEXT_ENCODING, reg3);
+    sqlite3VdbeJumpHere(v, j1);
+
+    /* This just creates a place-holder record in the sqlite_master table.
+    ** The record created does not contain anything yet.  It will be replaced
+    ** by the real entry in code generated at sqlite3EndTable().
+    **
+    ** The rowid for the new entry is left in register pParse->regRowid.
+    ** The root page number of the new table is left in reg pParse->regRoot.
+    ** The rowid and root page number values are needed by the code that
+    ** sqlite3EndTable will generate.
+    */
+#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE)
+    if( isView || isVirtual ){
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, reg2);
+    }else
+#endif
+    {
+      pParse->addrCrTab = sqlite3VdbeAddOp2(v, OP_CreateTable, iDb, reg2);
+    }
+    sqlite3OpenMasterTable(pParse, iDb);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, 0, reg1);
+    sqlite3VdbeAddOp2(v, OP_Null, 0, reg3);
+    sqlite3VdbeAddOp3(v, OP_Insert, 0, reg3, reg1);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+    sqlite3VdbeAddOp0(v, OP_Close);
+  }
+
+  /* Normal (non-error) return. */
+  return;
+
+  /* If an error occurs, we jump here */
+begin_table_error:
+  sqlite3DbFree(db, zName);
+  return;
+}
+
+/*
+** This macro is used to compare two strings in a case-insensitive manner.
+** It is slightly faster than calling sqlite3StrICmp() directly, but
+** produces larger code.
+**
+** WARNING: This macro is not compatible with the strcmp() family. It
+** returns true if the two strings are equal, otherwise false.
+*/
+#define STRICMP(x, y) (\
+sqlite3UpperToLower[*(unsigned char *)(x)]==   \
+sqlite3UpperToLower[*(unsigned char *)(y)]     \
+&& sqlite3StrICmp((x)+1,(y)+1)==0 )
+
+/*
+** Add a new column to the table currently being constructed.
+**
+** The parser calls this routine once for each column declaration
+** in a CREATE TABLE statement.  sqlite3StartTable() gets called
+** first to get things going.  Then this routine is called for each
+** column.
+*/
+SQLITE_PRIVATE void sqlite3AddColumn(Parse *pParse, Token *pName){
+  Table *p;
+  int i;
+  char *z;
+  Column *pCol;
+  sqlite3 *db = pParse->db;
+  if( (p = pParse->pNewTable)==0 ) return;
+#if SQLITE_MAX_COLUMN
+  if( p->nCol+1>db->aLimit[SQLITE_LIMIT_COLUMN] ){
+    sqlite3ErrorMsg(pParse, "too many columns on %s", p->zName);
+    return;
+  }
+#endif
+  z = sqlite3NameFromToken(db, pName);
+  if( z==0 ) return;
+  for(i=0; i<p->nCol; i++){
+    if( STRICMP(z, p->aCol[i].zName) ){
+      sqlite3ErrorMsg(pParse, "duplicate column name: %s", z);
+      sqlite3DbFree(db, z);
+      return;
+    }
+  }
+  if( (p->nCol & 0x7)==0 ){
+    Column *aNew;
+    aNew = sqlite3DbRealloc(db,p->aCol,(p->nCol+8)*sizeof(p->aCol[0]));
+    if( aNew==0 ){
+      sqlite3DbFree(db, z);
+      return;
+    }
+    p->aCol = aNew;
+  }
+  pCol = &p->aCol[p->nCol];
+  memset(pCol, 0, sizeof(p->aCol[0]));
+  pCol->zName = z;
+ 
+  /* If there is no type specified, columns have the default affinity
+  ** 'NONE'. If there is a type specified, then sqlite3AddColumnType() will
+  ** be called next to set pCol->affinity correctly.
+  */
+  pCol->affinity = SQLITE_AFF_NONE;
+  pCol->szEst = 1;
+  p->nCol++;
+}
+
+/*
+** This routine is called by the parser while in the middle of
+** parsing a CREATE TABLE statement.  A "NOT NULL" constraint has
+** been seen on a column.  This routine sets the notNull flag on
+** the column currently under construction.
+*/
+SQLITE_PRIVATE void sqlite3AddNotNull(Parse *pParse, int onError){
+  Table *p;
+  p = pParse->pNewTable;
+  if( p==0 || NEVER(p->nCol<1) ) return;
+  p->aCol[p->nCol-1].notNull = (u8)onError;
+}
+
+/*
+** Scan the column type name zType (length nType) and return the
+** associated affinity type.
+**
+** This routine does a case-independent search of zType for the 
+** substrings in the following table. If one of the substrings is
+** found, the corresponding affinity is returned. If zType contains
+** more than one of the substrings, entries toward the top of 
+** the table take priority. For example, if zType is 'BLOBINT', 
+** SQLITE_AFF_INTEGER is returned.
+**
+** Substring     | Affinity
+** --------------------------------
+** 'INT'         | SQLITE_AFF_INTEGER
+** 'CHAR'        | SQLITE_AFF_TEXT
+** 'CLOB'        | SQLITE_AFF_TEXT
