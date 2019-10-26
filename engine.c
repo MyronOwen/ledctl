@@ -91082,3 +91082,247 @@ SQLITE_PRIVATE void sqlite3AddCollateType(Parse *pParse, Token *pToken){
   db = pParse->db;
   zColl = sqlite3NameFromToken(db, pToken);
   if( !zColl ) return;
+
+  if( sqlite3LocateCollSeq(pParse, zColl) ){
+    Index *pIdx;
+    sqlite3DbFree(db, p->aCol[i].zColl);
+    p->aCol[i].zColl = zColl;
+  
+    /* If the column is declared as "<name> PRIMARY KEY COLLATE <type>",
+    ** then an index may have been created on this column before the
+    ** collation type was added. Correct this if it is the case.
+    */
+    for(pIdx=p->pIndex; pIdx; pIdx=pIdx->pNext){
+      assert( pIdx->nKeyCol==1 );
+      if( pIdx->aiColumn[0]==i ){
+        pIdx->azColl[0] = p->aCol[i].zColl;
+      }
+    }
+  }else{
+    sqlite3DbFree(db, zColl);
+  }
+}
+
+/*
+** This function returns the collation sequence for database native text
+** encoding identified by the string zName, length nName.
+**
+** If the requested collation sequence is not available, or not available
+** in the database native encoding, the collation factory is invoked to
+** request it. If the collation factory does not supply such a sequence,
+** and the sequence is available in another text encoding, then that is
+** returned instead.
+**
+** If no versions of the requested collations sequence are available, or
+** another error occurs, NULL is returned and an error message written into
+** pParse.
+**
+** This routine is a wrapper around sqlite3FindCollSeq().  This routine
+** invokes the collation factory if the named collation cannot be found
+** and generates an error message.
+**
+** See also: sqlite3FindCollSeq(), sqlite3GetCollSeq()
+*/
+SQLITE_PRIVATE CollSeq *sqlite3LocateCollSeq(Parse *pParse, const char *zName){
+  sqlite3 *db = pParse->db;
+  u8 enc = ENC(db);
+  u8 initbusy = db->init.busy;
+  CollSeq *pColl;
+
+  pColl = sqlite3FindCollSeq(db, enc, zName, initbusy);
+  if( !initbusy && (!pColl || !pColl->xCmp) ){
+    pColl = sqlite3GetCollSeq(pParse, enc, pColl, zName);
+  }
+
+  return pColl;
+}
+
+
+/*
+** Generate code that will increment the schema cookie.
+**
+** The schema cookie is used to determine when the schema for the
+** database changes.  After each schema change, the cookie value
+** changes.  When a process first reads the schema it records the
+** cookie.  Thereafter, whenever it goes to access the database,
+** it checks the cookie to make sure the schema has not changed
+** since it was last read.
+**
+** This plan is not completely bullet-proof.  It is possible for
+** the schema to change multiple times and for the cookie to be
+** set back to prior value.  But schema changes are infrequent
+** and the probability of hitting the same cookie value is only
+** 1 chance in 2^32.  So we're safe enough.
+*/
+SQLITE_PRIVATE void sqlite3ChangeCookie(Parse *pParse, int iDb){
+  int r1 = sqlite3GetTempReg(pParse);
+  sqlite3 *db = pParse->db;
+  Vdbe *v = pParse->pVdbe;
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  sqlite3VdbeAddOp2(v, OP_Integer, db->aDb[iDb].pSchema->schema_cookie+1, r1);
+  sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_SCHEMA_VERSION, r1);
+  sqlite3ReleaseTempReg(pParse, r1);
+}
+
+/*
+** Measure the number of characters needed to output the given
+** identifier.  The number returned includes any quotes used
+** but does not include the null terminator.
+**
+** The estimate is conservative.  It might be larger that what is
+** really needed.
+*/
+static int identLength(const char *z){
+  int n;
+  for(n=0; *z; n++, z++){
+    if( *z=='"' ){ n++; }
+  }
+  return n + 2;
+}
+
+/*
+** The first parameter is a pointer to an output buffer. The second 
+** parameter is a pointer to an integer that contains the offset at
+** which to write into the output buffer. This function copies the
+** nul-terminated string pointed to by the third parameter, zSignedIdent,
+** to the specified offset in the buffer and updates *pIdx to refer
+** to the first byte after the last byte written before returning.
+** 
+** If the string zSignedIdent consists entirely of alpha-numeric
+** characters, does not begin with a digit and is not an SQL keyword,
+** then it is copied to the output buffer exactly as it is. Otherwise,
+** it is quoted using double-quotes.
+*/
+static void identPut(char *z, int *pIdx, char *zSignedIdent){
+  unsigned char *zIdent = (unsigned char*)zSignedIdent;
+  int i, j, needQuote;
+  i = *pIdx;
+
+  for(j=0; zIdent[j]; j++){
+    if( !sqlite3Isalnum(zIdent[j]) && zIdent[j]!='_' ) break;
+  }
+  needQuote = sqlite3Isdigit(zIdent[0])
+            || sqlite3KeywordCode(zIdent, j)!=TK_ID
+            || zIdent[j]!=0
+            || j==0;
+
+  if( needQuote ) z[i++] = '"';
+  for(j=0; zIdent[j]; j++){
+    z[i++] = zIdent[j];
+    if( zIdent[j]=='"' ) z[i++] = '"';
+  }
+  if( needQuote ) z[i++] = '"';
+  z[i] = 0;
+  *pIdx = i;
+}
+
+/*
+** Generate a CREATE TABLE statement appropriate for the given
+** table.  Memory to hold the text of the statement is obtained
+** from sqliteMalloc() and must be freed by the calling function.
+*/
+static char *createTableStmt(sqlite3 *db, Table *p){
+  int i, k, n;
+  char *zStmt;
+  char *zSep, *zSep2, *zEnd;
+  Column *pCol;
+  n = 0;
+  for(pCol = p->aCol, i=0; i<p->nCol; i++, pCol++){
+    n += identLength(pCol->zName) + 5;
+  }
+  n += identLength(p->zName);
+  if( n<50 ){ 
+    zSep = "";
+    zSep2 = ",";
+    zEnd = ")";
+  }else{
+    zSep = "\n  ";
+    zSep2 = ",\n  ";
+    zEnd = "\n)";
+  }
+  n += 35 + 6*p->nCol;
+  zStmt = sqlite3DbMallocRaw(0, n);
+  if( zStmt==0 ){
+    db->mallocFailed = 1;
+    return 0;
+  }
+  sqlite3_snprintf(n, zStmt, "CREATE TABLE ");
+  k = sqlite3Strlen30(zStmt);
+  identPut(zStmt, &k, p->zName);
+  zStmt[k++] = '(';
+  for(pCol=p->aCol, i=0; i<p->nCol; i++, pCol++){
+    static const char * const azType[] = {
+        /* SQLITE_AFF_NONE    */ "",
+        /* SQLITE_AFF_TEXT    */ " TEXT",
+        /* SQLITE_AFF_NUMERIC */ " NUM",
+        /* SQLITE_AFF_INTEGER */ " INT",
+        /* SQLITE_AFF_REAL    */ " REAL"
+    };
+    int len;
+    const char *zType;
+
+    sqlite3_snprintf(n-k, &zStmt[k], zSep);
+    k += sqlite3Strlen30(&zStmt[k]);
+    zSep = zSep2;
+    identPut(zStmt, &k, pCol->zName);
+    assert( pCol->affinity-SQLITE_AFF_NONE >= 0 );
+    assert( pCol->affinity-SQLITE_AFF_NONE < ArraySize(azType) );
+    testcase( pCol->affinity==SQLITE_AFF_NONE );
+    testcase( pCol->affinity==SQLITE_AFF_TEXT );
+    testcase( pCol->affinity==SQLITE_AFF_NUMERIC );
+    testcase( pCol->affinity==SQLITE_AFF_INTEGER );
+    testcase( pCol->affinity==SQLITE_AFF_REAL );
+    
+    zType = azType[pCol->affinity - SQLITE_AFF_NONE];
+    len = sqlite3Strlen30(zType);
+    assert( pCol->affinity==SQLITE_AFF_NONE 
+            || pCol->affinity==sqlite3AffinityType(zType, 0) );
+    memcpy(&zStmt[k], zType, len);
+    k += len;
+    assert( k<=n );
+  }
+  sqlite3_snprintf(n-k, &zStmt[k], "%s", zEnd);
+  return zStmt;
+}
+
+/*
+** Resize an Index object to hold N columns total.  Return SQLITE_OK
+** on success and SQLITE_NOMEM on an OOM error.
+*/
+static int resizeIndexObject(sqlite3 *db, Index *pIdx, int N){
+  char *zExtra;
+  int nByte;
+  if( pIdx->nColumn>=N ) return SQLITE_OK;
+  assert( pIdx->isResized==0 );
+  nByte = (sizeof(char*) + sizeof(i16) + 1)*N;
+  zExtra = sqlite3DbMallocZero(db, nByte);
+  if( zExtra==0 ) return SQLITE_NOMEM;
+  memcpy(zExtra, pIdx->azColl, sizeof(char*)*pIdx->nColumn);
+  pIdx->azColl = (char**)zExtra;
+  zExtra += sizeof(char*)*N;
+  memcpy(zExtra, pIdx->aiColumn, sizeof(i16)*pIdx->nColumn);
+  pIdx->aiColumn = (i16*)zExtra;
+  zExtra += sizeof(i16)*N;
+  memcpy(zExtra, pIdx->aSortOrder, pIdx->nColumn);
+  pIdx->aSortOrder = (u8*)zExtra;
+  pIdx->nColumn = N;
+  pIdx->isResized = 1;
+  return SQLITE_OK;
+}
+
+/*
+** Estimate the total row width for a table.
+*/
+static void estimateTableWidth(Table *pTab){
+  unsigned wTable = 0;
+  const Column *pTabCol;
+  int i;
+  for(i=pTab->nCol, pTabCol=pTab->aCol; i>0; i--, pTabCol++){
+    wTable += pTabCol->szEst;
+  }
+  if( pTab->iPKey<0 ) wTable++;
+  pTab->szTabRow = sqlite3LogEst(wTable*4);
+}
+
+/*
+** Estimate the average size of a row for an index.
