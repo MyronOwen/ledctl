@@ -91326,3 +91326,212 @@ static void estimateTableWidth(Table *pTab){
 
 /*
 ** Estimate the average size of a row for an index.
+*/
+static void estimateIndexWidth(Index *pIdx){
+  unsigned wIndex = 0;
+  int i;
+  const Column *aCol = pIdx->pTable->aCol;
+  for(i=0; i<pIdx->nColumn; i++){
+    i16 x = pIdx->aiColumn[i];
+    assert( x<pIdx->pTable->nCol );
+    wIndex += x<0 ? 1 : aCol[pIdx->aiColumn[i]].szEst;
+  }
+  pIdx->szIdxRow = sqlite3LogEst(wIndex*4);
+}
+
+/* Return true if value x is found any of the first nCol entries of aiCol[]
+*/
+static int hasColumn(const i16 *aiCol, int nCol, int x){
+  while( nCol-- > 0 ) if( x==*(aiCol++) ) return 1;
+  return 0;
+}
+
+/*
+** This routine runs at the end of parsing a CREATE TABLE statement that
+** has a WITHOUT ROWID clause.  The job of this routine is to convert both
+** internal schema data structures and the generated VDBE code so that they
+** are appropriate for a WITHOUT ROWID table instead of a rowid table.
+** Changes include:
+**
+**     (1)  Convert the OP_CreateTable into an OP_CreateIndex.  There is
+**          no rowid btree for a WITHOUT ROWID.  Instead, the canonical
+**          data storage is a covering index btree.
+**     (2)  Bypass the creation of the sqlite_master table entry
+**          for the PRIMARY KEY as the primary key index is now
+**          identified by the sqlite_master table entry of the table itself.
+**     (3)  Set the Index.tnum of the PRIMARY KEY Index object in the
+**          schema to the rootpage from the main table.
+**     (4)  Set all columns of the PRIMARY KEY schema object to be NOT NULL.
+**     (5)  Add all table columns to the PRIMARY KEY Index object
+**          so that the PRIMARY KEY is a covering index.  The surplus
+**          columns are part of KeyInfo.nXField and are not used for
+**          sorting or lookup or uniqueness checks.
+**     (6)  Replace the rowid tail on all automatically generated UNIQUE
+**          indices with the PRIMARY KEY columns.
+*/
+static void convertToWithoutRowidTable(Parse *pParse, Table *pTab){
+  Index *pIdx;
+  Index *pPk;
+  int nPk;
+  int i, j;
+  sqlite3 *db = pParse->db;
+  Vdbe *v = pParse->pVdbe;
+
+  /* Convert the OP_CreateTable opcode that would normally create the
+  ** root-page for the table into an OP_CreateIndex opcode.  The index
+  ** created will become the PRIMARY KEY index.
+  */
+  if( pParse->addrCrTab ){
+    assert( v );
+    sqlite3VdbeGetOp(v, pParse->addrCrTab)->opcode = OP_CreateIndex;
+  }
+
+  /* Bypass the creation of the PRIMARY KEY btree and the sqlite_master
+  ** table entry.
+  */
+  if( pParse->addrSkipPK ){
+    assert( v );
+    sqlite3VdbeGetOp(v, pParse->addrSkipPK)->opcode = OP_Goto;
+  }
+
+  /* Locate the PRIMARY KEY index.  Or, if this table was originally
+  ** an INTEGER PRIMARY KEY table, create a new PRIMARY KEY index. 
+  */
+  if( pTab->iPKey>=0 ){
+    ExprList *pList;
+    pList = sqlite3ExprListAppend(pParse, 0, 0);
+    if( pList==0 ) return;
+    pList->a[0].zName = sqlite3DbStrDup(pParse->db,
+                                        pTab->aCol[pTab->iPKey].zName);
+    pList->a[0].sortOrder = pParse->iPkSortOrder;
+    assert( pParse->pNewTable==pTab );
+    pPk = sqlite3CreateIndex(pParse, 0, 0, 0, pList, pTab->keyConf, 0, 0, 0, 0);
+    if( pPk==0 ) return;
+    pPk->idxType = SQLITE_IDXTYPE_PRIMARYKEY;
+    pTab->iPKey = -1;
+  }else{
+    pPk = sqlite3PrimaryKeyIndex(pTab);
+    /*
+    ** Remove all redundant columns from the PRIMARY KEY.  For example, change
+    ** "PRIMARY KEY(a,b,a,b,c,b,c,d)" into just "PRIMARY KEY(a,b,c,d)".  Later
+    ** code assumes the PRIMARY KEY contains no repeated columns.
+    */
+    for(i=j=1; i<pPk->nKeyCol; i++){
+      if( hasColumn(pPk->aiColumn, j, pPk->aiColumn[i]) ){
+        pPk->nColumn--;
+      }else{
+        pPk->aiColumn[j++] = pPk->aiColumn[i];
+      }
+    }
+    pPk->nKeyCol = j;
+  }
+  pPk->isCovering = 1;
+  assert( pPk!=0 );
+  nPk = pPk->nKeyCol;
+
+  /* Make sure every column of the PRIMARY KEY is NOT NULL */
+  for(i=0; i<nPk; i++){
+    pTab->aCol[pPk->aiColumn[i]].notNull = 1;
+  }
+  pPk->uniqNotNull = 1;
+
+  /* The root page of the PRIMARY KEY is the table root page */
+  pPk->tnum = pTab->tnum;
+
+  /* Update the in-memory representation of all UNIQUE indices by converting
+  ** the final rowid column into one or more columns of the PRIMARY KEY.
+  */
+  for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+    int n;
+    if( IsPrimaryKeyIndex(pIdx) ) continue;
+    for(i=n=0; i<nPk; i++){
+      if( !hasColumn(pIdx->aiColumn, pIdx->nKeyCol, pPk->aiColumn[i]) ) n++;
+    }
+    if( n==0 ){
+      /* This index is a superset of the primary key */
+      pIdx->nColumn = pIdx->nKeyCol;
+      continue;
+    }
+    if( resizeIndexObject(db, pIdx, pIdx->nKeyCol+n) ) return;
+    for(i=0, j=pIdx->nKeyCol; i<nPk; i++){
+      if( !hasColumn(pIdx->aiColumn, pIdx->nKeyCol, pPk->aiColumn[i]) ){
+        pIdx->aiColumn[j] = pPk->aiColumn[i];
+        pIdx->azColl[j] = pPk->azColl[i];
+        j++;
+      }
+    }
+    assert( pIdx->nColumn>=pIdx->nKeyCol+n );
+    assert( pIdx->nColumn>=j );
+  }
+
+  /* Add all table columns to the PRIMARY KEY index
+  */
+  if( nPk<pTab->nCol ){
+    if( resizeIndexObject(db, pPk, pTab->nCol) ) return;
+    for(i=0, j=nPk; i<pTab->nCol; i++){
+      if( !hasColumn(pPk->aiColumn, j, i) ){
+        assert( j<pPk->nColumn );
+        pPk->aiColumn[j] = i;
+        pPk->azColl[j] = "BINARY";
+        j++;
+      }
+    }
+    assert( pPk->nColumn==j );
+    assert( pTab->nCol==j );
+  }else{
+    pPk->nColumn = pTab->nCol;
+  }
+}
+
+/*
+** This routine is called to report the final ")" that terminates
+** a CREATE TABLE statement.
+**
+** The table structure that other action routines have been building
+** is added to the internal hash tables, assuming no errors have
+** occurred.
+**
+** An entry for the table is made in the master table on disk, unless
+** this is a temporary table or db->init.busy==1.  When db->init.busy==1
+** it means we are reading the sqlite_master table because we just
+** connected to the database or because the sqlite_master table has
+** recently changed, so the entry for this table already exists in
+** the sqlite_master table.  We do not want to create it again.
+**
+** If the pSelect argument is not NULL, it means that this routine
+** was called to create a table generated from a 
+** "CREATE TABLE ... AS SELECT ..." statement.  The column names of
+** the new table will match the result set of the SELECT.
+*/
+SQLITE_PRIVATE void sqlite3EndTable(
+  Parse *pParse,          /* Parse context */
+  Token *pCons,           /* The ',' token after the last column defn. */
+  Token *pEnd,            /* The ')' before options in the CREATE TABLE */
+  u8 tabOpts,             /* Extra table options. Usually 0. */
+  Select *pSelect         /* Select from a "CREATE ... AS SELECT" */
+){
+  Table *p;                 /* The new table */
+  sqlite3 *db = pParse->db; /* The database connection */
+  int iDb;                  /* Database in which the table lives */
+  Index *pIdx;              /* An implied index of the table */
+
+  if( (pEnd==0 && pSelect==0) || db->mallocFailed ){
+    return;
+  }
+  p = pParse->pNewTable;
+  if( p==0 ) return;
+
+  assert( !db->init.busy || !pSelect );
+
+  /* If the db->init.busy is 1 it means we are reading the SQL off the
+  ** "sqlite_master" or "sqlite_temp_master" table on the disk.
+  ** So do not write to the disk again.  Extract the root page number
+  ** for the table from the db->init.newTnum field.  (The page number
+  ** should have been put there by the sqliteOpenCb routine.)
+  */
+  if( db->init.busy ){
+    p->tnum = db->init.newTnum;
+  }
+
+  /* Special processing for WITHOUT ROWID Tables */
+  if( tabOpts & TF_WithoutRowid ){
