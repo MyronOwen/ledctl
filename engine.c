@@ -92214,3 +92214,248 @@ SQLITE_PRIVATE void sqlite3DropTable(Parse *pParse, SrcList *pName, int isView, 
   if( isView && pTab->pSelect==0 ){
     sqlite3ErrorMsg(pParse, "use DROP TABLE to delete table %s", pTab->zName);
     goto exit_drop_table;
+  }
+  if( !isView && pTab->pSelect ){
+    sqlite3ErrorMsg(pParse, "use DROP VIEW to delete view %s", pTab->zName);
+    goto exit_drop_table;
+  }
+#endif
+
+  /* Generate code to remove the table from the master table
+  ** on disk.
+  */
+  v = sqlite3GetVdbe(pParse);
+  if( v ){
+    sqlite3BeginWriteOperation(pParse, 1, iDb);
+    sqlite3ClearStatTables(pParse, iDb, "tbl", pTab->zName);
+    sqlite3FkDropTable(pParse, pName, pTab);
+    sqlite3CodeDropTable(pParse, pTab, iDb, isView);
+  }
+
+exit_drop_table:
+  sqlite3SrcListDelete(db, pName);
+}
+
+/*
+** This routine is called to create a new foreign key on the table
+** currently under construction.  pFromCol determines which columns
+** in the current table point to the foreign key.  If pFromCol==0 then
+** connect the key to the last column inserted.  pTo is the name of
+** the table referred to (a.k.a the "parent" table).  pToCol is a list
+** of tables in the parent pTo table.  flags contains all
+** information about the conflict resolution algorithms specified
+** in the ON DELETE, ON UPDATE and ON INSERT clauses.
+**
+** An FKey structure is created and added to the table currently
+** under construction in the pParse->pNewTable field.
+**
+** The foreign key is set for IMMEDIATE processing.  A subsequent call
+** to sqlite3DeferForeignKey() might change this to DEFERRED.
+*/
+SQLITE_PRIVATE void sqlite3CreateForeignKey(
+  Parse *pParse,       /* Parsing context */
+  ExprList *pFromCol,  /* Columns in this table that point to other table */
+  Token *pTo,          /* Name of the other table */
+  ExprList *pToCol,    /* Columns in the other table */
+  int flags            /* Conflict resolution algorithms. */
+){
+  sqlite3 *db = pParse->db;
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+  FKey *pFKey = 0;
+  FKey *pNextTo;
+  Table *p = pParse->pNewTable;
+  int nByte;
+  int i;
+  int nCol;
+  char *z;
+
+  assert( pTo!=0 );
+  if( p==0 || IN_DECLARE_VTAB ) goto fk_end;
+  if( pFromCol==0 ){
+    int iCol = p->nCol-1;
+    if( NEVER(iCol<0) ) goto fk_end;
+    if( pToCol && pToCol->nExpr!=1 ){
+      sqlite3ErrorMsg(pParse, "foreign key on %s"
+         " should reference only one column of table %T",
+         p->aCol[iCol].zName, pTo);
+      goto fk_end;
+    }
+    nCol = 1;
+  }else if( pToCol && pToCol->nExpr!=pFromCol->nExpr ){
+    sqlite3ErrorMsg(pParse,
+        "number of columns in foreign key does not match the number of "
+        "columns in the referenced table");
+    goto fk_end;
+  }else{
+    nCol = pFromCol->nExpr;
+  }
+  nByte = sizeof(*pFKey) + (nCol-1)*sizeof(pFKey->aCol[0]) + pTo->n + 1;
+  if( pToCol ){
+    for(i=0; i<pToCol->nExpr; i++){
+      nByte += sqlite3Strlen30(pToCol->a[i].zName) + 1;
+    }
+  }
+  pFKey = sqlite3DbMallocZero(db, nByte );
+  if( pFKey==0 ){
+    goto fk_end;
+  }
+  pFKey->pFrom = p;
+  pFKey->pNextFrom = p->pFKey;
+  z = (char*)&pFKey->aCol[nCol];
+  pFKey->zTo = z;
+  memcpy(z, pTo->z, pTo->n);
+  z[pTo->n] = 0;
+  sqlite3Dequote(z);
+  z += pTo->n+1;
+  pFKey->nCol = nCol;
+  if( pFromCol==0 ){
+    pFKey->aCol[0].iFrom = p->nCol-1;
+  }else{
+    for(i=0; i<nCol; i++){
+      int j;
+      for(j=0; j<p->nCol; j++){
+        if( sqlite3StrICmp(p->aCol[j].zName, pFromCol->a[i].zName)==0 ){
+          pFKey->aCol[i].iFrom = j;
+          break;
+        }
+      }
+      if( j>=p->nCol ){
+        sqlite3ErrorMsg(pParse, 
+          "unknown column \"%s\" in foreign key definition", 
+          pFromCol->a[i].zName);
+        goto fk_end;
+      }
+    }
+  }
+  if( pToCol ){
+    for(i=0; i<nCol; i++){
+      int n = sqlite3Strlen30(pToCol->a[i].zName);
+      pFKey->aCol[i].zCol = z;
+      memcpy(z, pToCol->a[i].zName, n);
+      z[n] = 0;
+      z += n+1;
+    }
+  }
+  pFKey->isDeferred = 0;
+  pFKey->aAction[0] = (u8)(flags & 0xff);            /* ON DELETE action */
+  pFKey->aAction[1] = (u8)((flags >> 8 ) & 0xff);    /* ON UPDATE action */
+
+  assert( sqlite3SchemaMutexHeld(db, 0, p->pSchema) );
+  pNextTo = (FKey *)sqlite3HashInsert(&p->pSchema->fkeyHash, 
+      pFKey->zTo, (void *)pFKey
+  );
+  if( pNextTo==pFKey ){
+    db->mallocFailed = 1;
+    goto fk_end;
+  }
+  if( pNextTo ){
+    assert( pNextTo->pPrevTo==0 );
+    pFKey->pNextTo = pNextTo;
+    pNextTo->pPrevTo = pFKey;
+  }
+
+  /* Link the foreign key to the table as the last step.
+  */
+  p->pFKey = pFKey;
+  pFKey = 0;
+
+fk_end:
+  sqlite3DbFree(db, pFKey);
+#endif /* !defined(SQLITE_OMIT_FOREIGN_KEY) */
+  sqlite3ExprListDelete(db, pFromCol);
+  sqlite3ExprListDelete(db, pToCol);
+}
+
+/*
+** This routine is called when an INITIALLY IMMEDIATE or INITIALLY DEFERRED
+** clause is seen as part of a foreign key definition.  The isDeferred
+** parameter is 1 for INITIALLY DEFERRED and 0 for INITIALLY IMMEDIATE.
+** The behavior of the most recently created foreign key is adjusted
+** accordingly.
+*/
+SQLITE_PRIVATE void sqlite3DeferForeignKey(Parse *pParse, int isDeferred){
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+  Table *pTab;
+  FKey *pFKey;
+  if( (pTab = pParse->pNewTable)==0 || (pFKey = pTab->pFKey)==0 ) return;
+  assert( isDeferred==0 || isDeferred==1 ); /* EV: R-30323-21917 */
+  pFKey->isDeferred = (u8)isDeferred;
+#endif
+}
+
+/*
+** Generate code that will erase and refill index *pIdx.  This is
+** used to initialize a newly created index or to recompute the
+** content of an index in response to a REINDEX command.
+**
+** if memRootPage is not negative, it means that the index is newly
+** created.  The register specified by memRootPage contains the
+** root page number of the index.  If memRootPage is negative, then
+** the index already exists and must be cleared before being refilled and
+** the root page number of the index is taken from pIndex->tnum.
+*/
+static void sqlite3RefillIndex(Parse *pParse, Index *pIndex, int memRootPage){
+  Table *pTab = pIndex->pTable;  /* The table that is indexed */
+  int iTab = pParse->nTab++;     /* Btree cursor used for pTab */
+  int iIdx = pParse->nTab++;     /* Btree cursor used for pIndex */
+  int iSorter;                   /* Cursor opened by OpenSorter (if in use) */
+  int addr1;                     /* Address of top of loop */
+  int addr2;                     /* Address to jump to for next iteration */
+  int tnum;                      /* Root page of index */
+  int iPartIdxLabel;             /* Jump to this label to skip a row */
+  Vdbe *v;                       /* Generate code into this virtual machine */
+  KeyInfo *pKey;                 /* KeyInfo for index */
+  int regRecord;                 /* Register holding assembled index record */
+  sqlite3 *db = pParse->db;      /* The database connection */
+  int iDb = sqlite3SchemaToIndex(db, pIndex->pSchema);
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  if( sqlite3AuthCheck(pParse, SQLITE_REINDEX, pIndex->zName, 0,
+      db->aDb[iDb].zName ) ){
+    return;
+  }
+#endif
+
+  /* Require a write-lock on the table to perform this operation */
+  sqlite3TableLock(pParse, iDb, pTab->tnum, 1, pTab->zName);
+
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 ) return;
+  if( memRootPage>=0 ){
+    tnum = memRootPage;
+  }else{
+    tnum = pIndex->tnum;
+  }
+  pKey = sqlite3KeyInfoOfIndex(pParse, pIndex);
+
+  /* Open the sorter cursor if we are to use one. */
+  iSorter = pParse->nTab++;
+  sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorter, 0, pIndex->nKeyCol, (char*)
+                    sqlite3KeyInfoRef(pKey), P4_KEYINFO);
+
+  /* Open the table. Loop through all rows of the table, inserting index
+  ** records into the sorter. */
+  sqlite3OpenTable(pParse, iTab, iDb, pTab, OP_OpenRead);
+  addr1 = sqlite3VdbeAddOp2(v, OP_Rewind, iTab, 0); VdbeCoverage(v);
+  regRecord = sqlite3GetTempReg(pParse);
+
+  sqlite3GenerateIndexKey(pParse,pIndex,iTab,regRecord,0,&iPartIdxLabel,0,0);
+  sqlite3VdbeAddOp2(v, OP_SorterInsert, iSorter, regRecord);
+  sqlite3ResolvePartIdxLabel(pParse, iPartIdxLabel);
+  sqlite3VdbeAddOp2(v, OP_Next, iTab, addr1+1); VdbeCoverage(v);
+  sqlite3VdbeJumpHere(v, addr1);
+  if( memRootPage<0 ) sqlite3VdbeAddOp2(v, OP_Clear, tnum, iDb);
+  sqlite3VdbeAddOp4(v, OP_OpenWrite, iIdx, tnum, iDb, 
+                    (char *)pKey, P4_KEYINFO);
+  sqlite3VdbeChangeP5(v, OPFLAG_BULKCSR|((memRootPage>=0)?OPFLAG_P2ISREG:0));
+
+  addr1 = sqlite3VdbeAddOp2(v, OP_SorterSort, iSorter, 0); VdbeCoverage(v);
+  assert( pKey!=0 || db->mallocFailed || pParse->nErr );
+  if( IsUniqueIndex(pIndex) && pKey!=0 ){
+    int j2 = sqlite3VdbeCurrentAddr(v) + 3;
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, j2);
+    addr2 = sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp4Int(v, OP_SorterCompare, iSorter, j2, regRecord,
+                         pIndex->nKeyCol); VdbeCoverage(v);
+    sqlite3UniqueConstraint(pParse, OE_Abort, pIndex);
+  }else{
