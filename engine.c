@@ -92003,3 +92003,214 @@ static void destroyTable(Parse *pParse, Table *pTab){
   ** following were coded:
   **
   ** OP_Destroy 4 0
+  ** ...
+  ** OP_Destroy 5 0
+  **
+  ** and root page 5 happened to be the largest root-page number in the
+  ** database, then root page 5 would be moved to page 4 by the 
+  ** "OP_Destroy 4 0" opcode. The subsequent "OP_Destroy 5 0" would hit
+  ** a free-list page.
+  */
+  int iTab = pTab->tnum;
+  int iDestroyed = 0;
+
+  while( 1 ){
+    Index *pIdx;
+    int iLargest = 0;
+
+    if( iDestroyed==0 || iTab<iDestroyed ){
+      iLargest = iTab;
+    }
+    for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+      int iIdx = pIdx->tnum;
+      assert( pIdx->pSchema==pTab->pSchema );
+      if( (iDestroyed==0 || (iIdx<iDestroyed)) && iIdx>iLargest ){
+        iLargest = iIdx;
+      }
+    }
+    if( iLargest==0 ){
+      return;
+    }else{
+      int iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+      assert( iDb>=0 && iDb<pParse->db->nDb );
+      destroyRootPage(pParse, iLargest, iDb);
+      iDestroyed = iLargest;
+    }
+  }
+#endif
+}
+
+/*
+** Remove entries from the sqlite_statN tables (for N in (1,2,3))
+** after a DROP INDEX or DROP TABLE command.
+*/
+static void sqlite3ClearStatTables(
+  Parse *pParse,         /* The parsing context */
+  int iDb,               /* The database number */
+  const char *zType,     /* "idx" or "tbl" */
+  const char *zName      /* Name of index or table */
+){
+  int i;
+  const char *zDbName = pParse->db->aDb[iDb].zName;
+  for(i=1; i<=4; i++){
+    char zTab[24];
+    sqlite3_snprintf(sizeof(zTab),zTab,"sqlite_stat%d",i);
+    if( sqlite3FindTable(pParse->db, zTab, zDbName) ){
+      sqlite3NestedParse(pParse,
+        "DELETE FROM %Q.%s WHERE %s=%Q",
+        zDbName, zTab, zType, zName
+      );
+    }
+  }
+}
+
+/*
+** Generate code to drop a table.
+*/
+SQLITE_PRIVATE void sqlite3CodeDropTable(Parse *pParse, Table *pTab, int iDb, int isView){
+  Vdbe *v;
+  sqlite3 *db = pParse->db;
+  Trigger *pTrigger;
+  Db *pDb = &db->aDb[iDb];
+
+  v = sqlite3GetVdbe(pParse);
+  assert( v!=0 );
+  sqlite3BeginWriteOperation(pParse, 1, iDb);
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( IsVirtual(pTab) ){
+    sqlite3VdbeAddOp0(v, OP_VBegin);
+  }
+#endif
+
+  /* Drop all triggers associated with the table being dropped. Code
+  ** is generated to remove entries from sqlite_master and/or
+  ** sqlite_temp_master if required.
+  */
+  pTrigger = sqlite3TriggerList(pParse, pTab);
+  while( pTrigger ){
+    assert( pTrigger->pSchema==pTab->pSchema || 
+        pTrigger->pSchema==db->aDb[1].pSchema );
+    sqlite3DropTriggerPtr(pParse, pTrigger);
+    pTrigger = pTrigger->pNext;
+  }
+
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+  /* Remove any entries of the sqlite_sequence table associated with
+  ** the table being dropped. This is done before the table is dropped
+  ** at the btree level, in case the sqlite_sequence table needs to
+  ** move as a result of the drop (can happen in auto-vacuum mode).
+  */
+  if( pTab->tabFlags & TF_Autoincrement ){
+    sqlite3NestedParse(pParse,
+      "DELETE FROM %Q.sqlite_sequence WHERE name=%Q",
+      pDb->zName, pTab->zName
+    );
+  }
+#endif
+
+  /* Drop all SQLITE_MASTER table and index entries that refer to the
+  ** table. The program name loops through the master table and deletes
+  ** every row that refers to a table of the same name as the one being
+  ** dropped. Triggers are handled separately because a trigger can be
+  ** created in the temp database that refers to a table in another
+  ** database.
+  */
+  sqlite3NestedParse(pParse, 
+      "DELETE FROM %Q.%s WHERE tbl_name=%Q and type!='trigger'",
+      pDb->zName, SCHEMA_TABLE(iDb), pTab->zName);
+  if( !isView && !IsVirtual(pTab) ){
+    destroyTable(pParse, pTab);
+  }
+
+  /* Remove the table entry from SQLite's internal schema and modify
+  ** the schema cookie.
+  */
+  if( IsVirtual(pTab) ){
+    sqlite3VdbeAddOp4(v, OP_VDestroy, iDb, 0, 0, pTab->zName, 0);
+  }
+  sqlite3VdbeAddOp4(v, OP_DropTable, iDb, 0, 0, pTab->zName, 0);
+  sqlite3ChangeCookie(pParse, iDb);
+  sqliteViewResetAll(db, iDb);
+}
+
+/*
+** This routine is called to do the work of a DROP TABLE statement.
+** pName is the name of the table to be dropped.
+*/
+SQLITE_PRIVATE void sqlite3DropTable(Parse *pParse, SrcList *pName, int isView, int noErr){
+  Table *pTab;
+  Vdbe *v;
+  sqlite3 *db = pParse->db;
+  int iDb;
+
+  if( db->mallocFailed ){
+    goto exit_drop_table;
+  }
+  assert( pParse->nErr==0 );
+  assert( pName->nSrc==1 );
+  if( noErr ) db->suppressErr++;
+  pTab = sqlite3LocateTableItem(pParse, isView, &pName->a[0]);
+  if( noErr ) db->suppressErr--;
+
+  if( pTab==0 ){
+    if( noErr ) sqlite3CodeVerifyNamedSchema(pParse, pName->a[0].zDatabase);
+    goto exit_drop_table;
+  }
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  assert( iDb>=0 && iDb<db->nDb );
+
+  /* If pTab is a virtual table, call ViewGetColumnNames() to ensure
+  ** it is initialized.
+  */
+  if( IsVirtual(pTab) && sqlite3ViewGetColumnNames(pParse, pTab) ){
+    goto exit_drop_table;
+  }
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  {
+    int code;
+    const char *zTab = SCHEMA_TABLE(iDb);
+    const char *zDb = db->aDb[iDb].zName;
+    const char *zArg2 = 0;
+    if( sqlite3AuthCheck(pParse, SQLITE_DELETE, zTab, 0, zDb)){
+      goto exit_drop_table;
+    }
+    if( isView ){
+      if( !OMIT_TEMPDB && iDb==1 ){
+        code = SQLITE_DROP_TEMP_VIEW;
+      }else{
+        code = SQLITE_DROP_VIEW;
+      }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    }else if( IsVirtual(pTab) ){
+      code = SQLITE_DROP_VTABLE;
+      zArg2 = sqlite3GetVTable(db, pTab)->pMod->zName;
+#endif
+    }else{
+      if( !OMIT_TEMPDB && iDb==1 ){
+        code = SQLITE_DROP_TEMP_TABLE;
+      }else{
+        code = SQLITE_DROP_TABLE;
+      }
+    }
+    if( sqlite3AuthCheck(pParse, code, pTab->zName, zArg2, zDb) ){
+      goto exit_drop_table;
+    }
+    if( sqlite3AuthCheck(pParse, SQLITE_DELETE, pTab->zName, 0, zDb) ){
+      goto exit_drop_table;
+    }
+  }
+#endif
+  if( sqlite3StrNICmp(pTab->zName, "sqlite_", 7)==0 
+    && sqlite3StrNICmp(pTab->zName, "sqlite_stat", 11)!=0 ){
+    sqlite3ErrorMsg(pParse, "table %s may not be dropped", pTab->zName);
+    goto exit_drop_table;
+  }
+
+#ifndef SQLITE_OMIT_VIEW
+  /* Ensure DROP TABLE is not used on a view, and DROP VIEW is not used
+  ** on a table.
+  */
+  if( isView && pTab->pSelect==0 ){
+    sqlite3ErrorMsg(pParse, "use DROP TABLE to delete table %s", pTab->zName);
+    goto exit_drop_table;
