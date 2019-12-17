@@ -93107,3 +93107,227 @@ SQLITE_PRIVATE void sqlite3DropIndex(Parse *pParse, SrcList *pName, int ifExists
     );
     sqlite3ClearStatTables(pParse, iDb, "idx", pIndex->zName);
     sqlite3ChangeCookie(pParse, iDb);
+    destroyRootPage(pParse, pIndex->tnum, iDb);
+    sqlite3VdbeAddOp4(v, OP_DropIndex, iDb, 0, 0, pIndex->zName, 0);
+  }
+
+exit_drop_index:
+  sqlite3SrcListDelete(db, pName);
+}
+
+/*
+** pArray is a pointer to an array of objects. Each object in the
+** array is szEntry bytes in size. This routine uses sqlite3DbRealloc()
+** to extend the array so that there is space for a new object at the end.
+**
+** When this function is called, *pnEntry contains the current size of
+** the array (in entries - so the allocation is ((*pnEntry) * szEntry) bytes
+** in total).
+**
+** If the realloc() is successful (i.e. if no OOM condition occurs), the
+** space allocated for the new object is zeroed, *pnEntry updated to
+** reflect the new size of the array and a pointer to the new allocation
+** returned. *pIdx is set to the index of the new array entry in this case.
+**
+** Otherwise, if the realloc() fails, *pIdx is set to -1, *pnEntry remains
+** unchanged and a copy of pArray returned.
+*/
+SQLITE_PRIVATE void *sqlite3ArrayAllocate(
+  sqlite3 *db,      /* Connection to notify of malloc failures */
+  void *pArray,     /* Array of objects.  Might be reallocated */
+  int szEntry,      /* Size of each object in the array */
+  int *pnEntry,     /* Number of objects currently in use */
+  int *pIdx         /* Write the index of a new slot here */
+){
+  char *z;
+  int n = *pnEntry;
+  if( (n & (n-1))==0 ){
+    int sz = (n==0) ? 1 : 2*n;
+    void *pNew = sqlite3DbRealloc(db, pArray, sz*szEntry);
+    if( pNew==0 ){
+      *pIdx = -1;
+      return pArray;
+    }
+    pArray = pNew;
+  }
+  z = (char*)pArray;
+  memset(&z[n * szEntry], 0, szEntry);
+  *pIdx = n;
+  ++*pnEntry;
+  return pArray;
+}
+
+/*
+** Append a new element to the given IdList.  Create a new IdList if
+** need be.
+**
+** A new IdList is returned, or NULL if malloc() fails.
+*/
+SQLITE_PRIVATE IdList *sqlite3IdListAppend(sqlite3 *db, IdList *pList, Token *pToken){
+  int i;
+  if( pList==0 ){
+    pList = sqlite3DbMallocZero(db, sizeof(IdList) );
+    if( pList==0 ) return 0;
+  }
+  pList->a = sqlite3ArrayAllocate(
+      db,
+      pList->a,
+      sizeof(pList->a[0]),
+      &pList->nId,
+      &i
+  );
+  if( i<0 ){
+    sqlite3IdListDelete(db, pList);
+    return 0;
+  }
+  pList->a[i].zName = sqlite3NameFromToken(db, pToken);
+  return pList;
+}
+
+/*
+** Delete an IdList.
+*/
+SQLITE_PRIVATE void sqlite3IdListDelete(sqlite3 *db, IdList *pList){
+  int i;
+  if( pList==0 ) return;
+  for(i=0; i<pList->nId; i++){
+    sqlite3DbFree(db, pList->a[i].zName);
+  }
+  sqlite3DbFree(db, pList->a);
+  sqlite3DbFree(db, pList);
+}
+
+/*
+** Return the index in pList of the identifier named zId.  Return -1
+** if not found.
+*/
+SQLITE_PRIVATE int sqlite3IdListIndex(IdList *pList, const char *zName){
+  int i;
+  if( pList==0 ) return -1;
+  for(i=0; i<pList->nId; i++){
+    if( sqlite3StrICmp(pList->a[i].zName, zName)==0 ) return i;
+  }
+  return -1;
+}
+
+/*
+** Expand the space allocated for the given SrcList object by
+** creating nExtra new slots beginning at iStart.  iStart is zero based.
+** New slots are zeroed.
+**
+** For example, suppose a SrcList initially contains two entries: A,B.
+** To append 3 new entries onto the end, do this:
+**
+**    sqlite3SrcListEnlarge(db, pSrclist, 3, 2);
+**
+** After the call above it would contain:  A, B, nil, nil, nil.
+** If the iStart argument had been 1 instead of 2, then the result
+** would have been:  A, nil, nil, nil, B.  To prepend the new slots,
+** the iStart value would be 0.  The result then would
+** be: nil, nil, nil, A, B.
+**
+** If a memory allocation fails the SrcList is unchanged.  The
+** db->mallocFailed flag will be set to true.
+*/
+SQLITE_PRIVATE SrcList *sqlite3SrcListEnlarge(
+  sqlite3 *db,       /* Database connection to notify of OOM errors */
+  SrcList *pSrc,     /* The SrcList to be enlarged */
+  int nExtra,        /* Number of new slots to add to pSrc->a[] */
+  int iStart         /* Index in pSrc->a[] of first new slot */
+){
+  int i;
+
+  /* Sanity checking on calling parameters */
+  assert( iStart>=0 );
+  assert( nExtra>=1 );
+  assert( pSrc!=0 );
+  assert( iStart<=pSrc->nSrc );
+
+  /* Allocate additional space if needed */
+  if( (u32)pSrc->nSrc+nExtra>pSrc->nAlloc ){
+    SrcList *pNew;
+    int nAlloc = pSrc->nSrc+nExtra;
+    int nGot;
+    pNew = sqlite3DbRealloc(db, pSrc,
+               sizeof(*pSrc) + (nAlloc-1)*sizeof(pSrc->a[0]) );
+    if( pNew==0 ){
+      assert( db->mallocFailed );
+      return pSrc;
+    }
+    pSrc = pNew;
+    nGot = (sqlite3DbMallocSize(db, pNew) - sizeof(*pSrc))/sizeof(pSrc->a[0])+1;
+    pSrc->nAlloc = nGot;
+  }
+
+  /* Move existing slots that come after the newly inserted slots
+  ** out of the way */
+  for(i=pSrc->nSrc-1; i>=iStart; i--){
+    pSrc->a[i+nExtra] = pSrc->a[i];
+  }
+  pSrc->nSrc += nExtra;
+
+  /* Zero the newly allocated slots */
+  memset(&pSrc->a[iStart], 0, sizeof(pSrc->a[0])*nExtra);
+  for(i=iStart; i<iStart+nExtra; i++){
+    pSrc->a[i].iCursor = -1;
+  }
+
+  /* Return a pointer to the enlarged SrcList */
+  return pSrc;
+}
+
+
+/*
+** Append a new table name to the given SrcList.  Create a new SrcList if
+** need be.  A new entry is created in the SrcList even if pTable is NULL.
+**
+** A SrcList is returned, or NULL if there is an OOM error.  The returned
+** SrcList might be the same as the SrcList that was input or it might be
+** a new one.  If an OOM error does occurs, then the prior value of pList
+** that is input to this routine is automatically freed.
+**
+** If pDatabase is not null, it means that the table has an optional
+** database name prefix.  Like this:  "database.table".  The pDatabase
+** points to the table name and the pTable points to the database name.
+** The SrcList.a[].zName field is filled with the table name which might
+** come from pTable (if pDatabase is NULL) or from pDatabase.  
+** SrcList.a[].zDatabase is filled with the database name from pTable,
+** or with NULL if no database is specified.
+**
+** In other words, if call like this:
+**
+**         sqlite3SrcListAppend(D,A,B,0);
+**
+** Then B is a table name and the database name is unspecified.  If called
+** like this:
+**
+**         sqlite3SrcListAppend(D,A,B,C);
+**
+** Then C is the table name and B is the database name.  If C is defined
+** then so is B.  In other words, we never have a case where:
+**
+**         sqlite3SrcListAppend(D,A,0,C);
+**
+** Both pTable and pDatabase are assumed to be quoted.  They are dequoted
+** before being added to the SrcList.
+*/
+SQLITE_PRIVATE SrcList *sqlite3SrcListAppend(
+  sqlite3 *db,        /* Connection to notify of malloc failures */
+  SrcList *pList,     /* Append to this SrcList. NULL creates a new SrcList */
+  Token *pTable,      /* Table to append */
+  Token *pDatabase    /* Database of the table */
+){
+  struct SrcList_item *pItem;
+  assert( pDatabase==0 || pTable!=0 );  /* Cannot have C without B */
+  if( pList==0 ){
+    pList = sqlite3DbMallocZero(db, sizeof(SrcList) );
+    if( pList==0 ) return 0;
+    pList->nAlloc = 1;
+  }
+  pList = sqlite3SrcListEnlarge(db, pList, 1, pList->nSrc);
+  if( db->mallocFailed ){
+    sqlite3SrcListDelete(db, pList);
+    return 0;
+  }
+  pItem = &pList->a[pList->nSrc-1];
+  if( pDatabase && pDatabase->z==0 ){
