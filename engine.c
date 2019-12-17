@@ -91765,3 +91765,241 @@ SQLITE_PRIVATE void sqlite3CreateView(
   p->pSelect = sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
   sqlite3SelectDelete(db, pSelect);
   if( db->mallocFailed ){
+    return;
+  }
+  if( !db->init.busy ){
+    sqlite3ViewGetColumnNames(pParse, p);
+  }
+
+  /* Locate the end of the CREATE VIEW statement.  Make sEnd point to
+  ** the end.
+  */
+  sEnd = pParse->sLastToken;
+  if( ALWAYS(sEnd.z[0]!=0) && sEnd.z[0]!=';' ){
+    sEnd.z += sEnd.n;
+  }
+  sEnd.n = 0;
+  n = (int)(sEnd.z - pBegin->z);
+  z = pBegin->z;
+  while( ALWAYS(n>0) && sqlite3Isspace(z[n-1]) ){ n--; }
+  sEnd.z = &z[n-1];
+  sEnd.n = 1;
+
+  /* Use sqlite3EndTable() to add the view to the SQLITE_MASTER table */
+  sqlite3EndTable(pParse, 0, &sEnd, 0, 0);
+  return;
+}
+#endif /* SQLITE_OMIT_VIEW */
+
+#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE)
+/*
+** The Table structure pTable is really a VIEW.  Fill in the names of
+** the columns of the view in the pTable structure.  Return the number
+** of errors.  If an error is seen leave an error message in pParse->zErrMsg.
+*/
+SQLITE_PRIVATE int sqlite3ViewGetColumnNames(Parse *pParse, Table *pTable){
+  Table *pSelTab;   /* A fake table from which we get the result set */
+  Select *pSel;     /* Copy of the SELECT that implements the view */
+  int nErr = 0;     /* Number of errors encountered */
+  int n;            /* Temporarily holds the number of cursors assigned */
+  sqlite3 *db = pParse->db;  /* Database connection for malloc errors */
+  sqlite3_xauth xAuth;       /* Saved xAuth pointer */
+
+  assert( pTable );
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( sqlite3VtabCallConnect(pParse, pTable) ){
+    return SQLITE_ERROR;
+  }
+  if( IsVirtual(pTable) ) return 0;
+#endif
+
+#ifndef SQLITE_OMIT_VIEW
+  /* A positive nCol means the columns names for this view are
+  ** already known.
+  */
+  if( pTable->nCol>0 ) return 0;
+
+  /* A negative nCol is a special marker meaning that we are currently
+  ** trying to compute the column names.  If we enter this routine with
+  ** a negative nCol, it means two or more views form a loop, like this:
+  **
+  **     CREATE VIEW one AS SELECT * FROM two;
+  **     CREATE VIEW two AS SELECT * FROM one;
+  **
+  ** Actually, the error above is now caught prior to reaching this point.
+  ** But the following test is still important as it does come up
+  ** in the following:
+  ** 
+  **     CREATE TABLE main.ex1(a);
+  **     CREATE TEMP VIEW ex1 AS SELECT a FROM ex1;
+  **     SELECT * FROM temp.ex1;
+  */
+  if( pTable->nCol<0 ){
+    sqlite3ErrorMsg(pParse, "view %s is circularly defined", pTable->zName);
+    return 1;
+  }
+  assert( pTable->nCol>=0 );
+
+  /* If we get this far, it means we need to compute the table names.
+  ** Note that the call to sqlite3ResultSetOfSelect() will expand any
+  ** "*" elements in the results set of the view and will assign cursors
+  ** to the elements of the FROM clause.  But we do not want these changes
+  ** to be permanent.  So the computation is done on a copy of the SELECT
+  ** statement that defines the view.
+  */
+  assert( pTable->pSelect );
+  pSel = sqlite3SelectDup(db, pTable->pSelect, 0);
+  if( pSel ){
+    u8 enableLookaside = db->lookaside.bEnabled;
+    n = pParse->nTab;
+    sqlite3SrcListAssignCursors(pParse, pSel->pSrc);
+    pTable->nCol = -1;
+    db->lookaside.bEnabled = 0;
+#ifndef SQLITE_OMIT_AUTHORIZATION
+    xAuth = db->xAuth;
+    db->xAuth = 0;
+    pSelTab = sqlite3ResultSetOfSelect(pParse, pSel);
+    db->xAuth = xAuth;
+#else
+    pSelTab = sqlite3ResultSetOfSelect(pParse, pSel);
+#endif
+    db->lookaside.bEnabled = enableLookaside;
+    pParse->nTab = n;
+    if( pSelTab ){
+      assert( pTable->aCol==0 );
+      pTable->nCol = pSelTab->nCol;
+      pTable->aCol = pSelTab->aCol;
+      pSelTab->nCol = 0;
+      pSelTab->aCol = 0;
+      sqlite3DeleteTable(db, pSelTab);
+      assert( sqlite3SchemaMutexHeld(db, 0, pTable->pSchema) );
+      pTable->pSchema->schemaFlags |= DB_UnresetViews;
+    }else{
+      pTable->nCol = 0;
+      nErr++;
+    }
+    sqlite3SelectDelete(db, pSel);
+  } else {
+    nErr++;
+  }
+#endif /* SQLITE_OMIT_VIEW */
+  return nErr;  
+}
+#endif /* !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE) */
+
+#ifndef SQLITE_OMIT_VIEW
+/*
+** Clear the column names from every VIEW in database idx.
+*/
+static void sqliteViewResetAll(sqlite3 *db, int idx){
+  HashElem *i;
+  assert( sqlite3SchemaMutexHeld(db, idx, 0) );
+  if( !DbHasProperty(db, idx, DB_UnresetViews) ) return;
+  for(i=sqliteHashFirst(&db->aDb[idx].pSchema->tblHash); i;i=sqliteHashNext(i)){
+    Table *pTab = sqliteHashData(i);
+    if( pTab->pSelect ){
+      sqliteDeleteColumnNames(db, pTab);
+      pTab->aCol = 0;
+      pTab->nCol = 0;
+    }
+  }
+  DbClearProperty(db, idx, DB_UnresetViews);
+}
+#else
+# define sqliteViewResetAll(A,B)
+#endif /* SQLITE_OMIT_VIEW */
+
+/*
+** This function is called by the VDBE to adjust the internal schema
+** used by SQLite when the btree layer moves a table root page. The
+** root-page of a table or index in database iDb has changed from iFrom
+** to iTo.
+**
+** Ticket #1728:  The symbol table might still contain information
+** on tables and/or indices that are the process of being deleted.
+** If you are unlucky, one of those deleted indices or tables might
+** have the same rootpage number as the real table or index that is
+** being moved.  So we cannot stop searching after the first match 
+** because the first match might be for one of the deleted indices
+** or tables and not the table/index that is actually being moved.
+** We must continue looping until all tables and indices with
+** rootpage==iFrom have been converted to have a rootpage of iTo
+** in order to be certain that we got the right one.
+*/
+#ifndef SQLITE_OMIT_AUTOVACUUM
+SQLITE_PRIVATE void sqlite3RootPageMoved(sqlite3 *db, int iDb, int iFrom, int iTo){
+  HashElem *pElem;
+  Hash *pHash;
+  Db *pDb;
+
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  pDb = &db->aDb[iDb];
+  pHash = &pDb->pSchema->tblHash;
+  for(pElem=sqliteHashFirst(pHash); pElem; pElem=sqliteHashNext(pElem)){
+    Table *pTab = sqliteHashData(pElem);
+    if( pTab->tnum==iFrom ){
+      pTab->tnum = iTo;
+    }
+  }
+  pHash = &pDb->pSchema->idxHash;
+  for(pElem=sqliteHashFirst(pHash); pElem; pElem=sqliteHashNext(pElem)){
+    Index *pIdx = sqliteHashData(pElem);
+    if( pIdx->tnum==iFrom ){
+      pIdx->tnum = iTo;
+    }
+  }
+}
+#endif
+
+/*
+** Write code to erase the table with root-page iTable from database iDb.
+** Also write code to modify the sqlite_master table and internal schema
+** if a root-page of another table is moved by the btree-layer whilst
+** erasing iTable (this can happen with an auto-vacuum database).
+*/ 
+static void destroyRootPage(Parse *pParse, int iTable, int iDb){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  int r1 = sqlite3GetTempReg(pParse);
+  sqlite3VdbeAddOp3(v, OP_Destroy, iTable, r1, iDb);
+  sqlite3MayAbort(pParse);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  /* OP_Destroy stores an in integer r1. If this integer
+  ** is non-zero, then it is the root page number of a table moved to
+  ** location iTable. The following code modifies the sqlite_master table to
+  ** reflect this.
+  **
+  ** The "#NNN" in the SQL is a special constant that means whatever value
+  ** is in register NNN.  See grammar rules associated with the TK_REGISTER
+  ** token for additional information.
+  */
+  sqlite3NestedParse(pParse, 
+     "UPDATE %Q.%s SET rootpage=%d WHERE #%d AND rootpage=#%d",
+     pParse->db->aDb[iDb].zName, SCHEMA_TABLE(iDb), iTable, r1, r1);
+#endif
+  sqlite3ReleaseTempReg(pParse, r1);
+}
+
+/*
+** Write VDBE code to erase table pTab and all associated indices on disk.
+** Code to update the sqlite_master tables and internal schema definitions
+** in case a root-page belonging to another table is moved by the btree layer
+** is also added (this can happen with an auto-vacuum database).
+*/
+static void destroyTable(Parse *pParse, Table *pTab){
+#ifdef SQLITE_OMIT_AUTOVACUUM
+  Index *pIdx;
+  int iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  destroyRootPage(pParse, pTab->tnum, iDb);
+  for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+    destroyRootPage(pParse, pIdx->tnum, iDb);
+  }
+#else
+  /* If the database may be auto-vacuum capable (if SQLITE_OMIT_AUTOVACUUM
+  ** is not defined), then it is important to call OP_Destroy on the
+  ** table and index root-pages in order, starting with the numerically 
+  ** largest root-page number. This guarantees that none of the root-pages
+  ** to be destroyed is relocated by an earlier OP_Destroy. i.e. if the
+  ** following were coded:
+  **
+  ** OP_Destroy 4 0
