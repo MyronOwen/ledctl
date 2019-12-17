@@ -92677,3 +92677,234 @@ SQLITE_PRIVATE Index *sqlite3CreateIndex(
   }else{
     int n;
     Index *pLoop;
+    for(pLoop=pTab->pIndex, n=1; pLoop; pLoop=pLoop->pNext, n++){}
+    zName = sqlite3MPrintf(db, "sqlite_autoindex_%s_%d", pTab->zName, n);
+    if( zName==0 ){
+      goto exit_create_index;
+    }
+  }
+
+  /* Check for authorization to create an index.
+  */
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  {
+    const char *zDb = pDb->zName;
+    if( sqlite3AuthCheck(pParse, SQLITE_INSERT, SCHEMA_TABLE(iDb), 0, zDb) ){
+      goto exit_create_index;
+    }
+    i = SQLITE_CREATE_INDEX;
+    if( !OMIT_TEMPDB && iDb==1 ) i = SQLITE_CREATE_TEMP_INDEX;
+    if( sqlite3AuthCheck(pParse, i, zName, pTab->zName, zDb) ){
+      goto exit_create_index;
+    }
+  }
+#endif
+
+  /* If pList==0, it means this routine was called to make a primary
+  ** key out of the last column added to the table under construction.
+  ** So create a fake list to simulate this.
+  */
+  if( pList==0 ){
+    pList = sqlite3ExprListAppend(pParse, 0, 0);
+    if( pList==0 ) goto exit_create_index;
+    pList->a[0].zName = sqlite3DbStrDup(pParse->db,
+                                        pTab->aCol[pTab->nCol-1].zName);
+    pList->a[0].sortOrder = (u8)sortOrder;
+  }
+
+  /* Figure out how many bytes of space are required to store explicitly
+  ** specified collation sequence names.
+  */
+  for(i=0; i<pList->nExpr; i++){
+    Expr *pExpr = pList->a[i].pExpr;
+    if( pExpr ){
+      assert( pExpr->op==TK_COLLATE );
+      nExtra += (1 + sqlite3Strlen30(pExpr->u.zToken));
+    }
+  }
+
+  /* 
+  ** Allocate the index structure. 
+  */
+  nName = sqlite3Strlen30(zName);
+  nExtraCol = pPk ? pPk->nKeyCol : 1;
+  pIndex = sqlite3AllocateIndexObject(db, pList->nExpr + nExtraCol,
+                                      nName + nExtra + 1, &zExtra);
+  if( db->mallocFailed ){
+    goto exit_create_index;
+  }
+  assert( EIGHT_BYTE_ALIGNMENT(pIndex->aiRowLogEst) );
+  assert( EIGHT_BYTE_ALIGNMENT(pIndex->azColl) );
+  pIndex->zName = zExtra;
+  zExtra += nName + 1;
+  memcpy(pIndex->zName, zName, nName+1);
+  pIndex->pTable = pTab;
+  pIndex->onError = (u8)onError;
+  pIndex->uniqNotNull = onError!=OE_None;
+  pIndex->idxType = pName ? SQLITE_IDXTYPE_APPDEF : SQLITE_IDXTYPE_UNIQUE;
+  pIndex->pSchema = db->aDb[iDb].pSchema;
+  pIndex->nKeyCol = pList->nExpr;
+  if( pPIWhere ){
+    sqlite3ResolveSelfReference(pParse, pTab, NC_PartIdx, pPIWhere, 0);
+    pIndex->pPartIdxWhere = pPIWhere;
+    pPIWhere = 0;
+  }
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+
+  /* Check to see if we should honor DESC requests on index columns
+  */
+  if( pDb->pSchema->file_format>=4 ){
+    sortOrderMask = -1;   /* Honor DESC */
+  }else{
+    sortOrderMask = 0;    /* Ignore DESC */
+  }
+
+  /* Scan the names of the columns of the table to be indexed and
+  ** load the column indices into the Index structure.  Report an error
+  ** if any column is not found.
+  **
+  ** TODO:  Add a test to make sure that the same column is not named
+  ** more than once within the same index.  Only the first instance of
+  ** the column will ever be used by the optimizer.  Note that using the
+  ** same column more than once cannot be an error because that would 
+  ** break backwards compatibility - it needs to be a warning.
+  */
+  for(i=0, pListItem=pList->a; i<pList->nExpr; i++, pListItem++){
+    const char *zColName = pListItem->zName;
+    int requestedSortOrder;
+    char *zColl;                   /* Collation sequence name */
+
+    for(j=0, pTabCol=pTab->aCol; j<pTab->nCol; j++, pTabCol++){
+      if( sqlite3StrICmp(zColName, pTabCol->zName)==0 ) break;
+    }
+    if( j>=pTab->nCol ){
+      sqlite3ErrorMsg(pParse, "table %s has no column named %s",
+        pTab->zName, zColName);
+      pParse->checkSchema = 1;
+      goto exit_create_index;
+    }
+    assert( j<=0x7fff );
+    pIndex->aiColumn[i] = (i16)j;
+    if( pListItem->pExpr ){
+      int nColl;
+      assert( pListItem->pExpr->op==TK_COLLATE );
+      zColl = pListItem->pExpr->u.zToken;
+      nColl = sqlite3Strlen30(zColl) + 1;
+      assert( nExtra>=nColl );
+      memcpy(zExtra, zColl, nColl);
+      zColl = zExtra;
+      zExtra += nColl;
+      nExtra -= nColl;
+    }else{
+      zColl = pTab->aCol[j].zColl;
+      if( !zColl ) zColl = "BINARY";
+    }
+    if( !db->init.busy && !sqlite3LocateCollSeq(pParse, zColl) ){
+      goto exit_create_index;
+    }
+    pIndex->azColl[i] = zColl;
+    requestedSortOrder = pListItem->sortOrder & sortOrderMask;
+    pIndex->aSortOrder[i] = (u8)requestedSortOrder;
+    if( pTab->aCol[j].notNull==0 ) pIndex->uniqNotNull = 0;
+  }
+  if( pPk ){
+    for(j=0; j<pPk->nKeyCol; j++){
+      int x = pPk->aiColumn[j];
+      if( hasColumn(pIndex->aiColumn, pIndex->nKeyCol, x) ){
+        pIndex->nColumn--; 
+      }else{
+        pIndex->aiColumn[i] = x;
+        pIndex->azColl[i] = pPk->azColl[j];
+        pIndex->aSortOrder[i] = pPk->aSortOrder[j];
+        i++;
+      }
+    }
+    assert( i==pIndex->nColumn );
+  }else{
+    pIndex->aiColumn[i] = -1;
+    pIndex->azColl[i] = "BINARY";
+  }
+  sqlite3DefaultRowEst(pIndex);
+  if( pParse->pNewTable==0 ) estimateIndexWidth(pIndex);
+
+  if( pTab==pParse->pNewTable ){
+    /* This routine has been called to create an automatic index as a
+    ** result of a PRIMARY KEY or UNIQUE clause on a column definition, or
+    ** a PRIMARY KEY or UNIQUE clause following the column definitions.
+    ** i.e. one of:
+    **
+    ** CREATE TABLE t(x PRIMARY KEY, y);
+    ** CREATE TABLE t(x, y, UNIQUE(x, y));
+    **
+    ** Either way, check to see if the table already has such an index. If
+    ** so, don't bother creating this one. This only applies to
+    ** automatically created indices. Users can do as they wish with
+    ** explicit indices.
+    **
+    ** Two UNIQUE or PRIMARY KEY constraints are considered equivalent
+    ** (and thus suppressing the second one) even if they have different
+    ** sort orders.
+    **
+    ** If there are different collating sequences or if the columns of
+    ** the constraint occur in different orders, then the constraints are
+    ** considered distinct and both result in separate indices.
+    */
+    Index *pIdx;
+    for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+      int k;
+      assert( IsUniqueIndex(pIdx) );
+      assert( pIdx->idxType!=SQLITE_IDXTYPE_APPDEF );
+      assert( IsUniqueIndex(pIndex) );
+
+      if( pIdx->nKeyCol!=pIndex->nKeyCol ) continue;
+      for(k=0; k<pIdx->nKeyCol; k++){
+        const char *z1;
+        const char *z2;
+        if( pIdx->aiColumn[k]!=pIndex->aiColumn[k] ) break;
+        z1 = pIdx->azColl[k];
+        z2 = pIndex->azColl[k];
+        if( z1!=z2 && sqlite3StrICmp(z1, z2) ) break;
+      }
+      if( k==pIdx->nKeyCol ){
+        if( pIdx->onError!=pIndex->onError ){
+          /* This constraint creates the same index as a previous
+          ** constraint specified somewhere in the CREATE TABLE statement.
+          ** However the ON CONFLICT clauses are different. If both this 
+          ** constraint and the previous equivalent constraint have explicit
+          ** ON CONFLICT clauses this is an error. Otherwise, use the
+          ** explicitly specified behavior for the index.
+          */
+          if( !(pIdx->onError==OE_Default || pIndex->onError==OE_Default) ){
+            sqlite3ErrorMsg(pParse, 
+                "conflicting ON CONFLICT clauses specified", 0);
+          }
+          if( pIdx->onError==OE_Default ){
+            pIdx->onError = pIndex->onError;
+          }
+        }
+        goto exit_create_index;
+      }
+    }
+  }
+
+  /* Link the new Index structure to its table and to the other
+  ** in-memory database structures. 
+  */
+  if( db->init.busy ){
+    Index *p;
+    assert( sqlite3SchemaMutexHeld(db, 0, pIndex->pSchema) );
+    p = sqlite3HashInsert(&pIndex->pSchema->idxHash, 
+                          pIndex->zName, pIndex);
+    if( p ){
+      assert( p==pIndex );  /* Malloc must have failed */
+      db->mallocFailed = 1;
+      goto exit_create_index;
+    }
+    db->flags |= SQLITE_InternChanges;
+    if( pTblName!=0 ){
+      pIndex->tnum = db->init.newTnum;
+    }
+  }
+
+  /* If this is the initial CREATE INDEX statement (or CREATE TABLE if the
+  ** index is an implied index for a UNIQUE or PRIMARY KEY constraint) then
