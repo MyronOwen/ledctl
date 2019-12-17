@@ -92908,3 +92908,202 @@ SQLITE_PRIVATE Index *sqlite3CreateIndex(
 
   /* If this is the initial CREATE INDEX statement (or CREATE TABLE if the
   ** index is an implied index for a UNIQUE or PRIMARY KEY constraint) then
+  ** emit code to allocate the index rootpage on disk and make an entry for
+  ** the index in the sqlite_master table and populate the index with
+  ** content.  But, do not do this if we are simply reading the sqlite_master
+  ** table to parse the schema, or if this index is the PRIMARY KEY index
+  ** of a WITHOUT ROWID table.
+  **
+  ** If pTblName==0 it means this index is generated as an implied PRIMARY KEY
+  ** or UNIQUE index in a CREATE TABLE statement.  Since the table
+  ** has just been created, it contains no data and the index initialization
+  ** step can be skipped.
+  */
+  else if( pParse->nErr==0 && (HasRowid(pTab) || pTblName!=0) ){
+    Vdbe *v;
+    char *zStmt;
+    int iMem = ++pParse->nMem;
+
+    v = sqlite3GetVdbe(pParse);
+    if( v==0 ) goto exit_create_index;
+
+
+    /* Create the rootpage for the index
+    */
+    sqlite3BeginWriteOperation(pParse, 1, iDb);
+    sqlite3VdbeAddOp2(v, OP_CreateIndex, iDb, iMem);
+
+    /* Gather the complete text of the CREATE INDEX statement into
+    ** the zStmt variable
+    */
+    if( pStart ){
+      int n = (int)(pParse->sLastToken.z - pName->z) + pParse->sLastToken.n;
+      if( pName->z[n-1]==';' ) n--;
+      /* A named index with an explicit CREATE INDEX statement */
+      zStmt = sqlite3MPrintf(db, "CREATE%s INDEX %.*s",
+        onError==OE_None ? "" : " UNIQUE", n, pName->z);
+    }else{
+      /* An automatic index created by a PRIMARY KEY or UNIQUE constraint */
+      /* zStmt = sqlite3MPrintf(""); */
+      zStmt = 0;
+    }
+
+    /* Add an entry in sqlite_master for this index
+    */
+    sqlite3NestedParse(pParse, 
+        "INSERT INTO %Q.%s VALUES('index',%Q,%Q,#%d,%Q);",
+        db->aDb[iDb].zName, SCHEMA_TABLE(iDb),
+        pIndex->zName,
+        pTab->zName,
+        iMem,
+        zStmt
+    );
+    sqlite3DbFree(db, zStmt);
+
+    /* Fill the index with data and reparse the schema. Code an OP_Expire
+    ** to invalidate all pre-compiled statements.
+    */
+    if( pTblName ){
+      sqlite3RefillIndex(pParse, pIndex, iMem);
+      sqlite3ChangeCookie(pParse, iDb);
+      sqlite3VdbeAddParseSchemaOp(v, iDb,
+         sqlite3MPrintf(db, "name='%q' AND type='index'", pIndex->zName));
+      sqlite3VdbeAddOp1(v, OP_Expire, 0);
+    }
+  }
+
+  /* When adding an index to the list of indices for a table, make
+  ** sure all indices labeled OE_Replace come after all those labeled
+  ** OE_Ignore.  This is necessary for the correct constraint check
+  ** processing (in sqlite3GenerateConstraintChecks()) as part of
+  ** UPDATE and INSERT statements.  
+  */
+  if( db->init.busy || pTblName==0 ){
+    if( onError!=OE_Replace || pTab->pIndex==0
+         || pTab->pIndex->onError==OE_Replace){
+      pIndex->pNext = pTab->pIndex;
+      pTab->pIndex = pIndex;
+    }else{
+      Index *pOther = pTab->pIndex;
+      while( pOther->pNext && pOther->pNext->onError!=OE_Replace ){
+        pOther = pOther->pNext;
+      }
+      pIndex->pNext = pOther->pNext;
+      pOther->pNext = pIndex;
+    }
+    pRet = pIndex;
+    pIndex = 0;
+  }
+
+  /* Clean up before exiting */
+exit_create_index:
+  if( pIndex ) freeIndex(db, pIndex);
+  sqlite3ExprDelete(db, pPIWhere);
+  sqlite3ExprListDelete(db, pList);
+  sqlite3SrcListDelete(db, pTblName);
+  sqlite3DbFree(db, zName);
+  return pRet;
+}
+
+/*
+** Fill the Index.aiRowEst[] array with default information - information
+** to be used when we have not run the ANALYZE command.
+**
+** aiRowEst[0] is supposed to contain the number of elements in the index.
+** Since we do not know, guess 1 million.  aiRowEst[1] is an estimate of the
+** number of rows in the table that match any particular value of the
+** first column of the index.  aiRowEst[2] is an estimate of the number
+** of rows that match any particular combination of the first 2 columns
+** of the index.  And so forth.  It must always be the case that
+*
+**           aiRowEst[N]<=aiRowEst[N-1]
+**           aiRowEst[N]>=1
+**
+** Apart from that, we have little to go on besides intuition as to
+** how aiRowEst[] should be initialized.  The numbers generated here
+** are based on typical values found in actual indices.
+*/
+SQLITE_PRIVATE void sqlite3DefaultRowEst(Index *pIdx){
+  /*                10,  9,  8,  7,  6 */
+  LogEst aVal[] = { 33, 32, 30, 28, 26 };
+  LogEst *a = pIdx->aiRowLogEst;
+  int nCopy = MIN(ArraySize(aVal), pIdx->nKeyCol);
+  int i;
+
+  /* Set the first entry (number of rows in the index) to the estimated 
+  ** number of rows in the table. Or 10, if the estimated number of rows 
+  ** in the table is less than that.  */
+  a[0] = pIdx->pTable->nRowLogEst;
+  if( a[0]<33 ) a[0] = 33;        assert( 33==sqlite3LogEst(10) );
+
+  /* Estimate that a[1] is 10, a[2] is 9, a[3] is 8, a[4] is 7, a[5] is
+  ** 6 and each subsequent value (if any) is 5.  */
+  memcpy(&a[1], aVal, nCopy*sizeof(LogEst));
+  for(i=nCopy+1; i<=pIdx->nKeyCol; i++){
+    a[i] = 23;                    assert( 23==sqlite3LogEst(5) );
+  }
+
+  assert( 0==sqlite3LogEst(1) );
+  if( IsUniqueIndex(pIdx) ) a[pIdx->nKeyCol] = 0;
+}
+
+/*
+** This routine will drop an existing named index.  This routine
+** implements the DROP INDEX statement.
+*/
+SQLITE_PRIVATE void sqlite3DropIndex(Parse *pParse, SrcList *pName, int ifExists){
+  Index *pIndex;
+  Vdbe *v;
+  sqlite3 *db = pParse->db;
+  int iDb;
+
+  assert( pParse->nErr==0 );   /* Never called with prior errors */
+  if( db->mallocFailed ){
+    goto exit_drop_index;
+  }
+  assert( pName->nSrc==1 );
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    goto exit_drop_index;
+  }
+  pIndex = sqlite3FindIndex(db, pName->a[0].zName, pName->a[0].zDatabase);
+  if( pIndex==0 ){
+    if( !ifExists ){
+      sqlite3ErrorMsg(pParse, "no such index: %S", pName, 0);
+    }else{
+      sqlite3CodeVerifyNamedSchema(pParse, pName->a[0].zDatabase);
+    }
+    pParse->checkSchema = 1;
+    goto exit_drop_index;
+  }
+  if( pIndex->idxType!=SQLITE_IDXTYPE_APPDEF ){
+    sqlite3ErrorMsg(pParse, "index associated with UNIQUE "
+      "or PRIMARY KEY constraint cannot be dropped", 0);
+    goto exit_drop_index;
+  }
+  iDb = sqlite3SchemaToIndex(db, pIndex->pSchema);
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  {
+    int code = SQLITE_DROP_INDEX;
+    Table *pTab = pIndex->pTable;
+    const char *zDb = db->aDb[iDb].zName;
+    const char *zTab = SCHEMA_TABLE(iDb);
+    if( sqlite3AuthCheck(pParse, SQLITE_DELETE, zTab, 0, zDb) ){
+      goto exit_drop_index;
+    }
+    if( !OMIT_TEMPDB && iDb ) code = SQLITE_DROP_TEMP_INDEX;
+    if( sqlite3AuthCheck(pParse, code, pIndex->zName, pTab->zName, zDb) ){
+      goto exit_drop_index;
+    }
+  }
+#endif
+
+  /* Generate code to remove the index and from the master table */
+  v = sqlite3GetVdbe(pParse);
+  if( v ){
+    sqlite3BeginWriteOperation(pParse, 1, iDb);
+    sqlite3NestedParse(pParse,
+       "DELETE FROM %Q.%s WHERE name=%Q AND type='index'",
+       db->aDb[iDb].zName, SCHEMA_TABLE(iDb), pIndex->zName
+    );
+    sqlite3ClearStatTables(pParse, iDb, "idx", pIndex->zName);
+    sqlite3ChangeCookie(pParse, iDb);
