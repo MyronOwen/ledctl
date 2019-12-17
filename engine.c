@@ -92459,3 +92459,221 @@ static void sqlite3RefillIndex(Parse *pParse, Index *pIndex, int memRootPage){
                          pIndex->nKeyCol); VdbeCoverage(v);
     sqlite3UniqueConstraint(pParse, OE_Abort, pIndex);
   }else{
+    addr2 = sqlite3VdbeCurrentAddr(v);
+  }
+  sqlite3VdbeAddOp3(v, OP_SorterData, iSorter, regRecord, iIdx);
+  sqlite3VdbeAddOp3(v, OP_IdxInsert, iIdx, regRecord, 1);
+  sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+  sqlite3ReleaseTempReg(pParse, regRecord);
+  sqlite3VdbeAddOp2(v, OP_SorterNext, iSorter, addr2); VdbeCoverage(v);
+  sqlite3VdbeJumpHere(v, addr1);
+
+  sqlite3VdbeAddOp1(v, OP_Close, iTab);
+  sqlite3VdbeAddOp1(v, OP_Close, iIdx);
+  sqlite3VdbeAddOp1(v, OP_Close, iSorter);
+}
+
+/*
+** Allocate heap space to hold an Index object with nCol columns.
+**
+** Increase the allocation size to provide an extra nExtra bytes
+** of 8-byte aligned space after the Index object and return a
+** pointer to this extra space in *ppExtra.
+*/
+SQLITE_PRIVATE Index *sqlite3AllocateIndexObject(
+  sqlite3 *db,         /* Database connection */
+  i16 nCol,            /* Total number of columns in the index */
+  int nExtra,          /* Number of bytes of extra space to alloc */
+  char **ppExtra       /* Pointer to the "extra" space */
+){
+  Index *p;            /* Allocated index object */
+  int nByte;           /* Bytes of space for Index object + arrays */
+
+  nByte = ROUND8(sizeof(Index)) +              /* Index structure  */
+          ROUND8(sizeof(char*)*nCol) +         /* Index.azColl     */
+          ROUND8(sizeof(LogEst)*(nCol+1) +     /* Index.aiRowLogEst   */
+                 sizeof(i16)*nCol +            /* Index.aiColumn   */
+                 sizeof(u8)*nCol);             /* Index.aSortOrder */
+  p = sqlite3DbMallocZero(db, nByte + nExtra);
+  if( p ){
+    char *pExtra = ((char*)p)+ROUND8(sizeof(Index));
+    p->azColl = (char**)pExtra;       pExtra += ROUND8(sizeof(char*)*nCol);
+    p->aiRowLogEst = (LogEst*)pExtra; pExtra += sizeof(LogEst)*(nCol+1);
+    p->aiColumn = (i16*)pExtra;       pExtra += sizeof(i16)*nCol;
+    p->aSortOrder = (u8*)pExtra;
+    p->nColumn = nCol;
+    p->nKeyCol = nCol - 1;
+    *ppExtra = ((char*)p) + nByte;
+  }
+  return p;
+}
+
+/*
+** Create a new index for an SQL table.  pName1.pName2 is the name of the index 
+** and pTblList is the name of the table that is to be indexed.  Both will 
+** be NULL for a primary key or an index that is created to satisfy a
+** UNIQUE constraint.  If pTable and pIndex are NULL, use pParse->pNewTable
+** as the table to be indexed.  pParse->pNewTable is a table that is
+** currently being constructed by a CREATE TABLE statement.
+**
+** pList is a list of columns to be indexed.  pList will be NULL if this
+** is a primary key or unique-constraint on the most recent column added
+** to the table currently under construction.  
+**
+** If the index is created successfully, return a pointer to the new Index
+** structure. This is used by sqlite3AddPrimaryKey() to mark the index
+** as the tables primary key (Index.idxType==SQLITE_IDXTYPE_PRIMARYKEY)
+*/
+SQLITE_PRIVATE Index *sqlite3CreateIndex(
+  Parse *pParse,     /* All information about this parse */
+  Token *pName1,     /* First part of index name. May be NULL */
+  Token *pName2,     /* Second part of index name. May be NULL */
+  SrcList *pTblName, /* Table to index. Use pParse->pNewTable if 0 */
+  ExprList *pList,   /* A list of columns to be indexed */
+  int onError,       /* OE_Abort, OE_Ignore, OE_Replace, or OE_None */
+  Token *pStart,     /* The CREATE token that begins this statement */
+  Expr *pPIWhere,    /* WHERE clause for partial indices */
+  int sortOrder,     /* Sort order of primary key when pList==NULL */
+  int ifNotExist     /* Omit error if index already exists */
+){
+  Index *pRet = 0;     /* Pointer to return */
+  Table *pTab = 0;     /* Table to be indexed */
+  Index *pIndex = 0;   /* The index to be created */
+  char *zName = 0;     /* Name of the index */
+  int nName;           /* Number of characters in zName */
+  int i, j;
+  DbFixer sFix;        /* For assigning database names to pTable */
+  int sortOrderMask;   /* 1 to honor DESC in index.  0 to ignore. */
+  sqlite3 *db = pParse->db;
+  Db *pDb;             /* The specific table containing the indexed database */
+  int iDb;             /* Index of the database that is being written */
+  Token *pName = 0;    /* Unqualified name of the index to create */
+  struct ExprList_item *pListItem; /* For looping over pList */
+  const Column *pTabCol;           /* A column in the table */
+  int nExtra = 0;                  /* Space allocated for zExtra[] */
+  int nExtraCol;                   /* Number of extra columns needed */
+  char *zExtra = 0;                /* Extra space after the Index object */
+  Index *pPk = 0;      /* PRIMARY KEY index for WITHOUT ROWID tables */
+
+  assert( pParse->nErr==0 );      /* Never called with prior errors */
+  if( db->mallocFailed || IN_DECLARE_VTAB ){
+    goto exit_create_index;
+  }
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    goto exit_create_index;
+  }
+
+  /*
+  ** Find the table that is to be indexed.  Return early if not found.
+  */
+  if( pTblName!=0 ){
+
+    /* Use the two-part index name to determine the database 
+    ** to search for the table. 'Fix' the table name to this db
+    ** before looking up the table.
+    */
+    assert( pName1 && pName2 );
+    iDb = sqlite3TwoPartName(pParse, pName1, pName2, &pName);
+    if( iDb<0 ) goto exit_create_index;
+    assert( pName && pName->z );
+
+#ifndef SQLITE_OMIT_TEMPDB
+    /* If the index name was unqualified, check if the table
+    ** is a temp table. If so, set the database to 1. Do not do this
+    ** if initialising a database schema.
+    */
+    if( !db->init.busy ){
+      pTab = sqlite3SrcListLookup(pParse, pTblName);
+      if( pName2->n==0 && pTab && pTab->pSchema==db->aDb[1].pSchema ){
+        iDb = 1;
+      }
+    }
+#endif
+
+    sqlite3FixInit(&sFix, pParse, iDb, "index", pName);
+    if( sqlite3FixSrcList(&sFix, pTblName) ){
+      /* Because the parser constructs pTblName from a single identifier,
+      ** sqlite3FixSrcList can never fail. */
+      assert(0);
+    }
+    pTab = sqlite3LocateTableItem(pParse, 0, &pTblName->a[0]);
+    assert( db->mallocFailed==0 || pTab==0 );
+    if( pTab==0 ) goto exit_create_index;
+    if( iDb==1 && db->aDb[iDb].pSchema!=pTab->pSchema ){
+      sqlite3ErrorMsg(pParse, 
+           "cannot create a TEMP index on non-TEMP table \"%s\"",
+           pTab->zName);
+      goto exit_create_index;
+    }
+    if( !HasRowid(pTab) ) pPk = sqlite3PrimaryKeyIndex(pTab);
+  }else{
+    assert( pName==0 );
+    assert( pStart==0 );
+    pTab = pParse->pNewTable;
+    if( !pTab ) goto exit_create_index;
+    iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  }
+  pDb = &db->aDb[iDb];
+
+  assert( pTab!=0 );
+  assert( pParse->nErr==0 );
+  if( sqlite3StrNICmp(pTab->zName, "sqlite_", 7)==0 
+       && db->init.busy==0
+#if SQLITE_USER_AUTHENTICATION
+       && sqlite3UserAuthTable(pTab->zName)==0
+#endif
+       && sqlite3StrNICmp(&pTab->zName[7],"altertab_",9)!=0 ){
+    sqlite3ErrorMsg(pParse, "table %s may not be indexed", pTab->zName);
+    goto exit_create_index;
+  }
+#ifndef SQLITE_OMIT_VIEW
+  if( pTab->pSelect ){
+    sqlite3ErrorMsg(pParse, "views may not be indexed");
+    goto exit_create_index;
+  }
+#endif
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( IsVirtual(pTab) ){
+    sqlite3ErrorMsg(pParse, "virtual tables may not be indexed");
+    goto exit_create_index;
+  }
+#endif
+
+  /*
+  ** Find the name of the index.  Make sure there is not already another
+  ** index or table with the same name.  
+  **
+  ** Exception:  If we are reading the names of permanent indices from the
+  ** sqlite_master table (because some other process changed the schema) and
+  ** one of the index names collides with the name of a temporary table or
+  ** index, then we will continue to process this index.
+  **
+  ** If pName==0 it means that we are
+  ** dealing with a primary key or UNIQUE constraint.  We have to invent our
+  ** own name.
+  */
+  if( pName ){
+    zName = sqlite3NameFromToken(db, pName);
+    if( zName==0 ) goto exit_create_index;
+    assert( pName->z!=0 );
+    if( SQLITE_OK!=sqlite3CheckObjectName(pParse, zName) ){
+      goto exit_create_index;
+    }
+    if( !db->init.busy ){
+      if( sqlite3FindTable(db, zName, 0)!=0 ){
+        sqlite3ErrorMsg(pParse, "there is already a table named %s", zName);
+        goto exit_create_index;
+      }
+    }
+    if( sqlite3FindIndex(db, zName, pDb->zName)!=0 ){
+      if( !ifNotExist ){
+        sqlite3ErrorMsg(pParse, "index %s already exists", zName);
+      }else{
+        assert( !db->init.busy );
+        sqlite3CodeVerifySchema(pParse, iDb);
+      }
+      goto exit_create_index;
+    }
+  }else{
+    int n;
+    Index *pLoop;
