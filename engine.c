@@ -93331,3 +93331,230 @@ SQLITE_PRIVATE SrcList *sqlite3SrcListAppend(
   }
   pItem = &pList->a[pList->nSrc-1];
   if( pDatabase && pDatabase->z==0 ){
+    pDatabase = 0;
+  }
+  if( pDatabase ){
+    Token *pTemp = pDatabase;
+    pDatabase = pTable;
+    pTable = pTemp;
+  }
+  pItem->zName = sqlite3NameFromToken(db, pTable);
+  pItem->zDatabase = sqlite3NameFromToken(db, pDatabase);
+  return pList;
+}
+
+/*
+** Assign VdbeCursor index numbers to all tables in a SrcList
+*/
+SQLITE_PRIVATE void sqlite3SrcListAssignCursors(Parse *pParse, SrcList *pList){
+  int i;
+  struct SrcList_item *pItem;
+  assert(pList || pParse->db->mallocFailed );
+  if( pList ){
+    for(i=0, pItem=pList->a; i<pList->nSrc; i++, pItem++){
+      if( pItem->iCursor>=0 ) break;
+      pItem->iCursor = pParse->nTab++;
+      if( pItem->pSelect ){
+        sqlite3SrcListAssignCursors(pParse, pItem->pSelect->pSrc);
+      }
+    }
+  }
+}
+
+/*
+** Delete an entire SrcList including all its substructure.
+*/
+SQLITE_PRIVATE void sqlite3SrcListDelete(sqlite3 *db, SrcList *pList){
+  int i;
+  struct SrcList_item *pItem;
+  if( pList==0 ) return;
+  for(pItem=pList->a, i=0; i<pList->nSrc; i++, pItem++){
+    sqlite3DbFree(db, pItem->zDatabase);
+    sqlite3DbFree(db, pItem->zName);
+    sqlite3DbFree(db, pItem->zAlias);
+    sqlite3DbFree(db, pItem->zIndex);
+    sqlite3DeleteTable(db, pItem->pTab);
+    sqlite3SelectDelete(db, pItem->pSelect);
+    sqlite3ExprDelete(db, pItem->pOn);
+    sqlite3IdListDelete(db, pItem->pUsing);
+  }
+  sqlite3DbFree(db, pList);
+}
+
+/*
+** This routine is called by the parser to add a new term to the
+** end of a growing FROM clause.  The "p" parameter is the part of
+** the FROM clause that has already been constructed.  "p" is NULL
+** if this is the first term of the FROM clause.  pTable and pDatabase
+** are the name of the table and database named in the FROM clause term.
+** pDatabase is NULL if the database name qualifier is missing - the
+** usual case.  If the term has an alias, then pAlias points to the
+** alias token.  If the term is a subquery, then pSubquery is the
+** SELECT statement that the subquery encodes.  The pTable and
+** pDatabase parameters are NULL for subqueries.  The pOn and pUsing
+** parameters are the content of the ON and USING clauses.
+**
+** Return a new SrcList which encodes is the FROM with the new
+** term added.
+*/
+SQLITE_PRIVATE SrcList *sqlite3SrcListAppendFromTerm(
+  Parse *pParse,          /* Parsing context */
+  SrcList *p,             /* The left part of the FROM clause already seen */
+  Token *pTable,          /* Name of the table to add to the FROM clause */
+  Token *pDatabase,       /* Name of the database containing pTable */
+  Token *pAlias,          /* The right-hand side of the AS subexpression */
+  Select *pSubquery,      /* A subquery used in place of a table name */
+  Expr *pOn,              /* The ON clause of a join */
+  IdList *pUsing          /* The USING clause of a join */
+){
+  struct SrcList_item *pItem;
+  sqlite3 *db = pParse->db;
+  if( !p && (pOn || pUsing) ){
+    sqlite3ErrorMsg(pParse, "a JOIN clause is required before %s", 
+      (pOn ? "ON" : "USING")
+    );
+    goto append_from_error;
+  }
+  p = sqlite3SrcListAppend(db, p, pTable, pDatabase);
+  if( p==0 || NEVER(p->nSrc==0) ){
+    goto append_from_error;
+  }
+  pItem = &p->a[p->nSrc-1];
+  assert( pAlias!=0 );
+  if( pAlias->n ){
+    pItem->zAlias = sqlite3NameFromToken(db, pAlias);
+  }
+  pItem->pSelect = pSubquery;
+  pItem->pOn = pOn;
+  pItem->pUsing = pUsing;
+  return p;
+
+ append_from_error:
+  assert( p==0 );
+  sqlite3ExprDelete(db, pOn);
+  sqlite3IdListDelete(db, pUsing);
+  sqlite3SelectDelete(db, pSubquery);
+  return 0;
+}
+
+/*
+** Add an INDEXED BY or NOT INDEXED clause to the most recently added 
+** element of the source-list passed as the second argument.
+*/
+SQLITE_PRIVATE void sqlite3SrcListIndexedBy(Parse *pParse, SrcList *p, Token *pIndexedBy){
+  assert( pIndexedBy!=0 );
+  if( p && ALWAYS(p->nSrc>0) ){
+    struct SrcList_item *pItem = &p->a[p->nSrc-1];
+    assert( pItem->notIndexed==0 && pItem->zIndex==0 );
+    if( pIndexedBy->n==1 && !pIndexedBy->z ){
+      /* A "NOT INDEXED" clause was supplied. See parse.y 
+      ** construct "indexed_opt" for details. */
+      pItem->notIndexed = 1;
+    }else{
+      pItem->zIndex = sqlite3NameFromToken(pParse->db, pIndexedBy);
+    }
+  }
+}
+
+/*
+** When building up a FROM clause in the parser, the join operator
+** is initially attached to the left operand.  But the code generator
+** expects the join operator to be on the right operand.  This routine
+** Shifts all join operators from left to right for an entire FROM
+** clause.
+**
+** Example: Suppose the join is like this:
+**
+**           A natural cross join B
+**
+** The operator is "natural cross join".  The A and B operands are stored
+** in p->a[0] and p->a[1], respectively.  The parser initially stores the
+** operator with A.  This routine shifts that operator over to B.
+*/
+SQLITE_PRIVATE void sqlite3SrcListShiftJoinType(SrcList *p){
+  if( p ){
+    int i;
+    assert( p->a || p->nSrc==0 );
+    for(i=p->nSrc-1; i>0; i--){
+      p->a[i].jointype = p->a[i-1].jointype;
+    }
+    p->a[0].jointype = 0;
+  }
+}
+
+/*
+** Begin a transaction
+*/
+SQLITE_PRIVATE void sqlite3BeginTransaction(Parse *pParse, int type){
+  sqlite3 *db;
+  Vdbe *v;
+  int i;
+
+  assert( pParse!=0 );
+  db = pParse->db;
+  assert( db!=0 );
+/*  if( db->aDb[0].pBt==0 ) return; */
+  if( sqlite3AuthCheck(pParse, SQLITE_TRANSACTION, "BEGIN", 0, 0) ){
+    return;
+  }
+  v = sqlite3GetVdbe(pParse);
+  if( !v ) return;
+  if( type!=TK_DEFERRED ){
+    for(i=0; i<db->nDb; i++){
+      sqlite3VdbeAddOp2(v, OP_Transaction, i, (type==TK_EXCLUSIVE)+1);
+      sqlite3VdbeUsesBtree(v, i);
+    }
+  }
+  sqlite3VdbeAddOp2(v, OP_AutoCommit, 0, 0);
+}
+
+/*
+** Commit a transaction
+*/
+SQLITE_PRIVATE void sqlite3CommitTransaction(Parse *pParse){
+  Vdbe *v;
+
+  assert( pParse!=0 );
+  assert( pParse->db!=0 );
+  if( sqlite3AuthCheck(pParse, SQLITE_TRANSACTION, "COMMIT", 0, 0) ){
+    return;
+  }
+  v = sqlite3GetVdbe(pParse);
+  if( v ){
+    sqlite3VdbeAddOp2(v, OP_AutoCommit, 1, 0);
+  }
+}
+
+/*
+** Rollback a transaction
+*/
+SQLITE_PRIVATE void sqlite3RollbackTransaction(Parse *pParse){
+  Vdbe *v;
+
+  assert( pParse!=0 );
+  assert( pParse->db!=0 );
+  if( sqlite3AuthCheck(pParse, SQLITE_TRANSACTION, "ROLLBACK", 0, 0) ){
+    return;
+  }
+  v = sqlite3GetVdbe(pParse);
+  if( v ){
+    sqlite3VdbeAddOp2(v, OP_AutoCommit, 1, 1);
+  }
+}
+
+/*
+** This function is called by the parser when it parses a command to create,
+** release or rollback an SQL savepoint. 
+*/
+SQLITE_PRIVATE void sqlite3Savepoint(Parse *pParse, int op, Token *pName){
+  char *zName = sqlite3NameFromToken(pParse->db, pName);
+  if( zName ){
+    Vdbe *v = sqlite3GetVdbe(pParse);
+#ifndef SQLITE_OMIT_AUTHORIZATION
+    static const char * const az[] = { "BEGIN", "RELEASE", "ROLLBACK" };
+    assert( !SAVEPOINT_BEGIN && SAVEPOINT_RELEASE==1 && SAVEPOINT_ROLLBACK==2 );
+#endif
+    if( !v || sqlite3AuthCheck(pParse, SQLITE_SAVEPOINT, az[op], zName, 0) ){
+      sqlite3DbFree(pParse->db, zName);
+      return;
+    }
