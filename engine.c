@@ -93780,3 +93780,213 @@ static int collationMatch(const char *zColl, Index *pIndex){
 #endif
 
 /*
+** Recompute all indices of pTab that use the collating sequence pColl.
+** If pColl==0 then recompute all indices of pTab.
+*/
+#ifndef SQLITE_OMIT_REINDEX
+static void reindexTable(Parse *pParse, Table *pTab, char const *zColl){
+  Index *pIndex;              /* An index associated with pTab */
+
+  for(pIndex=pTab->pIndex; pIndex; pIndex=pIndex->pNext){
+    if( zColl==0 || collationMatch(zColl, pIndex) ){
+      int iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+      sqlite3BeginWriteOperation(pParse, 0, iDb);
+      sqlite3RefillIndex(pParse, pIndex, -1);
+    }
+  }
+}
+#endif
+
+/*
+** Recompute all indices of all tables in all databases where the
+** indices use the collating sequence pColl.  If pColl==0 then recompute
+** all indices everywhere.
+*/
+#ifndef SQLITE_OMIT_REINDEX
+static void reindexDatabases(Parse *pParse, char const *zColl){
+  Db *pDb;                    /* A single database */
+  int iDb;                    /* The database index number */
+  sqlite3 *db = pParse->db;   /* The database connection */
+  HashElem *k;                /* For looping over tables in pDb */
+  Table *pTab;                /* A table in the database */
+
+  assert( sqlite3BtreeHoldsAllMutexes(db) );  /* Needed for schema access */
+  for(iDb=0, pDb=db->aDb; iDb<db->nDb; iDb++, pDb++){
+    assert( pDb!=0 );
+    for(k=sqliteHashFirst(&pDb->pSchema->tblHash);  k; k=sqliteHashNext(k)){
+      pTab = (Table*)sqliteHashData(k);
+      reindexTable(pParse, pTab, zColl);
+    }
+  }
+}
+#endif
+
+/*
+** Generate code for the REINDEX command.
+**
+**        REINDEX                            -- 1
+**        REINDEX  <collation>               -- 2
+**        REINDEX  ?<database>.?<tablename>  -- 3
+**        REINDEX  ?<database>.?<indexname>  -- 4
+**
+** Form 1 causes all indices in all attached databases to be rebuilt.
+** Form 2 rebuilds all indices in all databases that use the named
+** collating function.  Forms 3 and 4 rebuild the named index or all
+** indices associated with the named table.
+*/
+#ifndef SQLITE_OMIT_REINDEX
+SQLITE_PRIVATE void sqlite3Reindex(Parse *pParse, Token *pName1, Token *pName2){
+  CollSeq *pColl;             /* Collating sequence to be reindexed, or NULL */
+  char *z;                    /* Name of a table or index */
+  const char *zDb;            /* Name of the database */
+  Table *pTab;                /* A table in the database */
+  Index *pIndex;              /* An index associated with pTab */
+  int iDb;                    /* The database index number */
+  sqlite3 *db = pParse->db;   /* The database connection */
+  Token *pObjName;            /* Name of the table or index to be reindexed */
+
+  /* Read the database schema. If an error occurs, leave an error message
+  ** and code in pParse and return NULL. */
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    return;
+  }
+
+  if( pName1==0 ){
+    reindexDatabases(pParse, 0);
+    return;
+  }else if( NEVER(pName2==0) || pName2->z==0 ){
+    char *zColl;
+    assert( pName1->z );
+    zColl = sqlite3NameFromToken(pParse->db, pName1);
+    if( !zColl ) return;
+    pColl = sqlite3FindCollSeq(db, ENC(db), zColl, 0);
+    if( pColl ){
+      reindexDatabases(pParse, zColl);
+      sqlite3DbFree(db, zColl);
+      return;
+    }
+    sqlite3DbFree(db, zColl);
+  }
+  iDb = sqlite3TwoPartName(pParse, pName1, pName2, &pObjName);
+  if( iDb<0 ) return;
+  z = sqlite3NameFromToken(db, pObjName);
+  if( z==0 ) return;
+  zDb = db->aDb[iDb].zName;
+  pTab = sqlite3FindTable(db, z, zDb);
+  if( pTab ){
+    reindexTable(pParse, pTab, 0);
+    sqlite3DbFree(db, z);
+    return;
+  }
+  pIndex = sqlite3FindIndex(db, z, zDb);
+  sqlite3DbFree(db, z);
+  if( pIndex ){
+    sqlite3BeginWriteOperation(pParse, 0, iDb);
+    sqlite3RefillIndex(pParse, pIndex, -1);
+    return;
+  }
+  sqlite3ErrorMsg(pParse, "unable to identify the object to be reindexed");
+}
+#endif
+
+/*
+** Return a KeyInfo structure that is appropriate for the given Index.
+**
+** The KeyInfo structure for an index is cached in the Index object.
+** So there might be multiple references to the returned pointer.  The
+** caller should not try to modify the KeyInfo object.
+**
+** The caller should invoke sqlite3KeyInfoUnref() on the returned object
+** when it has finished using it.
+*/
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoOfIndex(Parse *pParse, Index *pIdx){
+  int i;
+  int nCol = pIdx->nColumn;
+  int nKey = pIdx->nKeyCol;
+  KeyInfo *pKey;
+  if( pParse->nErr ) return 0;
+  if( pIdx->uniqNotNull ){
+    pKey = sqlite3KeyInfoAlloc(pParse->db, nKey, nCol-nKey);
+  }else{
+    pKey = sqlite3KeyInfoAlloc(pParse->db, nCol, 0);
+  }
+  if( pKey ){
+    assert( sqlite3KeyInfoIsWriteable(pKey) );
+    for(i=0; i<nCol; i++){
+      char *zColl = pIdx->azColl[i];
+      assert( zColl!=0 );
+      pKey->aColl[i] = strcmp(zColl,"BINARY")==0 ? 0 :
+                        sqlite3LocateCollSeq(pParse, zColl);
+      pKey->aSortOrder[i] = pIdx->aSortOrder[i];
+    }
+    if( pParse->nErr ){
+      sqlite3KeyInfoUnref(pKey);
+      pKey = 0;
+    }
+  }
+  return pKey;
+}
+
+#ifndef SQLITE_OMIT_CTE
+/* 
+** This routine is invoked once per CTE by the parser while parsing a 
+** WITH clause. 
+*/
+SQLITE_PRIVATE With *sqlite3WithAdd(
+  Parse *pParse,          /* Parsing context */
+  With *pWith,            /* Existing WITH clause, or NULL */
+  Token *pName,           /* Name of the common-table */
+  ExprList *pArglist,     /* Optional column name list for the table */
+  Select *pQuery          /* Query used to initialize the table */
+){
+  sqlite3 *db = pParse->db;
+  With *pNew;
+  char *zName;
+
+  /* Check that the CTE name is unique within this WITH clause. If
+  ** not, store an error in the Parse structure. */
+  zName = sqlite3NameFromToken(pParse->db, pName);
+  if( zName && pWith ){
+    int i;
+    for(i=0; i<pWith->nCte; i++){
+      if( sqlite3StrICmp(zName, pWith->a[i].zName)==0 ){
+        sqlite3ErrorMsg(pParse, "duplicate WITH table name: %s", zName);
+      }
+    }
+  }
+
+  if( pWith ){
+    int nByte = sizeof(*pWith) + (sizeof(pWith->a[1]) * pWith->nCte);
+    pNew = sqlite3DbRealloc(db, pWith, nByte);
+  }else{
+    pNew = sqlite3DbMallocZero(db, sizeof(*pWith));
+  }
+  assert( zName!=0 || pNew==0 );
+  assert( db->mallocFailed==0 || pNew==0 );
+
+  if( pNew==0 ){
+    sqlite3ExprListDelete(db, pArglist);
+    sqlite3SelectDelete(db, pQuery);
+    sqlite3DbFree(db, zName);
+    pNew = pWith;
+  }else{
+    pNew->a[pNew->nCte].pSelect = pQuery;
+    pNew->a[pNew->nCte].pCols = pArglist;
+    pNew->a[pNew->nCte].zName = zName;
+    pNew->a[pNew->nCte].zErr = 0;
+    pNew->nCte++;
+  }
+
+  return pNew;
+}
+
+/*
+** Free the contents of the With object passed as the second argument.
+*/
+SQLITE_PRIVATE void sqlite3WithDelete(sqlite3 *db, With *pWith){
+  if( pWith ){
+    int i;
+    for(i=0; i<pWith->nCte; i++){
+      struct Cte *pCte = &pWith->a[i];
+      sqlite3ExprListDelete(db, pCte->pCols);
+      sqlite3SelectDelete(db, pCte->pSelect);
