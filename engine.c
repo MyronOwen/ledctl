@@ -94220,3 +94220,238 @@ SQLITE_PRIVATE CollSeq *sqlite3FindCollSeq(
 }
 
 /* During the search for the best function definition, this procedure
+** is called to test how well the function passed as the first argument
+** matches the request for a function with nArg arguments in a system
+** that uses encoding enc. The value returned indicates how well the
+** request is matched. A higher value indicates a better match.
+**
+** If nArg is -1 that means to only return a match (non-zero) if p->nArg
+** is also -1.  In other words, we are searching for a function that
+** takes a variable number of arguments.
+**
+** If nArg is -2 that means that we are searching for any function 
+** regardless of the number of arguments it uses, so return a positive
+** match score for any
+**
+** The returned value is always between 0 and 6, as follows:
+**
+** 0: Not a match.
+** 1: UTF8/16 conversion required and function takes any number of arguments.
+** 2: UTF16 byte order change required and function takes any number of args.
+** 3: encoding matches and function takes any number of arguments
+** 4: UTF8/16 conversion required - argument count matches exactly
+** 5: UTF16 byte order conversion required - argument count matches exactly
+** 6: Perfect match:  encoding and argument count match exactly.
+**
+** If nArg==(-2) then any function with a non-null xStep or xFunc is
+** a perfect match and any function with both xStep and xFunc NULL is
+** a non-match.
+*/
+#define FUNC_PERFECT_MATCH 6  /* The score for a perfect match */
+static int matchQuality(
+  FuncDef *p,     /* The function we are evaluating for match quality */
+  int nArg,       /* Desired number of arguments.  (-1)==any */
+  u8 enc          /* Desired text encoding */
+){
+  int match;
+
+  /* nArg of -2 is a special case */
+  if( nArg==(-2) ) return (p->xFunc==0 && p->xStep==0) ? 0 : FUNC_PERFECT_MATCH;
+
+  /* Wrong number of arguments means "no match" */
+  if( p->nArg!=nArg && p->nArg>=0 ) return 0;
+
+  /* Give a better score to a function with a specific number of arguments
+  ** than to function that accepts any number of arguments. */
+  if( p->nArg==nArg ){
+    match = 4;
+  }else{
+    match = 1;
+  }
+
+  /* Bonus points if the text encoding matches */
+  if( enc==(p->funcFlags & SQLITE_FUNC_ENCMASK) ){
+    match += 2;  /* Exact encoding match */
+  }else if( (enc & p->funcFlags & 2)!=0 ){
+    match += 1;  /* Both are UTF16, but with different byte orders */
+  }
+
+  return match;
+}
+
+/*
+** Search a FuncDefHash for a function with the given name.  Return
+** a pointer to the matching FuncDef if found, or 0 if there is no match.
+*/
+static FuncDef *functionSearch(
+  FuncDefHash *pHash,  /* Hash table to search */
+  int h,               /* Hash of the name */
+  const char *zFunc,   /* Name of function */
+  int nFunc            /* Number of bytes in zFunc */
+){
+  FuncDef *p;
+  for(p=pHash->a[h]; p; p=p->pHash){
+    if( sqlite3StrNICmp(p->zName, zFunc, nFunc)==0 && p->zName[nFunc]==0 ){
+      return p;
+    }
+  }
+  return 0;
+}
+
+/*
+** Insert a new FuncDef into a FuncDefHash hash table.
+*/
+SQLITE_PRIVATE void sqlite3FuncDefInsert(
+  FuncDefHash *pHash,  /* The hash table into which to insert */
+  FuncDef *pDef        /* The function definition to insert */
+){
+  FuncDef *pOther;
+  int nName = sqlite3Strlen30(pDef->zName);
+  u8 c1 = (u8)pDef->zName[0];
+  int h = (sqlite3UpperToLower[c1] + nName) % ArraySize(pHash->a);
+  pOther = functionSearch(pHash, h, pDef->zName, nName);
+  if( pOther ){
+    assert( pOther!=pDef && pOther->pNext!=pDef );
+    pDef->pNext = pOther->pNext;
+    pOther->pNext = pDef;
+  }else{
+    pDef->pNext = 0;
+    pDef->pHash = pHash->a[h];
+    pHash->a[h] = pDef;
+  }
+}
+  
+  
+
+/*
+** Locate a user function given a name, a number of arguments and a flag
+** indicating whether the function prefers UTF-16 over UTF-8.  Return a
+** pointer to the FuncDef structure that defines that function, or return
+** NULL if the function does not exist.
+**
+** If the createFlag argument is true, then a new (blank) FuncDef
+** structure is created and liked into the "db" structure if a
+** no matching function previously existed.
+**
+** If nArg is -2, then the first valid function found is returned.  A
+** function is valid if either xFunc or xStep is non-zero.  The nArg==(-2)
+** case is used to see if zName is a valid function name for some number
+** of arguments.  If nArg is -2, then createFlag must be 0.
+**
+** If createFlag is false, then a function with the required name and
+** number of arguments may be returned even if the eTextRep flag does not
+** match that requested.
+*/
+SQLITE_PRIVATE FuncDef *sqlite3FindFunction(
+  sqlite3 *db,       /* An open database */
+  const char *zName, /* Name of the function.  Not null-terminated */
+  int nName,         /* Number of characters in the name */
+  int nArg,          /* Number of arguments.  -1 means any number */
+  u8 enc,            /* Preferred text encoding */
+  u8 createFlag      /* Create new entry if true and does not otherwise exist */
+){
+  FuncDef *p;         /* Iterator variable */
+  FuncDef *pBest = 0; /* Best match found so far */
+  int bestScore = 0;  /* Score of best match */
+  int h;              /* Hash value */
+
+  assert( nArg>=(-2) );
+  assert( nArg>=(-1) || createFlag==0 );
+  h = (sqlite3UpperToLower[(u8)zName[0]] + nName) % ArraySize(db->aFunc.a);
+
+  /* First search for a match amongst the application-defined functions.
+  */
+  p = functionSearch(&db->aFunc, h, zName, nName);
+  while( p ){
+    int score = matchQuality(p, nArg, enc);
+    if( score>bestScore ){
+      pBest = p;
+      bestScore = score;
+    }
+    p = p->pNext;
+  }
+
+  /* If no match is found, search the built-in functions.
+  **
+  ** If the SQLITE_PreferBuiltin flag is set, then search the built-in
+  ** functions even if a prior app-defined function was found.  And give
+  ** priority to built-in functions.
+  **
+  ** Except, if createFlag is true, that means that we are trying to
+  ** install a new function.  Whatever FuncDef structure is returned it will
+  ** have fields overwritten with new information appropriate for the
+  ** new function.  But the FuncDefs for built-in functions are read-only.
+  ** So we must not search for built-ins when creating a new function.
+  */ 
+  if( !createFlag && (pBest==0 || (db->flags & SQLITE_PreferBuiltin)!=0) ){
+    FuncDefHash *pHash = &GLOBAL(FuncDefHash, sqlite3GlobalFunctions);
+    bestScore = 0;
+    p = functionSearch(pHash, h, zName, nName);
+    while( p ){
+      int score = matchQuality(p, nArg, enc);
+      if( score>bestScore ){
+        pBest = p;
+        bestScore = score;
+      }
+      p = p->pNext;
+    }
+  }
+
+  /* If the createFlag parameter is true and the search did not reveal an
+  ** exact match for the name, number of arguments and encoding, then add a
+  ** new entry to the hash table and return it.
+  */
+  if( createFlag && bestScore<FUNC_PERFECT_MATCH && 
+      (pBest = sqlite3DbMallocZero(db, sizeof(*pBest)+nName+1))!=0 ){
+    pBest->zName = (char *)&pBest[1];
+    pBest->nArg = (u16)nArg;
+    pBest->funcFlags = enc;
+    memcpy(pBest->zName, zName, nName);
+    pBest->zName[nName] = 0;
+    sqlite3FuncDefInsert(&db->aFunc, pBest);
+  }
+
+  if( pBest && (pBest->xStep || pBest->xFunc || createFlag) ){
+    return pBest;
+  }
+  return 0;
+}
+
+/*
+** Free all resources held by the schema structure. The void* argument points
+** at a Schema struct. This function does not call sqlite3DbFree(db, ) on the 
+** pointer itself, it just cleans up subsidiary resources (i.e. the contents
+** of the schema hash tables).
+**
+** The Schema.cache_size variable is not cleared.
+*/
+SQLITE_PRIVATE void sqlite3SchemaClear(void *p){
+  Hash temp1;
+  Hash temp2;
+  HashElem *pElem;
+  Schema *pSchema = (Schema *)p;
+
+  temp1 = pSchema->tblHash;
+  temp2 = pSchema->trigHash;
+  sqlite3HashInit(&pSchema->trigHash);
+  sqlite3HashClear(&pSchema->idxHash);
+  for(pElem=sqliteHashFirst(&temp2); pElem; pElem=sqliteHashNext(pElem)){
+    sqlite3DeleteTrigger(0, (Trigger*)sqliteHashData(pElem));
+  }
+  sqlite3HashClear(&temp2);
+  sqlite3HashInit(&pSchema->tblHash);
+  for(pElem=sqliteHashFirst(&temp1); pElem; pElem=sqliteHashNext(pElem)){
+    Table *pTab = sqliteHashData(pElem);
+    sqlite3DeleteTable(0, pTab);
+  }
+  sqlite3HashClear(&temp1);
+  sqlite3HashClear(&pSchema->fkeyHash);
+  pSchema->pSeqTab = 0;
+  if( pSchema->schemaFlags & DB_SchemaLoaded ){
+    pSchema->iGeneration++;
+    pSchema->schemaFlags &= ~DB_SchemaLoaded;
+  }
+}
+
+/*
+** Find and return the schema associated with a BTree.  Create
