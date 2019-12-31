@@ -93990,3 +93990,233 @@ SQLITE_PRIVATE void sqlite3WithDelete(sqlite3 *db, With *pWith){
       struct Cte *pCte = &pWith->a[i];
       sqlite3ExprListDelete(db, pCte->pCols);
       sqlite3SelectDelete(db, pCte->pSelect);
+      sqlite3DbFree(db, pCte->zName);
+    }
+    sqlite3DbFree(db, pWith);
+  }
+}
+#endif /* !defined(SQLITE_OMIT_CTE) */
+
+/************** End of build.c ***********************************************/
+/************** Begin file callback.c ****************************************/
+/*
+** 2005 May 23 
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains functions used to access the internal hash tables
+** of user defined functions and collation sequences.
+*/
+
+
+/*
+** Invoke the 'collation needed' callback to request a collation sequence
+** in the encoding enc of name zName, length nName.
+*/
+static void callCollNeeded(sqlite3 *db, int enc, const char *zName){
+  assert( !db->xCollNeeded || !db->xCollNeeded16 );
+  if( db->xCollNeeded ){
+    char *zExternal = sqlite3DbStrDup(db, zName);
+    if( !zExternal ) return;
+    db->xCollNeeded(db->pCollNeededArg, db, enc, zExternal);
+    sqlite3DbFree(db, zExternal);
+  }
+#ifndef SQLITE_OMIT_UTF16
+  if( db->xCollNeeded16 ){
+    char const *zExternal;
+    sqlite3_value *pTmp = sqlite3ValueNew(db);
+    sqlite3ValueSetStr(pTmp, -1, zName, SQLITE_UTF8, SQLITE_STATIC);
+    zExternal = sqlite3ValueText(pTmp, SQLITE_UTF16NATIVE);
+    if( zExternal ){
+      db->xCollNeeded16(db->pCollNeededArg, db, (int)ENC(db), zExternal);
+    }
+    sqlite3ValueFree(pTmp);
+  }
+#endif
+}
+
+/*
+** This routine is called if the collation factory fails to deliver a
+** collation function in the best encoding but there may be other versions
+** of this collation function (for other text encodings) available. Use one
+** of these instead if they exist. Avoid a UTF-8 <-> UTF-16 conversion if
+** possible.
+*/
+static int synthCollSeq(sqlite3 *db, CollSeq *pColl){
+  CollSeq *pColl2;
+  char *z = pColl->zName;
+  int i;
+  static const u8 aEnc[] = { SQLITE_UTF16BE, SQLITE_UTF16LE, SQLITE_UTF8 };
+  for(i=0; i<3; i++){
+    pColl2 = sqlite3FindCollSeq(db, aEnc[i], z, 0);
+    if( pColl2->xCmp!=0 ){
+      memcpy(pColl, pColl2, sizeof(CollSeq));
+      pColl->xDel = 0;         /* Do not copy the destructor */
+      return SQLITE_OK;
+    }
+  }
+  return SQLITE_ERROR;
+}
+
+/*
+** This function is responsible for invoking the collation factory callback
+** or substituting a collation sequence of a different encoding when the
+** requested collation sequence is not available in the desired encoding.
+** 
+** If it is not NULL, then pColl must point to the database native encoding 
+** collation sequence with name zName, length nName.
+**
+** The return value is either the collation sequence to be used in database
+** db for collation type name zName, length nName, or NULL, if no collation
+** sequence can be found.  If no collation is found, leave an error message.
+**
+** See also: sqlite3LocateCollSeq(), sqlite3FindCollSeq()
+*/
+SQLITE_PRIVATE CollSeq *sqlite3GetCollSeq(
+  Parse *pParse,        /* Parsing context */
+  u8 enc,               /* The desired encoding for the collating sequence */
+  CollSeq *pColl,       /* Collating sequence with native encoding, or NULL */
+  const char *zName     /* Collating sequence name */
+){
+  CollSeq *p;
+  sqlite3 *db = pParse->db;
+
+  p = pColl;
+  if( !p ){
+    p = sqlite3FindCollSeq(db, enc, zName, 0);
+  }
+  if( !p || !p->xCmp ){
+    /* No collation sequence of this type for this encoding is registered.
+    ** Call the collation factory to see if it can supply us with one.
+    */
+    callCollNeeded(db, enc, zName);
+    p = sqlite3FindCollSeq(db, enc, zName, 0);
+  }
+  if( p && !p->xCmp && synthCollSeq(db, p) ){
+    p = 0;
+  }
+  assert( !p || p->xCmp );
+  if( p==0 ){
+    sqlite3ErrorMsg(pParse, "no such collation sequence: %s", zName);
+  }
+  return p;
+}
+
+/*
+** This routine is called on a collation sequence before it is used to
+** check that it is defined. An undefined collation sequence exists when
+** a database is loaded that contains references to collation sequences
+** that have not been defined by sqlite3_create_collation() etc.
+**
+** If required, this routine calls the 'collation needed' callback to
+** request a definition of the collating sequence. If this doesn't work, 
+** an equivalent collating sequence that uses a text encoding different
+** from the main database is substituted, if one is available.
+*/
+SQLITE_PRIVATE int sqlite3CheckCollSeq(Parse *pParse, CollSeq *pColl){
+  if( pColl ){
+    const char *zName = pColl->zName;
+    sqlite3 *db = pParse->db;
+    CollSeq *p = sqlite3GetCollSeq(pParse, ENC(db), pColl, zName);
+    if( !p ){
+      return SQLITE_ERROR;
+    }
+    assert( p==pColl );
+  }
+  return SQLITE_OK;
+}
+
+
+
+/*
+** Locate and return an entry from the db.aCollSeq hash table. If the entry
+** specified by zName and nName is not found and parameter 'create' is
+** true, then create a new entry. Otherwise return NULL.
+**
+** Each pointer stored in the sqlite3.aCollSeq hash table contains an
+** array of three CollSeq structures. The first is the collation sequence
+** preferred for UTF-8, the second UTF-16le, and the third UTF-16be.
+**
+** Stored immediately after the three collation sequences is a copy of
+** the collation sequence name. A pointer to this string is stored in
+** each collation sequence structure.
+*/
+static CollSeq *findCollSeqEntry(
+  sqlite3 *db,          /* Database connection */
+  const char *zName,    /* Name of the collating sequence */
+  int create            /* Create a new entry if true */
+){
+  CollSeq *pColl;
+  pColl = sqlite3HashFind(&db->aCollSeq, zName);
+
+  if( 0==pColl && create ){
+    int nName = sqlite3Strlen30(zName);
+    pColl = sqlite3DbMallocZero(db, 3*sizeof(*pColl) + nName + 1);
+    if( pColl ){
+      CollSeq *pDel = 0;
+      pColl[0].zName = (char*)&pColl[3];
+      pColl[0].enc = SQLITE_UTF8;
+      pColl[1].zName = (char*)&pColl[3];
+      pColl[1].enc = SQLITE_UTF16LE;
+      pColl[2].zName = (char*)&pColl[3];
+      pColl[2].enc = SQLITE_UTF16BE;
+      memcpy(pColl[0].zName, zName, nName);
+      pColl[0].zName[nName] = 0;
+      pDel = sqlite3HashInsert(&db->aCollSeq, pColl[0].zName, pColl);
+
+      /* If a malloc() failure occurred in sqlite3HashInsert(), it will 
+      ** return the pColl pointer to be deleted (because it wasn't added
+      ** to the hash table).
+      */
+      assert( pDel==0 || pDel==pColl );
+      if( pDel!=0 ){
+        db->mallocFailed = 1;
+        sqlite3DbFree(db, pDel);
+        pColl = 0;
+      }
+    }
+  }
+  return pColl;
+}
+
+/*
+** Parameter zName points to a UTF-8 encoded string nName bytes long.
+** Return the CollSeq* pointer for the collation sequence named zName
+** for the encoding 'enc' from the database 'db'.
+**
+** If the entry specified is not found and 'create' is true, then create a
+** new entry.  Otherwise return NULL.
+**
+** A separate function sqlite3LocateCollSeq() is a wrapper around
+** this routine.  sqlite3LocateCollSeq() invokes the collation factory
+** if necessary and generates an error message if the collating sequence
+** cannot be found.
+**
+** See also: sqlite3LocateCollSeq(), sqlite3GetCollSeq()
+*/
+SQLITE_PRIVATE CollSeq *sqlite3FindCollSeq(
+  sqlite3 *db,
+  u8 enc,
+  const char *zName,
+  int create
+){
+  CollSeq *pColl;
+  if( zName ){
+    pColl = findCollSeqEntry(db, zName, create);
+  }else{
+    pColl = db->pDfltColl;
+  }
+  assert( SQLITE_UTF8==1 && SQLITE_UTF16LE==2 && SQLITE_UTF16BE==3 );
+  assert( enc>=SQLITE_UTF8 && enc<=SQLITE_UTF16BE );
+  if( pColl ) pColl += enc-1;
+  return pColl;
+}
+
+/* During the search for the best function definition, this procedure
