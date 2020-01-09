@@ -94455,3 +94455,229 @@ SQLITE_PRIVATE void sqlite3SchemaClear(void *p){
 
 /*
 ** Find and return the schema associated with a BTree.  Create
+** a new one if necessary.
+*/
+SQLITE_PRIVATE Schema *sqlite3SchemaGet(sqlite3 *db, Btree *pBt){
+  Schema * p;
+  if( pBt ){
+    p = (Schema *)sqlite3BtreeSchema(pBt, sizeof(Schema), sqlite3SchemaClear);
+  }else{
+    p = (Schema *)sqlite3DbMallocZero(0, sizeof(Schema));
+  }
+  if( !p ){
+    db->mallocFailed = 1;
+  }else if ( 0==p->file_format ){
+    sqlite3HashInit(&p->tblHash);
+    sqlite3HashInit(&p->idxHash);
+    sqlite3HashInit(&p->trigHash);
+    sqlite3HashInit(&p->fkeyHash);
+    p->enc = SQLITE_UTF8;
+  }
+  return p;
+}
+
+/************** End of callback.c ********************************************/
+/************** Begin file delete.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains C code routines that are called by the parser
+** in order to generate code for DELETE FROM statements.
+*/
+
+/*
+** While a SrcList can in general represent multiple tables and subqueries
+** (as in the FROM clause of a SELECT statement) in this case it contains
+** the name of a single table, as one might find in an INSERT, DELETE,
+** or UPDATE statement.  Look up that table in the symbol table and
+** return a pointer.  Set an error message and return NULL if the table 
+** name is not found or if any other error occurs.
+**
+** The following fields are initialized appropriate in pSrc:
+**
+**    pSrc->a[0].pTab       Pointer to the Table object
+**    pSrc->a[0].pIndex     Pointer to the INDEXED BY index, if there is one
+**
+*/
+SQLITE_PRIVATE Table *sqlite3SrcListLookup(Parse *pParse, SrcList *pSrc){
+  struct SrcList_item *pItem = pSrc->a;
+  Table *pTab;
+  assert( pItem && pSrc->nSrc==1 );
+  pTab = sqlite3LocateTableItem(pParse, 0, pItem);
+  sqlite3DeleteTable(pParse->db, pItem->pTab);
+  pItem->pTab = pTab;
+  if( pTab ){
+    pTab->nRef++;
+  }
+  if( sqlite3IndexedByLookup(pParse, pItem) ){
+    pTab = 0;
+  }
+  return pTab;
+}
+
+/*
+** Check to make sure the given table is writable.  If it is not
+** writable, generate an error message and return 1.  If it is
+** writable return 0;
+*/
+SQLITE_PRIVATE int sqlite3IsReadOnly(Parse *pParse, Table *pTab, int viewOk){
+  /* A table is not writable under the following circumstances:
+  **
+  **   1) It is a virtual table and no implementation of the xUpdate method
+  **      has been provided, or
+  **   2) It is a system table (i.e. sqlite_master), this call is not
+  **      part of a nested parse and writable_schema pragma has not 
+  **      been specified.
+  **
+  ** In either case leave an error message in pParse and return non-zero.
+  */
+  if( ( IsVirtual(pTab) 
+     && sqlite3GetVTable(pParse->db, pTab)->pMod->pModule->xUpdate==0 )
+   || ( (pTab->tabFlags & TF_Readonly)!=0
+     && (pParse->db->flags & SQLITE_WriteSchema)==0
+     && pParse->nested==0 )
+  ){
+    sqlite3ErrorMsg(pParse, "table %s may not be modified", pTab->zName);
+    return 1;
+  }
+
+#ifndef SQLITE_OMIT_VIEW
+  if( !viewOk && pTab->pSelect ){
+    sqlite3ErrorMsg(pParse,"cannot modify %s because it is a view",pTab->zName);
+    return 1;
+  }
+#endif
+  return 0;
+}
+
+
+#if !defined(SQLITE_OMIT_VIEW) && !defined(SQLITE_OMIT_TRIGGER)
+/*
+** Evaluate a view and store its result in an ephemeral table.  The
+** pWhere argument is an optional WHERE clause that restricts the
+** set of rows in the view that are to be added to the ephemeral table.
+*/
+SQLITE_PRIVATE void sqlite3MaterializeView(
+  Parse *pParse,       /* Parsing context */
+  Table *pView,        /* View definition */
+  Expr *pWhere,        /* Optional WHERE clause to be added */
+  int iCur             /* Cursor number for ephemeral table */
+){
+  SelectDest dest;
+  Select *pSel;
+  SrcList *pFrom;
+  sqlite3 *db = pParse->db;
+  int iDb = sqlite3SchemaToIndex(db, pView->pSchema);
+  pWhere = sqlite3ExprDup(db, pWhere, 0);
+  pFrom = sqlite3SrcListAppend(db, 0, 0, 0);
+  if( pFrom ){
+    assert( pFrom->nSrc==1 );
+    pFrom->a[0].zName = sqlite3DbStrDup(db, pView->zName);
+    pFrom->a[0].zDatabase = sqlite3DbStrDup(db, db->aDb[iDb].zName);
+    assert( pFrom->a[0].pOn==0 );
+    assert( pFrom->a[0].pUsing==0 );
+  }
+  pSel = sqlite3SelectNew(pParse, 0, pFrom, pWhere, 0, 0, 0, 0, 0, 0);
+  sqlite3SelectDestInit(&dest, SRT_EphemTab, iCur);
+  sqlite3Select(pParse, pSel, &dest);
+  sqlite3SelectDelete(db, pSel);
+}
+#endif /* !defined(SQLITE_OMIT_VIEW) && !defined(SQLITE_OMIT_TRIGGER) */
+
+#if defined(SQLITE_ENABLE_UPDATE_DELETE_LIMIT) && !defined(SQLITE_OMIT_SUBQUERY)
+/*
+** Generate an expression tree to implement the WHERE, ORDER BY,
+** and LIMIT/OFFSET portion of DELETE and UPDATE statements.
+**
+**     DELETE FROM table_wxyz WHERE a<5 ORDER BY a LIMIT 1;
+**                            \__________________________/
+**                               pLimitWhere (pInClause)
+*/
+SQLITE_PRIVATE Expr *sqlite3LimitWhere(
+  Parse *pParse,               /* The parser context */
+  SrcList *pSrc,               /* the FROM clause -- which tables to scan */
+  Expr *pWhere,                /* The WHERE clause.  May be null */
+  ExprList *pOrderBy,          /* The ORDER BY clause.  May be null */
+  Expr *pLimit,                /* The LIMIT clause.  May be null */
+  Expr *pOffset,               /* The OFFSET clause.  May be null */
+  char *zStmtType              /* Either DELETE or UPDATE.  For err msgs. */
+){
+  Expr *pWhereRowid = NULL;    /* WHERE rowid .. */
+  Expr *pInClause = NULL;      /* WHERE rowid IN ( select ) */
+  Expr *pSelectRowid = NULL;   /* SELECT rowid ... */
+  ExprList *pEList = NULL;     /* Expression list contaning only pSelectRowid */
+  SrcList *pSelectSrc = NULL;  /* SELECT rowid FROM x ... (dup of pSrc) */
+  Select *pSelect = NULL;      /* Complete SELECT tree */
+
+  /* Check that there isn't an ORDER BY without a LIMIT clause.
+  */
+  if( pOrderBy && (pLimit == 0) ) {
+    sqlite3ErrorMsg(pParse, "ORDER BY without LIMIT on %s", zStmtType);
+    goto limit_where_cleanup_2;
+  }
+
+  /* We only need to generate a select expression if there
+  ** is a limit/offset term to enforce.
+  */
+  if( pLimit == 0 ) {
+    /* if pLimit is null, pOffset will always be null as well. */
+    assert( pOffset == 0 );
+    return pWhere;
+  }
+
+  /* Generate a select expression tree to enforce the limit/offset 
+  ** term for the DELETE or UPDATE statement.  For example:
+  **   DELETE FROM table_a WHERE col1=1 ORDER BY col2 LIMIT 1 OFFSET 1
+  ** becomes:
+  **   DELETE FROM table_a WHERE rowid IN ( 
+  **     SELECT rowid FROM table_a WHERE col1=1 ORDER BY col2 LIMIT 1 OFFSET 1
+  **   );
+  */
+
+  pSelectRowid = sqlite3PExpr(pParse, TK_ROW, 0, 0, 0);
+  if( pSelectRowid == 0 ) goto limit_where_cleanup_2;
+  pEList = sqlite3ExprListAppend(pParse, 0, pSelectRowid);
+  if( pEList == 0 ) goto limit_where_cleanup_2;
+
+  /* duplicate the FROM clause as it is needed by both the DELETE/UPDATE tree
+  ** and the SELECT subtree. */
+  pSelectSrc = sqlite3SrcListDup(pParse->db, pSrc, 0);
+  if( pSelectSrc == 0 ) {
+    sqlite3ExprListDelete(pParse->db, pEList);
+    goto limit_where_cleanup_2;
+  }
+
+  /* generate the SELECT expression tree. */
+  pSelect = sqlite3SelectNew(pParse,pEList,pSelectSrc,pWhere,0,0,
+                             pOrderBy,0,pLimit,pOffset);
+  if( pSelect == 0 ) return 0;
+
+  /* now generate the new WHERE rowid IN clause for the DELETE/UDPATE */
+  pWhereRowid = sqlite3PExpr(pParse, TK_ROW, 0, 0, 0);
+  if( pWhereRowid == 0 ) goto limit_where_cleanup_1;
+  pInClause = sqlite3PExpr(pParse, TK_IN, pWhereRowid, 0, 0);
+  if( pInClause == 0 ) goto limit_where_cleanup_1;
+
+  pInClause->x.pSelect = pSelect;
+  pInClause->flags |= EP_xIsSelect;
+  sqlite3ExprSetHeight(pParse, pInClause);
+  return pInClause;
+
+  /* something went wrong. clean up anything allocated. */
+limit_where_cleanup_1:
+  sqlite3SelectDelete(pParse->db, pSelect);
+  return 0;
+
+limit_where_cleanup_2:
+  sqlite3ExprDelete(pParse->db, pWhere);
+  sqlite3ExprListDelete(pParse->db, pOrderBy);
+  sqlite3ExprDelete(pParse->db, pLimit);
+  sqlite3ExprDelete(pParse->db, pOffset);
