@@ -95125,3 +95125,216 @@ SQLITE_PRIVATE void sqlite3GenerateRowDelete(
       }
     }
 
+    /* Invoke BEFORE DELETE trigger programs. */
+    addrStart = sqlite3VdbeCurrentAddr(v);
+    sqlite3CodeRowTrigger(pParse, pTrigger, 
+        TK_DELETE, 0, TRIGGER_BEFORE, pTab, iOld, onconf, iLabel
+    );
+
+    /* If any BEFORE triggers were coded, then seek the cursor to the 
+    ** row to be deleted again. It may be that the BEFORE triggers moved
+    ** the cursor or of already deleted the row that the cursor was
+    ** pointing to.
+    */
+    if( addrStart<sqlite3VdbeCurrentAddr(v) ){
+      sqlite3VdbeAddOp4Int(v, opSeek, iDataCur, iLabel, iPk, nPk);
+      VdbeCoverageIf(v, opSeek==OP_NotExists);
+      VdbeCoverageIf(v, opSeek==OP_NotFound);
+    }
+
+    /* Do FK processing. This call checks that any FK constraints that
+    ** refer to this table (i.e. constraints attached to other tables) 
+    ** are not violated by deleting this row.  */
+    sqlite3FkCheck(pParse, pTab, iOld, 0, 0, 0);
+  }
+
+  /* Delete the index and table entries. Skip this step if pTab is really
+  ** a view (in which case the only effect of the DELETE statement is to
+  ** fire the INSTEAD OF triggers).  */ 
+  if( pTab->pSelect==0 ){
+    sqlite3GenerateRowIndexDelete(pParse, pTab, iDataCur, iIdxCur, 0);
+    sqlite3VdbeAddOp2(v, OP_Delete, iDataCur, (count?OPFLAG_NCHANGE:0));
+    if( count ){
+      sqlite3VdbeChangeP4(v, -1, pTab->zName, P4_TRANSIENT);
+    }
+  }
+
+  /* Do any ON CASCADE, SET NULL or SET DEFAULT operations required to
+  ** handle rows (possibly in other tables) that refer via a foreign key
+  ** to the row just deleted. */ 
+  sqlite3FkActions(pParse, pTab, 0, iOld, 0, 0);
+
+  /* Invoke AFTER DELETE trigger programs. */
+  sqlite3CodeRowTrigger(pParse, pTrigger, 
+      TK_DELETE, 0, TRIGGER_AFTER, pTab, iOld, onconf, iLabel
+  );
+
+  /* Jump here if the row had already been deleted before any BEFORE
+  ** trigger programs were invoked. Or if a trigger program throws a 
+  ** RAISE(IGNORE) exception.  */
+  sqlite3VdbeResolveLabel(v, iLabel);
+  VdbeModuleComment((v, "END: GenRowDel()"));
+}
+
+/*
+** This routine generates VDBE code that causes the deletion of all
+** index entries associated with a single row of a single table, pTab
+**
+** Preconditions:
+**
+**   1.  A read/write cursor "iDataCur" must be open on the canonical storage
+**       btree for the table pTab.  (This will be either the table itself
+**       for rowid tables or to the primary key index for WITHOUT ROWID
+**       tables.)
+**
+**   2.  Read/write cursors for all indices of pTab must be open as
+**       cursor number iIdxCur+i for the i-th index.  (The pTab->pIndex
+**       index is the 0-th index.)
+**
+**   3.  The "iDataCur" cursor must be already be positioned on the row
+**       that is to be deleted.
+*/
+SQLITE_PRIVATE void sqlite3GenerateRowIndexDelete(
+  Parse *pParse,     /* Parsing and code generating context */
+  Table *pTab,       /* Table containing the row to be deleted */
+  int iDataCur,      /* Cursor of table holding data. */
+  int iIdxCur,       /* First index cursor */
+  int *aRegIdx       /* Only delete if aRegIdx!=0 && aRegIdx[i]>0 */
+){
+  int i;             /* Index loop counter */
+  int r1 = -1;       /* Register holding an index key */
+  int iPartIdxLabel; /* Jump destination for skipping partial index entries */
+  Index *pIdx;       /* Current index */
+  Index *pPrior = 0; /* Prior index */
+  Vdbe *v;           /* The prepared statement under construction */
+  Index *pPk;        /* PRIMARY KEY index, or NULL for rowid tables */
+
+  v = pParse->pVdbe;
+  pPk = HasRowid(pTab) ? 0 : sqlite3PrimaryKeyIndex(pTab);
+  for(i=0, pIdx=pTab->pIndex; pIdx; i++, pIdx=pIdx->pNext){
+    assert( iIdxCur+i!=iDataCur || pPk==pIdx );
+    if( aRegIdx!=0 && aRegIdx[i]==0 ) continue;
+    if( pIdx==pPk ) continue;
+    VdbeModuleComment((v, "GenRowIdxDel for %s", pIdx->zName));
+    r1 = sqlite3GenerateIndexKey(pParse, pIdx, iDataCur, 0, 1,
+                                 &iPartIdxLabel, pPrior, r1);
+    sqlite3VdbeAddOp3(v, OP_IdxDelete, iIdxCur+i, r1,
+                      pIdx->uniqNotNull ? pIdx->nKeyCol : pIdx->nColumn);
+    sqlite3ResolvePartIdxLabel(pParse, iPartIdxLabel);
+    pPrior = pIdx;
+  }
+}
+
+/*
+** Generate code that will assemble an index key and stores it in register
+** regOut.  The key with be for index pIdx which is an index on pTab.
+** iCur is the index of a cursor open on the pTab table and pointing to
+** the entry that needs indexing.  If pTab is a WITHOUT ROWID table, then
+** iCur must be the cursor of the PRIMARY KEY index.
+**
+** Return a register number which is the first in a block of
+** registers that holds the elements of the index key.  The
+** block of registers has already been deallocated by the time
+** this routine returns.
+**
+** If *piPartIdxLabel is not NULL, fill it in with a label and jump
+** to that label if pIdx is a partial index that should be skipped.
+** The label should be resolved using sqlite3ResolvePartIdxLabel().
+** A partial index should be skipped if its WHERE clause evaluates
+** to false or null.  If pIdx is not a partial index, *piPartIdxLabel
+** will be set to zero which is an empty label that is ignored by
+** sqlite3ResolvePartIdxLabel().
+**
+** The pPrior and regPrior parameters are used to implement a cache to
+** avoid unnecessary register loads.  If pPrior is not NULL, then it is
+** a pointer to a different index for which an index key has just been
+** computed into register regPrior.  If the current pIdx index is generating
+** its key into the same sequence of registers and if pPrior and pIdx share
+** a column in common, then the register corresponding to that column already
+** holds the correct value and the loading of that register is skipped.
+** This optimization is helpful when doing a DELETE or an INTEGRITY_CHECK 
+** on a table with multiple indices, and especially with the ROWID or
+** PRIMARY KEY columns of the index.
+*/
+SQLITE_PRIVATE int sqlite3GenerateIndexKey(
+  Parse *pParse,       /* Parsing context */
+  Index *pIdx,         /* The index for which to generate a key */
+  int iDataCur,        /* Cursor number from which to take column data */
+  int regOut,          /* Put the new key into this register if not 0 */
+  int prefixOnly,      /* Compute only a unique prefix of the key */
+  int *piPartIdxLabel, /* OUT: Jump to this label to skip partial index */
+  Index *pPrior,       /* Previously generated index key */
+  int regPrior         /* Register holding previous generated key */
+){
+  Vdbe *v = pParse->pVdbe;
+  int j;
+  Table *pTab = pIdx->pTable;
+  int regBase;
+  int nCol;
+
+  if( piPartIdxLabel ){
+    if( pIdx->pPartIdxWhere ){
+      *piPartIdxLabel = sqlite3VdbeMakeLabel(v);
+      pParse->iPartIdxTab = iDataCur;
+      sqlite3ExprCachePush(pParse);
+      sqlite3ExprIfFalse(pParse, pIdx->pPartIdxWhere, *piPartIdxLabel, 
+                         SQLITE_JUMPIFNULL);
+    }else{
+      *piPartIdxLabel = 0;
+    }
+  }
+  nCol = (prefixOnly && pIdx->uniqNotNull) ? pIdx->nKeyCol : pIdx->nColumn;
+  regBase = sqlite3GetTempRange(pParse, nCol);
+  if( pPrior && (regBase!=regPrior || pPrior->pPartIdxWhere) ) pPrior = 0;
+  for(j=0; j<nCol; j++){
+    if( pPrior && pPrior->aiColumn[j]==pIdx->aiColumn[j] ) continue;
+    sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, pIdx->aiColumn[j],
+                                    regBase+j);
+    /* If the column affinity is REAL but the number is an integer, then it
+    ** might be stored in the table as an integer (using a compact
+    ** representation) then converted to REAL by an OP_RealAffinity opcode.
+    ** But we are getting ready to store this value back into an index, where
+    ** it should be converted by to INTEGER again.  So omit the OP_RealAffinity
+    ** opcode if it is present */
+    sqlite3VdbeDeletePriorOpcode(v, OP_RealAffinity);
+  }
+  if( regOut ){
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nCol, regOut);
+  }
+  sqlite3ReleaseTempRange(pParse, regBase, nCol);
+  return regBase;
+}
+
+/*
+** If a prior call to sqlite3GenerateIndexKey() generated a jump-over label
+** because it was a partial index, then this routine should be called to
+** resolve that label.
+*/
+SQLITE_PRIVATE void sqlite3ResolvePartIdxLabel(Parse *pParse, int iLabel){
+  if( iLabel ){
+    sqlite3VdbeResolveLabel(pParse->pVdbe, iLabel);
+    sqlite3ExprCachePop(pParse);
+  }
+}
+
+/************** End of delete.c **********************************************/
+/************** Begin file func.c ********************************************/
+/*
+** 2002 February 23
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C-language implementations for many of the SQL
+** functions of SQLite.  (Some function, and in particular the date and
+** time functions, are implemented separately.)
+*/
+/* #include <stdlib.h> */
+/* #include <assert.h> */
+
+/*
