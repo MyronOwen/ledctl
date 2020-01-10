@@ -94907,3 +94907,221 @@ SQLITE_PRIVATE void sqlite3DeleteFrom(
       */
       nKey = nPk; /* OP_Found will use an unpacked key */
       aToOpen = sqlite3DbMallocRaw(db, nIdx+2);
+      if( aToOpen==0 ){
+        sqlite3WhereEnd(pWInfo);
+        goto delete_from_cleanup;
+      }
+      memset(aToOpen, 1, nIdx+1);
+      aToOpen[nIdx+1] = 0;
+      if( aiCurOnePass[0]>=0 ) aToOpen[aiCurOnePass[0]-iTabCur] = 0;
+      if( aiCurOnePass[1]>=0 ) aToOpen[aiCurOnePass[1]-iTabCur] = 0;
+      if( addrEphOpen ) sqlite3VdbeChangeToNoop(v, addrEphOpen);
+      addrDelete = sqlite3VdbeAddOp0(v, OP_Goto); /* Jump to DELETE logic */
+    }else if( pPk ){
+      /* Construct a composite key for the row to be deleted and remember it */
+      iKey = ++pParse->nMem;
+      nKey = 0;   /* Zero tells OP_Found to use a composite key */
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, nPk, iKey,
+                        sqlite3IndexAffinityStr(v, pPk), nPk);
+      sqlite3VdbeAddOp2(v, OP_IdxInsert, iEphCur, iKey);
+    }else{
+      /* Get the rowid of the row to be deleted and remember it in the RowSet */
+      nKey = 1;  /* OP_Seek always uses a single rowid */
+      sqlite3VdbeAddOp2(v, OP_RowSetAdd, iRowSet, iKey);
+    }
+  
+    /* End of the WHERE loop */
+    sqlite3WhereEnd(pWInfo);
+    if( okOnePass ){
+      /* Bypass the delete logic below if the WHERE loop found zero rows */
+      addrBypass = sqlite3VdbeMakeLabel(v);
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrBypass);
+      sqlite3VdbeJumpHere(v, addrDelete);
+    }
+  
+    /* Unless this is a view, open cursors for the table we are 
+    ** deleting from and all its indices. If this is a view, then the
+    ** only effect this statement has is to fire the INSTEAD OF 
+    ** triggers.
+    */
+    if( !isView ){
+      testcase( IsVirtual(pTab) );
+      sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenWrite, iTabCur, aToOpen,
+                                 &iDataCur, &iIdxCur);
+      assert( pPk || IsVirtual(pTab) || iDataCur==iTabCur );
+      assert( pPk || IsVirtual(pTab) || iIdxCur==iDataCur+1 );
+    }
+  
+    /* Set up a loop over the rowids/primary-keys that were found in the
+    ** where-clause loop above.
+    */
+    if( okOnePass ){
+      /* Just one row.  Hence the top-of-loop is a no-op */
+      assert( nKey==nPk );  /* OP_Found will use an unpacked key */
+      assert( !IsVirtual(pTab) );
+      if( aToOpen[iDataCur-iTabCur] ){
+        assert( pPk!=0 || pTab->pSelect!=0 );
+        sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, addrBypass, iKey, nKey);
+        VdbeCoverage(v);
+      }
+    }else if( pPk ){
+      addrLoop = sqlite3VdbeAddOp1(v, OP_Rewind, iEphCur); VdbeCoverage(v);
+      sqlite3VdbeAddOp2(v, OP_RowKey, iEphCur, iKey);
+      assert( nKey==0 );  /* OP_Found will use a composite key */
+    }else{
+      addrLoop = sqlite3VdbeAddOp3(v, OP_RowSetRead, iRowSet, 0, iKey);
+      VdbeCoverage(v);
+      assert( nKey==1 );
+    }  
+  
+    /* Delete the row */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    if( IsVirtual(pTab) ){
+      const char *pVTab = (const char *)sqlite3GetVTable(db, pTab);
+      sqlite3VtabMakeWritable(pParse, pTab);
+      sqlite3VdbeAddOp4(v, OP_VUpdate, 0, 1, iKey, pVTab, P4_VTAB);
+      sqlite3VdbeChangeP5(v, OE_Abort);
+      sqlite3MayAbort(pParse);
+    }else
+#endif
+    {
+      int count = (pParse->nested==0);    /* True to count changes */
+      sqlite3GenerateRowDelete(pParse, pTab, pTrigger, iDataCur, iIdxCur,
+                               iKey, nKey, count, OE_Default, okOnePass);
+    }
+  
+    /* End of the loop over all rowids/primary-keys. */
+    if( okOnePass ){
+      sqlite3VdbeResolveLabel(v, addrBypass);
+    }else if( pPk ){
+      sqlite3VdbeAddOp2(v, OP_Next, iEphCur, addrLoop+1); VdbeCoverage(v);
+      sqlite3VdbeJumpHere(v, addrLoop);
+    }else{
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrLoop);
+      sqlite3VdbeJumpHere(v, addrLoop);
+    }     
+  
+    /* Close the cursors open on the table and its indexes. */
+    if( !isView && !IsVirtual(pTab) ){
+      if( !pPk ) sqlite3VdbeAddOp1(v, OP_Close, iDataCur);
+      for(i=0, pIdx=pTab->pIndex; pIdx; i++, pIdx=pIdx->pNext){
+        sqlite3VdbeAddOp1(v, OP_Close, iIdxCur + i);
+      }
+    }
+  } /* End non-truncate path */
+
+  /* Update the sqlite_sequence table by storing the content of the
+  ** maximum rowid counter values recorded while inserting into
+  ** autoincrement tables.
+  */
+  if( pParse->nested==0 && pParse->pTriggerTab==0 ){
+    sqlite3AutoincrementEnd(pParse);
+  }
+
+  /* Return the number of rows that were deleted. If this routine is 
+  ** generating code because of a call to sqlite3NestedParse(), do not
+  ** invoke the callback function.
+  */
+  if( (db->flags&SQLITE_CountRows) && !pParse->nested && !pParse->pTriggerTab ){
+    sqlite3VdbeAddOp2(v, OP_ResultRow, memCnt, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "rows deleted", SQLITE_STATIC);
+  }
+
+delete_from_cleanup:
+  sqlite3AuthContextPop(&sContext);
+  sqlite3SrcListDelete(db, pTabList);
+  sqlite3ExprDelete(db, pWhere);
+  sqlite3DbFree(db, aToOpen);
+  return;
+}
+/* Make sure "isView" and other macros defined above are undefined. Otherwise
+** they may interfere with compilation of other functions in this file
+** (or in another file, if this file becomes part of the amalgamation).  */
+#ifdef isView
+ #undef isView
+#endif
+#ifdef pTrigger
+ #undef pTrigger
+#endif
+
+/*
+** This routine generates VDBE code that causes a single row of a
+** single table to be deleted.  Both the original table entry and
+** all indices are removed.
+**
+** Preconditions:
+**
+**   1.  iDataCur is an open cursor on the btree that is the canonical data
+**       store for the table.  (This will be either the table itself,
+**       in the case of a rowid table, or the PRIMARY KEY index in the case
+**       of a WITHOUT ROWID table.)
+**
+**   2.  Read/write cursors for all indices of pTab must be open as
+**       cursor number iIdxCur+i for the i-th index.
+**
+**   3.  The primary key for the row to be deleted must be stored in a
+**       sequence of nPk memory cells starting at iPk.  If nPk==0 that means
+**       that a search record formed from OP_MakeRecord is contained in the
+**       single memory location iPk.
+*/
+SQLITE_PRIVATE void sqlite3GenerateRowDelete(
+  Parse *pParse,     /* Parsing context */
+  Table *pTab,       /* Table containing the row to be deleted */
+  Trigger *pTrigger, /* List of triggers to (potentially) fire */
+  int iDataCur,      /* Cursor from which column data is extracted */
+  int iIdxCur,       /* First index cursor */
+  int iPk,           /* First memory cell containing the PRIMARY KEY */
+  i16 nPk,           /* Number of PRIMARY KEY memory cells */
+  u8 count,          /* If non-zero, increment the row change counter */
+  u8 onconf,         /* Default ON CONFLICT policy for triggers */
+  u8 bNoSeek         /* iDataCur is already pointing to the row to delete */
+){
+  Vdbe *v = pParse->pVdbe;        /* Vdbe */
+  int iOld = 0;                   /* First register in OLD.* array */
+  int iLabel;                     /* Label resolved to end of generated code */
+  u8 opSeek;                      /* Seek opcode */
+
+  /* Vdbe is guaranteed to have been allocated by this stage. */
+  assert( v );
+  VdbeModuleComment((v, "BEGIN: GenRowDel(%d,%d,%d,%d)",
+                         iDataCur, iIdxCur, iPk, (int)nPk));
+
+  /* Seek cursor iCur to the row to delete. If this row no longer exists 
+  ** (this can happen if a trigger program has already deleted it), do
+  ** not attempt to delete it or fire any DELETE triggers.  */
+  iLabel = sqlite3VdbeMakeLabel(v);
+  opSeek = HasRowid(pTab) ? OP_NotExists : OP_NotFound;
+  if( !bNoSeek ){
+    sqlite3VdbeAddOp4Int(v, opSeek, iDataCur, iLabel, iPk, nPk);
+    VdbeCoverageIf(v, opSeek==OP_NotExists);
+    VdbeCoverageIf(v, opSeek==OP_NotFound);
+  }
+ 
+  /* If there are any triggers to fire, allocate a range of registers to
+  ** use for the old.* references in the triggers.  */
+  if( sqlite3FkRequired(pParse, pTab, 0, 0) || pTrigger ){
+    u32 mask;                     /* Mask of OLD.* columns in use */
+    int iCol;                     /* Iterator used while populating OLD.* */
+    int addrStart;                /* Start of BEFORE trigger programs */
+
+    /* TODO: Could use temporary registers here. Also could attempt to
+    ** avoid copying the contents of the rowid register.  */
+    mask = sqlite3TriggerColmask(
+        pParse, pTrigger, 0, 0, TRIGGER_BEFORE|TRIGGER_AFTER, pTab, onconf
+    );
+    mask |= sqlite3FkOldmask(pParse, pTab);
+    iOld = pParse->nMem+1;
+    pParse->nMem += (1 + pTab->nCol);
+
+    /* Populate the OLD.* pseudo-table register array. These values will be 
+    ** used by any BEFORE and AFTER triggers that exist.  */
+    sqlite3VdbeAddOp2(v, OP_Copy, iPk, iOld);
+    for(iCol=0; iCol<pTab->nCol; iCol++){
+      testcase( mask!=0xffffffff && iCol==31 );
+      testcase( mask!=0xffffffff && iCol==32 );
+      if( mask==0xffffffff || (iCol<=31 && (mask & MASKBIT32(iCol))!=0) ){
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, iCol, iOld+iCol+1);
+      }
+    }
+
