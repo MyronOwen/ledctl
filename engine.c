@@ -95338,3 +95338,228 @@ SQLITE_PRIVATE void sqlite3ResolvePartIdxLabel(Parse *pParse, int iLabel){
 /* #include <assert.h> */
 
 /*
+** Return the collating function associated with a function.
+*/
+static CollSeq *sqlite3GetFuncCollSeq(sqlite3_context *context){
+  VdbeOp *pOp = &context->pVdbe->aOp[context->iOp-1];
+  assert( pOp->opcode==OP_CollSeq );
+  assert( pOp->p4type==P4_COLLSEQ );
+  return pOp->p4.pColl;
+}
+
+/*
+** Indicate that the accumulator load should be skipped on this
+** iteration of the aggregate loop.
+*/
+static void sqlite3SkipAccumulatorLoad(sqlite3_context *context){
+  context->skipFlag = 1;
+}
+
+/*
+** Implementation of the non-aggregate min() and max() functions
+*/
+static void minmaxFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int i;
+  int mask;    /* 0 for min() or 0xffffffff for max() */
+  int iBest;
+  CollSeq *pColl;
+
+  assert( argc>1 );
+  mask = sqlite3_user_data(context)==0 ? 0 : -1;
+  pColl = sqlite3GetFuncCollSeq(context);
+  assert( pColl );
+  assert( mask==-1 || mask==0 );
+  iBest = 0;
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
+  for(i=1; i<argc; i++){
+    if( sqlite3_value_type(argv[i])==SQLITE_NULL ) return;
+    if( (sqlite3MemCompare(argv[iBest], argv[i], pColl)^mask)>=0 ){
+      testcase( mask==0 );
+      iBest = i;
+    }
+  }
+  sqlite3_result_value(context, argv[iBest]);
+}
+
+/*
+** Return the type of the argument.
+*/
+static void typeofFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **argv
+){
+  const char *z = 0;
+  UNUSED_PARAMETER(NotUsed);
+  switch( sqlite3_value_type(argv[0]) ){
+    case SQLITE_INTEGER: z = "integer"; break;
+    case SQLITE_TEXT:    z = "text";    break;
+    case SQLITE_FLOAT:   z = "real";    break;
+    case SQLITE_BLOB:    z = "blob";    break;
+    default:             z = "null";    break;
+  }
+  sqlite3_result_text(context, z, -1, SQLITE_STATIC);
+}
+
+
+/*
+** Implementation of the length() function
+*/
+static void lengthFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int len;
+
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  switch( sqlite3_value_type(argv[0]) ){
+    case SQLITE_BLOB:
+    case SQLITE_INTEGER:
+    case SQLITE_FLOAT: {
+      sqlite3_result_int(context, sqlite3_value_bytes(argv[0]));
+      break;
+    }
+    case SQLITE_TEXT: {
+      const unsigned char *z = sqlite3_value_text(argv[0]);
+      if( z==0 ) return;
+      len = 0;
+      while( *z ){
+        len++;
+        SQLITE_SKIP_UTF8(z);
+      }
+      sqlite3_result_int(context, len);
+      break;
+    }
+    default: {
+      sqlite3_result_null(context);
+      break;
+    }
+  }
+}
+
+/*
+** Implementation of the abs() function.
+**
+** IMP: R-23979-26855 The abs(X) function returns the absolute value of
+** the numeric argument X. 
+*/
+static void absFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  switch( sqlite3_value_type(argv[0]) ){
+    case SQLITE_INTEGER: {
+      i64 iVal = sqlite3_value_int64(argv[0]);
+      if( iVal<0 ){
+        if( iVal==SMALLEST_INT64 ){
+          /* IMP: R-31676-45509 If X is the integer -9223372036854775808
+          ** then abs(X) throws an integer overflow error since there is no
+          ** equivalent positive 64-bit two complement value. */
+          sqlite3_result_error(context, "integer overflow", -1);
+          return;
+        }
+        iVal = -iVal;
+      } 
+      sqlite3_result_int64(context, iVal);
+      break;
+    }
+    case SQLITE_NULL: {
+      /* IMP: R-37434-19929 Abs(X) returns NULL if X is NULL. */
+      sqlite3_result_null(context);
+      break;
+    }
+    default: {
+      /* Because sqlite3_value_double() returns 0.0 if the argument is not
+      ** something that can be converted into a number, we have:
+      ** IMP: R-01992-00519 Abs(X) returns 0.0 if X is a string or blob
+      ** that cannot be converted to a numeric value.
+      */
+      double rVal = sqlite3_value_double(argv[0]);
+      if( rVal<0 ) rVal = -rVal;
+      sqlite3_result_double(context, rVal);
+      break;
+    }
+  }
+}
+
+/*
+** Implementation of the instr() function.
+**
+** instr(haystack,needle) finds the first occurrence of needle
+** in haystack and returns the number of previous characters plus 1,
+** or 0 if needle does not occur within haystack.
+**
+** If both haystack and needle are BLOBs, then the result is one more than
+** the number of bytes in haystack prior to the first occurrence of needle,
+** or 0 if needle never occurs in haystack.
+*/
+static void instrFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *zHaystack;
+  const unsigned char *zNeedle;
+  int nHaystack;
+  int nNeedle;
+  int typeHaystack, typeNeedle;
+  int N = 1;
+  int isText;
+
+  UNUSED_PARAMETER(argc);
+  typeHaystack = sqlite3_value_type(argv[0]);
+  typeNeedle = sqlite3_value_type(argv[1]);
+  if( typeHaystack==SQLITE_NULL || typeNeedle==SQLITE_NULL ) return;
+  nHaystack = sqlite3_value_bytes(argv[0]);
+  nNeedle = sqlite3_value_bytes(argv[1]);
+  if( typeHaystack==SQLITE_BLOB && typeNeedle==SQLITE_BLOB ){
+    zHaystack = sqlite3_value_blob(argv[0]);
+    zNeedle = sqlite3_value_blob(argv[1]);
+    isText = 0;
+  }else{
+    zHaystack = sqlite3_value_text(argv[0]);
+    zNeedle = sqlite3_value_text(argv[1]);
+    isText = 1;
+  }
+  while( nNeedle<=nHaystack && memcmp(zHaystack, zNeedle, nNeedle)!=0 ){
+    N++;
+    do{
+      nHaystack--;
+      zHaystack++;
+    }while( isText && (zHaystack[0]&0xc0)==0x80 );
+  }
+  if( nNeedle>nHaystack ) N = 0;
+  sqlite3_result_int(context, N);
+}
+
+/*
+** Implementation of the printf() function.
+*/
+static void printfFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  PrintfArguments x;
+  StrAccum str;
+  const char *zFormat;
+  int n;
+
+  if( argc>=1 && (zFormat = (const char*)sqlite3_value_text(argv[0]))!=0 ){
+    x.nArg = argc-1;
+    x.nUsed = 0;
+    x.apArg = argv+1;
+    sqlite3StrAccumInit(&str, 0, 0, SQLITE_MAX_LENGTH);
+    str.db = sqlite3_context_db_handle(context);
+    sqlite3XPrintf(&str, SQLITE_PRINTF_SQLFUNC, zFormat, &x);
+    n = str.nChar;
+    sqlite3_result_text(context, sqlite3StrAccumFinish(&str), n,
+                        SQLITE_DYNAMIC);
+  }
+}
+
