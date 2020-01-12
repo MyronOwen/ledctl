@@ -96000,3 +96000,227 @@ static int patternCompare(
       */
       if( c<=0x80 ){
         u32 cx;
+        if( noCase ){
+          cx = sqlite3Toupper(c);
+          c = sqlite3Tolower(c);
+        }else{
+          cx = c;
+        }
+        while( (c2 = *(zString++))!=0 ){
+          if( c2!=c && c2!=cx ) continue;
+          if( patternCompare(zPattern,zString,pInfo,esc) ) return 1;
+        }
+      }else{
+        while( (c2 = sqlite3Utf8Read(&zString))!=0 ){
+          if( c2!=c ) continue;
+          if( patternCompare(zPattern,zString,pInfo,esc) ) return 1;
+        }
+      }
+      return 0;
+    }
+    if( c==matchOther ){
+      if( esc ){
+        c = sqlite3Utf8Read(&zPattern);
+        if( c==0 ) return 0;
+        zEscaped = zPattern;
+      }else{
+        u32 prior_c = 0;
+        int seen = 0;
+        int invert = 0;
+        c = sqlite3Utf8Read(&zString);
+        if( c==0 ) return 0;
+        c2 = sqlite3Utf8Read(&zPattern);
+        if( c2=='^' ){
+          invert = 1;
+          c2 = sqlite3Utf8Read(&zPattern);
+        }
+        if( c2==']' ){
+          if( c==']' ) seen = 1;
+          c2 = sqlite3Utf8Read(&zPattern);
+        }
+        while( c2 && c2!=']' ){
+          if( c2=='-' && zPattern[0]!=']' && zPattern[0]!=0 && prior_c>0 ){
+            c2 = sqlite3Utf8Read(&zPattern);
+            if( c>=prior_c && c<=c2 ) seen = 1;
+            prior_c = 0;
+          }else{
+            if( c==c2 ){
+              seen = 1;
+            }
+            prior_c = c2;
+          }
+          c2 = sqlite3Utf8Read(&zPattern);
+        }
+        if( c2==0 || (seen ^ invert)==0 ){
+          return 0;
+        }
+        continue;
+      }
+    }
+    c2 = sqlite3Utf8Read(&zString);
+    if( c==c2 ) continue;
+    if( noCase && c<0x80 && c2<0x80 && sqlite3Tolower(c)==sqlite3Tolower(c2) ){
+      continue;
+    }
+    if( c==matchOne && zPattern!=zEscaped && c2!=0 ) continue;
+    return 0;
+  }
+  return *zString==0;
+}
+
+/*
+** The sqlite3_strglob() interface.
+*/
+SQLITE_API int sqlite3_strglob(const char *zGlobPattern, const char *zString){
+  return patternCompare((u8*)zGlobPattern, (u8*)zString, &globInfo, 0)==0;
+}
+
+/*
+** Count the number of times that the LIKE operator (or GLOB which is
+** just a variation of LIKE) gets called.  This is used for testing
+** only.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_like_count = 0;
+#endif
+
+
+/*
+** Implementation of the like() SQL function.  This function implements
+** the build-in LIKE operator.  The first argument to the function is the
+** pattern and the second argument is the string.  So, the SQL statements:
+**
+**       A LIKE B
+**
+** is implemented as like(B,A).
+**
+** This same function (with a different compareInfo structure) computes
+** the GLOB operator.
+*/
+static void likeFunc(
+  sqlite3_context *context, 
+  int argc, 
+  sqlite3_value **argv
+){
+  const unsigned char *zA, *zB;
+  u32 escape = 0;
+  int nPat;
+  sqlite3 *db = sqlite3_context_db_handle(context);
+
+  zB = sqlite3_value_text(argv[0]);
+  zA = sqlite3_value_text(argv[1]);
+
+  /* Limit the length of the LIKE or GLOB pattern to avoid problems
+  ** of deep recursion and N*N behavior in patternCompare().
+  */
+  nPat = sqlite3_value_bytes(argv[0]);
+  testcase( nPat==db->aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH] );
+  testcase( nPat==db->aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]+1 );
+  if( nPat > db->aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH] ){
+    sqlite3_result_error(context, "LIKE or GLOB pattern too complex", -1);
+    return;
+  }
+  assert( zB==sqlite3_value_text(argv[0]) );  /* Encoding did not change */
+
+  if( argc==3 ){
+    /* The escape character string must consist of a single UTF-8 character.
+    ** Otherwise, return an error.
+    */
+    const unsigned char *zEsc = sqlite3_value_text(argv[2]);
+    if( zEsc==0 ) return;
+    if( sqlite3Utf8CharLen((char*)zEsc, -1)!=1 ){
+      sqlite3_result_error(context, 
+          "ESCAPE expression must be a single character", -1);
+      return;
+    }
+    escape = sqlite3Utf8Read(&zEsc);
+  }
+  if( zA && zB ){
+    struct compareInfo *pInfo = sqlite3_user_data(context);
+#ifdef SQLITE_TEST
+    sqlite3_like_count++;
+#endif
+    
+    sqlite3_result_int(context, patternCompare(zB, zA, pInfo, escape));
+  }
+}
+
+/*
+** Implementation of the NULLIF(x,y) function.  The result is the first
+** argument if the arguments are different.  The result is NULL if the
+** arguments are equal to each other.
+*/
+static void nullifFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **argv
+){
+  CollSeq *pColl = sqlite3GetFuncCollSeq(context);
+  UNUSED_PARAMETER(NotUsed);
+  if( sqlite3MemCompare(argv[0], argv[1], pColl)!=0 ){
+    sqlite3_result_value(context, argv[0]);
+  }
+}
+
+/*
+** Implementation of the sqlite_version() function.  The result is the version
+** of the SQLite library that is running.
+*/
+static void versionFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  /* IMP: R-48699-48617 This function is an SQL wrapper around the
+  ** sqlite3_libversion() C-interface. */
+  sqlite3_result_text(context, sqlite3_libversion(), -1, SQLITE_STATIC);
+}
+
+/*
+** Implementation of the sqlite_source_id() function. The result is a string
+** that identifies the particular version of the source code used to build
+** SQLite.
+*/
+static void sourceidFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  /* IMP: R-24470-31136 This function is an SQL wrapper around the
+  ** sqlite3_sourceid() C interface. */
+  sqlite3_result_text(context, sqlite3_sourceid(), -1, SQLITE_STATIC);
+}
+
+/*
+** Implementation of the sqlite_log() function.  This is a wrapper around
+** sqlite3_log().  The return value is NULL.  The function exists purely for
+** its side-effects.
+*/
+static void errlogFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(context);
+  sqlite3_log(sqlite3_value_int(argv[0]), "%s", sqlite3_value_text(argv[1]));
+}
+
+/*
+** Implementation of the sqlite_compileoption_used() function.
+** The result is an integer that identifies if the compiler option
+** was used to build SQLite.
+*/
+#ifndef SQLITE_OMIT_COMPILEOPTION_DIAGS
+static void compileoptionusedFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const char *zOptName;
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  /* IMP: R-39564-36305 The sqlite_compileoption_used() SQL
+  ** function is a wrapper around the sqlite3_compileoption_used() C/C++
