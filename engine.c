@@ -95563,3 +95563,206 @@ static void printfFunc(
   }
 }
 
+/*
+** Implementation of the substr() function.
+**
+** substr(x,p1,p2)  returns p2 characters of x[] beginning with p1.
+** p1 is 1-indexed.  So substr(x,1,1) returns the first character
+** of x.  If x is text, then we actually count UTF-8 characters.
+** If x is a blob, then we count bytes.
+**
+** If p1 is negative, then we begin abs(p1) from the end of x[].
+**
+** If p2 is negative, return the p2 characters preceding p1.
+*/
+static void substrFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *z;
+  const unsigned char *z2;
+  int len;
+  int p0type;
+  i64 p1, p2;
+  int negP2 = 0;
+
+  assert( argc==3 || argc==2 );
+  if( sqlite3_value_type(argv[1])==SQLITE_NULL
+   || (argc==3 && sqlite3_value_type(argv[2])==SQLITE_NULL)
+  ){
+    return;
+  }
+  p0type = sqlite3_value_type(argv[0]);
+  p1 = sqlite3_value_int(argv[1]);
+  if( p0type==SQLITE_BLOB ){
+    len = sqlite3_value_bytes(argv[0]);
+    z = sqlite3_value_blob(argv[0]);
+    if( z==0 ) return;
+    assert( len==sqlite3_value_bytes(argv[0]) );
+  }else{
+    z = sqlite3_value_text(argv[0]);
+    if( z==0 ) return;
+    len = 0;
+    if( p1<0 ){
+      for(z2=z; *z2; len++){
+        SQLITE_SKIP_UTF8(z2);
+      }
+    }
+  }
+  if( argc==3 ){
+    p2 = sqlite3_value_int(argv[2]);
+    if( p2<0 ){
+      p2 = -p2;
+      negP2 = 1;
+    }
+  }else{
+    p2 = sqlite3_context_db_handle(context)->aLimit[SQLITE_LIMIT_LENGTH];
+  }
+  if( p1<0 ){
+    p1 += len;
+    if( p1<0 ){
+      p2 += p1;
+      if( p2<0 ) p2 = 0;
+      p1 = 0;
+    }
+  }else if( p1>0 ){
+    p1--;
+  }else if( p2>0 ){
+    p2--;
+  }
+  if( negP2 ){
+    p1 -= p2;
+    if( p1<0 ){
+      p2 += p1;
+      p1 = 0;
+    }
+  }
+  assert( p1>=0 && p2>=0 );
+  if( p0type!=SQLITE_BLOB ){
+    while( *z && p1 ){
+      SQLITE_SKIP_UTF8(z);
+      p1--;
+    }
+    for(z2=z; *z2 && p2; p2--){
+      SQLITE_SKIP_UTF8(z2);
+    }
+    sqlite3_result_text64(context, (char*)z, z2-z, SQLITE_TRANSIENT,
+                          SQLITE_UTF8);
+  }else{
+    if( p1+p2>len ){
+      p2 = len-p1;
+      if( p2<0 ) p2 = 0;
+    }
+    sqlite3_result_blob64(context, (char*)&z[p1], (u64)p2, SQLITE_TRANSIENT);
+  }
+}
+
+/*
+** Implementation of the round() function
+*/
+#ifndef SQLITE_OMIT_FLOATING_POINT
+static void roundFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+  int n = 0;
+  double r;
+  char *zBuf;
+  assert( argc==1 || argc==2 );
+  if( argc==2 ){
+    if( SQLITE_NULL==sqlite3_value_type(argv[1]) ) return;
+    n = sqlite3_value_int(argv[1]);
+    if( n>30 ) n = 30;
+    if( n<0 ) n = 0;
+  }
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
+  r = sqlite3_value_double(argv[0]);
+  /* If Y==0 and X will fit in a 64-bit int,
+  ** handle the rounding directly,
+  ** otherwise use printf.
+  */
+  if( n==0 && r>=0 && r<LARGEST_INT64-1 ){
+    r = (double)((sqlite_int64)(r+0.5));
+  }else if( n==0 && r<0 && (-r)<LARGEST_INT64-1 ){
+    r = -(double)((sqlite_int64)((-r)+0.5));
+  }else{
+    zBuf = sqlite3_mprintf("%.*f",n,r);
+    if( zBuf==0 ){
+      sqlite3_result_error_nomem(context);
+      return;
+    }
+    sqlite3AtoF(zBuf, &r, sqlite3Strlen30(zBuf), SQLITE_UTF8);
+    sqlite3_free(zBuf);
+  }
+  sqlite3_result_double(context, r);
+}
+#endif
+
+/*
+** Allocate nByte bytes of space using sqlite3_malloc(). If the
+** allocation fails, call sqlite3_result_error_nomem() to notify
+** the database handle that malloc() has failed and return NULL.
+** If nByte is larger than the maximum string or blob length, then
+** raise an SQLITE_TOOBIG exception and return NULL.
+*/
+static void *contextMalloc(sqlite3_context *context, i64 nByte){
+  char *z;
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  assert( nByte>0 );
+  testcase( nByte==db->aLimit[SQLITE_LIMIT_LENGTH] );
+  testcase( nByte==db->aLimit[SQLITE_LIMIT_LENGTH]+1 );
+  if( nByte>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    sqlite3_result_error_toobig(context);
+    z = 0;
+  }else{
+    z = sqlite3Malloc(nByte);
+    if( !z ){
+      sqlite3_result_error_nomem(context);
+    }
+  }
+  return z;
+}
+
+/*
+** Implementation of the upper() and lower() SQL functions.
+*/
+static void upperFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+  char *z1;
+  const char *z2;
+  int i, n;
+  UNUSED_PARAMETER(argc);
+  z2 = (char*)sqlite3_value_text(argv[0]);
+  n = sqlite3_value_bytes(argv[0]);
+  /* Verify that the call to _bytes() does not invalidate the _text() pointer */
+  assert( z2==(char*)sqlite3_value_text(argv[0]) );
+  if( z2 ){
+    z1 = contextMalloc(context, ((i64)n)+1);
+    if( z1 ){
+      for(i=0; i<n; i++){
+        z1[i] = (char)sqlite3Toupper(z2[i]);
+      }
+      sqlite3_result_text(context, z1, n, sqlite3_free);
+    }
+  }
+}
+static void lowerFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+  char *z1;
+  const char *z2;
+  int i, n;
+  UNUSED_PARAMETER(argc);
+  z2 = (char*)sqlite3_value_text(argv[0]);
+  n = sqlite3_value_bytes(argv[0]);
+  /* Verify that the call to _bytes() does not invalidate the _text() pointer */
+  assert( z2==(char*)sqlite3_value_text(argv[0]) );
+  if( z2 ){
+    z1 = contextMalloc(context, ((i64)n)+1);
+    if( z1 ){
+      for(i=0; i<n; i++){
+        z1[i] = sqlite3Tolower(z2[i]);
+      }
+      sqlite3_result_text(context, z1, n, sqlite3_free);
+    }
+  }
+}
+
+/*
+** Some functions like COALESCE() and IFNULL() and UNLIKELY() are implemented
+** as VDBE code so that unused argument values do not have to be computed.
