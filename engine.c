@@ -95766,3 +95766,237 @@ static void lowerFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
 /*
 ** Some functions like COALESCE() and IFNULL() and UNLIKELY() are implemented
 ** as VDBE code so that unused argument values do not have to be computed.
+** However, we still need some kind of function implementation for this
+** routines in the function table.  The noopFunc macro provides this.
+** noopFunc will never be called so it doesn't matter what the implementation
+** is.  We might as well use the "version()" function as a substitute.
+*/
+#define noopFunc versionFunc   /* Substitute function - never called */
+
+/*
+** Implementation of random().  Return a random integer.  
+*/
+static void randomFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  sqlite_int64 r;
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  sqlite3_randomness(sizeof(r), &r);
+  if( r<0 ){
+    /* We need to prevent a random number of 0x8000000000000000 
+    ** (or -9223372036854775808) since when you do abs() of that
+    ** number of you get the same value back again.  To do this
+    ** in a way that is testable, mask the sign bit off of negative
+    ** values, resulting in a positive value.  Then take the 
+    ** 2s complement of that positive value.  The end result can
+    ** therefore be no less than -9223372036854775807.
+    */
+    r = -(r & LARGEST_INT64);
+  }
+  sqlite3_result_int64(context, r);
+}
+
+/*
+** Implementation of randomblob(N).  Return a random blob
+** that is N bytes long.
+*/
+static void randomBlob(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int n;
+  unsigned char *p;
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  n = sqlite3_value_int(argv[0]);
+  if( n<1 ){
+    n = 1;
+  }
+  p = contextMalloc(context, n);
+  if( p ){
+    sqlite3_randomness(n, p);
+    sqlite3_result_blob(context, (char*)p, n, sqlite3_free);
+  }
+}
+
+/*
+** Implementation of the last_insert_rowid() SQL function.  The return
+** value is the same as the sqlite3_last_insert_rowid() API function.
+*/
+static void last_insert_rowid(
+  sqlite3_context *context, 
+  int NotUsed, 
+  sqlite3_value **NotUsed2
+){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  /* IMP: R-51513-12026 The last_insert_rowid() SQL function is a
+  ** wrapper around the sqlite3_last_insert_rowid() C/C++ interface
+  ** function. */
+  sqlite3_result_int64(context, sqlite3_last_insert_rowid(db));
+}
+
+/*
+** Implementation of the changes() SQL function.
+**
+** IMP: R-62073-11209 The changes() SQL function is a wrapper
+** around the sqlite3_changes() C/C++ function and hence follows the same
+** rules for counting changes.
+*/
+static void changes(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  sqlite3_result_int(context, sqlite3_changes(db));
+}
+
+/*
+** Implementation of the total_changes() SQL function.  The return value is
+** the same as the sqlite3_total_changes() API function.
+*/
+static void total_changes(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  /* IMP: R-52756-41993 This function is a wrapper around the
+  ** sqlite3_total_changes() C/C++ interface. */
+  sqlite3_result_int(context, sqlite3_total_changes(db));
+}
+
+/*
+** A structure defining how to do GLOB-style comparisons.
+*/
+struct compareInfo {
+  u8 matchAll;
+  u8 matchOne;
+  u8 matchSet;
+  u8 noCase;
+};
+
+/*
+** For LIKE and GLOB matching on EBCDIC machines, assume that every
+** character is exactly one byte in size.  Also, all characters are
+** able to participate in upper-case-to-lower-case mappings in EBCDIC
+** whereas only characters less than 0x80 do in ASCII.
+*/
+#if defined(SQLITE_EBCDIC)
+# define sqlite3Utf8Read(A)        (*((*A)++))
+# define GlobUpperToLower(A)       A = sqlite3UpperToLower[A]
+# define GlobUpperToLowerAscii(A)  A = sqlite3UpperToLower[A]
+#else
+# define GlobUpperToLower(A)       if( A<=0x7f ){ A = sqlite3UpperToLower[A]; }
+# define GlobUpperToLowerAscii(A)  A = sqlite3UpperToLower[A]
+#endif
+
+static const struct compareInfo globInfo = { '*', '?', '[', 0 };
+/* The correct SQL-92 behavior is for the LIKE operator to ignore
+** case.  Thus  'a' LIKE 'A' would be true. */
+static const struct compareInfo likeInfoNorm = { '%', '_',   0, 1 };
+/* If SQLITE_CASE_SENSITIVE_LIKE is defined, then the LIKE operator
+** is case sensitive causing 'a' LIKE 'A' to be false */
+static const struct compareInfo likeInfoAlt = { '%', '_',   0, 0 };
+
+/*
+** Compare two UTF-8 strings for equality where the first string can
+** potentially be a "glob" or "like" expression.  Return true (1) if they
+** are the same and false (0) if they are different.
+**
+** Globbing rules:
+**
+**      '*'       Matches any sequence of zero or more characters.
+**
+**      '?'       Matches exactly one character.
+**
+**     [...]      Matches one character from the enclosed list of
+**                characters.
+**
+**     [^...]     Matches one character not in the enclosed list.
+**
+** With the [...] and [^...] matching, a ']' character can be included
+** in the list by making it the first character after '[' or '^'.  A
+** range of characters can be specified using '-'.  Example:
+** "[a-z]" matches any single lower-case letter.  To match a '-', make
+** it the last character in the list.
+**
+** Like matching rules:
+** 
+**      '%'       Matches any sequence of zero or more characters
+**
+***     '_'       Matches any one character
+**
+**      Ec        Where E is the "esc" character and c is any other
+**                character, including '%', '_', and esc, match exactly c.
+**
+** The comments through this routine usually assume glob matching.
+**
+** This routine is usually quick, but can be N**2 in the worst case.
+*/
+static int patternCompare(
+  const u8 *zPattern,              /* The glob pattern */
+  const u8 *zString,               /* The string to compare against the glob */
+  const struct compareInfo *pInfo, /* Information about how to do the compare */
+  u32 esc                          /* The escape character */
+){
+  u32 c, c2;                       /* Next pattern and input string chars */
+  u32 matchOne = pInfo->matchOne;  /* "?" or "_" */
+  u32 matchAll = pInfo->matchAll;  /* "*" or "%" */
+  u32 matchOther;                  /* "[" or the escape character */
+  u8 noCase = pInfo->noCase;       /* True if uppercase==lowercase */
+  const u8 *zEscaped = 0;          /* One past the last escaped input char */
+  
+  /* The GLOB operator does not have an ESCAPE clause.  And LIKE does not
+  ** have the matchSet operator.  So we either have to look for one or
+  ** the other, never both.  Hence the single variable matchOther is used
+  ** to store the one we have to look for.
+  */
+  matchOther = esc ? esc : pInfo->matchSet;
+
+  while( (c = sqlite3Utf8Read(&zPattern))!=0 ){
+    if( c==matchAll ){  /* Match "*" */
+      /* Skip over multiple "*" characters in the pattern.  If there
+      ** are also "?" characters, skip those as well, but consume a
+      ** single character of the input string for each "?" skipped */
+      while( (c=sqlite3Utf8Read(&zPattern)) == matchAll
+               || c == matchOne ){
+        if( c==matchOne && sqlite3Utf8Read(&zString)==0 ){
+          return 0;
+        }
+      }
+      if( c==0 ){
+        return 1;   /* "*" at the end of the pattern matches */
+      }else if( c==matchOther ){
+        if( esc ){
+          c = sqlite3Utf8Read(&zPattern);
+          if( c==0 ) return 0;
+        }else{
+          /* "[...]" immediately follows the "*".  We have to do a slow
+          ** recursive search in this case, but it is an unusual case. */
+          assert( matchOther<0x80 );  /* '[' is a single-byte character */
+          while( *zString
+                 && patternCompare(&zPattern[-1],zString,pInfo,esc)==0 ){
+            SQLITE_SKIP_UTF8(zString);
+          }
+          return *zString!=0;
+        }
+      }
+
+      /* At this point variable c contains the first character of the
+      ** pattern string past the "*".  Search in the input string for the
+      ** first matching character and recursively contine the match from
+      ** that point.
+      **
+      ** For a case-insensitive search, set variable cx to be the same as
+      ** c but in the other case and search the input string for either
+      ** c or cx.
+      */
+      if( c<=0x80 ){
+        u32 cx;
