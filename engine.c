@@ -96224,3 +96224,230 @@ static void compileoptionusedFunc(
   UNUSED_PARAMETER(argc);
   /* IMP: R-39564-36305 The sqlite_compileoption_used() SQL
   ** function is a wrapper around the sqlite3_compileoption_used() C/C++
+  ** function.
+  */
+  if( (zOptName = (const char*)sqlite3_value_text(argv[0]))!=0 ){
+    sqlite3_result_int(context, sqlite3_compileoption_used(zOptName));
+  }
+}
+#endif /* SQLITE_OMIT_COMPILEOPTION_DIAGS */
+
+/*
+** Implementation of the sqlite_compileoption_get() function. 
+** The result is a string that identifies the compiler options 
+** used to build SQLite.
+*/
+#ifndef SQLITE_OMIT_COMPILEOPTION_DIAGS
+static void compileoptiongetFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int n;
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  /* IMP: R-04922-24076 The sqlite_compileoption_get() SQL function
+  ** is a wrapper around the sqlite3_compileoption_get() C/C++ function.
+  */
+  n = sqlite3_value_int(argv[0]);
+  sqlite3_result_text(context, sqlite3_compileoption_get(n), -1, SQLITE_STATIC);
+}
+#endif /* SQLITE_OMIT_COMPILEOPTION_DIAGS */
+
+/* Array for converting from half-bytes (nybbles) into ASCII hex
+** digits. */
+static const char hexdigits[] = {
+  '0', '1', '2', '3', '4', '5', '6', '7',
+  '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' 
+};
+
+/*
+** Implementation of the QUOTE() function.  This function takes a single
+** argument.  If the argument is numeric, the return value is the same as
+** the argument.  If the argument is NULL, the return value is the string
+** "NULL".  Otherwise, the argument is enclosed in single quotes with
+** single-quote escapes.
+*/
+static void quoteFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  switch( sqlite3_value_type(argv[0]) ){
+    case SQLITE_FLOAT: {
+      double r1, r2;
+      char zBuf[50];
+      r1 = sqlite3_value_double(argv[0]);
+      sqlite3_snprintf(sizeof(zBuf), zBuf, "%!.15g", r1);
+      sqlite3AtoF(zBuf, &r2, 20, SQLITE_UTF8);
+      if( r1!=r2 ){
+        sqlite3_snprintf(sizeof(zBuf), zBuf, "%!.20e", r1);
+      }
+      sqlite3_result_text(context, zBuf, -1, SQLITE_TRANSIENT);
+      break;
+    }
+    case SQLITE_INTEGER: {
+      sqlite3_result_value(context, argv[0]);
+      break;
+    }
+    case SQLITE_BLOB: {
+      char *zText = 0;
+      char const *zBlob = sqlite3_value_blob(argv[0]);
+      int nBlob = sqlite3_value_bytes(argv[0]);
+      assert( zBlob==sqlite3_value_blob(argv[0]) ); /* No encoding change */
+      zText = (char *)contextMalloc(context, (2*(i64)nBlob)+4); 
+      if( zText ){
+        int i;
+        for(i=0; i<nBlob; i++){
+          zText[(i*2)+2] = hexdigits[(zBlob[i]>>4)&0x0F];
+          zText[(i*2)+3] = hexdigits[(zBlob[i])&0x0F];
+        }
+        zText[(nBlob*2)+2] = '\'';
+        zText[(nBlob*2)+3] = '\0';
+        zText[0] = 'X';
+        zText[1] = '\'';
+        sqlite3_result_text(context, zText, -1, SQLITE_TRANSIENT);
+        sqlite3_free(zText);
+      }
+      break;
+    }
+    case SQLITE_TEXT: {
+      int i,j;
+      u64 n;
+      const unsigned char *zArg = sqlite3_value_text(argv[0]);
+      char *z;
+
+      if( zArg==0 ) return;
+      for(i=0, n=0; zArg[i]; i++){ if( zArg[i]=='\'' ) n++; }
+      z = contextMalloc(context, ((i64)i)+((i64)n)+3);
+      if( z ){
+        z[0] = '\'';
+        for(i=0, j=1; zArg[i]; i++){
+          z[j++] = zArg[i];
+          if( zArg[i]=='\'' ){
+            z[j++] = '\'';
+          }
+        }
+        z[j++] = '\'';
+        z[j] = 0;
+        sqlite3_result_text(context, z, j, sqlite3_free);
+      }
+      break;
+    }
+    default: {
+      assert( sqlite3_value_type(argv[0])==SQLITE_NULL );
+      sqlite3_result_text(context, "NULL", 4, SQLITE_STATIC);
+      break;
+    }
+  }
+}
+
+/*
+** The unicode() function.  Return the integer unicode code-point value
+** for the first character of the input string. 
+*/
+static void unicodeFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *z = sqlite3_value_text(argv[0]);
+  (void)argc;
+  if( z && z[0] ) sqlite3_result_int(context, sqlite3Utf8Read(&z));
+}
+
+/*
+** The char() function takes zero or more arguments, each of which is
+** an integer.  It constructs a string where each character of the string
+** is the unicode character for the corresponding integer argument.
+*/
+static void charFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  unsigned char *z, *zOut;
+  int i;
+  zOut = z = sqlite3_malloc( argc*4+1 );
+  if( z==0 ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+  for(i=0; i<argc; i++){
+    sqlite3_int64 x;
+    unsigned c;
+    x = sqlite3_value_int64(argv[i]);
+    if( x<0 || x>0x10ffff ) x = 0xfffd;
+    c = (unsigned)(x & 0x1fffff);
+    if( c<0x00080 ){
+      *zOut++ = (u8)(c&0xFF);
+    }else if( c<0x00800 ){
+      *zOut++ = 0xC0 + (u8)((c>>6)&0x1F);
+      *zOut++ = 0x80 + (u8)(c & 0x3F);
+    }else if( c<0x10000 ){
+      *zOut++ = 0xE0 + (u8)((c>>12)&0x0F);
+      *zOut++ = 0x80 + (u8)((c>>6) & 0x3F);
+      *zOut++ = 0x80 + (u8)(c & 0x3F);
+    }else{
+      *zOut++ = 0xF0 + (u8)((c>>18) & 0x07);
+      *zOut++ = 0x80 + (u8)((c>>12) & 0x3F);
+      *zOut++ = 0x80 + (u8)((c>>6) & 0x3F);
+      *zOut++ = 0x80 + (u8)(c & 0x3F);
+    }                                                    \
+  }
+  sqlite3_result_text64(context, (char*)z, zOut-z, sqlite3_free, SQLITE_UTF8);
+}
+
+/*
+** The hex() function.  Interpret the argument as a blob.  Return
+** a hexadecimal rendering as text.
+*/
+static void hexFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int i, n;
+  const unsigned char *pBlob;
+  char *zHex, *z;
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  pBlob = sqlite3_value_blob(argv[0]);
+  n = sqlite3_value_bytes(argv[0]);
+  assert( pBlob==sqlite3_value_blob(argv[0]) );  /* No encoding change */
+  z = zHex = contextMalloc(context, ((i64)n)*2 + 1);
+  if( zHex ){
+    for(i=0; i<n; i++, pBlob++){
+      unsigned char c = *pBlob;
+      *(z++) = hexdigits[(c>>4)&0xf];
+      *(z++) = hexdigits[c&0xf];
+    }
+    *z = 0;
+    sqlite3_result_text(context, zHex, n*2, sqlite3_free);
+  }
+}
+
+/*
+** The zeroblob(N) function returns a zero-filled blob of size N bytes.
+*/
+static void zeroblobFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  i64 n;
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  n = sqlite3_value_int64(argv[0]);
+  testcase( n==db->aLimit[SQLITE_LIMIT_LENGTH] );
+  testcase( n==db->aLimit[SQLITE_LIMIT_LENGTH]+1 );
+  if( n>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    sqlite3_result_error_toobig(context);
+  }else{
+    sqlite3_result_zeroblob(context, (int)n); /* IMP: R-00293-64994 */
+  }
+}
+
+/*
+** The replace() function.  Three arguments are all strings: call
+** them A, B, and C. The result is also a string which is derived
+** from A by replacing every occurrence of B with C.  The match
