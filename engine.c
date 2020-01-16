@@ -97809,3 +97809,238 @@ static void fkTriggerDelete(sqlite3 *dbMem, Trigger *p){
 SQLITE_PRIVATE void sqlite3FkDropTable(Parse *pParse, SrcList *pName, Table *pTab){
   sqlite3 *db = pParse->db;
   if( (db->flags&SQLITE_ForeignKeys) && !IsVirtual(pTab) && !pTab->pSelect ){
+    int iSkip = 0;
+    Vdbe *v = sqlite3GetVdbe(pParse);
+
+    assert( v );                  /* VDBE has already been allocated */
+    if( sqlite3FkReferences(pTab)==0 ){
+      /* Search for a deferred foreign key constraint for which this table
+      ** is the child table. If one cannot be found, return without 
+      ** generating any VDBE code. If one can be found, then jump over
+      ** the entire DELETE if there are no outstanding deferred constraints
+      ** when this statement is run.  */
+      FKey *p;
+      for(p=pTab->pFKey; p; p=p->pNextFrom){
+        if( p->isDeferred || (db->flags & SQLITE_DeferFKs) ) break;
+      }
+      if( !p ) return;
+      iSkip = sqlite3VdbeMakeLabel(v);
+      sqlite3VdbeAddOp2(v, OP_FkIfZero, 1, iSkip); VdbeCoverage(v);
+    }
+
+    pParse->disableTriggers = 1;
+    sqlite3DeleteFrom(pParse, sqlite3SrcListDup(db, pName, 0), 0);
+    pParse->disableTriggers = 0;
+
+    /* If the DELETE has generated immediate foreign key constraint 
+    ** violations, halt the VDBE and return an error at this point, before
+    ** any modifications to the schema are made. This is because statement
+    ** transactions are not able to rollback schema changes.  
+    **
+    ** If the SQLITE_DeferFKs flag is set, then this is not required, as
+    ** the statement transaction will not be rolled back even if FK
+    ** constraints are violated.
+    */
+    if( (db->flags & SQLITE_DeferFKs)==0 ){
+      sqlite3VdbeAddOp2(v, OP_FkIfZero, 0, sqlite3VdbeCurrentAddr(v)+2);
+      VdbeCoverage(v);
+      sqlite3HaltConstraint(pParse, SQLITE_CONSTRAINT_FOREIGNKEY,
+          OE_Abort, 0, P4_STATIC, P5_ConstraintFK);
+    }
+
+    if( iSkip ){
+      sqlite3VdbeResolveLabel(v, iSkip);
+    }
+  }
+}
+
+
+/*
+** The second argument points to an FKey object representing a foreign key
+** for which pTab is the child table. An UPDATE statement against pTab
+** is currently being processed. For each column of the table that is 
+** actually updated, the corresponding element in the aChange[] array
+** is zero or greater (if a column is unmodified the corresponding element
+** is set to -1). If the rowid column is modified by the UPDATE statement
+** the bChngRowid argument is non-zero.
+**
+** This function returns true if any of the columns that are part of the
+** child key for FK constraint *p are modified.
+*/
+static int fkChildIsModified(
+  Table *pTab,                    /* Table being updated */
+  FKey *p,                        /* Foreign key for which pTab is the child */
+  int *aChange,                   /* Array indicating modified columns */
+  int bChngRowid                  /* True if rowid is modified by this update */
+){
+  int i;
+  for(i=0; i<p->nCol; i++){
+    int iChildKey = p->aCol[i].iFrom;
+    if( aChange[iChildKey]>=0 ) return 1;
+    if( iChildKey==pTab->iPKey && bChngRowid ) return 1;
+  }
+  return 0;
+}
+
+/*
+** The second argument points to an FKey object representing a foreign key
+** for which pTab is the parent table. An UPDATE statement against pTab
+** is currently being processed. For each column of the table that is 
+** actually updated, the corresponding element in the aChange[] array
+** is zero or greater (if a column is unmodified the corresponding element
+** is set to -1). If the rowid column is modified by the UPDATE statement
+** the bChngRowid argument is non-zero.
+**
+** This function returns true if any of the columns that are part of the
+** parent key for FK constraint *p are modified.
+*/
+static int fkParentIsModified(
+  Table *pTab, 
+  FKey *p, 
+  int *aChange, 
+  int bChngRowid
+){
+  int i;
+  for(i=0; i<p->nCol; i++){
+    char *zKey = p->aCol[i].zCol;
+    int iKey;
+    for(iKey=0; iKey<pTab->nCol; iKey++){
+      if( aChange[iKey]>=0 || (iKey==pTab->iPKey && bChngRowid) ){
+        Column *pCol = &pTab->aCol[iKey];
+        if( zKey ){
+          if( 0==sqlite3StrICmp(pCol->zName, zKey) ) return 1;
+        }else if( pCol->colFlags & COLFLAG_PRIMKEY ){
+          return 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** Return true if the parser passed as the first argument is being
+** used to code a trigger that is really a "SET NULL" action belonging
+** to trigger pFKey.
+*/
+static int isSetNullAction(Parse *pParse, FKey *pFKey){
+  Parse *pTop = sqlite3ParseToplevel(pParse);
+  if( pTop->pTriggerPrg ){
+    Trigger *p = pTop->pTriggerPrg->pTrigger;
+    if( (p==pFKey->apTrigger[0] && pFKey->aAction[0]==OE_SetNull)
+     || (p==pFKey->apTrigger[1] && pFKey->aAction[1]==OE_SetNull)
+    ){
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** This function is called when inserting, deleting or updating a row of
+** table pTab to generate VDBE code to perform foreign key constraint 
+** processing for the operation.
+**
+** For a DELETE operation, parameter regOld is passed the index of the
+** first register in an array of (pTab->nCol+1) registers containing the
+** rowid of the row being deleted, followed by each of the column values
+** of the row being deleted, from left to right. Parameter regNew is passed
+** zero in this case.
+**
+** For an INSERT operation, regOld is passed zero and regNew is passed the
+** first register of an array of (pTab->nCol+1) registers containing the new
+** row data.
+**
+** For an UPDATE operation, this function is called twice. Once before
+** the original record is deleted from the table using the calling convention
+** described for DELETE. Then again after the original record is deleted
+** but before the new record is inserted using the INSERT convention. 
+*/
+SQLITE_PRIVATE void sqlite3FkCheck(
+  Parse *pParse,                  /* Parse context */
+  Table *pTab,                    /* Row is being deleted from this table */ 
+  int regOld,                     /* Previous row data is stored here */
+  int regNew,                     /* New row data is stored here */
+  int *aChange,                   /* Array indicating UPDATEd columns (or 0) */
+  int bChngRowid                  /* True if rowid is UPDATEd */
+){
+  sqlite3 *db = pParse->db;       /* Database handle */
+  FKey *pFKey;                    /* Used to iterate through FKs */
+  int iDb;                        /* Index of database containing pTab */
+  const char *zDb;                /* Name of database containing pTab */
+  int isIgnoreErrors = pParse->disableTriggers;
+
+  /* Exactly one of regOld and regNew should be non-zero. */
+  assert( (regOld==0)!=(regNew==0) );
+
+  /* If foreign-keys are disabled, this function is a no-op. */
+  if( (db->flags&SQLITE_ForeignKeys)==0 ) return;
+
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  zDb = db->aDb[iDb].zName;
+
+  /* Loop through all the foreign key constraints for which pTab is the
+  ** child table (the table that the foreign key definition is part of).  */
+  for(pFKey=pTab->pFKey; pFKey; pFKey=pFKey->pNextFrom){
+    Table *pTo;                   /* Parent table of foreign key pFKey */
+    Index *pIdx = 0;              /* Index on key columns in pTo */
+    int *aiFree = 0;
+    int *aiCol;
+    int iCol;
+    int i;
+    int bIgnore = 0;
+
+    if( aChange 
+     && sqlite3_stricmp(pTab->zName, pFKey->zTo)!=0
+     && fkChildIsModified(pTab, pFKey, aChange, bChngRowid)==0 
+    ){
+      continue;
+    }
+
+    /* Find the parent table of this foreign key. Also find a unique index 
+    ** on the parent key columns in the parent table. If either of these 
+    ** schema items cannot be located, set an error in pParse and return 
+    ** early.  */
+    if( pParse->disableTriggers ){
+      pTo = sqlite3FindTable(db, pFKey->zTo, zDb);
+    }else{
+      pTo = sqlite3LocateTable(pParse, 0, pFKey->zTo, zDb);
+    }
+    if( !pTo || sqlite3FkLocateIndex(pParse, pTo, pFKey, &pIdx, &aiFree) ){
+      assert( isIgnoreErrors==0 || (regOld!=0 && regNew==0) );
+      if( !isIgnoreErrors || db->mallocFailed ) return;
+      if( pTo==0 ){
+        /* If isIgnoreErrors is true, then a table is being dropped. In this
+        ** case SQLite runs a "DELETE FROM xxx" on the table being dropped
+        ** before actually dropping it in order to check FK constraints.
+        ** If the parent table of an FK constraint on the current table is
+        ** missing, behave as if it is empty. i.e. decrement the relevant
+        ** FK counter for each row of the current table with non-NULL keys.
+        */
+        Vdbe *v = sqlite3GetVdbe(pParse);
+        int iJump = sqlite3VdbeCurrentAddr(v) + pFKey->nCol + 1;
+        for(i=0; i<pFKey->nCol; i++){
+          int iReg = pFKey->aCol[i].iFrom + regOld + 1;
+          sqlite3VdbeAddOp2(v, OP_IsNull, iReg, iJump); VdbeCoverage(v);
+        }
+        sqlite3VdbeAddOp2(v, OP_FkCounter, pFKey->isDeferred, -1);
+      }
+      continue;
+    }
+    assert( pFKey->nCol==1 || (aiFree && pIdx) );
+
+    if( aiFree ){
+      aiCol = aiFree;
+    }else{
+      iCol = pFKey->aCol[0].iFrom;
+      aiCol = &iCol;
+    }
+    for(i=0; i<pFKey->nCol; i++){
+      if( aiCol[i]==pTab->iPKey ){
+        aiCol[i] = -1;
+      }
+#ifndef SQLITE_OMIT_AUTHORIZATION
+      /* Request permission to read the parent key columns. If the 
+      ** authorization callback returns SQLITE_IGNORE, behave as if any
+      ** values read from the parent table are NULL. */
+      if( db->xAuth ){
