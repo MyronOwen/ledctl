@@ -96675,3 +96675,208 @@ static void soundexFunc(
     ** is NULL or contains no ASCII alphabetic characters. */
     sqlite3_result_text(context, "?000", 4, SQLITE_STATIC);
   }
+}
+#endif /* SQLITE_SOUNDEX */
+
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+/*
+** A function that loads a shared-library extension then returns NULL.
+*/
+static void loadExt(sqlite3_context *context, int argc, sqlite3_value **argv){
+  const char *zFile = (const char *)sqlite3_value_text(argv[0]);
+  const char *zProc;
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  char *zErrMsg = 0;
+
+  if( argc==2 ){
+    zProc = (const char *)sqlite3_value_text(argv[1]);
+  }else{
+    zProc = 0;
+  }
+  if( zFile && sqlite3_load_extension(db, zFile, zProc, &zErrMsg) ){
+    sqlite3_result_error(context, zErrMsg, -1);
+    sqlite3_free(zErrMsg);
+  }
+}
+#endif
+
+
+/*
+** An instance of the following structure holds the context of a
+** sum() or avg() aggregate computation.
+*/
+typedef struct SumCtx SumCtx;
+struct SumCtx {
+  double rSum;      /* Floating point sum */
+  i64 iSum;         /* Integer sum */   
+  i64 cnt;          /* Number of elements summed */
+  u8 overflow;      /* True if integer overflow seen */
+  u8 approx;        /* True if non-integer value was input to the sum */
+};
+
+/*
+** Routines used to compute the sum, average, and total.
+**
+** The SUM() function follows the (broken) SQL standard which means
+** that it returns NULL if it sums over no inputs.  TOTAL returns
+** 0.0 in that case.  In addition, TOTAL always returns a float where
+** SUM might return an integer if it never encounters a floating point
+** value.  TOTAL never fails, but SUM might through an exception if
+** it overflows an integer.
+*/
+static void sumStep(sqlite3_context *context, int argc, sqlite3_value **argv){
+  SumCtx *p;
+  int type;
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  p = sqlite3_aggregate_context(context, sizeof(*p));
+  type = sqlite3_value_numeric_type(argv[0]);
+  if( p && type!=SQLITE_NULL ){
+    p->cnt++;
+    if( type==SQLITE_INTEGER ){
+      i64 v = sqlite3_value_int64(argv[0]);
+      p->rSum += v;
+      if( (p->approx|p->overflow)==0 && sqlite3AddInt64(&p->iSum, v) ){
+        p->overflow = 1;
+      }
+    }else{
+      p->rSum += sqlite3_value_double(argv[0]);
+      p->approx = 1;
+    }
+  }
+}
+static void sumFinalize(sqlite3_context *context){
+  SumCtx *p;
+  p = sqlite3_aggregate_context(context, 0);
+  if( p && p->cnt>0 ){
+    if( p->overflow ){
+      sqlite3_result_error(context,"integer overflow",-1);
+    }else if( p->approx ){
+      sqlite3_result_double(context, p->rSum);
+    }else{
+      sqlite3_result_int64(context, p->iSum);
+    }
+  }
+}
+static void avgFinalize(sqlite3_context *context){
+  SumCtx *p;
+  p = sqlite3_aggregate_context(context, 0);
+  if( p && p->cnt>0 ){
+    sqlite3_result_double(context, p->rSum/(double)p->cnt);
+  }
+}
+static void totalFinalize(sqlite3_context *context){
+  SumCtx *p;
+  p = sqlite3_aggregate_context(context, 0);
+  /* (double)0 In case of SQLITE_OMIT_FLOATING_POINT... */
+  sqlite3_result_double(context, p ? p->rSum : (double)0);
+}
+
+/*
+** The following structure keeps track of state information for the
+** count() aggregate function.
+*/
+typedef struct CountCtx CountCtx;
+struct CountCtx {
+  i64 n;
+};
+
+/*
+** Routines to implement the count() aggregate function.
+*/
+static void countStep(sqlite3_context *context, int argc, sqlite3_value **argv){
+  CountCtx *p;
+  p = sqlite3_aggregate_context(context, sizeof(*p));
+  if( (argc==0 || SQLITE_NULL!=sqlite3_value_type(argv[0])) && p ){
+    p->n++;
+  }
+
+#ifndef SQLITE_OMIT_DEPRECATED
+  /* The sqlite3_aggregate_count() function is deprecated.  But just to make
+  ** sure it still operates correctly, verify that its count agrees with our 
+  ** internal count when using count(*) and when the total count can be
+  ** expressed as a 32-bit integer. */
+  assert( argc==1 || p==0 || p->n>0x7fffffff
+          || p->n==sqlite3_aggregate_count(context) );
+#endif
+}   
+static void countFinalize(sqlite3_context *context){
+  CountCtx *p;
+  p = sqlite3_aggregate_context(context, 0);
+  sqlite3_result_int64(context, p ? p->n : 0);
+}
+
+/*
+** Routines to implement min() and max() aggregate functions.
+*/
+static void minmaxStep(
+  sqlite3_context *context, 
+  int NotUsed, 
+  sqlite3_value **argv
+){
+  Mem *pArg  = (Mem *)argv[0];
+  Mem *pBest;
+  UNUSED_PARAMETER(NotUsed);
+
+  pBest = (Mem *)sqlite3_aggregate_context(context, sizeof(*pBest));
+  if( !pBest ) return;
+
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ){
+    if( pBest->flags ) sqlite3SkipAccumulatorLoad(context);
+  }else if( pBest->flags ){
+    int max;
+    int cmp;
+    CollSeq *pColl = sqlite3GetFuncCollSeq(context);
+    /* This step function is used for both the min() and max() aggregates,
+    ** the only difference between the two being that the sense of the
+    ** comparison is inverted. For the max() aggregate, the
+    ** sqlite3_user_data() function returns (void *)-1. For min() it
+    ** returns (void *)db, where db is the sqlite3* database pointer.
+    ** Therefore the next statement sets variable 'max' to 1 for the max()
+    ** aggregate, or 0 for min().
+    */
+    max = sqlite3_user_data(context)!=0;
+    cmp = sqlite3MemCompare(pBest, pArg, pColl);
+    if( (max && cmp<0) || (!max && cmp>0) ){
+      sqlite3VdbeMemCopy(pBest, pArg);
+    }else{
+      sqlite3SkipAccumulatorLoad(context);
+    }
+  }else{
+    pBest->db = sqlite3_context_db_handle(context);
+    sqlite3VdbeMemCopy(pBest, pArg);
+  }
+}
+static void minMaxFinalize(sqlite3_context *context){
+  sqlite3_value *pRes;
+  pRes = (sqlite3_value *)sqlite3_aggregate_context(context, 0);
+  if( pRes ){
+    if( pRes->flags ){
+      sqlite3_result_value(context, pRes);
+    }
+    sqlite3VdbeMemRelease(pRes);
+  }
+}
+
+/*
+** group_concat(EXPR, ?SEPARATOR?)
+*/
+static void groupConcatStep(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const char *zVal;
+  StrAccum *pAccum;
+  const char *zSep;
+  int nVal, nSep;
+  assert( argc==1 || argc==2 );
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
+  pAccum = (StrAccum*)sqlite3_aggregate_context(context, sizeof(*pAccum));
+
+  if( pAccum ){
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    int firstTerm = pAccum->useMalloc==0;
+    pAccum->useMalloc = 2;
+    pAccum->mxAlloc = db->aLimit[SQLITE_LIMIT_LENGTH];
+    if( !firstTerm ){
