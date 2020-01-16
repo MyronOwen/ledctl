@@ -96451,3 +96451,227 @@ static void zeroblobFunc(
 ** The replace() function.  Three arguments are all strings: call
 ** them A, B, and C. The result is also a string which is derived
 ** from A by replacing every occurrence of B with C.  The match
+** must be exact.  Collating sequences are not used.
+*/
+static void replaceFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *zStr;        /* The input string A */
+  const unsigned char *zPattern;    /* The pattern string B */
+  const unsigned char *zRep;        /* The replacement string C */
+  unsigned char *zOut;              /* The output */
+  int nStr;                /* Size of zStr */
+  int nPattern;            /* Size of zPattern */
+  int nRep;                /* Size of zRep */
+  i64 nOut;                /* Maximum size of zOut */
+  int loopLimit;           /* Last zStr[] that might match zPattern[] */
+  int i, j;                /* Loop counters */
+
+  assert( argc==3 );
+  UNUSED_PARAMETER(argc);
+  zStr = sqlite3_value_text(argv[0]);
+  if( zStr==0 ) return;
+  nStr = sqlite3_value_bytes(argv[0]);
+  assert( zStr==sqlite3_value_text(argv[0]) );  /* No encoding change */
+  zPattern = sqlite3_value_text(argv[1]);
+  if( zPattern==0 ){
+    assert( sqlite3_value_type(argv[1])==SQLITE_NULL
+            || sqlite3_context_db_handle(context)->mallocFailed );
+    return;
+  }
+  if( zPattern[0]==0 ){
+    assert( sqlite3_value_type(argv[1])!=SQLITE_NULL );
+    sqlite3_result_value(context, argv[0]);
+    return;
+  }
+  nPattern = sqlite3_value_bytes(argv[1]);
+  assert( zPattern==sqlite3_value_text(argv[1]) );  /* No encoding change */
+  zRep = sqlite3_value_text(argv[2]);
+  if( zRep==0 ) return;
+  nRep = sqlite3_value_bytes(argv[2]);
+  assert( zRep==sqlite3_value_text(argv[2]) );
+  nOut = nStr + 1;
+  assert( nOut<SQLITE_MAX_LENGTH );
+  zOut = contextMalloc(context, (i64)nOut);
+  if( zOut==0 ){
+    return;
+  }
+  loopLimit = nStr - nPattern;  
+  for(i=j=0; i<=loopLimit; i++){
+    if( zStr[i]!=zPattern[0] || memcmp(&zStr[i], zPattern, nPattern) ){
+      zOut[j++] = zStr[i];
+    }else{
+      u8 *zOld;
+      sqlite3 *db = sqlite3_context_db_handle(context);
+      nOut += nRep - nPattern;
+      testcase( nOut-1==db->aLimit[SQLITE_LIMIT_LENGTH] );
+      testcase( nOut-2==db->aLimit[SQLITE_LIMIT_LENGTH] );
+      if( nOut-1>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+        sqlite3_result_error_toobig(context);
+        sqlite3_free(zOut);
+        return;
+      }
+      zOld = zOut;
+      zOut = sqlite3_realloc(zOut, (int)nOut);
+      if( zOut==0 ){
+        sqlite3_result_error_nomem(context);
+        sqlite3_free(zOld);
+        return;
+      }
+      memcpy(&zOut[j], zRep, nRep);
+      j += nRep;
+      i += nPattern-1;
+    }
+  }
+  assert( j+nStr-i+1==nOut );
+  memcpy(&zOut[j], &zStr[i], nStr-i);
+  j += nStr - i;
+  assert( j<=nOut );
+  zOut[j] = 0;
+  sqlite3_result_text(context, (char*)zOut, j, sqlite3_free);
+}
+
+/*
+** Implementation of the TRIM(), LTRIM(), and RTRIM() functions.
+** The userdata is 0x1 for left trim, 0x2 for right trim, 0x3 for both.
+*/
+static void trimFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *zIn;         /* Input string */
+  const unsigned char *zCharSet;    /* Set of characters to trim */
+  int nIn;                          /* Number of bytes in input */
+  int flags;                        /* 1: trimleft  2: trimright  3: trim */
+  int i;                            /* Loop counter */
+  unsigned char *aLen = 0;          /* Length of each character in zCharSet */
+  unsigned char **azChar = 0;       /* Individual characters in zCharSet */
+  int nChar;                        /* Number of characters in zCharSet */
+
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ){
+    return;
+  }
+  zIn = sqlite3_value_text(argv[0]);
+  if( zIn==0 ) return;
+  nIn = sqlite3_value_bytes(argv[0]);
+  assert( zIn==sqlite3_value_text(argv[0]) );
+  if( argc==1 ){
+    static const unsigned char lenOne[] = { 1 };
+    static unsigned char * const azOne[] = { (u8*)" " };
+    nChar = 1;
+    aLen = (u8*)lenOne;
+    azChar = (unsigned char **)azOne;
+    zCharSet = 0;
+  }else if( (zCharSet = sqlite3_value_text(argv[1]))==0 ){
+    return;
+  }else{
+    const unsigned char *z;
+    for(z=zCharSet, nChar=0; *z; nChar++){
+      SQLITE_SKIP_UTF8(z);
+    }
+    if( nChar>0 ){
+      azChar = contextMalloc(context, ((i64)nChar)*(sizeof(char*)+1));
+      if( azChar==0 ){
+        return;
+      }
+      aLen = (unsigned char*)&azChar[nChar];
+      for(z=zCharSet, nChar=0; *z; nChar++){
+        azChar[nChar] = (unsigned char *)z;
+        SQLITE_SKIP_UTF8(z);
+        aLen[nChar] = (u8)(z - azChar[nChar]);
+      }
+    }
+  }
+  if( nChar>0 ){
+    flags = SQLITE_PTR_TO_INT(sqlite3_user_data(context));
+    if( flags & 1 ){
+      while( nIn>0 ){
+        int len = 0;
+        for(i=0; i<nChar; i++){
+          len = aLen[i];
+          if( len<=nIn && memcmp(zIn, azChar[i], len)==0 ) break;
+        }
+        if( i>=nChar ) break;
+        zIn += len;
+        nIn -= len;
+      }
+    }
+    if( flags & 2 ){
+      while( nIn>0 ){
+        int len = 0;
+        for(i=0; i<nChar; i++){
+          len = aLen[i];
+          if( len<=nIn && memcmp(&zIn[nIn-len],azChar[i],len)==0 ) break;
+        }
+        if( i>=nChar ) break;
+        nIn -= len;
+      }
+    }
+    if( zCharSet ){
+      sqlite3_free(azChar);
+    }
+  }
+  sqlite3_result_text(context, (char*)zIn, nIn, SQLITE_TRANSIENT);
+}
+
+
+/* IMP: R-25361-16150 This function is omitted from SQLite by default. It
+** is only available if the SQLITE_SOUNDEX compile-time option is used
+** when SQLite is built.
+*/
+#ifdef SQLITE_SOUNDEX
+/*
+** Compute the soundex encoding of a word.
+**
+** IMP: R-59782-00072 The soundex(X) function returns a string that is the
+** soundex encoding of the string X. 
+*/
+static void soundexFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  char zResult[8];
+  const u8 *zIn;
+  int i, j;
+  static const unsigned char iCode[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, 2, 3, 0, 1, 2, 0, 0, 2, 2, 4, 5, 5, 0,
+    1, 2, 6, 2, 3, 0, 1, 0, 2, 0, 2, 0, 0, 0, 0, 0,
+    0, 0, 1, 2, 3, 0, 1, 2, 0, 0, 2, 2, 4, 5, 5, 0,
+    1, 2, 6, 2, 3, 0, 1, 0, 2, 0, 2, 0, 0, 0, 0, 0,
+  };
+  assert( argc==1 );
+  zIn = (u8*)sqlite3_value_text(argv[0]);
+  if( zIn==0 ) zIn = (u8*)"";
+  for(i=0; zIn[i] && !sqlite3Isalpha(zIn[i]); i++){}
+  if( zIn[i] ){
+    u8 prevcode = iCode[zIn[i]&0x7f];
+    zResult[0] = sqlite3Toupper(zIn[i]);
+    for(j=1; j<4 && zIn[i]; i++){
+      int code = iCode[zIn[i]&0x7f];
+      if( code>0 ){
+        if( code!=prevcode ){
+          prevcode = code;
+          zResult[j++] = code + '0';
+        }
+      }else{
+        prevcode = 0;
+      }
+    }
+    while( j<4 ){
+      zResult[j++] = '0';
+    }
+    zResult[j] = 0;
+    sqlite3_result_text(context, zResult, 4, SQLITE_TRANSIENT);
+  }else{
+    /* IMP: R-64894-50321 The string "?000" is returned if the argument
+    ** is NULL or contains no ASCII alphabetic characters. */
+    sqlite3_result_text(context, "?000", 4, SQLITE_STATIC);
+  }
