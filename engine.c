@@ -98044,3 +98044,238 @@ SQLITE_PRIVATE void sqlite3FkCheck(
       ** authorization callback returns SQLITE_IGNORE, behave as if any
       ** values read from the parent table are NULL. */
       if( db->xAuth ){
+        int rcauth;
+        char *zCol = pTo->aCol[pIdx ? pIdx->aiColumn[i] : pTo->iPKey].zName;
+        rcauth = sqlite3AuthReadCol(pParse, pTo->zName, zCol, iDb);
+        bIgnore = (rcauth==SQLITE_IGNORE);
+      }
+#endif
+    }
+
+    /* Take a shared-cache advisory read-lock on the parent table. Allocate 
+    ** a cursor to use to search the unique index on the parent key columns 
+    ** in the parent table.  */
+    sqlite3TableLock(pParse, iDb, pTo->tnum, 0, pTo->zName);
+    pParse->nTab++;
+
+    if( regOld!=0 ){
+      /* A row is being removed from the child table. Search for the parent.
+      ** If the parent does not exist, removing the child row resolves an 
+      ** outstanding foreign key constraint violation. */
+      fkLookupParent(pParse, iDb, pTo, pIdx, pFKey, aiCol, regOld, -1, bIgnore);
+    }
+    if( regNew!=0 && !isSetNullAction(pParse, pFKey) ){
+      /* A row is being added to the child table. If a parent row cannot
+      ** be found, adding the child row has violated the FK constraint. 
+      **
+      ** If this operation is being performed as part of a trigger program
+      ** that is actually a "SET NULL" action belonging to this very 
+      ** foreign key, then omit this scan altogether. As all child key
+      ** values are guaranteed to be NULL, it is not possible for adding
+      ** this row to cause an FK violation.  */
+      fkLookupParent(pParse, iDb, pTo, pIdx, pFKey, aiCol, regNew, +1, bIgnore);
+    }
+
+    sqlite3DbFree(db, aiFree);
+  }
+
+  /* Loop through all the foreign key constraints that refer to this table.
+  ** (the "child" constraints) */
+  for(pFKey = sqlite3FkReferences(pTab); pFKey; pFKey=pFKey->pNextTo){
+    Index *pIdx = 0;              /* Foreign key index for pFKey */
+    SrcList *pSrc;
+    int *aiCol = 0;
+
+    if( aChange && fkParentIsModified(pTab, pFKey, aChange, bChngRowid)==0 ){
+      continue;
+    }
+
+    if( !pFKey->isDeferred && !(db->flags & SQLITE_DeferFKs) 
+     && !pParse->pToplevel && !pParse->isMultiWrite 
+    ){
+      assert( regOld==0 && regNew!=0 );
+      /* Inserting a single row into a parent table cannot cause (or fix)
+      ** an immediate foreign key violation. So do nothing in this case.  */
+      continue;
+    }
+
+    if( sqlite3FkLocateIndex(pParse, pTab, pFKey, &pIdx, &aiCol) ){
+      if( !isIgnoreErrors || db->mallocFailed ) return;
+      continue;
+    }
+    assert( aiCol || pFKey->nCol==1 );
+
+    /* Create a SrcList structure containing the child table.  We need the
+    ** child table as a SrcList for sqlite3WhereBegin() */
+    pSrc = sqlite3SrcListAppend(db, 0, 0, 0);
+    if( pSrc ){
+      struct SrcList_item *pItem = pSrc->a;
+      pItem->pTab = pFKey->pFrom;
+      pItem->zName = pFKey->pFrom->zName;
+      pItem->pTab->nRef++;
+      pItem->iCursor = pParse->nTab++;
+  
+      if( regNew!=0 ){
+        fkScanChildren(pParse, pSrc, pTab, pIdx, pFKey, aiCol, regNew, -1);
+      }
+      if( regOld!=0 ){
+        int eAction = pFKey->aAction[aChange!=0];
+        fkScanChildren(pParse, pSrc, pTab, pIdx, pFKey, aiCol, regOld, 1);
+        /* If this is a deferred FK constraint, or a CASCADE or SET NULL
+        ** action applies, then any foreign key violations caused by
+        ** removing the parent key will be rectified by the action trigger.
+        ** So do not set the "may-abort" flag in this case.
+        **
+        ** Note 1: If the FK is declared "ON UPDATE CASCADE", then the
+        ** may-abort flag will eventually be set on this statement anyway
+        ** (when this function is called as part of processing the UPDATE
+        ** within the action trigger).
+        **
+        ** Note 2: At first glance it may seem like SQLite could simply omit
+        ** all OP_FkCounter related scans when either CASCADE or SET NULL
+        ** applies. The trouble starts if the CASCADE or SET NULL action 
+        ** trigger causes other triggers or action rules attached to the 
+        ** child table to fire. In these cases the fk constraint counters
+        ** might be set incorrectly if any OP_FkCounter related scans are 
+        ** omitted.  */
+        if( !pFKey->isDeferred && eAction!=OE_Cascade && eAction!=OE_SetNull ){
+          sqlite3MayAbort(pParse);
+        }
+      }
+      pItem->zName = 0;
+      sqlite3SrcListDelete(db, pSrc);
+    }
+    sqlite3DbFree(db, aiCol);
+  }
+}
+
+#define COLUMN_MASK(x) (((x)>31) ? 0xffffffff : ((u32)1<<(x)))
+
+/*
+** This function is called before generating code to update or delete a 
+** row contained in table pTab.
+*/
+SQLITE_PRIVATE u32 sqlite3FkOldmask(
+  Parse *pParse,                  /* Parse context */
+  Table *pTab                     /* Table being modified */
+){
+  u32 mask = 0;
+  if( pParse->db->flags&SQLITE_ForeignKeys ){
+    FKey *p;
+    int i;
+    for(p=pTab->pFKey; p; p=p->pNextFrom){
+      for(i=0; i<p->nCol; i++) mask |= COLUMN_MASK(p->aCol[i].iFrom);
+    }
+    for(p=sqlite3FkReferences(pTab); p; p=p->pNextTo){
+      Index *pIdx = 0;
+      sqlite3FkLocateIndex(pParse, pTab, p, &pIdx, 0);
+      if( pIdx ){
+        for(i=0; i<pIdx->nKeyCol; i++) mask |= COLUMN_MASK(pIdx->aiColumn[i]);
+      }
+    }
+  }
+  return mask;
+}
+
+
+/*
+** This function is called before generating code to update or delete a 
+** row contained in table pTab. If the operation is a DELETE, then
+** parameter aChange is passed a NULL value. For an UPDATE, aChange points
+** to an array of size N, where N is the number of columns in table pTab.
+** If the i'th column is not modified by the UPDATE, then the corresponding 
+** entry in the aChange[] array is set to -1. If the column is modified,
+** the value is 0 or greater. Parameter chngRowid is set to true if the
+** UPDATE statement modifies the rowid fields of the table.
+**
+** If any foreign key processing will be required, this function returns
+** true. If there is no foreign key related processing, this function 
+** returns false.
+*/
+SQLITE_PRIVATE int sqlite3FkRequired(
+  Parse *pParse,                  /* Parse context */
+  Table *pTab,                    /* Table being modified */
+  int *aChange,                   /* Non-NULL for UPDATE operations */
+  int chngRowid                   /* True for UPDATE that affects rowid */
+){
+  if( pParse->db->flags&SQLITE_ForeignKeys ){
+    if( !aChange ){
+      /* A DELETE operation. Foreign key processing is required if the 
+      ** table in question is either the child or parent table for any 
+      ** foreign key constraint.  */
+      return (sqlite3FkReferences(pTab) || pTab->pFKey);
+    }else{
+      /* This is an UPDATE. Foreign key processing is only required if the
+      ** operation modifies one or more child or parent key columns. */
+      FKey *p;
+
+      /* Check if any child key columns are being modified. */
+      for(p=pTab->pFKey; p; p=p->pNextFrom){
+        if( fkChildIsModified(pTab, p, aChange, chngRowid) ) return 1;
+      }
+
+      /* Check if any parent key columns are being modified. */
+      for(p=sqlite3FkReferences(pTab); p; p=p->pNextTo){
+        if( fkParentIsModified(pTab, p, aChange, chngRowid) ) return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** This function is called when an UPDATE or DELETE operation is being 
+** compiled on table pTab, which is the parent table of foreign-key pFKey.
+** If the current operation is an UPDATE, then the pChanges parameter is
+** passed a pointer to the list of columns being modified. If it is a
+** DELETE, pChanges is passed a NULL pointer.
+**
+** It returns a pointer to a Trigger structure containing a trigger
+** equivalent to the ON UPDATE or ON DELETE action specified by pFKey.
+** If the action is "NO ACTION" or "RESTRICT", then a NULL pointer is
+** returned (these actions require no special handling by the triggers
+** sub-system, code for them is created by fkScanChildren()).
+**
+** For example, if pFKey is the foreign key and pTab is table "p" in 
+** the following schema:
+**
+**   CREATE TABLE p(pk PRIMARY KEY);
+**   CREATE TABLE c(ck REFERENCES p ON DELETE CASCADE);
+**
+** then the returned trigger structure is equivalent to:
+**
+**   CREATE TRIGGER ... DELETE ON p BEGIN
+**     DELETE FROM c WHERE ck = old.pk;
+**   END;
+**
+** The returned pointer is cached as part of the foreign key object. It
+** is eventually freed along with the rest of the foreign key object by 
+** sqlite3FkDelete().
+*/
+static Trigger *fkActionTrigger(
+  Parse *pParse,                  /* Parse context */
+  Table *pTab,                    /* Table being updated or deleted from */
+  FKey *pFKey,                    /* Foreign key to get action for */
+  ExprList *pChanges              /* Change-list for UPDATE, NULL for DELETE */
+){
+  sqlite3 *db = pParse->db;       /* Database handle */
+  int action;                     /* One of OE_None, OE_Cascade etc. */
+  Trigger *pTrigger;              /* Trigger definition to return */
+  int iAction = (pChanges!=0);    /* 1 for UPDATE, 0 for DELETE */
+
+  action = pFKey->aAction[iAction];
+  pTrigger = pFKey->apTrigger[iAction];
+
+  if( action!=OE_None && !pTrigger ){
+    u8 enableLookaside;           /* Copy of db->lookaside.bEnabled */
+    char const *zFrom;            /* Name of child table */
+    int nFrom;                    /* Length in bytes of zFrom */
+    Index *pIdx = 0;              /* Parent key index for this FK */
+    int *aiCol = 0;               /* child table cols -> parent key cols */
+    TriggerStep *pStep = 0;        /* First (only) step of trigger program */
+    Expr *pWhere = 0;             /* WHERE clause of trigger step */
+    ExprList *pList = 0;          /* Changes list if ON UPDATE CASCADE */
+    Select *pSelect = 0;          /* If RESTRICT, "SELECT RAISE(...)" */
+    int i;                        /* Iterator variable */
+    Expr *pWhen = 0;              /* WHEN clause for the trigger */
+
