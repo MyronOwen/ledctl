@@ -98279,3 +98279,199 @@ static Trigger *fkActionTrigger(
     int i;                        /* Iterator variable */
     Expr *pWhen = 0;              /* WHEN clause for the trigger */
 
+    if( sqlite3FkLocateIndex(pParse, pTab, pFKey, &pIdx, &aiCol) ) return 0;
+    assert( aiCol || pFKey->nCol==1 );
+
+    for(i=0; i<pFKey->nCol; i++){
+      Token tOld = { "old", 3 };  /* Literal "old" token */
+      Token tNew = { "new", 3 };  /* Literal "new" token */
+      Token tFromCol;             /* Name of column in child table */
+      Token tToCol;               /* Name of column in parent table */
+      int iFromCol;               /* Idx of column in child table */
+      Expr *pEq;                  /* tFromCol = OLD.tToCol */
+
+      iFromCol = aiCol ? aiCol[i] : pFKey->aCol[0].iFrom;
+      assert( iFromCol>=0 );
+      tToCol.z = pIdx ? pTab->aCol[pIdx->aiColumn[i]].zName : "oid";
+      tFromCol.z = pFKey->pFrom->aCol[iFromCol].zName;
+
+      tToCol.n = sqlite3Strlen30(tToCol.z);
+      tFromCol.n = sqlite3Strlen30(tFromCol.z);
+
+      /* Create the expression "OLD.zToCol = zFromCol". It is important
+      ** that the "OLD.zToCol" term is on the LHS of the = operator, so
+      ** that the affinity and collation sequence associated with the
+      ** parent table are used for the comparison. */
+      pEq = sqlite3PExpr(pParse, TK_EQ,
+          sqlite3PExpr(pParse, TK_DOT, 
+            sqlite3PExpr(pParse, TK_ID, 0, 0, &tOld),
+            sqlite3PExpr(pParse, TK_ID, 0, 0, &tToCol)
+          , 0),
+          sqlite3PExpr(pParse, TK_ID, 0, 0, &tFromCol)
+      , 0);
+      pWhere = sqlite3ExprAnd(db, pWhere, pEq);
+
+      /* For ON UPDATE, construct the next term of the WHEN clause.
+      ** The final WHEN clause will be like this:
+      **
+      **    WHEN NOT(old.col1 IS new.col1 AND ... AND old.colN IS new.colN)
+      */
+      if( pChanges ){
+        pEq = sqlite3PExpr(pParse, TK_IS,
+            sqlite3PExpr(pParse, TK_DOT, 
+              sqlite3PExpr(pParse, TK_ID, 0, 0, &tOld),
+              sqlite3PExpr(pParse, TK_ID, 0, 0, &tToCol),
+              0),
+            sqlite3PExpr(pParse, TK_DOT, 
+              sqlite3PExpr(pParse, TK_ID, 0, 0, &tNew),
+              sqlite3PExpr(pParse, TK_ID, 0, 0, &tToCol),
+              0),
+            0);
+        pWhen = sqlite3ExprAnd(db, pWhen, pEq);
+      }
+  
+      if( action!=OE_Restrict && (action!=OE_Cascade || pChanges) ){
+        Expr *pNew;
+        if( action==OE_Cascade ){
+          pNew = sqlite3PExpr(pParse, TK_DOT, 
+            sqlite3PExpr(pParse, TK_ID, 0, 0, &tNew),
+            sqlite3PExpr(pParse, TK_ID, 0, 0, &tToCol)
+          , 0);
+        }else if( action==OE_SetDflt ){
+          Expr *pDflt = pFKey->pFrom->aCol[iFromCol].pDflt;
+          if( pDflt ){
+            pNew = sqlite3ExprDup(db, pDflt, 0);
+          }else{
+            pNew = sqlite3PExpr(pParse, TK_NULL, 0, 0, 0);
+          }
+        }else{
+          pNew = sqlite3PExpr(pParse, TK_NULL, 0, 0, 0);
+        }
+        pList = sqlite3ExprListAppend(pParse, pList, pNew);
+        sqlite3ExprListSetName(pParse, pList, &tFromCol, 0);
+      }
+    }
+    sqlite3DbFree(db, aiCol);
+
+    zFrom = pFKey->pFrom->zName;
+    nFrom = sqlite3Strlen30(zFrom);
+
+    if( action==OE_Restrict ){
+      Token tFrom;
+      Expr *pRaise; 
+
+      tFrom.z = zFrom;
+      tFrom.n = nFrom;
+      pRaise = sqlite3Expr(db, TK_RAISE, "FOREIGN KEY constraint failed");
+      if( pRaise ){
+        pRaise->affinity = OE_Abort;
+      }
+      pSelect = sqlite3SelectNew(pParse, 
+          sqlite3ExprListAppend(pParse, 0, pRaise),
+          sqlite3SrcListAppend(db, 0, &tFrom, 0),
+          pWhere,
+          0, 0, 0, 0, 0, 0
+      );
+      pWhere = 0;
+    }
+
+    /* Disable lookaside memory allocation */
+    enableLookaside = db->lookaside.bEnabled;
+    db->lookaside.bEnabled = 0;
+
+    pTrigger = (Trigger *)sqlite3DbMallocZero(db, 
+        sizeof(Trigger) +         /* struct Trigger */
+        sizeof(TriggerStep) +     /* Single step in trigger program */
+        nFrom + 1                 /* Space for pStep->target.z */
+    );
+    if( pTrigger ){
+      pStep = pTrigger->step_list = (TriggerStep *)&pTrigger[1];
+      pStep->target.z = (char *)&pStep[1];
+      pStep->target.n = nFrom;
+      memcpy((char *)pStep->target.z, zFrom, nFrom);
+  
+      pStep->pWhere = sqlite3ExprDup(db, pWhere, EXPRDUP_REDUCE);
+      pStep->pExprList = sqlite3ExprListDup(db, pList, EXPRDUP_REDUCE);
+      pStep->pSelect = sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
+      if( pWhen ){
+        pWhen = sqlite3PExpr(pParse, TK_NOT, pWhen, 0, 0);
+        pTrigger->pWhen = sqlite3ExprDup(db, pWhen, EXPRDUP_REDUCE);
+      }
+    }
+
+    /* Re-enable the lookaside buffer, if it was disabled earlier. */
+    db->lookaside.bEnabled = enableLookaside;
+
+    sqlite3ExprDelete(db, pWhere);
+    sqlite3ExprDelete(db, pWhen);
+    sqlite3ExprListDelete(db, pList);
+    sqlite3SelectDelete(db, pSelect);
+    if( db->mallocFailed==1 ){
+      fkTriggerDelete(db, pTrigger);
+      return 0;
+    }
+    assert( pStep!=0 );
+
+    switch( action ){
+      case OE_Restrict:
+        pStep->op = TK_SELECT; 
+        break;
+      case OE_Cascade: 
+        if( !pChanges ){ 
+          pStep->op = TK_DELETE; 
+          break; 
+        }
+      default:
+        pStep->op = TK_UPDATE;
+    }
+    pStep->pTrig = pTrigger;
+    pTrigger->pSchema = pTab->pSchema;
+    pTrigger->pTabSchema = pTab->pSchema;
+    pFKey->apTrigger[iAction] = pTrigger;
+    pTrigger->op = (pChanges ? TK_UPDATE : TK_DELETE);
+  }
+
+  return pTrigger;
+}
+
+/*
+** This function is called when deleting or updating a row to implement
+** any required CASCADE, SET NULL or SET DEFAULT actions.
+*/
+SQLITE_PRIVATE void sqlite3FkActions(
+  Parse *pParse,                  /* Parse context */
+  Table *pTab,                    /* Table being updated or deleted from */
+  ExprList *pChanges,             /* Change-list for UPDATE, NULL for DELETE */
+  int regOld,                     /* Address of array containing old row */
+  int *aChange,                   /* Array indicating UPDATEd columns (or 0) */
+  int bChngRowid                  /* True if rowid is UPDATEd */
+){
+  /* If foreign-key support is enabled, iterate through all FKs that 
+  ** refer to table pTab. If there is an action associated with the FK 
+  ** for this operation (either update or delete), invoke the associated 
+  ** trigger sub-program.  */
+  if( pParse->db->flags&SQLITE_ForeignKeys ){
+    FKey *pFKey;                  /* Iterator variable */
+    for(pFKey = sqlite3FkReferences(pTab); pFKey; pFKey=pFKey->pNextTo){
+      if( aChange==0 || fkParentIsModified(pTab, pFKey, aChange, bChngRowid) ){
+        Trigger *pAct = fkActionTrigger(pParse, pTab, pFKey, pChanges);
+        if( pAct ){
+          sqlite3CodeRowTriggerDirect(pParse, pAct, pTab, regOld, OE_Abort, 0);
+        }
+      }
+    }
+  }
+}
+
+#endif /* ifndef SQLITE_OMIT_TRIGGER */
+
+/*
+** Free all memory associated with foreign key definitions attached to
+** table pTab. Remove the deleted foreign keys from the Schema.fkeyHash
+** hash table.
+*/
+SQLITE_PRIVATE void sqlite3FkDelete(sqlite3 *db, Table *pTab){
+  FKey *pFKey;                    /* Iterator variable */
+  FKey *pNext;                    /* Copy of pFKey->pNextFrom */
+
+  assert( db==0 || sqlite3SchemaMutexHeld(db, 0, pTab->pSchema) );
