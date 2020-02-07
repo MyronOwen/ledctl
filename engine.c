@@ -98475,3 +98475,274 @@ SQLITE_PRIVATE void sqlite3FkDelete(sqlite3 *db, Table *pTab){
   FKey *pNext;                    /* Copy of pFKey->pNextFrom */
 
   assert( db==0 || sqlite3SchemaMutexHeld(db, 0, pTab->pSchema) );
+  for(pFKey=pTab->pFKey; pFKey; pFKey=pNext){
+
+    /* Remove the FK from the fkeyHash hash table. */
+    if( !db || db->pnBytesFreed==0 ){
+      if( pFKey->pPrevTo ){
+        pFKey->pPrevTo->pNextTo = pFKey->pNextTo;
+      }else{
+        void *p = (void *)pFKey->pNextTo;
+        const char *z = (p ? pFKey->pNextTo->zTo : pFKey->zTo);
+        sqlite3HashInsert(&pTab->pSchema->fkeyHash, z, p);
+      }
+      if( pFKey->pNextTo ){
+        pFKey->pNextTo->pPrevTo = pFKey->pPrevTo;
+      }
+    }
+
+    /* EV: R-30323-21917 Each foreign key constraint in SQLite is
+    ** classified as either immediate or deferred.
+    */
+    assert( pFKey->isDeferred==0 || pFKey->isDeferred==1 );
+
+    /* Delete any triggers created to implement actions for this FK. */
+#ifndef SQLITE_OMIT_TRIGGER
+    fkTriggerDelete(db, pFKey->apTrigger[0]);
+    fkTriggerDelete(db, pFKey->apTrigger[1]);
+#endif
+
+    pNext = pFKey->pNextFrom;
+    sqlite3DbFree(db, pFKey);
+  }
+}
+#endif /* ifndef SQLITE_OMIT_FOREIGN_KEY */
+
+/************** End of fkey.c ************************************************/
+/************** Begin file insert.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains C code routines that are called by the parser
+** to handle INSERT statements in SQLite.
+*/
+
+/*
+** Generate code that will 
+**
+**   (1) acquire a lock for table pTab then
+**   (2) open pTab as cursor iCur.
+**
+** If pTab is a WITHOUT ROWID table, then it is the PRIMARY KEY index
+** for that table that is actually opened.
+*/
+SQLITE_PRIVATE void sqlite3OpenTable(
+  Parse *pParse,  /* Generate code into this VDBE */
+  int iCur,       /* The cursor number of the table */
+  int iDb,        /* The database index in sqlite3.aDb[] */
+  Table *pTab,    /* The table to be opened */
+  int opcode      /* OP_OpenRead or OP_OpenWrite */
+){
+  Vdbe *v;
+  assert( !IsVirtual(pTab) );
+  v = sqlite3GetVdbe(pParse);
+  assert( opcode==OP_OpenWrite || opcode==OP_OpenRead );
+  sqlite3TableLock(pParse, iDb, pTab->tnum, 
+                   (opcode==OP_OpenWrite)?1:0, pTab->zName);
+  if( HasRowid(pTab) ){
+    sqlite3VdbeAddOp4Int(v, opcode, iCur, pTab->tnum, iDb, pTab->nCol);
+    VdbeComment((v, "%s", pTab->zName));
+  }else{
+    Index *pPk = sqlite3PrimaryKeyIndex(pTab);
+    assert( pPk!=0 );
+    assert( pPk->tnum=pTab->tnum );
+    sqlite3VdbeAddOp3(v, opcode, iCur, pPk->tnum, iDb);
+    sqlite3VdbeSetP4KeyInfo(pParse, pPk);
+    VdbeComment((v, "%s", pTab->zName));
+  }
+}
+
+/*
+** Return a pointer to the column affinity string associated with index
+** pIdx. A column affinity string has one character for each column in 
+** the table, according to the affinity of the column:
+**
+**  Character      Column affinity
+**  ------------------------------
+**  'A'            NONE
+**  'B'            TEXT
+**  'C'            NUMERIC
+**  'D'            INTEGER
+**  'F'            REAL
+**
+** An extra 'D' is appended to the end of the string to cover the
+** rowid that appears as the last column in every index.
+**
+** Memory for the buffer containing the column index affinity string
+** is managed along with the rest of the Index structure. It will be
+** released when sqlite3DeleteIndex() is called.
+*/
+SQLITE_PRIVATE const char *sqlite3IndexAffinityStr(Vdbe *v, Index *pIdx){
+  if( !pIdx->zColAff ){
+    /* The first time a column affinity string for a particular index is
+    ** required, it is allocated and populated here. It is then stored as
+    ** a member of the Index structure for subsequent use.
+    **
+    ** The column affinity string will eventually be deleted by
+    ** sqliteDeleteIndex() when the Index structure itself is cleaned
+    ** up.
+    */
+    int n;
+    Table *pTab = pIdx->pTable;
+    sqlite3 *db = sqlite3VdbeDb(v);
+    pIdx->zColAff = (char *)sqlite3DbMallocRaw(0, pIdx->nColumn+1);
+    if( !pIdx->zColAff ){
+      db->mallocFailed = 1;
+      return 0;
+    }
+    for(n=0; n<pIdx->nColumn; n++){
+      i16 x = pIdx->aiColumn[n];
+      pIdx->zColAff[n] = x<0 ? SQLITE_AFF_INTEGER : pTab->aCol[x].affinity;
+    }
+    pIdx->zColAff[n] = 0;
+  }
+ 
+  return pIdx->zColAff;
+}
+
+/*
+** Compute the affinity string for table pTab, if it has not already been
+** computed.  As an optimization, omit trailing SQLITE_AFF_NONE affinities.
+**
+** If the affinity exists (if it is no entirely SQLITE_AFF_NONE values) and
+** if iReg>0 then code an OP_Affinity opcode that will set the affinities
+** for register iReg and following.  Or if affinities exists and iReg==0,
+** then just set the P4 operand of the previous opcode (which should  be
+** an OP_MakeRecord) to the affinity string.
+**
+** A column affinity string has one character per column:
+**
+**  Character      Column affinity
+**  ------------------------------
+**  'A'            NONE
+**  'B'            TEXT
+**  'C'            NUMERIC
+**  'D'            INTEGER
+**  'E'            REAL
+*/
+SQLITE_PRIVATE void sqlite3TableAffinity(Vdbe *v, Table *pTab, int iReg){
+  int i;
+  char *zColAff = pTab->zColAff;
+  if( zColAff==0 ){
+    sqlite3 *db = sqlite3VdbeDb(v);
+    zColAff = (char *)sqlite3DbMallocRaw(0, pTab->nCol+1);
+    if( !zColAff ){
+      db->mallocFailed = 1;
+      return;
+    }
+
+    for(i=0; i<pTab->nCol; i++){
+      zColAff[i] = pTab->aCol[i].affinity;
+    }
+    do{
+      zColAff[i--] = 0;
+    }while( i>=0 && zColAff[i]==SQLITE_AFF_NONE );
+    pTab->zColAff = zColAff;
+  }
+  i = sqlite3Strlen30(zColAff);
+  if( i ){
+    if( iReg ){
+      sqlite3VdbeAddOp4(v, OP_Affinity, iReg, i, 0, zColAff, i);
+    }else{
+      sqlite3VdbeChangeP4(v, -1, zColAff, i);
+    }
+  }
+}
+
+/*
+** Return non-zero if the table pTab in database iDb or any of its indices
+** have been opened at any point in the VDBE program. This is used to see if 
+** a statement of the form  "INSERT INTO <iDb, pTab> SELECT ..." can 
+** run without using a temporary table for the results of the SELECT. 
+*/
+static int readsTable(Parse *p, int iDb, Table *pTab){
+  Vdbe *v = sqlite3GetVdbe(p);
+  int i;
+  int iEnd = sqlite3VdbeCurrentAddr(v);
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  VTable *pVTab = IsVirtual(pTab) ? sqlite3GetVTable(p->db, pTab) : 0;
+#endif
+
+  for(i=1; i<iEnd; i++){
+    VdbeOp *pOp = sqlite3VdbeGetOp(v, i);
+    assert( pOp!=0 );
+    if( pOp->opcode==OP_OpenRead && pOp->p3==iDb ){
+      Index *pIndex;
+      int tnum = pOp->p2;
+      if( tnum==pTab->tnum ){
+        return 1;
+      }
+      for(pIndex=pTab->pIndex; pIndex; pIndex=pIndex->pNext){
+        if( tnum==pIndex->tnum ){
+          return 1;
+        }
+      }
+    }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    if( pOp->opcode==OP_VOpen && pOp->p4.pVtab==pVTab ){
+      assert( pOp->p4.pVtab!=0 );
+      assert( pOp->p4type==P4_VTAB );
+      return 1;
+    }
+#endif
+  }
+  return 0;
+}
+
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+/*
+** Locate or create an AutoincInfo structure associated with table pTab
+** which is in database iDb.  Return the register number for the register
+** that holds the maximum rowid.
+**
+** There is at most one AutoincInfo structure per table even if the
+** same table is autoincremented multiple times due to inserts within
+** triggers.  A new AutoincInfo structure is created if this is the
+** first use of table pTab.  On 2nd and subsequent uses, the original
+** AutoincInfo structure is used.
+**
+** Three memory locations are allocated:
+**
+**   (1)  Register to hold the name of the pTab table.
+**   (2)  Register to hold the maximum ROWID of pTab.
+**   (3)  Register to hold the rowid in sqlite_sequence of pTab
+**
+** The 2nd register is the one that is returned.  That is all the
+** insert routine needs to know about.
+*/
+static int autoIncBegin(
+  Parse *pParse,      /* Parsing context */
+  int iDb,            /* Index of the database holding pTab */
+  Table *pTab         /* The table we are writing to */
+){
+  int memId = 0;      /* Register holding maximum rowid */
+  if( pTab->tabFlags & TF_Autoincrement ){
+    Parse *pToplevel = sqlite3ParseToplevel(pParse);
+    AutoincInfo *pInfo;
+
+    pInfo = pToplevel->pAinc;
+    while( pInfo && pInfo->pTab!=pTab ){ pInfo = pInfo->pNext; }
+    if( pInfo==0 ){
+      pInfo = sqlite3DbMallocRaw(pParse->db, sizeof(*pInfo));
+      if( pInfo==0 ) return 0;
+      pInfo->pNext = pToplevel->pAinc;
+      pToplevel->pAinc = pInfo;
+      pInfo->pTab = pTab;
+      pInfo->iDb = iDb;
+      pToplevel->nMem++;                  /* Register to hold name of table */
+      pInfo->regCtr = ++pToplevel->nMem;  /* Max rowid register */
+      pToplevel->nMem++;                  /* Rowid in sqlite_sequence */
+    }
+    memId = pInfo->regCtr;
+  }
+  return memId;
+}
+
