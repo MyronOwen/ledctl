@@ -98746,3 +98746,269 @@ static int autoIncBegin(
   return memId;
 }
 
+/*
+** This routine generates code that will initialize all of the
+** register used by the autoincrement tracker.  
+*/
+SQLITE_PRIVATE void sqlite3AutoincrementBegin(Parse *pParse){
+  AutoincInfo *p;            /* Information about an AUTOINCREMENT */
+  sqlite3 *db = pParse->db;  /* The database connection */
+  Db *pDb;                   /* Database only autoinc table */
+  int memId;                 /* Register holding max rowid */
+  int addr;                  /* A VDBE address */
+  Vdbe *v = pParse->pVdbe;   /* VDBE under construction */
+
+  /* This routine is never called during trigger-generation.  It is
+  ** only called from the top-level */
+  assert( pParse->pTriggerTab==0 );
+  assert( pParse==sqlite3ParseToplevel(pParse) );
+
+  assert( v );   /* We failed long ago if this is not so */
+  for(p = pParse->pAinc; p; p = p->pNext){
+    pDb = &db->aDb[p->iDb];
+    memId = p->regCtr;
+    assert( sqlite3SchemaMutexHeld(db, 0, pDb->pSchema) );
+    sqlite3OpenTable(pParse, 0, p->iDb, pDb->pSchema->pSeqTab, OP_OpenRead);
+    sqlite3VdbeAddOp3(v, OP_Null, 0, memId, memId+1);
+    addr = sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp4(v, OP_String8, 0, memId-1, 0, p->pTab->zName, 0);
+    sqlite3VdbeAddOp2(v, OP_Rewind, 0, addr+9); VdbeCoverage(v);
+    sqlite3VdbeAddOp3(v, OP_Column, 0, 0, memId);
+    sqlite3VdbeAddOp3(v, OP_Ne, memId-1, addr+7, memId); VdbeCoverage(v);
+    sqlite3VdbeChangeP5(v, SQLITE_JUMPIFNULL);
+    sqlite3VdbeAddOp2(v, OP_Rowid, 0, memId+1);
+    sqlite3VdbeAddOp3(v, OP_Column, 0, 1, memId);
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addr+9);
+    sqlite3VdbeAddOp2(v, OP_Next, 0, addr+2); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, memId);
+    sqlite3VdbeAddOp0(v, OP_Close);
+  }
+}
+
+/*
+** Update the maximum rowid for an autoincrement calculation.
+**
+** This routine should be called when the top of the stack holds a
+** new rowid that is about to be inserted.  If that new rowid is
+** larger than the maximum rowid in the memId memory cell, then the
+** memory cell is updated.  The stack is unchanged.
+*/
+static void autoIncStep(Parse *pParse, int memId, int regRowid){
+  if( memId>0 ){
+    sqlite3VdbeAddOp2(pParse->pVdbe, OP_MemMax, memId, regRowid);
+  }
+}
+
+/*
+** This routine generates the code needed to write autoincrement
+** maximum rowid values back into the sqlite_sequence register.
+** Every statement that might do an INSERT into an autoincrement
+** table (either directly or through triggers) needs to call this
+** routine just before the "exit" code.
+*/
+SQLITE_PRIVATE void sqlite3AutoincrementEnd(Parse *pParse){
+  AutoincInfo *p;
+  Vdbe *v = pParse->pVdbe;
+  sqlite3 *db = pParse->db;
+
+  assert( v );
+  for(p = pParse->pAinc; p; p = p->pNext){
+    Db *pDb = &db->aDb[p->iDb];
+    int j1;
+    int iRec;
+    int memId = p->regCtr;
+
+    iRec = sqlite3GetTempReg(pParse);
+    assert( sqlite3SchemaMutexHeld(db, 0, pDb->pSchema) );
+    sqlite3OpenTable(pParse, 0, p->iDb, pDb->pSchema->pSeqTab, OP_OpenWrite);
+    j1 = sqlite3VdbeAddOp1(v, OP_NotNull, memId+1); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, 0, memId+1);
+    sqlite3VdbeJumpHere(v, j1);
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, memId-1, 2, iRec);
+    sqlite3VdbeAddOp3(v, OP_Insert, 0, iRec, memId+1);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+    sqlite3VdbeAddOp0(v, OP_Close);
+    sqlite3ReleaseTempReg(pParse, iRec);
+  }
+}
+#else
+/*
+** If SQLITE_OMIT_AUTOINCREMENT is defined, then the three routines
+** above are all no-ops
+*/
+# define autoIncBegin(A,B,C) (0)
+# define autoIncStep(A,B,C)
+#endif /* SQLITE_OMIT_AUTOINCREMENT */
+
+
+/* Forward declaration */
+static int xferOptimization(
+  Parse *pParse,        /* Parser context */
+  Table *pDest,         /* The table we are inserting into */
+  Select *pSelect,      /* A SELECT statement to use as the data source */
+  int onError,          /* How to handle constraint errors */
+  int iDbDest           /* The database of pDest */
+);
+
+/*
+** This routine is called to handle SQL of the following forms:
+**
+**    insert into TABLE (IDLIST) values(EXPRLIST)
+**    insert into TABLE (IDLIST) select
+**
+** The IDLIST following the table name is always optional.  If omitted,
+** then a list of all columns for the table is substituted.  The IDLIST
+** appears in the pColumn parameter.  pColumn is NULL if IDLIST is omitted.
+**
+** The pList parameter holds EXPRLIST in the first form of the INSERT
+** statement above, and pSelect is NULL.  For the second form, pList is
+** NULL and pSelect is a pointer to the select statement used to generate
+** data for the insert.
+**
+** The code generated follows one of four templates.  For a simple
+** insert with data coming from a VALUES clause, the code executes
+** once straight down through.  Pseudo-code follows (we call this
+** the "1st template"):
+**
+**         open write cursor to <table> and its indices
+**         put VALUES clause expressions into registers
+**         write the resulting record into <table>
+**         cleanup
+**
+** The three remaining templates assume the statement is of the form
+**
+**   INSERT INTO <table> SELECT ...
+**
+** If the SELECT clause is of the restricted form "SELECT * FROM <table2>" -
+** in other words if the SELECT pulls all columns from a single table
+** and there is no WHERE or LIMIT or GROUP BY or ORDER BY clauses, and
+** if <table2> and <table1> are distinct tables but have identical
+** schemas, including all the same indices, then a special optimization
+** is invoked that copies raw records from <table2> over to <table1>.
+** See the xferOptimization() function for the implementation of this
+** template.  This is the 2nd template.
+**
+**         open a write cursor to <table>
+**         open read cursor on <table2>
+**         transfer all records in <table2> over to <table>
+**         close cursors
+**         foreach index on <table>
+**           open a write cursor on the <table> index
+**           open a read cursor on the corresponding <table2> index
+**           transfer all records from the read to the write cursors
+**           close cursors
+**         end foreach
+**
+** The 3rd template is for when the second template does not apply
+** and the SELECT clause does not read from <table> at any time.
+** The generated code follows this template:
+**
+**         X <- A
+**         goto B
+**      A: setup for the SELECT
+**         loop over the rows in the SELECT
+**           load values into registers R..R+n
+**           yield X
+**         end loop
+**         cleanup after the SELECT
+**         end-coroutine X
+**      B: open write cursor to <table> and its indices
+**      C: yield X, at EOF goto D
+**         insert the select result into <table> from R..R+n
+**         goto C
+**      D: cleanup
+**
+** The 4th template is used if the insert statement takes its
+** values from a SELECT but the data is being inserted into a table
+** that is also read as part of the SELECT.  In the third form,
+** we have to use an intermediate table to store the results of
+** the select.  The template is like this:
+**
+**         X <- A
+**         goto B
+**      A: setup for the SELECT
+**         loop over the tables in the SELECT
+**           load value into register R..R+n
+**           yield X
+**         end loop
+**         cleanup after the SELECT
+**         end co-routine R
+**      B: open temp table
+**      L: yield X, at EOF goto M
+**         insert row from R..R+n into temp table
+**         goto L
+**      M: open write cursor to <table> and its indices
+**         rewind temp table
+**      C: loop over rows of intermediate table
+**           transfer values form intermediate table into <table>
+**         end loop
+**      D: cleanup
+*/
+SQLITE_PRIVATE void sqlite3Insert(
+  Parse *pParse,        /* Parser context */
+  SrcList *pTabList,    /* Name of table into which we are inserting */
+  Select *pSelect,      /* A SELECT statement to use as the data source */
+  IdList *pColumn,      /* Column names corresponding to IDLIST. */
+  int onError           /* How to handle constraint errors */
+){
+  sqlite3 *db;          /* The main database structure */
+  Table *pTab;          /* The table to insert into.  aka TABLE */
+  char *zTab;           /* Name of the table into which we are inserting */
+  const char *zDb;      /* Name of the database holding this table */
+  int i, j, idx;        /* Loop counters */
+  Vdbe *v;              /* Generate code into this virtual machine */
+  Index *pIdx;          /* For looping over indices of the table */
+  int nColumn;          /* Number of columns in the data */
+  int nHidden = 0;      /* Number of hidden columns if TABLE is virtual */
+  int iDataCur = 0;     /* VDBE cursor that is the main data repository */
+  int iIdxCur = 0;      /* First index cursor */
+  int ipkColumn = -1;   /* Column that is the INTEGER PRIMARY KEY */
+  int endOfLoop;        /* Label for the end of the insertion loop */
+  int srcTab = 0;       /* Data comes from this temporary cursor if >=0 */
+  int addrInsTop = 0;   /* Jump to label "D" */
+  int addrCont = 0;     /* Top of insert loop. Label "C" in templates 3 and 4 */
+  SelectDest dest;      /* Destination for SELECT on rhs of INSERT */
+  int iDb;              /* Index of database holding TABLE */
+  Db *pDb;              /* The database containing table being inserted into */
+  u8 useTempTable = 0;  /* Store SELECT results in intermediate table */
+  u8 appendFlag = 0;    /* True if the insert is likely to be an append */
+  u8 withoutRowid;      /* 0 for normal table.  1 for WITHOUT ROWID table */
+  u8 bIdListInOrder = 1; /* True if IDLIST is in table order */
+  ExprList *pList = 0;  /* List of VALUES() to be inserted  */
+
+  /* Register allocations */
+  int regFromSelect = 0;/* Base register for data coming from SELECT */
+  int regAutoinc = 0;   /* Register holding the AUTOINCREMENT counter */
+  int regRowCount = 0;  /* Memory cell used for the row counter */
+  int regIns;           /* Block of regs holding rowid+data being inserted */
+  int regRowid;         /* registers holding insert rowid */
+  int regData;          /* register holding first column to insert */
+  int *aRegIdx = 0;     /* One register allocated to each index */
+
+#ifndef SQLITE_OMIT_TRIGGER
+  int isView;                 /* True if attempting to insert into a view */
+  Trigger *pTrigger;          /* List of triggers on pTab, if required */
+  int tmask;                  /* Mask of trigger times */
+#endif
+
+  db = pParse->db;
+  memset(&dest, 0, sizeof(dest));
+  if( pParse->nErr || db->mallocFailed ){
+    goto insert_cleanup;
+  }
+
+  /* If the Select object is really just a simple VALUES() list with a
+  ** single row values (the common case) then keep that one row of values
+  ** and go ahead and discard the Select object
+  */
+  if( pSelect && (pSelect->selFlags & SF_Values)!=0 && pSelect->pPrior==0 ){
+    pList = pSelect->pEList;
+    pSelect->pEList = 0;
+    sqlite3SelectDelete(db, pSelect);
+    pSelect = 0;
+  }
+
+  /* Locate the table into which we will be inserting new information.
+  */
+  assert( pTabList->nSrc==1 );
+  zTab = pTabList->a[0].zName;
