@@ -99012,3 +99012,247 @@ SQLITE_PRIVATE void sqlite3Insert(
   */
   assert( pTabList->nSrc==1 );
   zTab = pTabList->a[0].zName;
+  if( NEVER(zTab==0) ) goto insert_cleanup;
+  pTab = sqlite3SrcListLookup(pParse, pTabList);
+  if( pTab==0 ){
+    goto insert_cleanup;
+  }
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  assert( iDb<db->nDb );
+  pDb = &db->aDb[iDb];
+  zDb = pDb->zName;
+  if( sqlite3AuthCheck(pParse, SQLITE_INSERT, pTab->zName, 0, zDb) ){
+    goto insert_cleanup;
+  }
+  withoutRowid = !HasRowid(pTab);
+
+  /* Figure out if we have any triggers and if the table being
+  ** inserted into is a view
+  */
+#ifndef SQLITE_OMIT_TRIGGER
+  pTrigger = sqlite3TriggersExist(pParse, pTab, TK_INSERT, 0, &tmask);
+  isView = pTab->pSelect!=0;
+#else
+# define pTrigger 0
+# define tmask 0
+# define isView 0
+#endif
+#ifdef SQLITE_OMIT_VIEW
+# undef isView
+# define isView 0
+#endif
+  assert( (pTrigger && tmask) || (pTrigger==0 && tmask==0) );
+
+  /* If pTab is really a view, make sure it has been initialized.
+  ** ViewGetColumnNames() is a no-op if pTab is not a view.
+  */
+  if( sqlite3ViewGetColumnNames(pParse, pTab) ){
+    goto insert_cleanup;
+  }
+
+  /* Cannot insert into a read-only table.
+  */
+  if( sqlite3IsReadOnly(pParse, pTab, tmask) ){
+    goto insert_cleanup;
+  }
+
+  /* Allocate a VDBE
+  */
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 ) goto insert_cleanup;
+  if( pParse->nested==0 ) sqlite3VdbeCountChanges(v);
+  sqlite3BeginWriteOperation(pParse, pSelect || pTrigger, iDb);
+
+#ifndef SQLITE_OMIT_XFER_OPT
+  /* If the statement is of the form
+  **
+  **       INSERT INTO <table1> SELECT * FROM <table2>;
+  **
+  ** Then special optimizations can be applied that make the transfer
+  ** very fast and which reduce fragmentation of indices.
+  **
+  ** This is the 2nd template.
+  */
+  if( pColumn==0 && xferOptimization(pParse, pTab, pSelect, onError, iDb) ){
+    assert( !pTrigger );
+    assert( pList==0 );
+    goto insert_end;
+  }
+#endif /* SQLITE_OMIT_XFER_OPT */
+
+  /* If this is an AUTOINCREMENT table, look up the sequence number in the
+  ** sqlite_sequence table and store it in memory cell regAutoinc.
+  */
+  regAutoinc = autoIncBegin(pParse, iDb, pTab);
+
+  /* Allocate registers for holding the rowid of the new row,
+  ** the content of the new row, and the assembled row record.
+  */
+  regRowid = regIns = pParse->nMem+1;
+  pParse->nMem += pTab->nCol + 1;
+  if( IsVirtual(pTab) ){
+    regRowid++;
+    pParse->nMem++;
+  }
+  regData = regRowid+1;
+
+  /* If the INSERT statement included an IDLIST term, then make sure
+  ** all elements of the IDLIST really are columns of the table and 
+  ** remember the column indices.
+  **
+  ** If the table has an INTEGER PRIMARY KEY column and that column
+  ** is named in the IDLIST, then record in the ipkColumn variable
+  ** the index into IDLIST of the primary key column.  ipkColumn is
+  ** the index of the primary key as it appears in IDLIST, not as
+  ** is appears in the original table.  (The index of the INTEGER
+  ** PRIMARY KEY in the original table is pTab->iPKey.)
+  */
+  if( pColumn ){
+    for(i=0; i<pColumn->nId; i++){
+      pColumn->a[i].idx = -1;
+    }
+    for(i=0; i<pColumn->nId; i++){
+      for(j=0; j<pTab->nCol; j++){
+        if( sqlite3StrICmp(pColumn->a[i].zName, pTab->aCol[j].zName)==0 ){
+          pColumn->a[i].idx = j;
+          if( i!=j ) bIdListInOrder = 0;
+          if( j==pTab->iPKey ){
+            ipkColumn = i;  assert( !withoutRowid );
+          }
+          break;
+        }
+      }
+      if( j>=pTab->nCol ){
+        if( sqlite3IsRowid(pColumn->a[i].zName) && !withoutRowid ){
+          ipkColumn = i;
+          bIdListInOrder = 0;
+        }else{
+          sqlite3ErrorMsg(pParse, "table %S has no column named %s",
+              pTabList, 0, pColumn->a[i].zName);
+          pParse->checkSchema = 1;
+          goto insert_cleanup;
+        }
+      }
+    }
+  }
+
+  /* Figure out how many columns of data are supplied.  If the data
+  ** is coming from a SELECT statement, then generate a co-routine that
+  ** produces a single row of the SELECT on each invocation.  The
+  ** co-routine is the common header to the 3rd and 4th templates.
+  */
+  if( pSelect ){
+    /* Data is coming from a SELECT.  Generate a co-routine to run the SELECT */
+    int regYield;       /* Register holding co-routine entry-point */
+    int addrTop;        /* Top of the co-routine */
+    int rc;             /* Result code */
+
+    regYield = ++pParse->nMem;
+    addrTop = sqlite3VdbeCurrentAddr(v) + 1;
+    sqlite3VdbeAddOp3(v, OP_InitCoroutine, regYield, 0, addrTop);
+    sqlite3SelectDestInit(&dest, SRT_Coroutine, regYield);
+    dest.iSdst = bIdListInOrder ? regData : 0;
+    dest.nSdst = pTab->nCol;
+    rc = sqlite3Select(pParse, pSelect, &dest);
+    regFromSelect = dest.iSdst;
+    assert( pParse->nErr==0 || rc );
+    if( rc || db->mallocFailed ) goto insert_cleanup;
+    sqlite3VdbeAddOp1(v, OP_EndCoroutine, regYield);
+    sqlite3VdbeJumpHere(v, addrTop - 1);                       /* label B: */
+    assert( pSelect->pEList );
+    nColumn = pSelect->pEList->nExpr;
+
+    /* Set useTempTable to TRUE if the result of the SELECT statement
+    ** should be written into a temporary table (template 4).  Set to
+    ** FALSE if each output row of the SELECT can be written directly into
+    ** the destination table (template 3).
+    **
+    ** A temp table must be used if the table being updated is also one
+    ** of the tables being read by the SELECT statement.  Also use a 
+    ** temp table in the case of row triggers.
+    */
+    if( pTrigger || readsTable(pParse, iDb, pTab) ){
+      useTempTable = 1;
+    }
+
+    if( useTempTable ){
+      /* Invoke the coroutine to extract information from the SELECT
+      ** and add it to a transient table srcTab.  The code generated
+      ** here is from the 4th template:
+      **
+      **      B: open temp table
+      **      L: yield X, goto M at EOF
+      **         insert row from R..R+n into temp table
+      **         goto L
+      **      M: ...
+      */
+      int regRec;          /* Register to hold packed record */
+      int regTempRowid;    /* Register to hold temp table ROWID */
+      int addrL;           /* Label "L" */
+
+      srcTab = pParse->nTab++;
+      regRec = sqlite3GetTempReg(pParse);
+      regTempRowid = sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral, srcTab, nColumn);
+      addrL = sqlite3VdbeAddOp1(v, OP_Yield, dest.iSDParm); VdbeCoverage(v);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regFromSelect, nColumn, regRec);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, srcTab, regTempRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, srcTab, regRec, regTempRowid);
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrL);
+      sqlite3VdbeJumpHere(v, addrL);
+      sqlite3ReleaseTempReg(pParse, regRec);
+      sqlite3ReleaseTempReg(pParse, regTempRowid);
+    }
+  }else{
+    /* This is the case if the data for the INSERT is coming from a VALUES
+    ** clause
+    */
+    NameContext sNC;
+    memset(&sNC, 0, sizeof(sNC));
+    sNC.pParse = pParse;
+    srcTab = -1;
+    assert( useTempTable==0 );
+    nColumn = pList ? pList->nExpr : 0;
+    for(i=0; i<nColumn; i++){
+      if( sqlite3ResolveExprNames(&sNC, pList->a[i].pExpr) ){
+        goto insert_cleanup;
+      }
+    }
+  }
+
+  /* If there is no IDLIST term but the table has an integer primary
+  ** key, the set the ipkColumn variable to the integer primary key 
+  ** column index in the original table definition.
+  */
+  if( pColumn==0 && nColumn>0 ){
+    ipkColumn = pTab->iPKey;
+  }
+
+  /* Make sure the number of columns in the source data matches the number
+  ** of columns to be inserted into the table.
+  */
+  if( IsVirtual(pTab) ){
+    for(i=0; i<pTab->nCol; i++){
+      nHidden += (IsHiddenColumn(&pTab->aCol[i]) ? 1 : 0);
+    }
+  }
+  if( pColumn==0 && nColumn && nColumn!=(pTab->nCol-nHidden) ){
+    sqlite3ErrorMsg(pParse, 
+       "table %S has %d columns but %d values were supplied",
+       pTabList, 0, pTab->nCol-nHidden, nColumn);
+    goto insert_cleanup;
+  }
+  if( pColumn!=0 && nColumn!=pColumn->nId ){
+    sqlite3ErrorMsg(pParse, "%d values for %d columns", nColumn, pColumn->nId);
+    goto insert_cleanup;
+  }
+    
+  /* Initialize the count of rows to be inserted
+  */
+  if( db->flags & SQLITE_CountRows ){
+    regRowCount = ++pParse->nMem;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regRowCount);
+  }
+
+  /* If this is not a view, open the table and and all indices */
+  if( !isView ){
