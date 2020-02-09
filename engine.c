@@ -99256,3 +99256,251 @@ SQLITE_PRIVATE void sqlite3Insert(
 
   /* If this is not a view, open the table and and all indices */
   if( !isView ){
+    int nIdx;
+    nIdx = sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenWrite, -1, 0,
+                                      &iDataCur, &iIdxCur);
+    aRegIdx = sqlite3DbMallocRaw(db, sizeof(int)*(nIdx+1));
+    if( aRegIdx==0 ){
+      goto insert_cleanup;
+    }
+    for(i=0; i<nIdx; i++){
+      aRegIdx[i] = ++pParse->nMem;
+    }
+  }
+
+  /* This is the top of the main insertion loop */
+  if( useTempTable ){
+    /* This block codes the top of loop only.  The complete loop is the
+    ** following pseudocode (template 4):
+    **
+    **         rewind temp table, if empty goto D
+    **      C: loop over rows of intermediate table
+    **           transfer values form intermediate table into <table>
+    **         end loop
+    **      D: ...
+    */
+    addrInsTop = sqlite3VdbeAddOp1(v, OP_Rewind, srcTab); VdbeCoverage(v);
+    addrCont = sqlite3VdbeCurrentAddr(v);
+  }else if( pSelect ){
+    /* This block codes the top of loop only.  The complete loop is the
+    ** following pseudocode (template 3):
+    **
+    **      C: yield X, at EOF goto D
+    **         insert the select result into <table> from R..R+n
+    **         goto C
+    **      D: ...
+    */
+    addrInsTop = addrCont = sqlite3VdbeAddOp1(v, OP_Yield, dest.iSDParm);
+    VdbeCoverage(v);
+  }
+
+  /* Run the BEFORE and INSTEAD OF triggers, if there are any
+  */
+  endOfLoop = sqlite3VdbeMakeLabel(v);
+  if( tmask & TRIGGER_BEFORE ){
+    int regCols = sqlite3GetTempRange(pParse, pTab->nCol+1);
+
+    /* build the NEW.* reference row.  Note that if there is an INTEGER
+    ** PRIMARY KEY into which a NULL is being inserted, that NULL will be
+    ** translated into a unique ID for the row.  But on a BEFORE trigger,
+    ** we do not know what the unique ID will be (because the insert has
+    ** not happened yet) so we substitute a rowid of -1
+    */
+    if( ipkColumn<0 ){
+      sqlite3VdbeAddOp2(v, OP_Integer, -1, regCols);
+    }else{
+      int j1;
+      assert( !withoutRowid );
+      if( useTempTable ){
+        sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regCols);
+      }else{
+        assert( pSelect==0 );  /* Otherwise useTempTable is true */
+        sqlite3ExprCode(pParse, pList->a[ipkColumn].pExpr, regCols);
+      }
+      j1 = sqlite3VdbeAddOp1(v, OP_NotNull, regCols); VdbeCoverage(v);
+      sqlite3VdbeAddOp2(v, OP_Integer, -1, regCols);
+      sqlite3VdbeJumpHere(v, j1);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, regCols); VdbeCoverage(v);
+    }
+
+    /* Cannot have triggers on a virtual table. If it were possible,
+    ** this block would have to account for hidden column.
+    */
+    assert( !IsVirtual(pTab) );
+
+    /* Create the new column data
+    */
+    for(i=0; i<pTab->nCol; i++){
+      if( pColumn==0 ){
+        j = i;
+      }else{
+        for(j=0; j<pColumn->nId; j++){
+          if( pColumn->a[j].idx==i ) break;
+        }
+      }
+      if( (!useTempTable && !pList) || (pColumn && j>=pColumn->nId) ){
+        sqlite3ExprCode(pParse, pTab->aCol[i].pDflt, regCols+i+1);
+      }else if( useTempTable ){
+        sqlite3VdbeAddOp3(v, OP_Column, srcTab, j, regCols+i+1); 
+      }else{
+        assert( pSelect==0 ); /* Otherwise useTempTable is true */
+        sqlite3ExprCodeAndCache(pParse, pList->a[j].pExpr, regCols+i+1);
+      }
+    }
+
+    /* If this is an INSERT on a view with an INSTEAD OF INSERT trigger,
+    ** do not attempt any conversions before assembling the record.
+    ** If this is a real table, attempt conversions as required by the
+    ** table column affinities.
+    */
+    if( !isView ){
+      sqlite3TableAffinity(v, pTab, regCols+1);
+    }
+
+    /* Fire BEFORE or INSTEAD OF triggers */
+    sqlite3CodeRowTrigger(pParse, pTrigger, TK_INSERT, 0, TRIGGER_BEFORE, 
+        pTab, regCols-pTab->nCol-1, onError, endOfLoop);
+
+    sqlite3ReleaseTempRange(pParse, regCols, pTab->nCol+1);
+  }
+
+  /* Compute the content of the next row to insert into a range of
+  ** registers beginning at regIns.
+  */
+  if( !isView ){
+    if( IsVirtual(pTab) ){
+      /* The row that the VUpdate opcode will delete: none */
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regIns);
+    }
+    if( ipkColumn>=0 ){
+      if( useTempTable ){
+        sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid);
+      }else if( pSelect ){
+        sqlite3VdbeAddOp2(v, OP_Copy, regFromSelect+ipkColumn, regRowid);
+      }else{
+        VdbeOp *pOp;
+        sqlite3ExprCode(pParse, pList->a[ipkColumn].pExpr, regRowid);
+        pOp = sqlite3VdbeGetOp(v, -1);
+        if( ALWAYS(pOp) && pOp->opcode==OP_Null && !IsVirtual(pTab) ){
+          appendFlag = 1;
+          pOp->opcode = OP_NewRowid;
+          pOp->p1 = iDataCur;
+          pOp->p2 = regRowid;
+          pOp->p3 = regAutoinc;
+        }
+      }
+      /* If the PRIMARY KEY expression is NULL, then use OP_NewRowid
+      ** to generate a unique primary key value.
+      */
+      if( !appendFlag ){
+        int j1;
+        if( !IsVirtual(pTab) ){
+          j1 = sqlite3VdbeAddOp1(v, OP_NotNull, regRowid); VdbeCoverage(v);
+          sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+          sqlite3VdbeJumpHere(v, j1);
+        }else{
+          j1 = sqlite3VdbeCurrentAddr(v);
+          sqlite3VdbeAddOp2(v, OP_IsNull, regRowid, j1+2); VdbeCoverage(v);
+        }
+        sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid); VdbeCoverage(v);
+      }
+    }else if( IsVirtual(pTab) || withoutRowid ){
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regRowid);
+    }else{
+      sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+      appendFlag = 1;
+    }
+    autoIncStep(pParse, regAutoinc, regRowid);
+
+    /* Compute data for all columns of the new entry, beginning
+    ** with the first column.
+    */
+    nHidden = 0;
+    for(i=0; i<pTab->nCol; i++){
+      int iRegStore = regRowid+1+i;
+      if( i==pTab->iPKey ){
+        /* The value of the INTEGER PRIMARY KEY column is always a NULL.
+        ** Whenever this column is read, the rowid will be substituted
+        ** in its place.  Hence, fill this column with a NULL to avoid
+        ** taking up data space with information that will never be used.
+        ** As there may be shallow copies of this value, make it a soft-NULL */
+        sqlite3VdbeAddOp1(v, OP_SoftNull, iRegStore);
+        continue;
+      }
+      if( pColumn==0 ){
+        if( IsHiddenColumn(&pTab->aCol[i]) ){
+          assert( IsVirtual(pTab) );
+          j = -1;
+          nHidden++;
+        }else{
+          j = i - nHidden;
+        }
+      }else{
+        for(j=0; j<pColumn->nId; j++){
+          if( pColumn->a[j].idx==i ) break;
+        }
+      }
+      if( j<0 || nColumn==0 || (pColumn && j>=pColumn->nId) ){
+        sqlite3ExprCodeFactorable(pParse, pTab->aCol[i].pDflt, iRegStore);
+      }else if( useTempTable ){
+        sqlite3VdbeAddOp3(v, OP_Column, srcTab, j, iRegStore); 
+      }else if( pSelect ){
+        if( regFromSelect!=regData ){
+          sqlite3VdbeAddOp2(v, OP_SCopy, regFromSelect+j, iRegStore);
+        }
+      }else{
+        sqlite3ExprCode(pParse, pList->a[j].pExpr, iRegStore);
+      }
+    }
+
+    /* Generate code to check constraints and generate index keys and
+    ** do the insertion.
+    */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    if( IsVirtual(pTab) ){
+      const char *pVTab = (const char *)sqlite3GetVTable(db, pTab);
+      sqlite3VtabMakeWritable(pParse, pTab);
+      sqlite3VdbeAddOp4(v, OP_VUpdate, 1, pTab->nCol+2, regIns, pVTab, P4_VTAB);
+      sqlite3VdbeChangeP5(v, onError==OE_Default ? OE_Abort : onError);
+      sqlite3MayAbort(pParse);
+    }else
+#endif
+    {
+      int isReplace;    /* Set to true if constraints may cause a replace */
+      sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
+          regIns, 0, ipkColumn>=0, onError, endOfLoop, &isReplace
+      );
+      sqlite3FkCheck(pParse, pTab, 0, regIns, 0, 0);
+      sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur,
+                               regIns, aRegIdx, 0, appendFlag, isReplace==0);
+    }
+  }
+
+  /* Update the count of rows that are inserted
+  */
+  if( (db->flags & SQLITE_CountRows)!=0 ){
+    sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+  }
+
+  if( pTrigger ){
+    /* Code AFTER triggers */
+    sqlite3CodeRowTrigger(pParse, pTrigger, TK_INSERT, 0, TRIGGER_AFTER, 
+        pTab, regData-2-pTab->nCol, onError, endOfLoop);
+  }
+
+  /* The bottom of the main insertion loop, if the data source
+  ** is a SELECT statement.
+  */
+  sqlite3VdbeResolveLabel(v, endOfLoop);
+  if( useTempTable ){
+    sqlite3VdbeAddOp2(v, OP_Next, srcTab, addrCont); VdbeCoverage(v);
+    sqlite3VdbeJumpHere(v, addrInsTop);
+    sqlite3VdbeAddOp1(v, OP_Close, srcTab);
+  }else if( pSelect ){
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addrCont);
+    sqlite3VdbeJumpHere(v, addrInsTop);
+  }
+
+  if( !IsVirtual(pTab) && !isView ){
+    /* Close all tables opened */
+    if( iDataCur<iIdxCur ) sqlite3VdbeAddOp1(v, OP_Close, iDataCur);
