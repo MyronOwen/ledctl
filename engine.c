@@ -99707,3 +99707,231 @@ SQLITE_PRIVATE void sqlite3GenerateConstraintChecks(
     switch( onError ){
       case OE_Abort:
         sqlite3MayAbort(pParse);
+        /* Fall through */
+      case OE_Rollback:
+      case OE_Fail: {
+        char *zMsg = sqlite3MPrintf(db, "%s.%s", pTab->zName,
+                                    pTab->aCol[i].zName);
+        sqlite3VdbeAddOp4(v, OP_HaltIfNull, SQLITE_CONSTRAINT_NOTNULL, onError,
+                          regNewData+1+i, zMsg, P4_DYNAMIC);
+        sqlite3VdbeChangeP5(v, P5_ConstraintNotNull);
+        VdbeCoverage(v);
+        break;
+      }
+      case OE_Ignore: {
+        sqlite3VdbeAddOp2(v, OP_IsNull, regNewData+1+i, ignoreDest);
+        VdbeCoverage(v);
+        break;
+      }
+      default: {
+        assert( onError==OE_Replace );
+        j1 = sqlite3VdbeAddOp1(v, OP_NotNull, regNewData+1+i); VdbeCoverage(v);
+        sqlite3ExprCode(pParse, pTab->aCol[i].pDflt, regNewData+1+i);
+        sqlite3VdbeJumpHere(v, j1);
+        break;
+      }
+    }
+  }
+
+  /* Test all CHECK constraints
+  */
+#ifndef SQLITE_OMIT_CHECK
+  if( pTab->pCheck && (db->flags & SQLITE_IgnoreChecks)==0 ){
+    ExprList *pCheck = pTab->pCheck;
+    pParse->ckBase = regNewData+1;
+    onError = overrideError!=OE_Default ? overrideError : OE_Abort;
+    for(i=0; i<pCheck->nExpr; i++){
+      int allOk = sqlite3VdbeMakeLabel(v);
+      sqlite3ExprIfTrue(pParse, pCheck->a[i].pExpr, allOk, SQLITE_JUMPIFNULL);
+      if( onError==OE_Ignore ){
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, ignoreDest);
+      }else{
+        char *zName = pCheck->a[i].zName;
+        if( zName==0 ) zName = pTab->zName;
+        if( onError==OE_Replace ) onError = OE_Abort; /* IMP: R-15569-63625 */
+        sqlite3HaltConstraint(pParse, SQLITE_CONSTRAINT_CHECK,
+                              onError, zName, P4_TRANSIENT,
+                              P5_ConstraintCheck);
+      }
+      sqlite3VdbeResolveLabel(v, allOk);
+    }
+  }
+#endif /* !defined(SQLITE_OMIT_CHECK) */
+
+  /* If rowid is changing, make sure the new rowid does not previously
+  ** exist in the table.
+  */
+  if( pkChng && pPk==0 ){
+    int addrRowidOk = sqlite3VdbeMakeLabel(v);
+
+    /* Figure out what action to take in case of a rowid collision */
+    onError = pTab->keyConf;
+    if( overrideError!=OE_Default ){
+      onError = overrideError;
+    }else if( onError==OE_Default ){
+      onError = OE_Abort;
+    }
+
+    if( isUpdate ){
+      /* pkChng!=0 does not mean that the rowid has change, only that
+      ** it might have changed.  Skip the conflict logic below if the rowid
+      ** is unchanged. */
+      sqlite3VdbeAddOp3(v, OP_Eq, regNewData, addrRowidOk, regOldData);
+      sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+      VdbeCoverage(v);
+    }
+
+    /* If the response to a rowid conflict is REPLACE but the response
+    ** to some other UNIQUE constraint is FAIL or IGNORE, then we need
+    ** to defer the running of the rowid conflict checking until after
+    ** the UNIQUE constraints have run.
+    */
+    if( onError==OE_Replace && overrideError!=OE_Replace ){
+      for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+        if( pIdx->onError==OE_Ignore || pIdx->onError==OE_Fail ){
+          ipkTop = sqlite3VdbeAddOp0(v, OP_Goto);
+          break;
+        }
+      }
+    }
+
+    /* Check to see if the new rowid already exists in the table.  Skip
+    ** the following conflict logic if it does not. */
+    sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, addrRowidOk, regNewData);
+    VdbeCoverage(v);
+
+    /* Generate code that deals with a rowid collision */
+    switch( onError ){
+      default: {
+        onError = OE_Abort;
+        /* Fall thru into the next case */
+      }
+      case OE_Rollback:
+      case OE_Abort:
+      case OE_Fail: {
+        sqlite3RowidConstraint(pParse, onError, pTab);
+        break;
+      }
+      case OE_Replace: {
+        /* If there are DELETE triggers on this table and the
+        ** recursive-triggers flag is set, call GenerateRowDelete() to
+        ** remove the conflicting row from the table. This will fire
+        ** the triggers and remove both the table and index b-tree entries.
+        **
+        ** Otherwise, if there are no triggers or the recursive-triggers
+        ** flag is not set, but the table has one or more indexes, call 
+        ** GenerateRowIndexDelete(). This removes the index b-tree entries 
+        ** only. The table b-tree entry will be replaced by the new entry 
+        ** when it is inserted.  
+        **
+        ** If either GenerateRowDelete() or GenerateRowIndexDelete() is called,
+        ** also invoke MultiWrite() to indicate that this VDBE may require
+        ** statement rollback (if the statement is aborted after the delete
+        ** takes place). Earlier versions called sqlite3MultiWrite() regardless,
+        ** but being more selective here allows statements like:
+        **
+        **   REPLACE INTO t(rowid) VALUES($newrowid)
+        **
+        ** to run without a statement journal if there are no indexes on the
+        ** table.
+        */
+        Trigger *pTrigger = 0;
+        if( db->flags&SQLITE_RecTriggers ){
+          pTrigger = sqlite3TriggersExist(pParse, pTab, TK_DELETE, 0, 0);
+        }
+        if( pTrigger || sqlite3FkRequired(pParse, pTab, 0, 0) ){
+          sqlite3MultiWrite(pParse);
+          sqlite3GenerateRowDelete(pParse, pTab, pTrigger, iDataCur, iIdxCur,
+                                   regNewData, 1, 0, OE_Replace, 1);
+        }else if( pTab->pIndex ){
+          sqlite3MultiWrite(pParse);
+          sqlite3GenerateRowIndexDelete(pParse, pTab, iDataCur, iIdxCur, 0);
+        }
+        seenReplace = 1;
+        break;
+      }
+      case OE_Ignore: {
+        /*assert( seenReplace==0 );*/
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, ignoreDest);
+        break;
+      }
+    }
+    sqlite3VdbeResolveLabel(v, addrRowidOk);
+    if( ipkTop ){
+      ipkBottom = sqlite3VdbeAddOp0(v, OP_Goto);
+      sqlite3VdbeJumpHere(v, ipkTop);
+    }
+  }
+
+  /* Test all UNIQUE constraints by creating entries for each UNIQUE
+  ** index and making sure that duplicate entries do not already exist.
+  ** Compute the revised record entries for indices as we go.
+  **
+  ** This loop also handles the case of the PRIMARY KEY index for a
+  ** WITHOUT ROWID table.
+  */
+  for(ix=0, pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext, ix++){
+    int regIdx;          /* Range of registers hold conent for pIdx */
+    int regR;            /* Range of registers holding conflicting PK */
+    int iThisCur;        /* Cursor for this UNIQUE index */
+    int addrUniqueOk;    /* Jump here if the UNIQUE constraint is satisfied */
+
+    if( aRegIdx[ix]==0 ) continue;  /* Skip indices that do not change */
+    if( bAffinityDone==0 ){
+      sqlite3TableAffinity(v, pTab, regNewData+1);
+      bAffinityDone = 1;
+    }
+    iThisCur = iIdxCur+ix;
+    addrUniqueOk = sqlite3VdbeMakeLabel(v);
+
+    /* Skip partial indices for which the WHERE clause is not true */
+    if( pIdx->pPartIdxWhere ){
+      sqlite3VdbeAddOp2(v, OP_Null, 0, aRegIdx[ix]);
+      pParse->ckBase = regNewData+1;
+      sqlite3ExprIfFalse(pParse, pIdx->pPartIdxWhere, addrUniqueOk,
+                         SQLITE_JUMPIFNULL);
+      pParse->ckBase = 0;
+    }
+
+    /* Create a record for this index entry as it should appear after
+    ** the insert or update.  Store that record in the aRegIdx[ix] register
+    */
+    regIdx = sqlite3GetTempRange(pParse, pIdx->nColumn);
+    for(i=0; i<pIdx->nColumn; i++){
+      int iField = pIdx->aiColumn[i];
+      int x;
+      if( iField<0 || iField==pTab->iPKey ){
+        if( regRowid==regIdx+i ) continue; /* ROWID already in regIdx+i */
+        x = regNewData;
+        regRowid =  pIdx->pPartIdxWhere ? -1 : regIdx+i;
+      }else{
+        x = iField + regNewData + 1;
+      }
+      sqlite3VdbeAddOp2(v, OP_SCopy, x, regIdx+i);
+      VdbeComment((v, "%s", iField<0 ? "rowid" : pTab->aCol[iField].zName));
+    }
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, regIdx, pIdx->nColumn, aRegIdx[ix]);
+    VdbeComment((v, "for %s", pIdx->zName));
+    sqlite3ExprCacheAffinityChange(pParse, regIdx, pIdx->nColumn);
+
+    /* In an UPDATE operation, if this index is the PRIMARY KEY index 
+    ** of a WITHOUT ROWID table and there has been no change the
+    ** primary key, then no collision is possible.  The collision detection
+    ** logic below can all be skipped. */
+    if( isUpdate && pPk==pIdx && pkChng==0 ){
+      sqlite3VdbeResolveLabel(v, addrUniqueOk);
+      continue;
+    }
+
+    /* Find out what action to take in case there is a uniqueness conflict */
+    onError = pIdx->onError;
+    if( onError==OE_None ){ 
+      sqlite3ReleaseTempRange(pParse, regIdx, pIdx->nColumn);
+      sqlite3VdbeResolveLabel(v, addrUniqueOk);
+      continue;  /* pIdx is not a UNIQUE index */
+    }
+    if( overrideError!=OE_Default ){
+      onError = overrideError;
+    }else if( onError==OE_Default ){
+      onError = OE_Abort;
+    }
