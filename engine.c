@@ -101130,3 +101130,234 @@ struct sqlite3_api_routines {
 #define sqlite3_release_memory         sqlite3_api->release_memory
 #define sqlite3_result_error_nomem     sqlite3_api->result_error_nomem
 #define sqlite3_result_error_toobig    sqlite3_api->result_error_toobig
+#define sqlite3_sleep                  sqlite3_api->sleep
+#define sqlite3_soft_heap_limit        sqlite3_api->soft_heap_limit
+#define sqlite3_vfs_find               sqlite3_api->vfs_find
+#define sqlite3_vfs_register           sqlite3_api->vfs_register
+#define sqlite3_vfs_unregister         sqlite3_api->vfs_unregister
+#define sqlite3_threadsafe             sqlite3_api->xthreadsafe
+#define sqlite3_result_zeroblob        sqlite3_api->result_zeroblob
+#define sqlite3_result_error_code      sqlite3_api->result_error_code
+#define sqlite3_test_control           sqlite3_api->test_control
+#define sqlite3_randomness             sqlite3_api->randomness
+#define sqlite3_context_db_handle      sqlite3_api->context_db_handle
+#define sqlite3_extended_result_codes  sqlite3_api->extended_result_codes
+#define sqlite3_limit                  sqlite3_api->limit
+#define sqlite3_next_stmt              sqlite3_api->next_stmt
+#define sqlite3_sql                    sqlite3_api->sql
+#define sqlite3_status                 sqlite3_api->status
+#define sqlite3_backup_finish          sqlite3_api->backup_finish
+#define sqlite3_backup_init            sqlite3_api->backup_init
+#define sqlite3_backup_pagecount       sqlite3_api->backup_pagecount
+#define sqlite3_backup_remaining       sqlite3_api->backup_remaining
+#define sqlite3_backup_step            sqlite3_api->backup_step
+#define sqlite3_compileoption_get      sqlite3_api->compileoption_get
+#define sqlite3_compileoption_used     sqlite3_api->compileoption_used
+#define sqlite3_create_function_v2     sqlite3_api->create_function_v2
+#define sqlite3_db_config              sqlite3_api->db_config
+#define sqlite3_db_mutex               sqlite3_api->db_mutex
+#define sqlite3_db_status              sqlite3_api->db_status
+#define sqlite3_extended_errcode       sqlite3_api->extended_errcode
+#define sqlite3_log                    sqlite3_api->log
+#define sqlite3_soft_heap_limit64      sqlite3_api->soft_heap_limit64
+#define sqlite3_sourceid               sqlite3_api->sourceid
+#define sqlite3_stmt_status            sqlite3_api->stmt_status
+#define sqlite3_strnicmp               sqlite3_api->strnicmp
+#define sqlite3_unlock_notify          sqlite3_api->unlock_notify
+#define sqlite3_wal_autocheckpoint     sqlite3_api->wal_autocheckpoint
+#define sqlite3_wal_checkpoint         sqlite3_api->wal_checkpoint
+#define sqlite3_wal_hook               sqlite3_api->wal_hook
+#define sqlite3_blob_reopen            sqlite3_api->blob_reopen
+#define sqlite3_vtab_config            sqlite3_api->vtab_config
+#define sqlite3_vtab_on_conflict       sqlite3_api->vtab_on_conflict
+/* Version 3.7.16 and later */
+#define sqlite3_close_v2               sqlite3_api->close_v2
+#define sqlite3_db_filename            sqlite3_api->db_filename
+#define sqlite3_db_readonly            sqlite3_api->db_readonly
+#define sqlite3_db_release_memory      sqlite3_api->db_release_memory
+#define sqlite3_errstr                 sqlite3_api->errstr
+#define sqlite3_stmt_busy              sqlite3_api->stmt_busy
+#define sqlite3_stmt_readonly          sqlite3_api->stmt_readonly
+#define sqlite3_stricmp                sqlite3_api->stricmp
+#define sqlite3_uri_boolean            sqlite3_api->uri_boolean
+#define sqlite3_uri_int64              sqlite3_api->uri_int64
+#define sqlite3_uri_parameter          sqlite3_api->uri_parameter
+#define sqlite3_uri_vsnprintf          sqlite3_api->vsnprintf
+#define sqlite3_wal_checkpoint_v2      sqlite3_api->wal_checkpoint_v2
+/* Version 3.8.7 and later */
+#define sqlite3_auto_extension         sqlite3_api->auto_extension
+#define sqlite3_bind_blob64            sqlite3_api->bind_blob64
+#define sqlite3_bind_text64            sqlite3_api->bind_text64
+#define sqlite3_cancel_auto_extension  sqlite3_api->cancel_auto_extension
+#define sqlite3_load_extension         sqlite3_api->load_extension
+#define sqlite3_malloc64               sqlite3_api->malloc64
+#define sqlite3_msize                  sqlite3_api->msize
+#define sqlite3_realloc64              sqlite3_api->realloc64
+#define sqlite3_reset_auto_extension   sqlite3_api->reset_auto_extension
+#define sqlite3_result_blob64          sqlite3_api->result_blob64
+#define sqlite3_result_text64          sqlite3_api->result_text64
+#define sqlite3_strglob                sqlite3_api->strglob
+#endif /* SQLITE_CORE */
+
+#ifndef SQLITE_CORE
+  /* This case when the file really is being compiled as a loadable 
+  ** extension */
+# define SQLITE_EXTENSION_INIT1     const sqlite3_api_routines *sqlite3_api=0;
+# define SQLITE_EXTENSION_INIT2(v)  sqlite3_api=v;
+# define SQLITE_EXTENSION_INIT3     \
+    extern const sqlite3_api_routines *sqlite3_api;
+#else
+  /* This case when the file is being statically linked into the 
+  ** application */
+# define SQLITE_EXTENSION_INIT1     /*no-op*/
+# define SQLITE_EXTENSION_INIT2(v)  (void)v; /* unused parameter */
+# define SQLITE_EXTENSION_INIT3     /*no-op*/
+#endif
+
+#endif /* _SQLITE3EXT_H_ */
+
+/************** End of sqlite3ext.h ******************************************/
+/************** Continuing where we left off in loadext.c ********************/
+/* #include <string.h> */
+
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+
+/*
+** Some API routines are omitted when various features are
+** excluded from a build of SQLite.  Substitute a NULL pointer
+** for any missing APIs.
+*/
+#ifndef SQLITE_ENABLE_COLUMN_METADATA
+# define sqlite3_column_database_name   0
+# define sqlite3_column_database_name16 0
+# define sqlite3_column_table_name      0
+# define sqlite3_column_table_name16    0
+# define sqlite3_column_origin_name     0
+# define sqlite3_column_origin_name16   0
+#endif
+
+#ifdef SQLITE_OMIT_AUTHORIZATION
+# define sqlite3_set_authorizer         0
+#endif
+
+#ifdef SQLITE_OMIT_UTF16
+# define sqlite3_bind_text16            0
+# define sqlite3_collation_needed16     0
+# define sqlite3_column_decltype16      0
+# define sqlite3_column_name16          0
+# define sqlite3_column_text16          0
+# define sqlite3_complete16             0
+# define sqlite3_create_collation16     0
+# define sqlite3_create_function16      0
+# define sqlite3_errmsg16               0
+# define sqlite3_open16                 0
+# define sqlite3_prepare16              0
+# define sqlite3_prepare16_v2           0
+# define sqlite3_result_error16         0
+# define sqlite3_result_text16          0
+# define sqlite3_result_text16be        0
+# define sqlite3_result_text16le        0
+# define sqlite3_value_text16           0
+# define sqlite3_value_text16be         0
+# define sqlite3_value_text16le         0
+# define sqlite3_column_database_name16 0
+# define sqlite3_column_table_name16    0
+# define sqlite3_column_origin_name16   0
+#endif
+
+#ifdef SQLITE_OMIT_COMPLETE
+# define sqlite3_complete 0
+# define sqlite3_complete16 0
+#endif
+
+#ifdef SQLITE_OMIT_DECLTYPE
+# define sqlite3_column_decltype16      0
+# define sqlite3_column_decltype        0
+#endif
+
+#ifdef SQLITE_OMIT_PROGRESS_CALLBACK
+# define sqlite3_progress_handler 0
+#endif
+
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+# define sqlite3_create_module 0
+# define sqlite3_create_module_v2 0
+# define sqlite3_declare_vtab 0
+# define sqlite3_vtab_config 0
+# define sqlite3_vtab_on_conflict 0
+#endif
+
+#ifdef SQLITE_OMIT_SHARED_CACHE
+# define sqlite3_enable_shared_cache 0
+#endif
+
+#ifdef SQLITE_OMIT_TRACE
+# define sqlite3_profile       0
+# define sqlite3_trace         0
+#endif
+
+#ifdef SQLITE_OMIT_GET_TABLE
+# define sqlite3_free_table    0
+# define sqlite3_get_table     0
+#endif
+
+#ifdef SQLITE_OMIT_INCRBLOB
+#define sqlite3_bind_zeroblob  0
+#define sqlite3_blob_bytes     0
+#define sqlite3_blob_close     0
+#define sqlite3_blob_open      0
+#define sqlite3_blob_read      0
+#define sqlite3_blob_write     0
+#define sqlite3_blob_reopen    0
+#endif
+
+/*
+** The following structure contains pointers to all SQLite API routines.
+** A pointer to this structure is passed into extensions when they are
+** loaded so that the extension can make calls back into the SQLite
+** library.
+**
+** When adding new APIs, add them to the bottom of this structure
+** in order to preserve backwards compatibility.
+**
+** Extensions that use newer APIs should first call the
+** sqlite3_libversion_number() to make sure that the API they
+** intend to use is supported by the library.  Extensions should
+** also check to make sure that the pointer to the function is
+** not NULL before calling it.
+*/
+static const sqlite3_api_routines sqlite3Apis = {
+  sqlite3_aggregate_context,
+#ifndef SQLITE_OMIT_DEPRECATED
+  sqlite3_aggregate_count,
+#else
+  0,
+#endif
+  sqlite3_bind_blob,
+  sqlite3_bind_double,
+  sqlite3_bind_int,
+  sqlite3_bind_int64,
+  sqlite3_bind_null,
+  sqlite3_bind_parameter_count,
+  sqlite3_bind_parameter_index,
+  sqlite3_bind_parameter_name,
+  sqlite3_bind_text,
+  sqlite3_bind_text16,
+  sqlite3_bind_value,
+  sqlite3_busy_handler,
+  sqlite3_busy_timeout,
+  sqlite3_changes,
+  sqlite3_close,
+  sqlite3_collation_needed,
+  sqlite3_collation_needed16,
+  sqlite3_column_blob,
+  sqlite3_column_bytes,
+  sqlite3_column_bytes16,
+  sqlite3_column_count,
+  sqlite3_column_database_name,
+  sqlite3_column_database_name16,
+  sqlite3_column_decltype,
+  sqlite3_column_decltype16,
+  sqlite3_column_double,
+  sqlite3_column_int,
+  sqlite3_column_int64,
