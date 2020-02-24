@@ -100892,3 +100892,241 @@ struct sqlite3_api_routines {
   int (*release_memory)(int);
   void (*result_error_nomem)(sqlite3_context*);
   void (*result_error_toobig)(sqlite3_context*);
+  int (*sleep)(int);
+  void (*soft_heap_limit)(int);
+  sqlite3_vfs *(*vfs_find)(const char*);
+  int (*vfs_register)(sqlite3_vfs*,int);
+  int (*vfs_unregister)(sqlite3_vfs*);
+  int (*xthreadsafe)(void);
+  void (*result_zeroblob)(sqlite3_context*,int);
+  void (*result_error_code)(sqlite3_context*,int);
+  int (*test_control)(int, ...);
+  void (*randomness)(int,void*);
+  sqlite3 *(*context_db_handle)(sqlite3_context*);
+  int (*extended_result_codes)(sqlite3*,int);
+  int (*limit)(sqlite3*,int,int);
+  sqlite3_stmt *(*next_stmt)(sqlite3*,sqlite3_stmt*);
+  const char *(*sql)(sqlite3_stmt*);
+  int (*status)(int,int*,int*,int);
+  int (*backup_finish)(sqlite3_backup*);
+  sqlite3_backup *(*backup_init)(sqlite3*,const char*,sqlite3*,const char*);
+  int (*backup_pagecount)(sqlite3_backup*);
+  int (*backup_remaining)(sqlite3_backup*);
+  int (*backup_step)(sqlite3_backup*,int);
+  const char *(*compileoption_get)(int);
+  int (*compileoption_used)(const char*);
+  int (*create_function_v2)(sqlite3*,const char*,int,int,void*,
+                            void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
+                            void (*xStep)(sqlite3_context*,int,sqlite3_value**),
+                            void (*xFinal)(sqlite3_context*),
+                            void(*xDestroy)(void*));
+  int (*db_config)(sqlite3*,int,...);
+  sqlite3_mutex *(*db_mutex)(sqlite3*);
+  int (*db_status)(sqlite3*,int,int*,int*,int);
+  int (*extended_errcode)(sqlite3*);
+  void (*log)(int,const char*,...);
+  sqlite3_int64 (*soft_heap_limit64)(sqlite3_int64);
+  const char *(*sourceid)(void);
+  int (*stmt_status)(sqlite3_stmt*,int,int);
+  int (*strnicmp)(const char*,const char*,int);
+  int (*unlock_notify)(sqlite3*,void(*)(void**,int),void*);
+  int (*wal_autocheckpoint)(sqlite3*,int);
+  int (*wal_checkpoint)(sqlite3*,const char*);
+  void *(*wal_hook)(sqlite3*,int(*)(void*,sqlite3*,const char*,int),void*);
+  int (*blob_reopen)(sqlite3_blob*,sqlite3_int64);
+  int (*vtab_config)(sqlite3*,int op,...);
+  int (*vtab_on_conflict)(sqlite3*);
+  /* Version 3.7.16 and later */
+  int (*close_v2)(sqlite3*);
+  const char *(*db_filename)(sqlite3*,const char*);
+  int (*db_readonly)(sqlite3*,const char*);
+  int (*db_release_memory)(sqlite3*);
+  const char *(*errstr)(int);
+  int (*stmt_busy)(sqlite3_stmt*);
+  int (*stmt_readonly)(sqlite3_stmt*);
+  int (*stricmp)(const char*,const char*);
+  int (*uri_boolean)(const char*,const char*,int);
+  sqlite3_int64 (*uri_int64)(const char*,const char*,sqlite3_int64);
+  const char *(*uri_parameter)(const char*,const char*);
+  char *(*vsnprintf)(int,char*,const char*,va_list);
+  int (*wal_checkpoint_v2)(sqlite3*,const char*,int,int*,int*);
+  /* Version 3.8.7 and later */
+  int (*auto_extension)(void(*)(void));
+  int (*bind_blob64)(sqlite3_stmt*,int,const void*,sqlite3_uint64,
+                     void(*)(void*));
+  int (*bind_text64)(sqlite3_stmt*,int,const char*,sqlite3_uint64,
+                      void(*)(void*),unsigned char);
+  int (*cancel_auto_extension)(void(*)(void));
+  int (*load_extension)(sqlite3*,const char*,const char*,char**);
+  void *(*malloc64)(sqlite3_uint64);
+  sqlite3_uint64 (*msize)(void*);
+  void *(*realloc64)(void*,sqlite3_uint64);
+  void (*reset_auto_extension)(void);
+  void (*result_blob64)(sqlite3_context*,const void*,sqlite3_uint64,
+                        void(*)(void*));
+  void (*result_text64)(sqlite3_context*,const char*,sqlite3_uint64,
+                         void(*)(void*), unsigned char);
+  int (*strglob)(const char*,const char*);
+};
+
+/*
+** The following macros redefine the API routines so that they are
+** redirected through the global sqlite3_api structure.
+**
+** This header file is also used by the loadext.c source file
+** (part of the main SQLite library - not an extension) so that
+** it can get access to the sqlite3_api_routines structure
+** definition.  But the main library does not want to redefine
+** the API.  So the redefinition macros are only valid if the
+** SQLITE_CORE macros is undefined.
+*/
+#ifndef SQLITE_CORE
+#define sqlite3_aggregate_context      sqlite3_api->aggregate_context
+#ifndef SQLITE_OMIT_DEPRECATED
+#define sqlite3_aggregate_count        sqlite3_api->aggregate_count
+#endif
+#define sqlite3_bind_blob              sqlite3_api->bind_blob
+#define sqlite3_bind_double            sqlite3_api->bind_double
+#define sqlite3_bind_int               sqlite3_api->bind_int
+#define sqlite3_bind_int64             sqlite3_api->bind_int64
+#define sqlite3_bind_null              sqlite3_api->bind_null
+#define sqlite3_bind_parameter_count   sqlite3_api->bind_parameter_count
+#define sqlite3_bind_parameter_index   sqlite3_api->bind_parameter_index
+#define sqlite3_bind_parameter_name    sqlite3_api->bind_parameter_name
+#define sqlite3_bind_text              sqlite3_api->bind_text
+#define sqlite3_bind_text16            sqlite3_api->bind_text16
+#define sqlite3_bind_value             sqlite3_api->bind_value
+#define sqlite3_busy_handler           sqlite3_api->busy_handler
+#define sqlite3_busy_timeout           sqlite3_api->busy_timeout
+#define sqlite3_changes                sqlite3_api->changes
+#define sqlite3_close                  sqlite3_api->close
+#define sqlite3_collation_needed       sqlite3_api->collation_needed
+#define sqlite3_collation_needed16     sqlite3_api->collation_needed16
+#define sqlite3_column_blob            sqlite3_api->column_blob
+#define sqlite3_column_bytes           sqlite3_api->column_bytes
+#define sqlite3_column_bytes16         sqlite3_api->column_bytes16
+#define sqlite3_column_count           sqlite3_api->column_count
+#define sqlite3_column_database_name   sqlite3_api->column_database_name
+#define sqlite3_column_database_name16 sqlite3_api->column_database_name16
+#define sqlite3_column_decltype        sqlite3_api->column_decltype
+#define sqlite3_column_decltype16      sqlite3_api->column_decltype16
+#define sqlite3_column_double          sqlite3_api->column_double
+#define sqlite3_column_int             sqlite3_api->column_int
+#define sqlite3_column_int64           sqlite3_api->column_int64
+#define sqlite3_column_name            sqlite3_api->column_name
+#define sqlite3_column_name16          sqlite3_api->column_name16
+#define sqlite3_column_origin_name     sqlite3_api->column_origin_name
+#define sqlite3_column_origin_name16   sqlite3_api->column_origin_name16
+#define sqlite3_column_table_name      sqlite3_api->column_table_name
+#define sqlite3_column_table_name16    sqlite3_api->column_table_name16
+#define sqlite3_column_text            sqlite3_api->column_text
+#define sqlite3_column_text16          sqlite3_api->column_text16
+#define sqlite3_column_type            sqlite3_api->column_type
+#define sqlite3_column_value           sqlite3_api->column_value
+#define sqlite3_commit_hook            sqlite3_api->commit_hook
+#define sqlite3_complete               sqlite3_api->complete
+#define sqlite3_complete16             sqlite3_api->complete16
+#define sqlite3_create_collation       sqlite3_api->create_collation
+#define sqlite3_create_collation16     sqlite3_api->create_collation16
+#define sqlite3_create_function        sqlite3_api->create_function
+#define sqlite3_create_function16      sqlite3_api->create_function16
+#define sqlite3_create_module          sqlite3_api->create_module
+#define sqlite3_create_module_v2       sqlite3_api->create_module_v2
+#define sqlite3_data_count             sqlite3_api->data_count
+#define sqlite3_db_handle              sqlite3_api->db_handle
+#define sqlite3_declare_vtab           sqlite3_api->declare_vtab
+#define sqlite3_enable_shared_cache    sqlite3_api->enable_shared_cache
+#define sqlite3_errcode                sqlite3_api->errcode
+#define sqlite3_errmsg                 sqlite3_api->errmsg
+#define sqlite3_errmsg16               sqlite3_api->errmsg16
+#define sqlite3_exec                   sqlite3_api->exec
+#ifndef SQLITE_OMIT_DEPRECATED
+#define sqlite3_expired                sqlite3_api->expired
+#endif
+#define sqlite3_finalize               sqlite3_api->finalize
+#define sqlite3_free                   sqlite3_api->free
+#define sqlite3_free_table             sqlite3_api->free_table
+#define sqlite3_get_autocommit         sqlite3_api->get_autocommit
+#define sqlite3_get_auxdata            sqlite3_api->get_auxdata
+#define sqlite3_get_table              sqlite3_api->get_table
+#ifndef SQLITE_OMIT_DEPRECATED
+#define sqlite3_global_recover         sqlite3_api->global_recover
+#endif
+#define sqlite3_interrupt              sqlite3_api->interruptx
+#define sqlite3_last_insert_rowid      sqlite3_api->last_insert_rowid
+#define sqlite3_libversion             sqlite3_api->libversion
+#define sqlite3_libversion_number      sqlite3_api->libversion_number
+#define sqlite3_malloc                 sqlite3_api->malloc
+#define sqlite3_mprintf                sqlite3_api->mprintf
+#define sqlite3_open                   sqlite3_api->open
+#define sqlite3_open16                 sqlite3_api->open16
+#define sqlite3_prepare                sqlite3_api->prepare
+#define sqlite3_prepare16              sqlite3_api->prepare16
+#define sqlite3_prepare_v2             sqlite3_api->prepare_v2
+#define sqlite3_prepare16_v2           sqlite3_api->prepare16_v2
+#define sqlite3_profile                sqlite3_api->profile
+#define sqlite3_progress_handler       sqlite3_api->progress_handler
+#define sqlite3_realloc                sqlite3_api->realloc
+#define sqlite3_reset                  sqlite3_api->reset
+#define sqlite3_result_blob            sqlite3_api->result_blob
+#define sqlite3_result_double          sqlite3_api->result_double
+#define sqlite3_result_error           sqlite3_api->result_error
+#define sqlite3_result_error16         sqlite3_api->result_error16
+#define sqlite3_result_int             sqlite3_api->result_int
+#define sqlite3_result_int64           sqlite3_api->result_int64
+#define sqlite3_result_null            sqlite3_api->result_null
+#define sqlite3_result_text            sqlite3_api->result_text
+#define sqlite3_result_text16          sqlite3_api->result_text16
+#define sqlite3_result_text16be        sqlite3_api->result_text16be
+#define sqlite3_result_text16le        sqlite3_api->result_text16le
+#define sqlite3_result_value           sqlite3_api->result_value
+#define sqlite3_rollback_hook          sqlite3_api->rollback_hook
+#define sqlite3_set_authorizer         sqlite3_api->set_authorizer
+#define sqlite3_set_auxdata            sqlite3_api->set_auxdata
+#define sqlite3_snprintf               sqlite3_api->snprintf
+#define sqlite3_step                   sqlite3_api->step
+#define sqlite3_table_column_metadata  sqlite3_api->table_column_metadata
+#define sqlite3_thread_cleanup         sqlite3_api->thread_cleanup
+#define sqlite3_total_changes          sqlite3_api->total_changes
+#define sqlite3_trace                  sqlite3_api->trace
+#ifndef SQLITE_OMIT_DEPRECATED
+#define sqlite3_transfer_bindings      sqlite3_api->transfer_bindings
+#endif
+#define sqlite3_update_hook            sqlite3_api->update_hook
+#define sqlite3_user_data              sqlite3_api->user_data
+#define sqlite3_value_blob             sqlite3_api->value_blob
+#define sqlite3_value_bytes            sqlite3_api->value_bytes
+#define sqlite3_value_bytes16          sqlite3_api->value_bytes16
+#define sqlite3_value_double           sqlite3_api->value_double
+#define sqlite3_value_int              sqlite3_api->value_int
+#define sqlite3_value_int64            sqlite3_api->value_int64
+#define sqlite3_value_numeric_type     sqlite3_api->value_numeric_type
+#define sqlite3_value_text             sqlite3_api->value_text
+#define sqlite3_value_text16           sqlite3_api->value_text16
+#define sqlite3_value_text16be         sqlite3_api->value_text16be
+#define sqlite3_value_text16le         sqlite3_api->value_text16le
+#define sqlite3_value_type             sqlite3_api->value_type
+#define sqlite3_vmprintf               sqlite3_api->vmprintf
+#define sqlite3_overload_function      sqlite3_api->overload_function
+#define sqlite3_prepare_v2             sqlite3_api->prepare_v2
+#define sqlite3_prepare16_v2           sqlite3_api->prepare16_v2
+#define sqlite3_clear_bindings         sqlite3_api->clear_bindings
+#define sqlite3_bind_zeroblob          sqlite3_api->bind_zeroblob
+#define sqlite3_blob_bytes             sqlite3_api->blob_bytes
+#define sqlite3_blob_close             sqlite3_api->blob_close
+#define sqlite3_blob_open              sqlite3_api->blob_open
+#define sqlite3_blob_read              sqlite3_api->blob_read
+#define sqlite3_blob_write             sqlite3_api->blob_write
+#define sqlite3_create_collation_v2    sqlite3_api->create_collation_v2
+#define sqlite3_file_control           sqlite3_api->file_control
+#define sqlite3_memory_highwater       sqlite3_api->memory_highwater
+#define sqlite3_memory_used            sqlite3_api->memory_used
+#define sqlite3_mutex_alloc            sqlite3_api->mutex_alloc
+#define sqlite3_mutex_enter            sqlite3_api->mutex_enter
+#define sqlite3_mutex_free             sqlite3_api->mutex_free
+#define sqlite3_mutex_leave            sqlite3_api->mutex_leave
+#define sqlite3_mutex_try              sqlite3_api->mutex_try
+#define sqlite3_open_v2                sqlite3_api->open_v2
+#define sqlite3_release_memory         sqlite3_api->release_memory
+#define sqlite3_result_error_nomem     sqlite3_api->result_error_nomem
+#define sqlite3_result_error_toobig    sqlite3_api->result_error_toobig
