@@ -100193,3 +100193,224 @@ SQLITE_API int sqlite3_xferopt_count;
 /*
 ** Check to collation names to see if they are compatible.
 */
+static int xferCompatibleCollation(const char *z1, const char *z2){
+  if( z1==0 ){
+    return z2==0;
+  }
+  if( z2==0 ){
+    return 0;
+  }
+  return sqlite3StrICmp(z1, z2)==0;
+}
+
+
+/*
+** Check to see if index pSrc is compatible as a source of data
+** for index pDest in an insert transfer optimization.  The rules
+** for a compatible index:
+**
+**    *   The index is over the same set of columns
+**    *   The same DESC and ASC markings occurs on all columns
+**    *   The same onError processing (OE_Abort, OE_Ignore, etc)
+**    *   The same collating sequence on each column
+**    *   The index has the exact same WHERE clause
+*/
+static int xferCompatibleIndex(Index *pDest, Index *pSrc){
+  int i;
+  assert( pDest && pSrc );
+  assert( pDest->pTable!=pSrc->pTable );
+  if( pDest->nKeyCol!=pSrc->nKeyCol ){
+    return 0;   /* Different number of columns */
+  }
+  if( pDest->onError!=pSrc->onError ){
+    return 0;   /* Different conflict resolution strategies */
+  }
+  for(i=0; i<pSrc->nKeyCol; i++){
+    if( pSrc->aiColumn[i]!=pDest->aiColumn[i] ){
+      return 0;   /* Different columns indexed */
+    }
+    if( pSrc->aSortOrder[i]!=pDest->aSortOrder[i] ){
+      return 0;   /* Different sort orders */
+    }
+    if( !xferCompatibleCollation(pSrc->azColl[i],pDest->azColl[i]) ){
+      return 0;   /* Different collating sequences */
+    }
+  }
+  if( sqlite3ExprCompare(pSrc->pPartIdxWhere, pDest->pPartIdxWhere, -1) ){
+    return 0;     /* Different WHERE clauses */
+  }
+
+  /* If no test above fails then the indices must be compatible */
+  return 1;
+}
+
+/*
+** Attempt the transfer optimization on INSERTs of the form
+**
+**     INSERT INTO tab1 SELECT * FROM tab2;
+**
+** The xfer optimization transfers raw records from tab2 over to tab1.  
+** Columns are not decoded and reassembled, which greatly improves
+** performance.  Raw index records are transferred in the same way.
+**
+** The xfer optimization is only attempted if tab1 and tab2 are compatible.
+** There are lots of rules for determining compatibility - see comments
+** embedded in the code for details.
+**
+** This routine returns TRUE if the optimization is guaranteed to be used.
+** Sometimes the xfer optimization will only work if the destination table
+** is empty - a factor that can only be determined at run-time.  In that
+** case, this routine generates code for the xfer optimization but also
+** does a test to see if the destination table is empty and jumps over the
+** xfer optimization code if the test fails.  In that case, this routine
+** returns FALSE so that the caller will know to go ahead and generate
+** an unoptimized transfer.  This routine also returns FALSE if there
+** is no chance that the xfer optimization can be applied.
+**
+** This optimization is particularly useful at making VACUUM run faster.
+*/
+static int xferOptimization(
+  Parse *pParse,        /* Parser context */
+  Table *pDest,         /* The table we are inserting into */
+  Select *pSelect,      /* A SELECT statement to use as the data source */
+  int onError,          /* How to handle constraint errors */
+  int iDbDest           /* The database of pDest */
+){
+  ExprList *pEList;                /* The result set of the SELECT */
+  Table *pSrc;                     /* The table in the FROM clause of SELECT */
+  Index *pSrcIdx, *pDestIdx;       /* Source and destination indices */
+  struct SrcList_item *pItem;      /* An element of pSelect->pSrc */
+  int i;                           /* Loop counter */
+  int iDbSrc;                      /* The database of pSrc */
+  int iSrc, iDest;                 /* Cursors from source and destination */
+  int addr1, addr2;                /* Loop addresses */
+  int emptyDestTest = 0;           /* Address of test for empty pDest */
+  int emptySrcTest = 0;            /* Address of test for empty pSrc */
+  Vdbe *v;                         /* The VDBE we are building */
+  int regAutoinc;                  /* Memory register used by AUTOINC */
+  int destHasUniqueIdx = 0;        /* True if pDest has a UNIQUE index */
+  int regData, regRowid;           /* Registers holding data and rowid */
+
+  if( pSelect==0 ){
+    return 0;   /* Must be of the form  INSERT INTO ... SELECT ... */
+  }
+  if( pParse->pWith || pSelect->pWith ){
+    /* Do not attempt to process this query if there are an WITH clauses
+    ** attached to it. Proceeding may generate a false "no such table: xxx"
+    ** error if pSelect reads from a CTE named "xxx".  */
+    return 0;
+  }
+  if( sqlite3TriggerList(pParse, pDest) ){
+    return 0;   /* tab1 must not have triggers */
+  }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( pDest->tabFlags & TF_Virtual ){
+    return 0;   /* tab1 must not be a virtual table */
+  }
+#endif
+  if( onError==OE_Default ){
+    if( pDest->iPKey>=0 ) onError = pDest->keyConf;
+    if( onError==OE_Default ) onError = OE_Abort;
+  }
+  assert(pSelect->pSrc);   /* allocated even if there is no FROM clause */
+  if( pSelect->pSrc->nSrc!=1 ){
+    return 0;   /* FROM clause must have exactly one term */
+  }
+  if( pSelect->pSrc->a[0].pSelect ){
+    return 0;   /* FROM clause cannot contain a subquery */
+  }
+  if( pSelect->pWhere ){
+    return 0;   /* SELECT may not have a WHERE clause */
+  }
+  if( pSelect->pOrderBy ){
+    return 0;   /* SELECT may not have an ORDER BY clause */
+  }
+  /* Do not need to test for a HAVING clause.  If HAVING is present but
+  ** there is no ORDER BY, we will get an error. */
+  if( pSelect->pGroupBy ){
+    return 0;   /* SELECT may not have a GROUP BY clause */
+  }
+  if( pSelect->pLimit ){
+    return 0;   /* SELECT may not have a LIMIT clause */
+  }
+  assert( pSelect->pOffset==0 );  /* Must be so if pLimit==0 */
+  if( pSelect->pPrior ){
+    return 0;   /* SELECT may not be a compound query */
+  }
+  if( pSelect->selFlags & SF_Distinct ){
+    return 0;   /* SELECT may not be DISTINCT */
+  }
+  pEList = pSelect->pEList;
+  assert( pEList!=0 );
+  if( pEList->nExpr!=1 ){
+    return 0;   /* The result set must have exactly one column */
+  }
+  assert( pEList->a[0].pExpr );
+  if( pEList->a[0].pExpr->op!=TK_ALL ){
+    return 0;   /* The result set must be the special operator "*" */
+  }
+
+  /* At this point we have established that the statement is of the
+  ** correct syntactic form to participate in this optimization.  Now
+  ** we have to check the semantics.
+  */
+  pItem = pSelect->pSrc->a;
+  pSrc = sqlite3LocateTableItem(pParse, 0, pItem);
+  if( pSrc==0 ){
+    return 0;   /* FROM clause does not contain a real table */
+  }
+  if( pSrc==pDest ){
+    return 0;   /* tab1 and tab2 may not be the same table */
+  }
+  if( HasRowid(pDest)!=HasRowid(pSrc) ){
+    return 0;   /* source and destination must both be WITHOUT ROWID or not */
+  }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( pSrc->tabFlags & TF_Virtual ){
+    return 0;   /* tab2 must not be a virtual table */
+  }
+#endif
+  if( pSrc->pSelect ){
+    return 0;   /* tab2 may not be a view */
+  }
+  if( pDest->nCol!=pSrc->nCol ){
+    return 0;   /* Number of columns must be the same in tab1 and tab2 */
+  }
+  if( pDest->iPKey!=pSrc->iPKey ){
+    return 0;   /* Both tables must have the same INTEGER PRIMARY KEY */
+  }
+  for(i=0; i<pDest->nCol; i++){
+    Column *pDestCol = &pDest->aCol[i];
+    Column *pSrcCol = &pSrc->aCol[i];
+    if( pDestCol->affinity!=pSrcCol->affinity ){
+      return 0;    /* Affinity must be the same on all columns */
+    }
+    if( !xferCompatibleCollation(pDestCol->zColl, pSrcCol->zColl) ){
+      return 0;    /* Collating sequence must be the same on all columns */
+    }
+    if( pDestCol->notNull && !pSrcCol->notNull ){
+      return 0;    /* tab2 must be NOT NULL if tab1 is */
+    }
+    /* Default values for second and subsequent columns need to match. */
+    if( i>0
+     && ((pDestCol->zDflt==0)!=(pSrcCol->zDflt==0) 
+         || (pDestCol->zDflt && strcmp(pDestCol->zDflt, pSrcCol->zDflt)!=0))
+    ){
+      return 0;    /* Default values must be the same for all columns */
+    }
+  }
+  for(pDestIdx=pDest->pIndex; pDestIdx; pDestIdx=pDestIdx->pNext){
+    if( IsUniqueIndex(pDestIdx) ){
+      destHasUniqueIdx = 1;
+    }
+    for(pSrcIdx=pSrc->pIndex; pSrcIdx; pSrcIdx=pSrcIdx->pNext){
+      if( xferCompatibleIndex(pDestIdx, pSrcIdx) ) break;
+    }
+    if( pSrcIdx==0 ){
+      return 0;    /* pDestIdx has no corresponding index in pSrc */
+    }
+  }
+#ifndef SQLITE_OMIT_CHECK
+  if( pDest->pCheck && sqlite3ExprListCompare(pSrc->pCheck,pDest->pCheck,-1) ){
+    return 0;   /* Tables have different CHECK constraints.  Ticket #2252 */
+  }
