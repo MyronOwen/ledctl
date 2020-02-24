@@ -100414,3 +100414,247 @@ static int xferOptimization(
   if( pDest->pCheck && sqlite3ExprListCompare(pSrc->pCheck,pDest->pCheck,-1) ){
     return 0;   /* Tables have different CHECK constraints.  Ticket #2252 */
   }
+#endif
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+  /* Disallow the transfer optimization if the destination table constains
+  ** any foreign key constraints.  This is more restrictive than necessary.
+  ** But the main beneficiary of the transfer optimization is the VACUUM 
+  ** command, and the VACUUM command disables foreign key constraints.  So
+  ** the extra complication to make this rule less restrictive is probably
+  ** not worth the effort.  Ticket [6284df89debdfa61db8073e062908af0c9b6118e]
+  */
+  if( (pParse->db->flags & SQLITE_ForeignKeys)!=0 && pDest->pFKey!=0 ){
+    return 0;
+  }
+#endif
+  if( (pParse->db->flags & SQLITE_CountRows)!=0 ){
+    return 0;  /* xfer opt does not play well with PRAGMA count_changes */
+  }
+
+  /* If we get this far, it means that the xfer optimization is at
+  ** least a possibility, though it might only work if the destination
+  ** table (tab1) is initially empty.
+  */
+#ifdef SQLITE_TEST
+  sqlite3_xferopt_count++;
+#endif
+  iDbSrc = sqlite3SchemaToIndex(pParse->db, pSrc->pSchema);
+  v = sqlite3GetVdbe(pParse);
+  sqlite3CodeVerifySchema(pParse, iDbSrc);
+  iSrc = pParse->nTab++;
+  iDest = pParse->nTab++;
+  regAutoinc = autoIncBegin(pParse, iDbDest, pDest);
+  regData = sqlite3GetTempReg(pParse);
+  regRowid = sqlite3GetTempReg(pParse);
+  sqlite3OpenTable(pParse, iDest, iDbDest, pDest, OP_OpenWrite);
+  assert( HasRowid(pDest) || destHasUniqueIdx );
+  if( (pDest->iPKey<0 && pDest->pIndex!=0)          /* (1) */
+   || destHasUniqueIdx                              /* (2) */
+   || (onError!=OE_Abort && onError!=OE_Rollback)   /* (3) */
+  ){
+    /* In some circumstances, we are able to run the xfer optimization
+    ** only if the destination table is initially empty.  This code makes
+    ** that determination.  Conditions under which the destination must
+    ** be empty:
+    **
+    ** (1) There is no INTEGER PRIMARY KEY but there are indices.
+    **     (If the destination is not initially empty, the rowid fields
+    **     of index entries might need to change.)
+    **
+    ** (2) The destination has a unique index.  (The xfer optimization 
+    **     is unable to test uniqueness.)
+    **
+    ** (3) onError is something other than OE_Abort and OE_Rollback.
+    */
+    addr1 = sqlite3VdbeAddOp2(v, OP_Rewind, iDest, 0); VdbeCoverage(v);
+    emptyDestTest = sqlite3VdbeAddOp2(v, OP_Goto, 0, 0);
+    sqlite3VdbeJumpHere(v, addr1);
+  }
+  if( HasRowid(pSrc) ){
+    sqlite3OpenTable(pParse, iSrc, iDbSrc, pSrc, OP_OpenRead);
+    emptySrcTest = sqlite3VdbeAddOp2(v, OP_Rewind, iSrc, 0); VdbeCoverage(v);
+    if( pDest->iPKey>=0 ){
+      addr1 = sqlite3VdbeAddOp2(v, OP_Rowid, iSrc, regRowid);
+      addr2 = sqlite3VdbeAddOp3(v, OP_NotExists, iDest, 0, regRowid);
+      VdbeCoverage(v);
+      sqlite3RowidConstraint(pParse, onError, pDest);
+      sqlite3VdbeJumpHere(v, addr2);
+      autoIncStep(pParse, regAutoinc, regRowid);
+    }else if( pDest->pIndex==0 ){
+      addr1 = sqlite3VdbeAddOp2(v, OP_NewRowid, iDest, regRowid);
+    }else{
+      addr1 = sqlite3VdbeAddOp2(v, OP_Rowid, iSrc, regRowid);
+      assert( (pDest->tabFlags & TF_Autoincrement)==0 );
+    }
+    sqlite3VdbeAddOp2(v, OP_RowData, iSrc, regData);
+    sqlite3VdbeAddOp3(v, OP_Insert, iDest, regData, regRowid);
+    sqlite3VdbeChangeP5(v, OPFLAG_NCHANGE|OPFLAG_LASTROWID|OPFLAG_APPEND);
+    sqlite3VdbeChangeP4(v, -1, pDest->zName, 0);
+    sqlite3VdbeAddOp2(v, OP_Next, iSrc, addr1); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Close, iSrc, 0);
+    sqlite3VdbeAddOp2(v, OP_Close, iDest, 0);
+  }else{
+    sqlite3TableLock(pParse, iDbDest, pDest->tnum, 1, pDest->zName);
+    sqlite3TableLock(pParse, iDbSrc, pSrc->tnum, 0, pSrc->zName);
+  }
+  for(pDestIdx=pDest->pIndex; pDestIdx; pDestIdx=pDestIdx->pNext){
+    for(pSrcIdx=pSrc->pIndex; ALWAYS(pSrcIdx); pSrcIdx=pSrcIdx->pNext){
+      if( xferCompatibleIndex(pDestIdx, pSrcIdx) ) break;
+    }
+    assert( pSrcIdx );
+    sqlite3VdbeAddOp3(v, OP_OpenRead, iSrc, pSrcIdx->tnum, iDbSrc);
+    sqlite3VdbeSetP4KeyInfo(pParse, pSrcIdx);
+    VdbeComment((v, "%s", pSrcIdx->zName));
+    sqlite3VdbeAddOp3(v, OP_OpenWrite, iDest, pDestIdx->tnum, iDbDest);
+    sqlite3VdbeSetP4KeyInfo(pParse, pDestIdx);
+    sqlite3VdbeChangeP5(v, OPFLAG_BULKCSR);
+    VdbeComment((v, "%s", pDestIdx->zName));
+    addr1 = sqlite3VdbeAddOp2(v, OP_Rewind, iSrc, 0); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_RowKey, iSrc, regData);
+    sqlite3VdbeAddOp3(v, OP_IdxInsert, iDest, regData, 1);
+    sqlite3VdbeAddOp2(v, OP_Next, iSrc, addr1+1); VdbeCoverage(v);
+    sqlite3VdbeJumpHere(v, addr1);
+    sqlite3VdbeAddOp2(v, OP_Close, iSrc, 0);
+    sqlite3VdbeAddOp2(v, OP_Close, iDest, 0);
+  }
+  if( emptySrcTest ) sqlite3VdbeJumpHere(v, emptySrcTest);
+  sqlite3ReleaseTempReg(pParse, regRowid);
+  sqlite3ReleaseTempReg(pParse, regData);
+  if( emptyDestTest ){
+    sqlite3VdbeAddOp2(v, OP_Halt, SQLITE_OK, 0);
+    sqlite3VdbeJumpHere(v, emptyDestTest);
+    sqlite3VdbeAddOp2(v, OP_Close, iDest, 0);
+    return 0;
+  }else{
+    return 1;
+  }
+}
+#endif /* SQLITE_OMIT_XFER_OPT */
+
+/************** End of insert.c **********************************************/
+/************** Begin file legacy.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** Main file for the SQLite library.  The routines in this file
+** implement the programmer interface to the library.  Routines in
+** other files are for internal use by SQLite and should not be
+** accessed by users of the library.
+*/
+
+
+/*
+** Execute SQL code.  Return one of the SQLITE_ success/failure
+** codes.  Also write an error message into memory obtained from
+** malloc() and make *pzErrMsg point to that message.
+**
+** If the SQL is a query, then for each row in the query result
+** the xCallback() function is called.  pArg becomes the first
+** argument to xCallback().  If xCallback=NULL then no callback
+** is invoked, even for queries.
+*/
+SQLITE_API int sqlite3_exec(
+  sqlite3 *db,                /* The database on which the SQL executes */
+  const char *zSql,           /* The SQL to be executed */
+  sqlite3_callback xCallback, /* Invoke this callback routine */
+  void *pArg,                 /* First argument to xCallback() */
+  char **pzErrMsg             /* Write error messages here */
+){
+  int rc = SQLITE_OK;         /* Return code */
+  const char *zLeftover;      /* Tail of unprocessed SQL */
+  sqlite3_stmt *pStmt = 0;    /* The current SQL statement */
+  char **azCols = 0;          /* Names of result columns */
+  int callbackIsInit;         /* True if callback data is initialized */
+
+  if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
+  if( zSql==0 ) zSql = "";
+
+  sqlite3_mutex_enter(db->mutex);
+  sqlite3Error(db, SQLITE_OK);
+  while( rc==SQLITE_OK && zSql[0] ){
+    int nCol;
+    char **azVals = 0;
+
+    pStmt = 0;
+    rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, &zLeftover);
+    assert( rc==SQLITE_OK || pStmt==0 );
+    if( rc!=SQLITE_OK ){
+      continue;
+    }
+    if( !pStmt ){
+      /* this happens for a comment or white-space */
+      zSql = zLeftover;
+      continue;
+    }
+
+    callbackIsInit = 0;
+    nCol = sqlite3_column_count(pStmt);
+
+    while( 1 ){
+      int i;
+      rc = sqlite3_step(pStmt);
+
+      /* Invoke the callback function if required */
+      if( xCallback && (SQLITE_ROW==rc || 
+          (SQLITE_DONE==rc && !callbackIsInit
+                           && db->flags&SQLITE_NullCallback)) ){
+        if( !callbackIsInit ){
+          azCols = sqlite3DbMallocZero(db, 2*nCol*sizeof(const char*) + 1);
+          if( azCols==0 ){
+            goto exec_out;
+          }
+          for(i=0; i<nCol; i++){
+            azCols[i] = (char *)sqlite3_column_name(pStmt, i);
+            /* sqlite3VdbeSetColName() installs column names as UTF8
+            ** strings so there is no way for sqlite3_column_name() to fail. */
+            assert( azCols[i]!=0 );
+          }
+          callbackIsInit = 1;
+        }
+        if( rc==SQLITE_ROW ){
+          azVals = &azCols[nCol];
+          for(i=0; i<nCol; i++){
+            azVals[i] = (char *)sqlite3_column_text(pStmt, i);
+            if( !azVals[i] && sqlite3_column_type(pStmt, i)!=SQLITE_NULL ){
+              db->mallocFailed = 1;
+              goto exec_out;
+            }
+          }
+        }
+        if( xCallback(pArg, nCol, azVals, azCols) ){
+          /* EVIDENCE-OF: R-38229-40159 If the callback function to
+          ** sqlite3_exec() returns non-zero, then sqlite3_exec() will
+          ** return SQLITE_ABORT. */
+          rc = SQLITE_ABORT;
+          sqlite3VdbeFinalize((Vdbe *)pStmt);
+          pStmt = 0;
+          sqlite3Error(db, SQLITE_ABORT);
+          goto exec_out;
+        }
+      }
+
+      if( rc!=SQLITE_ROW ){
+        rc = sqlite3VdbeFinalize((Vdbe *)pStmt);
+        pStmt = 0;
+        zSql = zLeftover;
+        while( sqlite3Isspace(zSql[0]) ) zSql++;
+        break;
+      }
+    }
+
+    sqlite3DbFree(db, azCols);
+    azCols = 0;
+  }
+
+exec_out:
+  if( pStmt ) sqlite3VdbeFinalize((Vdbe *)pStmt);
+  sqlite3DbFree(db, azCols);
+
