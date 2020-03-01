@@ -101361,3 +101361,236 @@ static const sqlite3_api_routines sqlite3Apis = {
   sqlite3_column_double,
   sqlite3_column_int,
   sqlite3_column_int64,
+  sqlite3_column_name,
+  sqlite3_column_name16,
+  sqlite3_column_origin_name,
+  sqlite3_column_origin_name16,
+  sqlite3_column_table_name,
+  sqlite3_column_table_name16,
+  sqlite3_column_text,
+  sqlite3_column_text16,
+  sqlite3_column_type,
+  sqlite3_column_value,
+  sqlite3_commit_hook,
+  sqlite3_complete,
+  sqlite3_complete16,
+  sqlite3_create_collation,
+  sqlite3_create_collation16,
+  sqlite3_create_function,
+  sqlite3_create_function16,
+  sqlite3_create_module,
+  sqlite3_data_count,
+  sqlite3_db_handle,
+  sqlite3_declare_vtab,
+  sqlite3_enable_shared_cache,
+  sqlite3_errcode,
+  sqlite3_errmsg,
+  sqlite3_errmsg16,
+  sqlite3_exec,
+#ifndef SQLITE_OMIT_DEPRECATED
+  sqlite3_expired,
+#else
+  0,
+#endif
+  sqlite3_finalize,
+  sqlite3_free,
+  sqlite3_free_table,
+  sqlite3_get_autocommit,
+  sqlite3_get_auxdata,
+  sqlite3_get_table,
+  0,     /* Was sqlite3_global_recover(), but that function is deprecated */
+  sqlite3_interrupt,
+  sqlite3_last_insert_rowid,
+  sqlite3_libversion,
+  sqlite3_libversion_number,
+  sqlite3_malloc,
+  sqlite3_mprintf,
+  sqlite3_open,
+  sqlite3_open16,
+  sqlite3_prepare,
+  sqlite3_prepare16,
+  sqlite3_profile,
+  sqlite3_progress_handler,
+  sqlite3_realloc,
+  sqlite3_reset,
+  sqlite3_result_blob,
+  sqlite3_result_double,
+  sqlite3_result_error,
+  sqlite3_result_error16,
+  sqlite3_result_int,
+  sqlite3_result_int64,
+  sqlite3_result_null,
+  sqlite3_result_text,
+  sqlite3_result_text16,
+  sqlite3_result_text16be,
+  sqlite3_result_text16le,
+  sqlite3_result_value,
+  sqlite3_rollback_hook,
+  sqlite3_set_authorizer,
+  sqlite3_set_auxdata,
+  sqlite3_snprintf,
+  sqlite3_step,
+  sqlite3_table_column_metadata,
+#ifndef SQLITE_OMIT_DEPRECATED
+  sqlite3_thread_cleanup,
+#else
+  0,
+#endif
+  sqlite3_total_changes,
+  sqlite3_trace,
+#ifndef SQLITE_OMIT_DEPRECATED
+  sqlite3_transfer_bindings,
+#else
+  0,
+#endif
+  sqlite3_update_hook,
+  sqlite3_user_data,
+  sqlite3_value_blob,
+  sqlite3_value_bytes,
+  sqlite3_value_bytes16,
+  sqlite3_value_double,
+  sqlite3_value_int,
+  sqlite3_value_int64,
+  sqlite3_value_numeric_type,
+  sqlite3_value_text,
+  sqlite3_value_text16,
+  sqlite3_value_text16be,
+  sqlite3_value_text16le,
+  sqlite3_value_type,
+  sqlite3_vmprintf,
+  /*
+  ** The original API set ends here.  All extensions can call any
+  ** of the APIs above provided that the pointer is not NULL.  But
+  ** before calling APIs that follow, extension should check the
+  ** sqlite3_libversion_number() to make sure they are dealing with
+  ** a library that is new enough to support that API.
+  *************************************************************************
+  */
+  sqlite3_overload_function,
+
+  /*
+  ** Added after 3.3.13
+  */
+  sqlite3_prepare_v2,
+  sqlite3_prepare16_v2,
+  sqlite3_clear_bindings,
+
+  /*
+  ** Added for 3.4.1
+  */
+  sqlite3_create_module_v2,
+
+  /*
+  ** Added for 3.5.0
+  */
+  sqlite3_bind_zeroblob,
+  sqlite3_blob_bytes,
+  sqlite3_blob_close,
+  sqlite3_blob_open,
+  sqlite3_blob_read,
+  sqlite3_blob_write,
+  sqlite3_create_collation_v2,
+  sqlite3_file_control,
+  sqlite3_memory_highwater,
+  sqlite3_memory_used,
+#ifdef SQLITE_MUTEX_OMIT
+  0, 
+  0, 
+  0,
+  0,
+  0,
+#else
+  sqlite3_mutex_alloc,
+  sqlite3_mutex_enter,
+  sqlite3_mutex_free,
+  sqlite3_mutex_leave,
+  sqlite3_mutex_try,
+#endif
+  sqlite3_open_v2,
+  sqlite3_release_memory,
+  sqlite3_result_error_nomem,
+  sqlite3_result_error_toobig,
+  sqlite3_sleep,
+  sqlite3_soft_heap_limit,
+  sqlite3_vfs_find,
+  sqlite3_vfs_register,
+  sqlite3_vfs_unregister,
+
+  /*
+  ** Added for 3.5.8
+  */
+  sqlite3_threadsafe,
+  sqlite3_result_zeroblob,
+  sqlite3_result_error_code,
+  sqlite3_test_control,
+  sqlite3_randomness,
+  sqlite3_context_db_handle,
+
+  /*
+  ** Added for 3.6.0
+  */
+  sqlite3_extended_result_codes,
+  sqlite3_limit,
+  sqlite3_next_stmt,
+  sqlite3_sql,
+  sqlite3_status,
+
+  /*
+  ** Added for 3.7.4
+  */
+  sqlite3_backup_finish,
+  sqlite3_backup_init,
+  sqlite3_backup_pagecount,
+  sqlite3_backup_remaining,
+  sqlite3_backup_step,
+#ifndef SQLITE_OMIT_COMPILEOPTION_DIAGS
+  sqlite3_compileoption_get,
+  sqlite3_compileoption_used,
+#else
+  0,
+  0,
+#endif
+  sqlite3_create_function_v2,
+  sqlite3_db_config,
+  sqlite3_db_mutex,
+  sqlite3_db_status,
+  sqlite3_extended_errcode,
+  sqlite3_log,
+  sqlite3_soft_heap_limit64,
+  sqlite3_sourceid,
+  sqlite3_stmt_status,
+  sqlite3_strnicmp,
+#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY
+  sqlite3_unlock_notify,
+#else
+  0,
+#endif
+#ifndef SQLITE_OMIT_WAL
+  sqlite3_wal_autocheckpoint,
+  sqlite3_wal_checkpoint,
+  sqlite3_wal_hook,
+#else
+  0,
+  0,
+  0,
+#endif
+  sqlite3_blob_reopen,
+  sqlite3_vtab_config,
+  sqlite3_vtab_on_conflict,
+  sqlite3_close_v2,
+  sqlite3_db_filename,
+  sqlite3_db_readonly,
+  sqlite3_db_release_memory,
+  sqlite3_errstr,
+  sqlite3_stmt_busy,
+  sqlite3_stmt_readonly,
+  sqlite3_stricmp,
+  sqlite3_uri_boolean,
+  sqlite3_uri_int64,
+  sqlite3_uri_parameter,
+  sqlite3_vsnprintf,
+  sqlite3_wal_checkpoint_v2,
+  /* Version 3.8.7 and later */
+  sqlite3_auto_extension,
+  sqlite3_bind_blob64,
+  sqlite3_bind_text64,
