@@ -101818,3 +101818,235 @@ static const sqlite3_api_routines sqlite3Apis = { 0 };
 ** This list is shared across threads.  The SQLITE_MUTEX_STATIC_MASTER
 ** mutex must be held while accessing this list.
 */
+typedef struct sqlite3AutoExtList sqlite3AutoExtList;
+static SQLITE_WSD struct sqlite3AutoExtList {
+  int nExt;              /* Number of entries in aExt[] */          
+  void (**aExt)(void);   /* Pointers to the extension init functions */
+} sqlite3Autoext = { 0, 0 };
+
+/* The "wsdAutoext" macro will resolve to the autoextension
+** state vector.  If writable static data is unsupported on the target,
+** we have to locate the state vector at run-time.  In the more common
+** case where writable static data is supported, wsdStat can refer directly
+** to the "sqlite3Autoext" state vector declared above.
+*/
+#ifdef SQLITE_OMIT_WSD
+# define wsdAutoextInit \
+  sqlite3AutoExtList *x = &GLOBAL(sqlite3AutoExtList,sqlite3Autoext)
+# define wsdAutoext x[0]
+#else
+# define wsdAutoextInit
+# define wsdAutoext sqlite3Autoext
+#endif
+
+
+/*
+** Register a statically linked extension that is automatically
+** loaded by every new database connection.
+*/
+SQLITE_API int sqlite3_auto_extension(void (*xInit)(void)){
+  int rc = SQLITE_OK;
+#ifndef SQLITE_OMIT_AUTOINIT
+  rc = sqlite3_initialize();
+  if( rc ){
+    return rc;
+  }else
+#endif
+  {
+    int i;
+#if SQLITE_THREADSAFE
+    sqlite3_mutex *mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+#endif
+    wsdAutoextInit;
+    sqlite3_mutex_enter(mutex);
+    for(i=0; i<wsdAutoext.nExt; i++){
+      if( wsdAutoext.aExt[i]==xInit ) break;
+    }
+    if( i==wsdAutoext.nExt ){
+      int nByte = (wsdAutoext.nExt+1)*sizeof(wsdAutoext.aExt[0]);
+      void (**aNew)(void);
+      aNew = sqlite3_realloc(wsdAutoext.aExt, nByte);
+      if( aNew==0 ){
+        rc = SQLITE_NOMEM;
+      }else{
+        wsdAutoext.aExt = aNew;
+        wsdAutoext.aExt[wsdAutoext.nExt] = xInit;
+        wsdAutoext.nExt++;
+      }
+    }
+    sqlite3_mutex_leave(mutex);
+    assert( (rc&0xff)==rc );
+    return rc;
+  }
+}
+
+/*
+** Cancel a prior call to sqlite3_auto_extension.  Remove xInit from the
+** set of routines that is invoked for each new database connection, if it
+** is currently on the list.  If xInit is not on the list, then this
+** routine is a no-op.
+**
+** Return 1 if xInit was found on the list and removed.  Return 0 if xInit
+** was not on the list.
+*/
+SQLITE_API int sqlite3_cancel_auto_extension(void (*xInit)(void)){
+#if SQLITE_THREADSAFE
+  sqlite3_mutex *mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+#endif
+  int i;
+  int n = 0;
+  wsdAutoextInit;
+  sqlite3_mutex_enter(mutex);
+  for(i=wsdAutoext.nExt-1; i>=0; i--){
+    if( wsdAutoext.aExt[i]==xInit ){
+      wsdAutoext.nExt--;
+      wsdAutoext.aExt[i] = wsdAutoext.aExt[wsdAutoext.nExt];
+      n++;
+      break;
+    }
+  }
+  sqlite3_mutex_leave(mutex);
+  return n;
+}
+
+/*
+** Reset the automatic extension loading mechanism.
+*/
+SQLITE_API void sqlite3_reset_auto_extension(void){
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize()==SQLITE_OK )
+#endif
+  {
+#if SQLITE_THREADSAFE
+    sqlite3_mutex *mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+#endif
+    wsdAutoextInit;
+    sqlite3_mutex_enter(mutex);
+    sqlite3_free(wsdAutoext.aExt);
+    wsdAutoext.aExt = 0;
+    wsdAutoext.nExt = 0;
+    sqlite3_mutex_leave(mutex);
+  }
+}
+
+/*
+** Load all automatic extensions.
+**
+** If anything goes wrong, set an error in the database connection.
+*/
+SQLITE_PRIVATE void sqlite3AutoLoadExtensions(sqlite3 *db){
+  int i;
+  int go = 1;
+  int rc;
+  int (*xInit)(sqlite3*,char**,const sqlite3_api_routines*);
+
+  wsdAutoextInit;
+  if( wsdAutoext.nExt==0 ){
+    /* Common case: early out without every having to acquire a mutex */
+    return;
+  }
+  for(i=0; go; i++){
+    char *zErrmsg;
+#if SQLITE_THREADSAFE
+    sqlite3_mutex *mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MASTER);
+#endif
+    sqlite3_mutex_enter(mutex);
+    if( i>=wsdAutoext.nExt ){
+      xInit = 0;
+      go = 0;
+    }else{
+      xInit = (int(*)(sqlite3*,char**,const sqlite3_api_routines*))
+              wsdAutoext.aExt[i];
+    }
+    sqlite3_mutex_leave(mutex);
+    zErrmsg = 0;
+    if( xInit && (rc = xInit(db, &zErrmsg, &sqlite3Apis))!=0 ){
+      sqlite3ErrorWithMsg(db, rc,
+            "automatic extension loading failed: %s", zErrmsg);
+      go = 0;
+    }
+    sqlite3_free(zErrmsg);
+  }
+}
+
+/************** End of loadext.c *********************************************/
+/************** Begin file pragma.c ******************************************/
+/*
+** 2003 April 6
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code used to implement the PRAGMA command.
+*/
+
+#if !defined(SQLITE_ENABLE_LOCKING_STYLE)
+#  if defined(__APPLE__)
+#    define SQLITE_ENABLE_LOCKING_STYLE 1
+#  else
+#    define SQLITE_ENABLE_LOCKING_STYLE 0
+#  endif
+#endif
+
+/***************************************************************************
+** The next block of code, including the PragTyp_XXXX macro definitions and
+** the aPragmaName[] object is composed of generated code. DO NOT EDIT.
+**
+** To add new pragmas, edit the code in ../tool/mkpragmatab.tcl and rerun
+** that script.  Then copy/paste the output in place of the following:
+*/
+#define PragTyp_HEADER_VALUE                   0
+#define PragTyp_AUTO_VACUUM                    1
+#define PragTyp_FLAG                           2
+#define PragTyp_BUSY_TIMEOUT                   3
+#define PragTyp_CACHE_SIZE                     4
+#define PragTyp_CASE_SENSITIVE_LIKE            5
+#define PragTyp_COLLATION_LIST                 6
+#define PragTyp_COMPILE_OPTIONS                7
+#define PragTyp_DATA_STORE_DIRECTORY           8
+#define PragTyp_DATABASE_LIST                  9
+#define PragTyp_DEFAULT_CACHE_SIZE            10
+#define PragTyp_ENCODING                      11
+#define PragTyp_FOREIGN_KEY_CHECK             12
+#define PragTyp_FOREIGN_KEY_LIST              13
+#define PragTyp_INCREMENTAL_VACUUM            14
+#define PragTyp_INDEX_INFO                    15
+#define PragTyp_INDEX_LIST                    16
+#define PragTyp_INTEGRITY_CHECK               17
+#define PragTyp_JOURNAL_MODE                  18
+#define PragTyp_JOURNAL_SIZE_LIMIT            19
+#define PragTyp_LOCK_PROXY_FILE               20
+#define PragTyp_LOCKING_MODE                  21
+#define PragTyp_PAGE_COUNT                    22
+#define PragTyp_MMAP_SIZE                     23
+#define PragTyp_PAGE_SIZE                     24
+#define PragTyp_SECURE_DELETE                 25
+#define PragTyp_SHRINK_MEMORY                 26
+#define PragTyp_SOFT_HEAP_LIMIT               27
+#define PragTyp_STATS                         28
+#define PragTyp_SYNCHRONOUS                   29
+#define PragTyp_TABLE_INFO                    30
+#define PragTyp_TEMP_STORE                    31
+#define PragTyp_TEMP_STORE_DIRECTORY          32
+#define PragTyp_THREADS                       33
+#define PragTyp_WAL_AUTOCHECKPOINT            34
+#define PragTyp_WAL_CHECKPOINT                35
+#define PragTyp_ACTIVATE_EXTENSIONS           36
+#define PragTyp_HEXKEY                        37
+#define PragTyp_KEY                           38
+#define PragTyp_REKEY                         39
+#define PragTyp_LOCK_STATUS                   40
+#define PragTyp_PARSER_TRACE                  41
+#define PragFlag_NeedSchema           0x01
+#define PragFlag_ReadOnly             0x02
+static const struct sPragmaNames {
+  const char *const zName;  /* Name of pragma */
+  u8 ePragTyp;              /* PragTyp_XXX value */
+  u8 mPragFlag;             /* Zero or more PragFlag_XXX values */
+  u32 iArg;                 /* Extra argument */
+} aPragmaNames[] = {
