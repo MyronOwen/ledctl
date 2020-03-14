@@ -102050,3 +102050,229 @@ static const struct sPragmaNames {
   u8 mPragFlag;             /* Zero or more PragFlag_XXX values */
   u32 iArg;                 /* Extra argument */
 } aPragmaNames[] = {
+#if defined(SQLITE_HAS_CODEC) || defined(SQLITE_ENABLE_CEROD)
+  { /* zName:     */ "activate_extensions",
+    /* ePragTyp:  */ PragTyp_ACTIVATE_EXTENSIONS,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS)
+  { /* zName:     */ "application_id",
+    /* ePragTyp:  */ PragTyp_HEADER_VALUE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ BTREE_APPLICATION_ID },
+#endif
+#if !defined(SQLITE_OMIT_AUTOVACUUM)
+  { /* zName:     */ "auto_vacuum",
+    /* ePragTyp:  */ PragTyp_AUTO_VACUUM,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+#if !defined(SQLITE_OMIT_AUTOMATIC_INDEX)
+  { /* zName:     */ "automatic_index",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_AutoIndex },
+#endif
+#endif
+  { /* zName:     */ "busy_timeout",
+    /* ePragTyp:  */ PragTyp_BUSY_TIMEOUT,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
+  { /* zName:     */ "cache_size",
+    /* ePragTyp:  */ PragTyp_CACHE_SIZE,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "cache_spill",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_CacheSpill },
+#endif
+  { /* zName:     */ "case_sensitive_like",
+    /* ePragTyp:  */ PragTyp_CASE_SENSITIVE_LIKE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "checkpoint_fullfsync",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_CkptFullFSync },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  { /* zName:     */ "collation_list",
+    /* ePragTyp:  */ PragTyp_COLLATION_LIST,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_COMPILEOPTION_DIAGS)
+  { /* zName:     */ "compile_options",
+    /* ePragTyp:  */ PragTyp_COMPILE_OPTIONS,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "count_changes",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_CountRows },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS) && SQLITE_OS_WIN
+  { /* zName:     */ "data_store_directory",
+    /* ePragTyp:  */ PragTyp_DATA_STORE_DIRECTORY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS)
+  { /* zName:     */ "data_version",
+    /* ePragTyp:  */ PragTyp_HEADER_VALUE,
+    /* ePragFlag: */ PragFlag_ReadOnly,
+    /* iArg:      */ BTREE_DATA_VERSION },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  { /* zName:     */ "database_list",
+    /* ePragTyp:  */ PragTyp_DATABASE_LIST,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS) && !defined(SQLITE_OMIT_DEPRECATED)
+  { /* zName:     */ "default_cache_size",
+    /* ePragTyp:  */ PragTyp_DEFAULT_CACHE_SIZE,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+#if !defined(SQLITE_OMIT_FOREIGN_KEY) && !defined(SQLITE_OMIT_TRIGGER)
+  { /* zName:     */ "defer_foreign_keys",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_DeferFKs },
+#endif
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "empty_result_callbacks",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_NullCallback },
+#endif
+#if !defined(SQLITE_OMIT_UTF16)
+  { /* zName:     */ "encoding",
+    /* ePragTyp:  */ PragTyp_ENCODING,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FOREIGN_KEY) && !defined(SQLITE_OMIT_TRIGGER)
+  { /* zName:     */ "foreign_key_check",
+    /* ePragTyp:  */ PragTyp_FOREIGN_KEY_CHECK,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FOREIGN_KEY)
+  { /* zName:     */ "foreign_key_list",
+    /* ePragTyp:  */ PragTyp_FOREIGN_KEY_LIST,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+#if !defined(SQLITE_OMIT_FOREIGN_KEY) && !defined(SQLITE_OMIT_TRIGGER)
+  { /* zName:     */ "foreign_keys",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_ForeignKeys },
+#endif
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS)
+  { /* zName:     */ "freelist_count",
+    /* ePragTyp:  */ PragTyp_HEADER_VALUE,
+    /* ePragFlag: */ PragFlag_ReadOnly,
+    /* iArg:      */ BTREE_FREE_PAGE_COUNT },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "full_column_names",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_FullColNames },
+  { /* zName:     */ "fullfsync",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_FullFSync },
+#endif
+#if defined(SQLITE_HAS_CODEC)
+  { /* zName:     */ "hexkey",
+    /* ePragTyp:  */ PragTyp_HEXKEY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "hexrekey",
+    /* ePragTyp:  */ PragTyp_HEXKEY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+#if !defined(SQLITE_OMIT_CHECK)
+  { /* zName:     */ "ignore_check_constraints",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_IgnoreChecks },
+#endif
+#endif
+#if !defined(SQLITE_OMIT_AUTOVACUUM)
+  { /* zName:     */ "incremental_vacuum",
+    /* ePragTyp:  */ PragTyp_INCREMENTAL_VACUUM,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  { /* zName:     */ "index_info",
+    /* ePragTyp:  */ PragTyp_INDEX_INFO,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "index_list",
+    /* ePragTyp:  */ PragTyp_INDEX_LIST,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_INTEGRITY_CHECK)
+  { /* zName:     */ "integrity_check",
+    /* ePragTyp:  */ PragTyp_INTEGRITY_CHECK,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
+  { /* zName:     */ "journal_mode",
+    /* ePragTyp:  */ PragTyp_JOURNAL_MODE,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "journal_size_limit",
+    /* ePragTyp:  */ PragTyp_JOURNAL_SIZE_LIMIT,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if defined(SQLITE_HAS_CODEC)
+  { /* zName:     */ "key",
+    /* ePragTyp:  */ PragTyp_KEY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "legacy_file_format",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_LegacyFileFmt },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS) && SQLITE_ENABLE_LOCKING_STYLE
+  { /* zName:     */ "lock_proxy_file",
+    /* ePragTyp:  */ PragTyp_LOCK_PROXY_FILE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  { /* zName:     */ "lock_status",
+    /* ePragTyp:  */ PragTyp_LOCK_STATUS,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
+  { /* zName:     */ "locking_mode",
