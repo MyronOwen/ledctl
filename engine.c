@@ -102276,3 +102276,230 @@ static const struct sPragmaNames {
 #endif
 #if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
   { /* zName:     */ "locking_mode",
+    /* ePragTyp:  */ PragTyp_LOCKING_MODE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "max_page_count",
+    /* ePragTyp:  */ PragTyp_PAGE_COUNT,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "mmap_size",
+    /* ePragTyp:  */ PragTyp_MMAP_SIZE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "page_count",
+    /* ePragTyp:  */ PragTyp_PAGE_COUNT,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "page_size",
+    /* ePragTyp:  */ PragTyp_PAGE_SIZE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if defined(SQLITE_DEBUG)
+  { /* zName:     */ "parser_trace",
+    /* ePragTyp:  */ PragTyp_PARSER_TRACE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "query_only",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_QueryOnly },
+#endif
+#if !defined(SQLITE_OMIT_INTEGRITY_CHECK)
+  { /* zName:     */ "quick_check",
+    /* ePragTyp:  */ PragTyp_INTEGRITY_CHECK,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "read_uncommitted",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_ReadUncommitted },
+  { /* zName:     */ "recursive_triggers",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_RecTriggers },
+#endif
+#if defined(SQLITE_HAS_CODEC)
+  { /* zName:     */ "rekey",
+    /* ePragTyp:  */ PragTyp_REKEY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "reverse_unordered_selects",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_ReverseOrder },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS)
+  { /* zName:     */ "schema_version",
+    /* ePragTyp:  */ PragTyp_HEADER_VALUE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ BTREE_SCHEMA_VERSION },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
+  { /* zName:     */ "secure_delete",
+    /* ePragTyp:  */ PragTyp_SECURE_DELETE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "short_column_names",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_ShortColNames },
+#endif
+  { /* zName:     */ "shrink_memory",
+    /* ePragTyp:  */ PragTyp_SHRINK_MEMORY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "soft_heap_limit",
+    /* ePragTyp:  */ PragTyp_SOFT_HEAP_LIMIT,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+#if defined(SQLITE_DEBUG)
+  { /* zName:     */ "sql_trace",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_SqlTrace },
+#endif
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  { /* zName:     */ "stats",
+    /* ePragTyp:  */ PragTyp_STATS,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
+  { /* zName:     */ "synchronous",
+    /* ePragTyp:  */ PragTyp_SYNCHRONOUS,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  { /* zName:     */ "table_info",
+    /* ePragTyp:  */ PragTyp_TABLE_INFO,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_PAGER_PRAGMAS)
+  { /* zName:     */ "temp_store",
+    /* ePragTyp:  */ PragTyp_TEMP_STORE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "temp_store_directory",
+    /* ePragTyp:  */ PragTyp_TEMP_STORE_DIRECTORY,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#endif
+  { /* zName:     */ "threads",
+    /* ePragTyp:  */ PragTyp_THREADS,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+#if !defined(SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS)
+  { /* zName:     */ "user_version",
+    /* ePragTyp:  */ PragTyp_HEADER_VALUE,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ BTREE_USER_VERSION },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+#if defined(SQLITE_DEBUG)
+  { /* zName:     */ "vdbe_addoptrace",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_VdbeAddopTrace },
+  { /* zName:     */ "vdbe_debug",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_SqlTrace|SQLITE_VdbeListing|SQLITE_VdbeTrace },
+  { /* zName:     */ "vdbe_eqp",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_VdbeEQP },
+  { /* zName:     */ "vdbe_listing",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_VdbeListing },
+  { /* zName:     */ "vdbe_trace",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_VdbeTrace },
+#endif
+#endif
+#if !defined(SQLITE_OMIT_WAL)
+  { /* zName:     */ "wal_autocheckpoint",
+    /* ePragTyp:  */ PragTyp_WAL_AUTOCHECKPOINT,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ 0 },
+  { /* zName:     */ "wal_checkpoint",
+    /* ePragTyp:  */ PragTyp_WAL_CHECKPOINT,
+    /* ePragFlag: */ PragFlag_NeedSchema,
+    /* iArg:      */ 0 },
+#endif
+#if !defined(SQLITE_OMIT_FLAG_PRAGMAS)
+  { /* zName:     */ "writable_schema",
+    /* ePragTyp:  */ PragTyp_FLAG,
+    /* ePragFlag: */ 0,
+    /* iArg:      */ SQLITE_WriteSchema|SQLITE_RecoveryMode },
+#endif
+};
+/* Number of pragmas: 58 on by default, 71 total. */
+/* End of the automatically generated pragma table.
+***************************************************************************/
+
+/*
+** Interpret the given string as a safety level.  Return 0 for OFF,
+** 1 for ON or NORMAL and 2 for FULL.  Return 1 for an empty or 
+** unrecognized string argument.  The FULL option is disallowed
+** if the omitFull parameter it 1.
+**
+** Note that the values returned are one less that the values that
+** should be passed into sqlite3BtreeSetSafetyLevel().  The is done
+** to support legacy SQL code.  The safety level used to be boolean
+** and older scripts may have used numbers 0 for OFF and 1 for ON.
+*/
+static u8 getSafetyLevel(const char *z, int omitFull, u8 dflt){
+                             /* 123456789 123456789 */
+  static const char zText[] = "onoffalseyestruefull";
+  static const u8 iOffset[] = {0, 1, 2, 4, 9, 12, 16};
+  static const u8 iLength[] = {2, 2, 3, 5, 3, 4, 4};
+  static const u8 iValue[] =  {1, 0, 0, 0, 1, 1, 2};
+  int i, n;
+  if( sqlite3Isdigit(*z) ){
+    return (u8)sqlite3Atoi(z);
+  }
+  n = sqlite3Strlen30(z);
+  for(i=0; i<ArraySize(iLength)-omitFull; i++){
+    if( iLength[i]==n && sqlite3StrNICmp(&zText[iOffset[i]],z,n)==0 ){
+      return iValue[i];
+    }
+  }
+  return dflt;
+}
+
+/*
+** Interpret the given string as a boolean value.
+*/
+SQLITE_PRIVATE u8 sqlite3GetBoolean(const char *z, u8 dflt){
+  return getSafetyLevel(z,1,dflt)!=0;
+}
+
+/* The sqlite3GetBoolean() function is used by other modules but the
+** remainder of this file is specific to PRAGMA processing.  So omit
+** the rest of the file if PRAGMAs are omitted from the build.
+*/
+#if !defined(SQLITE_OMIT_PRAGMA)
+
+/*
+** Interpret the given string as a locking mode value.
+*/
+static int getLockingMode(const char *z){
+  if( z ){
+    if( 0==sqlite3StrICmp(z, "exclusive") ) return PAGER_LOCKINGMODE_EXCLUSIVE;
+    if( 0==sqlite3StrICmp(z, "normal") ) return PAGER_LOCKINGMODE_NORMAL;
