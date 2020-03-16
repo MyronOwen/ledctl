@@ -102503,3 +102503,231 @@ static int getLockingMode(const char *z){
   if( z ){
     if( 0==sqlite3StrICmp(z, "exclusive") ) return PAGER_LOCKINGMODE_EXCLUSIVE;
     if( 0==sqlite3StrICmp(z, "normal") ) return PAGER_LOCKINGMODE_NORMAL;
+  }
+  return PAGER_LOCKINGMODE_QUERY;
+}
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+/*
+** Interpret the given string as an auto-vacuum mode value.
+**
+** The following strings, "none", "full" and "incremental" are 
+** acceptable, as are their numeric equivalents: 0, 1 and 2 respectively.
+*/
+static int getAutoVacuum(const char *z){
+  int i;
+  if( 0==sqlite3StrICmp(z, "none") ) return BTREE_AUTOVACUUM_NONE;
+  if( 0==sqlite3StrICmp(z, "full") ) return BTREE_AUTOVACUUM_FULL;
+  if( 0==sqlite3StrICmp(z, "incremental") ) return BTREE_AUTOVACUUM_INCR;
+  i = sqlite3Atoi(z);
+  return (u8)((i>=0&&i<=2)?i:0);
+}
+#endif /* ifndef SQLITE_OMIT_AUTOVACUUM */
+
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+/*
+** Interpret the given string as a temp db location. Return 1 for file
+** backed temporary databases, 2 for the Red-Black tree in memory database
+** and 0 to use the compile-time default.
+*/
+static int getTempStore(const char *z){
+  if( z[0]>='0' && z[0]<='2' ){
+    return z[0] - '0';
+  }else if( sqlite3StrICmp(z, "file")==0 ){
+    return 1;
+  }else if( sqlite3StrICmp(z, "memory")==0 ){
+    return 2;
+  }else{
+    return 0;
+  }
+}
+#endif /* SQLITE_PAGER_PRAGMAS */
+
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+/*
+** Invalidate temp storage, either when the temp storage is changed
+** from default, or when 'file' and the temp_store_directory has changed
+*/
+static int invalidateTempStorage(Parse *pParse){
+  sqlite3 *db = pParse->db;
+  if( db->aDb[1].pBt!=0 ){
+    if( !db->autoCommit || sqlite3BtreeIsInReadTrans(db->aDb[1].pBt) ){
+      sqlite3ErrorMsg(pParse, "temporary storage cannot be changed "
+        "from within a transaction");
+      return SQLITE_ERROR;
+    }
+    sqlite3BtreeClose(db->aDb[1].pBt);
+    db->aDb[1].pBt = 0;
+    sqlite3ResetAllSchemasOfConnection(db);
+  }
+  return SQLITE_OK;
+}
+#endif /* SQLITE_PAGER_PRAGMAS */
+
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+/*
+** If the TEMP database is open, close it and mark the database schema
+** as needing reloading.  This must be done when using the SQLITE_TEMP_STORE
+** or DEFAULT_TEMP_STORE pragmas.
+*/
+static int changeTempStorage(Parse *pParse, const char *zStorageType){
+  int ts = getTempStore(zStorageType);
+  sqlite3 *db = pParse->db;
+  if( db->temp_store==ts ) return SQLITE_OK;
+  if( invalidateTempStorage( pParse ) != SQLITE_OK ){
+    return SQLITE_ERROR;
+  }
+  db->temp_store = (u8)ts;
+  return SQLITE_OK;
+}
+#endif /* SQLITE_PAGER_PRAGMAS */
+
+/*
+** Generate code to return a single integer value.
+*/
+static void returnSingleInt(Parse *pParse, const char *zLabel, i64 value){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  int mem = ++pParse->nMem;
+  i64 *pI64 = sqlite3DbMallocRaw(pParse->db, sizeof(value));
+  if( pI64 ){
+    memcpy(pI64, &value, sizeof(value));
+  }
+  sqlite3VdbeAddOp4(v, OP_Int64, 0, mem, 0, (char*)pI64, P4_INT64);
+  sqlite3VdbeSetNumCols(v, 1);
+  sqlite3VdbeSetColName(v, 0, COLNAME_NAME, zLabel, SQLITE_STATIC);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, mem, 1);
+}
+
+
+/*
+** Set the safety_level and pager flags for pager iDb.  Or if iDb<0
+** set these values for all pagers.
+*/
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+static void setAllPagerFlags(sqlite3 *db){
+  if( db->autoCommit ){
+    Db *pDb = db->aDb;
+    int n = db->nDb;
+    assert( SQLITE_FullFSync==PAGER_FULLFSYNC );
+    assert( SQLITE_CkptFullFSync==PAGER_CKPT_FULLFSYNC );
+    assert( SQLITE_CacheSpill==PAGER_CACHESPILL );
+    assert( (PAGER_FULLFSYNC | PAGER_CKPT_FULLFSYNC | PAGER_CACHESPILL)
+             ==  PAGER_FLAGS_MASK );
+    assert( (pDb->safety_level & PAGER_SYNCHRONOUS_MASK)==pDb->safety_level );
+    while( (n--) > 0 ){
+      if( pDb->pBt ){
+        sqlite3BtreeSetPagerFlags(pDb->pBt,
+                 pDb->safety_level | (db->flags & PAGER_FLAGS_MASK) );
+      }
+      pDb++;
+    }
+  }
+}
+#else
+# define setAllPagerFlags(X)  /* no-op */
+#endif
+
+
+/*
+** Return a human-readable name for a constraint resolution action.
+*/
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+static const char *actionName(u8 action){
+  const char *zName;
+  switch( action ){
+    case OE_SetNull:  zName = "SET NULL";        break;
+    case OE_SetDflt:  zName = "SET DEFAULT";     break;
+    case OE_Cascade:  zName = "CASCADE";         break;
+    case OE_Restrict: zName = "RESTRICT";        break;
+    default:          zName = "NO ACTION";  
+                      assert( action==OE_None ); break;
+  }
+  return zName;
+}
+#endif
+
+
+/*
+** Parameter eMode must be one of the PAGER_JOURNALMODE_XXX constants
+** defined in pager.h. This function returns the associated lowercase
+** journal-mode name.
+*/
+SQLITE_PRIVATE const char *sqlite3JournalModename(int eMode){
+  static char * const azModeName[] = {
+    "delete", "persist", "off", "truncate", "memory"
+#ifndef SQLITE_OMIT_WAL
+     , "wal"
+#endif
+  };
+  assert( PAGER_JOURNALMODE_DELETE==0 );
+  assert( PAGER_JOURNALMODE_PERSIST==1 );
+  assert( PAGER_JOURNALMODE_OFF==2 );
+  assert( PAGER_JOURNALMODE_TRUNCATE==3 );
+  assert( PAGER_JOURNALMODE_MEMORY==4 );
+  assert( PAGER_JOURNALMODE_WAL==5 );
+  assert( eMode>=0 && eMode<=ArraySize(azModeName) );
+
+  if( eMode==ArraySize(azModeName) ) return 0;
+  return azModeName[eMode];
+}
+
+/*
+** Process a pragma statement.  
+**
+** Pragmas are of this form:
+**
+**      PRAGMA [database.]id [= value]
+**
+** The identifier might also be a string.  The value is a string, and
+** identifier, or a number.  If minusFlag is true, then the value is
+** a number that was preceded by a minus sign.
+**
+** If the left side is "database.id" then pId1 is the database name
+** and pId2 is the id.  If the left side is just "id" then pId1 is the
+** id and pId2 is any empty string.
+*/
+SQLITE_PRIVATE void sqlite3Pragma(
+  Parse *pParse, 
+  Token *pId1,        /* First part of [database.]id field */
+  Token *pId2,        /* Second part of [database.]id field, or NULL */
+  Token *pValue,      /* Token for <value>, or NULL */
+  int minusFlag       /* True if a '-' sign preceded <value> */
+){
+  char *zLeft = 0;       /* Nul-terminated UTF-8 string <id> */
+  char *zRight = 0;      /* Nul-terminated UTF-8 string <value>, or NULL */
+  const char *zDb = 0;   /* The database name */
+  Token *pId;            /* Pointer to <id> token */
+  char *aFcntl[4];       /* Argument to SQLITE_FCNTL_PRAGMA */
+  int iDb;               /* Database index for <database> */
+  int lwr, upr, mid = 0;       /* Binary search bounds */
+  int rc;                      /* return value form SQLITE_FCNTL_PRAGMA */
+  sqlite3 *db = pParse->db;    /* The database connection */
+  Db *pDb;                     /* The specific database being pragmaed */
+  Vdbe *v = sqlite3GetVdbe(pParse);  /* Prepared statement */
+
+  if( v==0 ) return;
+  sqlite3VdbeRunOnlyOnce(v);
+  pParse->nMem = 2;
+
+  /* Interpret the [database.] part of the pragma statement. iDb is the
+  ** index of the database this pragma is being applied to in db.aDb[]. */
+  iDb = sqlite3TwoPartName(pParse, pId1, pId2, &pId);
+  if( iDb<0 ) return;
+  pDb = &db->aDb[iDb];
+
+  /* If the temp database has been explicitly named as part of the 
+  ** pragma, make sure it is open. 
+  */
+  if( iDb==1 && sqlite3OpenTempDatabase(pParse) ){
+    return;
+  }
+
+  zLeft = sqlite3NameFromToken(db, pId);
+  if( !zLeft ) return;
+  if( minusFlag ){
+    zRight = sqlite3MPrintf(db, "-%T", pValue);
+  }else{
+    zRight = sqlite3NameFromToken(db, pValue);
+  }
+
+  assert( pId2 );
