@@ -102954,3 +102954,239 @@ SQLITE_PRIVATE void sqlite3Pragma(
         ** Also, the sqlite3.dfltLockMode variable is set so that
         ** any subsequently attached databases also use the specified
         ** locking mode.
+        */
+        int ii;
+        assert(pDb==&db->aDb[0]);
+        for(ii=2; ii<db->nDb; ii++){
+          pPager = sqlite3BtreePager(db->aDb[ii].pBt);
+          sqlite3PagerLockingMode(pPager, eMode);
+        }
+        db->dfltLockMode = (u8)eMode;
+      }
+      pPager = sqlite3BtreePager(pDb->pBt);
+      eMode = sqlite3PagerLockingMode(pPager, eMode);
+    }
+
+    assert( eMode==PAGER_LOCKINGMODE_NORMAL
+            || eMode==PAGER_LOCKINGMODE_EXCLUSIVE );
+    if( eMode==PAGER_LOCKINGMODE_EXCLUSIVE ){
+      zRet = "exclusive";
+    }
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "locking_mode", SQLITE_STATIC);
+    sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, zRet, 0);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    break;
+  }
+
+  /*
+  **  PRAGMA [database.]journal_mode
+  **  PRAGMA [database.]journal_mode =
+  **                      (delete|persist|off|truncate|memory|wal|off)
+  */
+  case PragTyp_JOURNAL_MODE: {
+    int eMode;        /* One of the PAGER_JOURNALMODE_XXX symbols */
+    int ii;           /* Loop counter */
+
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "journal_mode", SQLITE_STATIC);
+
+    if( zRight==0 ){
+      /* If there is no "=MODE" part of the pragma, do a query for the
+      ** current mode */
+      eMode = PAGER_JOURNALMODE_QUERY;
+    }else{
+      const char *zMode;
+      int n = sqlite3Strlen30(zRight);
+      for(eMode=0; (zMode = sqlite3JournalModename(eMode))!=0; eMode++){
+        if( sqlite3StrNICmp(zRight, zMode, n)==0 ) break;
+      }
+      if( !zMode ){
+        /* If the "=MODE" part does not match any known journal mode,
+        ** then do a query */
+        eMode = PAGER_JOURNALMODE_QUERY;
+      }
+    }
+    if( eMode==PAGER_JOURNALMODE_QUERY && pId2->n==0 ){
+      /* Convert "PRAGMA journal_mode" into "PRAGMA main.journal_mode" */
+      iDb = 0;
+      pId2->n = 1;
+    }
+    for(ii=db->nDb-1; ii>=0; ii--){
+      if( db->aDb[ii].pBt && (ii==iDb || pId2->n==0) ){
+        sqlite3VdbeUsesBtree(v, ii);
+        sqlite3VdbeAddOp3(v, OP_JournalMode, ii, 1, eMode);
+      }
+    }
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    break;
+  }
+
+  /*
+  **  PRAGMA [database.]journal_size_limit
+  **  PRAGMA [database.]journal_size_limit=N
+  **
+  ** Get or set the size limit on rollback journal files.
+  */
+  case PragTyp_JOURNAL_SIZE_LIMIT: {
+    Pager *pPager = sqlite3BtreePager(pDb->pBt);
+    i64 iLimit = -2;
+    if( zRight ){
+      sqlite3DecOrHexToI64(zRight, &iLimit);
+      if( iLimit<-1 ) iLimit = -1;
+    }
+    iLimit = sqlite3PagerJournalSizeLimit(pPager, iLimit);
+    returnSingleInt(pParse, "journal_size_limit", iLimit);
+    break;
+  }
+
+#endif /* SQLITE_OMIT_PAGER_PRAGMAS */
+
+  /*
+  **  PRAGMA [database.]auto_vacuum
+  **  PRAGMA [database.]auto_vacuum=N
+  **
+  ** Get or set the value of the database 'auto-vacuum' parameter.
+  ** The value is one of:  0 NONE 1 FULL 2 INCREMENTAL
+  */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  case PragTyp_AUTO_VACUUM: {
+    Btree *pBt = pDb->pBt;
+    assert( pBt!=0 );
+    if( !zRight ){
+      returnSingleInt(pParse, "auto_vacuum", sqlite3BtreeGetAutoVacuum(pBt));
+    }else{
+      int eAuto = getAutoVacuum(zRight);
+      assert( eAuto>=0 && eAuto<=2 );
+      db->nextAutovac = (u8)eAuto;
+      /* Call SetAutoVacuum() to set initialize the internal auto and
+      ** incr-vacuum flags. This is required in case this connection
+      ** creates the database file. It is important that it is created
+      ** as an auto-vacuum capable db.
+      */
+      rc = sqlite3BtreeSetAutoVacuum(pBt, eAuto);
+      if( rc==SQLITE_OK && (eAuto==1 || eAuto==2) ){
+        /* When setting the auto_vacuum mode to either "full" or 
+        ** "incremental", write the value of meta[6] in the database
+        ** file. Before writing to meta[6], check that meta[3] indicates
+        ** that this really is an auto-vacuum capable database.
+        */
+        static const int iLn = VDBE_OFFSET_LINENO(2);
+        static const VdbeOpList setMeta6[] = {
+          { OP_Transaction,    0,         1,                 0},    /* 0 */
+          { OP_ReadCookie,     0,         1,         BTREE_LARGEST_ROOT_PAGE},
+          { OP_If,             1,         0,                 0},    /* 2 */
+          { OP_Halt,           SQLITE_OK, OE_Abort,          0},    /* 3 */
+          { OP_Integer,        0,         1,                 0},    /* 4 */
+          { OP_SetCookie,      0,         BTREE_INCR_VACUUM, 1},    /* 5 */
+        };
+        int iAddr;
+        iAddr = sqlite3VdbeAddOpList(v, ArraySize(setMeta6), setMeta6, iLn);
+        sqlite3VdbeChangeP1(v, iAddr, iDb);
+        sqlite3VdbeChangeP1(v, iAddr+1, iDb);
+        sqlite3VdbeChangeP2(v, iAddr+2, iAddr+4);
+        sqlite3VdbeChangeP1(v, iAddr+4, eAuto-1);
+        sqlite3VdbeChangeP1(v, iAddr+5, iDb);
+        sqlite3VdbeUsesBtree(v, iDb);
+      }
+    }
+    break;
+  }
+#endif
+
+  /*
+  **  PRAGMA [database.]incremental_vacuum(N)
+  **
+  ** Do N steps of incremental vacuuming on a database.
+  */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  case PragTyp_INCREMENTAL_VACUUM: {
+    int iLimit, addr;
+    if( zRight==0 || !sqlite3GetInt32(zRight, &iLimit) || iLimit<=0 ){
+      iLimit = 0x7fffffff;
+    }
+    sqlite3BeginWriteOperation(pParse, 0, iDb);
+    sqlite3VdbeAddOp2(v, OP_Integer, iLimit, 1);
+    addr = sqlite3VdbeAddOp1(v, OP_IncrVacuum, iDb); VdbeCoverage(v);
+    sqlite3VdbeAddOp1(v, OP_ResultRow, 1);
+    sqlite3VdbeAddOp2(v, OP_AddImm, 1, -1);
+    sqlite3VdbeAddOp2(v, OP_IfPos, 1, addr); VdbeCoverage(v);
+    sqlite3VdbeJumpHere(v, addr);
+    break;
+  }
+#endif
+
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+  /*
+  **  PRAGMA [database.]cache_size
+  **  PRAGMA [database.]cache_size=N
+  **
+  ** The first form reports the current local setting for the
+  ** page cache size. The second form sets the local
+  ** page cache size value.  If N is positive then that is the
+  ** number of pages in the cache.  If N is negative, then the
+  ** number of pages is adjusted so that the cache uses -N kibibytes
+  ** of memory.
+  */
+  case PragTyp_CACHE_SIZE: {
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    if( !zRight ){
+      returnSingleInt(pParse, "cache_size", pDb->pSchema->cache_size);
+    }else{
+      int size = sqlite3Atoi(zRight);
+      pDb->pSchema->cache_size = size;
+      sqlite3BtreeSetCacheSize(pDb->pBt, pDb->pSchema->cache_size);
+    }
+    break;
+  }
+
+  /*
+  **  PRAGMA [database.]mmap_size(N)
+  **
+  ** Used to set mapping size limit. The mapping size limit is
+  ** used to limit the aggregate size of all memory mapped regions of the
+  ** database file. If this parameter is set to zero, then memory mapping
+  ** is not used at all.  If N is negative, then the default memory map
+  ** limit determined by sqlite3_config(SQLITE_CONFIG_MMAP_SIZE) is set.
+  ** The parameter N is measured in bytes.
+  **
+  ** This value is advisory.  The underlying VFS is free to memory map
+  ** as little or as much as it wants.  Except, if N is set to 0 then the
+  ** upper layers will never invoke the xFetch interfaces to the VFS.
+  */
+  case PragTyp_MMAP_SIZE: {
+    sqlite3_int64 sz;
+#if SQLITE_MAX_MMAP_SIZE>0
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    if( zRight ){
+      int ii;
+      sqlite3DecOrHexToI64(zRight, &sz);
+      if( sz<0 ) sz = sqlite3GlobalConfig.szMmap;
+      if( pId2->n==0 ) db->szMmap = sz;
+      for(ii=db->nDb-1; ii>=0; ii--){
+        if( db->aDb[ii].pBt && (ii==iDb || pId2->n==0) ){
+          sqlite3BtreeSetMmapLimit(db->aDb[ii].pBt, sz);
+        }
+      }
+    }
+    sz = -1;
+    rc = sqlite3_file_control(db, zDb, SQLITE_FCNTL_MMAP_SIZE, &sz);
+#else
+    sz = 0;
+    rc = SQLITE_OK;
+#endif
+    if( rc==SQLITE_OK ){
+      returnSingleInt(pParse, "mmap_size", sz);
+    }else if( rc!=SQLITE_NOTFOUND ){
+      pParse->nErr++;
+      pParse->rc = rc;
+    }
+    break;
+  }
+
+  /*
+  **   PRAGMA temp_store
+  **   PRAGMA temp_store = "default"|"memory"|"file"
+  **
+  ** Return or set the local value of the temp_store flag.  Changing
+  ** the local value does not make changes to the disk file and the default
