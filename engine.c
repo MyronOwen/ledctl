@@ -103396,3 +103396,222 @@ SQLITE_PRIVATE void sqlite3Pragma(
       */
       sqlite3VdbeAddOp2(v, OP_Expire, 0, 0);
       setAllPagerFlags(db);
+    }
+    break;
+  }
+#endif /* SQLITE_OMIT_FLAG_PRAGMAS */
+
+#ifndef SQLITE_OMIT_SCHEMA_PRAGMAS
+  /*
+  **   PRAGMA table_info(<table>)
+  **
+  ** Return a single row for each column of the named table. The columns of
+  ** the returned data set are:
+  **
+  ** cid:        Column id (numbered from left to right, starting at 0)
+  ** name:       Column name
+  ** type:       Column declaration type.
+  ** notnull:    True if 'NOT NULL' is part of column declaration
+  ** dflt_value: The default value for the column, if any.
+  */
+  case PragTyp_TABLE_INFO: if( zRight ){
+    Table *pTab;
+    pTab = sqlite3FindTable(db, zRight, zDb);
+    if( pTab ){
+      int i, k;
+      int nHidden = 0;
+      Column *pCol;
+      Index *pPk = sqlite3PrimaryKeyIndex(pTab);
+      sqlite3VdbeSetNumCols(v, 6);
+      pParse->nMem = 6;
+      sqlite3CodeVerifySchema(pParse, iDb);
+      sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "cid", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "name", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "type", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 3, COLNAME_NAME, "notnull", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 4, COLNAME_NAME, "dflt_value", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 5, COLNAME_NAME, "pk", SQLITE_STATIC);
+      sqlite3ViewGetColumnNames(pParse, pTab);
+      for(i=0, pCol=pTab->aCol; i<pTab->nCol; i++, pCol++){
+        if( IsHiddenColumn(pCol) ){
+          nHidden++;
+          continue;
+        }
+        sqlite3VdbeAddOp2(v, OP_Integer, i-nHidden, 1);
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, pCol->zName, 0);
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+           pCol->zType ? pCol->zType : "", 0);
+        sqlite3VdbeAddOp2(v, OP_Integer, (pCol->notNull ? 1 : 0), 4);
+        if( pCol->zDflt ){
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 5, 0, (char*)pCol->zDflt, 0);
+        }else{
+          sqlite3VdbeAddOp2(v, OP_Null, 0, 5);
+        }
+        if( (pCol->colFlags & COLFLAG_PRIMKEY)==0 ){
+          k = 0;
+        }else if( pPk==0 ){
+          k = 1;
+        }else{
+          for(k=1; ALWAYS(k<=pTab->nCol) && pPk->aiColumn[k-1]!=i; k++){}
+        }
+        sqlite3VdbeAddOp2(v, OP_Integer, k, 6);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 6);
+      }
+    }
+  }
+  break;
+
+  case PragTyp_STATS: {
+    Index *pIdx;
+    HashElem *i;
+    v = sqlite3GetVdbe(pParse);
+    sqlite3VdbeSetNumCols(v, 4);
+    pParse->nMem = 4;
+    sqlite3CodeVerifySchema(pParse, iDb);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "table", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "index", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "width", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 3, COLNAME_NAME, "height", SQLITE_STATIC);
+    for(i=sqliteHashFirst(&pDb->pSchema->tblHash); i; i=sqliteHashNext(i)){
+      Table *pTab = sqliteHashData(i);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, pTab->zName, 0);
+      sqlite3VdbeAddOp2(v, OP_Null, 0, 2);
+      sqlite3VdbeAddOp2(v, OP_Integer,
+                           (int)sqlite3LogEstToInt(pTab->szTabRow), 3);
+      sqlite3VdbeAddOp2(v, OP_Integer, 
+          (int)sqlite3LogEstToInt(pTab->nRowLogEst), 4);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 4);
+      for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, pIdx->zName, 0);
+        sqlite3VdbeAddOp2(v, OP_Integer,
+                             (int)sqlite3LogEstToInt(pIdx->szIdxRow), 3);
+        sqlite3VdbeAddOp2(v, OP_Integer, 
+            (int)sqlite3LogEstToInt(pIdx->aiRowLogEst[0]), 4);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 4);
+      }
+    }
+  }
+  break;
+
+  case PragTyp_INDEX_INFO: if( zRight ){
+    Index *pIdx;
+    Table *pTab;
+    pIdx = sqlite3FindIndex(db, zRight, zDb);
+    if( pIdx ){
+      int i;
+      pTab = pIdx->pTable;
+      sqlite3VdbeSetNumCols(v, 3);
+      pParse->nMem = 3;
+      sqlite3CodeVerifySchema(pParse, iDb);
+      sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "seqno", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "cid", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "name", SQLITE_STATIC);
+      for(i=0; i<pIdx->nKeyCol; i++){
+        i16 cnum = pIdx->aiColumn[i];
+        sqlite3VdbeAddOp2(v, OP_Integer, i, 1);
+        sqlite3VdbeAddOp2(v, OP_Integer, cnum, 2);
+        assert( pTab->nCol>cnum );
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, pTab->aCol[cnum].zName, 0);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 3);
+      }
+    }
+  }
+  break;
+
+  case PragTyp_INDEX_LIST: if( zRight ){
+    Index *pIdx;
+    Table *pTab;
+    int i;
+    pTab = sqlite3FindTable(db, zRight, zDb);
+    if( pTab ){
+      v = sqlite3GetVdbe(pParse);
+      sqlite3VdbeSetNumCols(v, 3);
+      pParse->nMem = 3;
+      sqlite3CodeVerifySchema(pParse, iDb);
+      sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "seq", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "name", SQLITE_STATIC);
+      sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "unique", SQLITE_STATIC);
+      for(pIdx=pTab->pIndex, i=0; pIdx; pIdx=pIdx->pNext, i++){
+        sqlite3VdbeAddOp2(v, OP_Integer, i, 1);
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, pIdx->zName, 0);
+        sqlite3VdbeAddOp2(v, OP_Integer, IsUniqueIndex(pIdx), 3);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 3);
+      }
+    }
+  }
+  break;
+
+  case PragTyp_DATABASE_LIST: {
+    int i;
+    sqlite3VdbeSetNumCols(v, 3);
+    pParse->nMem = 3;
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "seq", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "name", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "file", SQLITE_STATIC);
+    for(i=0; i<db->nDb; i++){
+      if( db->aDb[i].pBt==0 ) continue;
+      assert( db->aDb[i].zName!=0 );
+      sqlite3VdbeAddOp2(v, OP_Integer, i, 1);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, db->aDb[i].zName, 0);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+           sqlite3BtreeGetFilename(db->aDb[i].pBt), 0);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 3);
+    }
+  }
+  break;
+
+  case PragTyp_COLLATION_LIST: {
+    int i = 0;
+    HashElem *p;
+    sqlite3VdbeSetNumCols(v, 2);
+    pParse->nMem = 2;
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "seq", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "name", SQLITE_STATIC);
+    for(p=sqliteHashFirst(&db->aCollSeq); p; p=sqliteHashNext(p)){
+      CollSeq *pColl = (CollSeq *)sqliteHashData(p);
+      sqlite3VdbeAddOp2(v, OP_Integer, i++, 1);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, pColl->zName, 0);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+  }
+  break;
+#endif /* SQLITE_OMIT_SCHEMA_PRAGMAS */
+
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+  case PragTyp_FOREIGN_KEY_LIST: if( zRight ){
+    FKey *pFK;
+    Table *pTab;
+    pTab = sqlite3FindTable(db, zRight, zDb);
+    if( pTab ){
+      v = sqlite3GetVdbe(pParse);
+      pFK = pTab->pFKey;
+      if( pFK ){
+        int i = 0; 
+        sqlite3VdbeSetNumCols(v, 8);
+        pParse->nMem = 8;
+        sqlite3CodeVerifySchema(pParse, iDb);
+        sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "id", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "seq", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "table", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 3, COLNAME_NAME, "from", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 4, COLNAME_NAME, "to", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 5, COLNAME_NAME, "on_update", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 6, COLNAME_NAME, "on_delete", SQLITE_STATIC);
+        sqlite3VdbeSetColName(v, 7, COLNAME_NAME, "match", SQLITE_STATIC);
+        while(pFK){
+          int j;
+          for(j=0; j<pFK->nCol; j++){
+            char *zCol = pFK->aCol[j].zCol;
+            char *zOnDelete = (char *)actionName(pFK->aAction[0]);
+            char *zOnUpdate = (char *)actionName(pFK->aAction[1]);
+            sqlite3VdbeAddOp2(v, OP_Integer, i, 1);
+            sqlite3VdbeAddOp2(v, OP_Integer, j, 2);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, pFK->zTo, 0);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 4, 0,
+                              pTab->aCol[pFK->aCol[j].iFrom].zName, 0);
+            sqlite3VdbeAddOp4(v, zCol ? OP_String8 : OP_Null, 0, 5, 0, zCol, 0);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 6, 0, zOnUpdate, 0);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 7, 0, zOnDelete, 0);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 8, 0, "NONE", 0);
+            sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 8);
+          }
