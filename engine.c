@@ -103854,3 +103854,252 @@ SQLITE_PRIVATE void sqlite3Pragma(
           VdbeComment((v, "%s", pIdx->zName));
           cnt++;
         }
+      }
+
+      /* Make sure sufficient number of registers have been allocated */
+      pParse->nMem = MAX( pParse->nMem, cnt+8 );
+
+      /* Do the b-tree integrity checks */
+      sqlite3VdbeAddOp3(v, OP_IntegrityCk, 2, cnt, 1);
+      sqlite3VdbeChangeP5(v, (u8)i);
+      addr = sqlite3VdbeAddOp1(v, OP_IsNull, 2); VdbeCoverage(v);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+         sqlite3MPrintf(db, "*** in database %s ***\n", db->aDb[i].zName),
+         P4_DYNAMIC);
+      sqlite3VdbeAddOp3(v, OP_Move, 2, 4, 1);
+      sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 2);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 2, 1);
+      sqlite3VdbeJumpHere(v, addr);
+
+      /* Make sure all the indices are constructed correctly.
+      */
+      for(x=sqliteHashFirst(pTbls); x && !isQuick; x=sqliteHashNext(x)){
+        Table *pTab = sqliteHashData(x);
+        Index *pIdx, *pPk;
+        Index *pPrior = 0;
+        int loopTop;
+        int iDataCur, iIdxCur;
+        int r1 = -1;
+
+        if( pTab->pIndex==0 ) continue;
+        pPk = HasRowid(pTab) ? 0 : sqlite3PrimaryKeyIndex(pTab);
+        addr = sqlite3VdbeAddOp1(v, OP_IfPos, 1);  /* Stop if out of errors */
+        VdbeCoverage(v);
+        sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+        sqlite3VdbeJumpHere(v, addr);
+        sqlite3ExprCacheClear(pParse);
+        sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenRead,
+                                   1, 0, &iDataCur, &iIdxCur);
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, 7);
+        for(j=0, pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext, j++){
+          sqlite3VdbeAddOp2(v, OP_Integer, 0, 8+j); /* index entries counter */
+        }
+        pParse->nMem = MAX(pParse->nMem, 8+j);
+        sqlite3VdbeAddOp2(v, OP_Rewind, iDataCur, 0); VdbeCoverage(v);
+        loopTop = sqlite3VdbeAddOp2(v, OP_AddImm, 7, 1);
+        /* Verify that all NOT NULL columns really are NOT NULL */
+        for(j=0; j<pTab->nCol; j++){
+          char *zErr;
+          int jmp2, jmp3;
+          if( j==pTab->iPKey ) continue;
+          if( pTab->aCol[j].notNull==0 ) continue;
+          sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, j, 3);
+          sqlite3VdbeChangeP5(v, OPFLAG_TYPEOFARG);
+          jmp2 = sqlite3VdbeAddOp1(v, OP_NotNull, 3); VdbeCoverage(v);
+          sqlite3VdbeAddOp2(v, OP_AddImm, 1, -1); /* Decrement error limit */
+          zErr = sqlite3MPrintf(db, "NULL value in %s.%s", pTab->zName,
+                              pTab->aCol[j].zName);
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErr, P4_DYNAMIC);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+          jmp3 = sqlite3VdbeAddOp1(v, OP_IfPos, 1); VdbeCoverage(v);
+          sqlite3VdbeAddOp0(v, OP_Halt);
+          sqlite3VdbeJumpHere(v, jmp2);
+          sqlite3VdbeJumpHere(v, jmp3);
+        }
+        /* Validate index entries for the current row */
+        for(j=0, pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext, j++){
+          int jmp2, jmp3, jmp4, jmp5;
+          int ckUniq = sqlite3VdbeMakeLabel(v);
+          if( pPk==pIdx ) continue;
+          r1 = sqlite3GenerateIndexKey(pParse, pIdx, iDataCur, 0, 0, &jmp3,
+                                       pPrior, r1);
+          pPrior = pIdx;
+          sqlite3VdbeAddOp2(v, OP_AddImm, 8+j, 1);  /* increment entry count */
+          /* Verify that an index entry exists for the current table row */
+          jmp2 = sqlite3VdbeAddOp4Int(v, OP_Found, iIdxCur+j, ckUniq, r1,
+                                      pIdx->nColumn); VdbeCoverage(v);
+          sqlite3VdbeAddOp2(v, OP_AddImm, 1, -1); /* Decrement error limit */
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, "row ", P4_STATIC);
+          sqlite3VdbeAddOp3(v, OP_Concat, 7, 3, 3);
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 4, 0, 
+                            " missing from index ", P4_STATIC);
+          sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 3);
+          jmp5 = sqlite3VdbeAddOp4(v, OP_String8, 0, 4, 0,
+                                   pIdx->zName, P4_TRANSIENT);
+          sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 3);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+          jmp4 = sqlite3VdbeAddOp1(v, OP_IfPos, 1); VdbeCoverage(v);
+          sqlite3VdbeAddOp0(v, OP_Halt);
+          sqlite3VdbeJumpHere(v, jmp2);
+          /* For UNIQUE indexes, verify that only one entry exists with the
+          ** current key.  The entry is unique if (1) any column is NULL
+          ** or (2) the next entry has a different key */
+          if( IsUniqueIndex(pIdx) ){
+            int uniqOk = sqlite3VdbeMakeLabel(v);
+            int jmp6;
+            int kk;
+            for(kk=0; kk<pIdx->nKeyCol; kk++){
+              int iCol = pIdx->aiColumn[kk];
+              assert( iCol>=0 && iCol<pTab->nCol );
+              if( pTab->aCol[iCol].notNull ) continue;
+              sqlite3VdbeAddOp2(v, OP_IsNull, r1+kk, uniqOk);
+              VdbeCoverage(v);
+            }
+            jmp6 = sqlite3VdbeAddOp1(v, OP_Next, iIdxCur+j); VdbeCoverage(v);
+            sqlite3VdbeAddOp2(v, OP_Goto, 0, uniqOk);
+            sqlite3VdbeJumpHere(v, jmp6);
+            sqlite3VdbeAddOp4Int(v, OP_IdxGT, iIdxCur+j, uniqOk, r1,
+                                 pIdx->nKeyCol); VdbeCoverage(v);
+            sqlite3VdbeAddOp2(v, OP_AddImm, 1, -1); /* Decrement error limit */
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+                              "non-unique entry in index ", P4_STATIC);
+            sqlite3VdbeAddOp2(v, OP_Goto, 0, jmp5);
+            sqlite3VdbeResolveLabel(v, uniqOk);
+          }
+          sqlite3VdbeJumpHere(v, jmp4);
+          sqlite3ResolvePartIdxLabel(pParse, jmp3);
+        }
+        sqlite3VdbeAddOp2(v, OP_Next, iDataCur, loopTop); VdbeCoverage(v);
+        sqlite3VdbeJumpHere(v, loopTop-1);
+#ifndef SQLITE_OMIT_BTREECOUNT
+        sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, 
+                     "wrong # of entries in index ", P4_STATIC);
+        for(j=0, pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext, j++){
+          if( pPk==pIdx ) continue;
+          addr = sqlite3VdbeCurrentAddr(v);
+          sqlite3VdbeAddOp2(v, OP_IfPos, 1, addr+2); VdbeCoverage(v);
+          sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+          sqlite3VdbeAddOp2(v, OP_Count, iIdxCur+j, 3);
+          sqlite3VdbeAddOp3(v, OP_Eq, 8+j, addr+8, 3); VdbeCoverage(v);
+          sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+          sqlite3VdbeAddOp2(v, OP_AddImm, 1, -1);
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, pIdx->zName, P4_TRANSIENT);
+          sqlite3VdbeAddOp3(v, OP_Concat, 3, 2, 7);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 7, 1);
+        }
+#endif /* SQLITE_OMIT_BTREECOUNT */
+      } 
+    }
+    addr = sqlite3VdbeAddOpList(v, ArraySize(endCode), endCode, iLn);
+    sqlite3VdbeChangeP3(v, addr, -mxErr);
+    sqlite3VdbeJumpHere(v, addr);
+    sqlite3VdbeChangeP4(v, addr+1, "ok", P4_STATIC);
+  }
+  break;
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+#ifndef SQLITE_OMIT_UTF16
+  /*
+  **   PRAGMA encoding
+  **   PRAGMA encoding = "utf-8"|"utf-16"|"utf-16le"|"utf-16be"
+  **
+  ** In its first form, this pragma returns the encoding of the main
+  ** database. If the database is not initialized, it is initialized now.
+  **
+  ** The second form of this pragma is a no-op if the main database file
+  ** has not already been initialized. In this case it sets the default
+  ** encoding that will be used for the main database file if a new file
+  ** is created. If an existing main database file is opened, then the
+  ** default text encoding for the existing database is used.
+  ** 
+  ** In all cases new databases created using the ATTACH command are
+  ** created to use the same default text encoding as the main database. If
+  ** the main database has not been initialized and/or created when ATTACH
+  ** is executed, this is done before the ATTACH operation.
+  **
+  ** In the second form this pragma sets the text encoding to be used in
+  ** new database files created using this database handle. It is only
+  ** useful if invoked immediately after the main database i
+  */
+  case PragTyp_ENCODING: {
+    static const struct EncName {
+      char *zName;
+      u8 enc;
+    } encnames[] = {
+      { "UTF8",     SQLITE_UTF8        },
+      { "UTF-8",    SQLITE_UTF8        },  /* Must be element [1] */
+      { "UTF-16le", SQLITE_UTF16LE     },  /* Must be element [2] */
+      { "UTF-16be", SQLITE_UTF16BE     },  /* Must be element [3] */
+      { "UTF16le",  SQLITE_UTF16LE     },
+      { "UTF16be",  SQLITE_UTF16BE     },
+      { "UTF-16",   0                  }, /* SQLITE_UTF16NATIVE */
+      { "UTF16",    0                  }, /* SQLITE_UTF16NATIVE */
+      { 0, 0 }
+    };
+    const struct EncName *pEnc;
+    if( !zRight ){    /* "PRAGMA encoding" */
+      if( sqlite3ReadSchema(pParse) ) goto pragma_out;
+      sqlite3VdbeSetNumCols(v, 1);
+      sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "encoding", SQLITE_STATIC);
+      sqlite3VdbeAddOp2(v, OP_String8, 0, 1);
+      assert( encnames[SQLITE_UTF8].enc==SQLITE_UTF8 );
+      assert( encnames[SQLITE_UTF16LE].enc==SQLITE_UTF16LE );
+      assert( encnames[SQLITE_UTF16BE].enc==SQLITE_UTF16BE );
+      sqlite3VdbeChangeP4(v, -1, encnames[ENC(pParse->db)].zName, P4_STATIC);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    }else{                        /* "PRAGMA encoding = XXX" */
+      /* Only change the value of sqlite.enc if the database handle is not
+      ** initialized. If the main database exists, the new sqlite.enc value
+      ** will be overwritten when the schema is next loaded. If it does not
+      ** already exists, it will be created to use the new encoding value.
+      */
+      if( 
+        !(DbHasProperty(db, 0, DB_SchemaLoaded)) || 
+        DbHasProperty(db, 0, DB_Empty) 
+      ){
+        for(pEnc=&encnames[0]; pEnc->zName; pEnc++){
+          if( 0==sqlite3StrICmp(zRight, pEnc->zName) ){
+            SCHEMA_ENC(db) = ENC(db) =
+                pEnc->enc ? pEnc->enc : SQLITE_UTF16NATIVE;
+            break;
+          }
+        }
+        if( !pEnc->zName ){
+          sqlite3ErrorMsg(pParse, "unsupported encoding: %s", zRight);
+        }
+      }
+    }
+  }
+  break;
+#endif /* SQLITE_OMIT_UTF16 */
+
+#ifndef SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS
+  /*
+  **   PRAGMA [database.]schema_version
+  **   PRAGMA [database.]schema_version = <integer>
+  **
+  **   PRAGMA [database.]user_version
+  **   PRAGMA [database.]user_version = <integer>
+  **
+  **   PRAGMA [database.]freelist_count = <integer>
+  **
+  **   PRAGMA [database.]application_id
+  **   PRAGMA [database.]application_id = <integer>
+  **
+  ** The pragma's schema_version and user_version are used to set or get
+  ** the value of the schema-version and user-version, respectively. Both
+  ** the schema-version and the user-version are 32-bit signed integers
+  ** stored in the database header.
+  **
+  ** The schema-cookie is usually only manipulated internally by SQLite. It
+  ** is incremented by SQLite whenever the database schema is modified (by
+  ** creating or dropping a table or index). The schema version is used by
+  ** SQLite each time a query is executed to ensure that the internal cache
+  ** of the schema used when compiling the SQL query matches the schema of
+  ** the database against which the compiled query is actually executed.
+  ** Subverting this mechanism by using "PRAGMA schema_version" to modify
+  ** the schema-version is potentially dangerous and may lead to program
+  ** crashes or database corruption. Use with caution!
+  **
+  ** The user-version is not used internally by SQLite. It may be used by
+  ** applications for any purpose.
