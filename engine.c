@@ -104103,3 +104103,212 @@ SQLITE_PRIVATE void sqlite3Pragma(
   **
   ** The user-version is not used internally by SQLite. It may be used by
   ** applications for any purpose.
+  */
+  case PragTyp_HEADER_VALUE: {
+    int iCookie = aPragmaNames[mid].iArg;  /* Which cookie to read or write */
+    sqlite3VdbeUsesBtree(v, iDb);
+    if( zRight && (aPragmaNames[mid].mPragFlag & PragFlag_ReadOnly)==0 ){
+      /* Write the specified cookie value */
+      static const VdbeOpList setCookie[] = {
+        { OP_Transaction,    0,  1,  0},    /* 0 */
+        { OP_Integer,        0,  1,  0},    /* 1 */
+        { OP_SetCookie,      0,  0,  1},    /* 2 */
+      };
+      int addr = sqlite3VdbeAddOpList(v, ArraySize(setCookie), setCookie, 0);
+      sqlite3VdbeChangeP1(v, addr, iDb);
+      sqlite3VdbeChangeP1(v, addr+1, sqlite3Atoi(zRight));
+      sqlite3VdbeChangeP1(v, addr+2, iDb);
+      sqlite3VdbeChangeP2(v, addr+2, iCookie);
+    }else{
+      /* Read the specified cookie value */
+      static const VdbeOpList readCookie[] = {
+        { OP_Transaction,     0,  0,  0},    /* 0 */
+        { OP_ReadCookie,      0,  1,  0},    /* 1 */
+        { OP_ResultRow,       1,  1,  0}
+      };
+      int addr = sqlite3VdbeAddOpList(v, ArraySize(readCookie), readCookie, 0);
+      sqlite3VdbeChangeP1(v, addr, iDb);
+      sqlite3VdbeChangeP1(v, addr+1, iDb);
+      sqlite3VdbeChangeP3(v, addr+1, iCookie);
+      sqlite3VdbeSetNumCols(v, 1);
+      sqlite3VdbeSetColName(v, 0, COLNAME_NAME, zLeft, SQLITE_TRANSIENT);
+    }
+  }
+  break;
+#endif /* SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS */
+
+#ifndef SQLITE_OMIT_COMPILEOPTION_DIAGS
+  /*
+  **   PRAGMA compile_options
+  **
+  ** Return the names of all compile-time options used in this build,
+  ** one option per row.
+  */
+  case PragTyp_COMPILE_OPTIONS: {
+    int i = 0;
+    const char *zOpt;
+    sqlite3VdbeSetNumCols(v, 1);
+    pParse->nMem = 1;
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "compile_option", SQLITE_STATIC);
+    while( (zOpt = sqlite3_compileoption_get(i++))!=0 ){
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, zOpt, 0);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    }
+  }
+  break;
+#endif /* SQLITE_OMIT_COMPILEOPTION_DIAGS */
+
+#ifndef SQLITE_OMIT_WAL
+  /*
+  **   PRAGMA [database.]wal_checkpoint = passive|full|restart|truncate
+  **
+  ** Checkpoint the database.
+  */
+  case PragTyp_WAL_CHECKPOINT: {
+    int iBt = (pId2->z?iDb:SQLITE_MAX_ATTACHED);
+    int eMode = SQLITE_CHECKPOINT_PASSIVE;
+    if( zRight ){
+      if( sqlite3StrICmp(zRight, "full")==0 ){
+        eMode = SQLITE_CHECKPOINT_FULL;
+      }else if( sqlite3StrICmp(zRight, "restart")==0 ){
+        eMode = SQLITE_CHECKPOINT_RESTART;
+      }else if( sqlite3StrICmp(zRight, "truncate")==0 ){
+        eMode = SQLITE_CHECKPOINT_TRUNCATE;
+      }
+    }
+    sqlite3VdbeSetNumCols(v, 3);
+    pParse->nMem = 3;
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "busy", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "log", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 2, COLNAME_NAME, "checkpointed", SQLITE_STATIC);
+
+    sqlite3VdbeAddOp3(v, OP_Checkpoint, iBt, eMode, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 3);
+  }
+  break;
+
+  /*
+  **   PRAGMA wal_autocheckpoint
+  **   PRAGMA wal_autocheckpoint = N
+  **
+  ** Configure a database connection to automatically checkpoint a database
+  ** after accumulating N frames in the log. Or query for the current value
+  ** of N.
+  */
+  case PragTyp_WAL_AUTOCHECKPOINT: {
+    if( zRight ){
+      sqlite3_wal_autocheckpoint(db, sqlite3Atoi(zRight));
+    }
+    returnSingleInt(pParse, "wal_autocheckpoint", 
+       db->xWalCallback==sqlite3WalDefaultHook ? 
+           SQLITE_PTR_TO_INT(db->pWalArg) : 0);
+  }
+  break;
+#endif
+
+  /*
+  **  PRAGMA shrink_memory
+  **
+  ** This pragma attempts to free as much memory as possible from the
+  ** current database connection.
+  */
+  case PragTyp_SHRINK_MEMORY: {
+    sqlite3_db_release_memory(db);
+    break;
+  }
+
+  /*
+  **   PRAGMA busy_timeout
+  **   PRAGMA busy_timeout = N
+  **
+  ** Call sqlite3_busy_timeout(db, N).  Return the current timeout value
+  ** if one is set.  If no busy handler or a different busy handler is set
+  ** then 0 is returned.  Setting the busy_timeout to 0 or negative
+  ** disables the timeout.
+  */
+  /*case PragTyp_BUSY_TIMEOUT*/ default: {
+    assert( aPragmaNames[mid].ePragTyp==PragTyp_BUSY_TIMEOUT );
+    if( zRight ){
+      sqlite3_busy_timeout(db, sqlite3Atoi(zRight));
+    }
+    returnSingleInt(pParse, "timeout",  db->busyTimeout);
+    break;
+  }
+
+  /*
+  **   PRAGMA soft_heap_limit
+  **   PRAGMA soft_heap_limit = N
+  **
+  ** Call sqlite3_soft_heap_limit64(N).  Return the result.  If N is omitted,
+  ** use -1.
+  */
+  case PragTyp_SOFT_HEAP_LIMIT: {
+    sqlite3_int64 N;
+    if( zRight && sqlite3DecOrHexToI64(zRight, &N)==SQLITE_OK ){
+      sqlite3_soft_heap_limit64(N);
+    }
+    returnSingleInt(pParse, "soft_heap_limit",  sqlite3_soft_heap_limit64(-1));
+    break;
+  }
+
+  /*
+  **   PRAGMA threads
+  **   PRAGMA threads = N
+  **
+  ** Configure the maximum number of worker threads.  Return the new
+  ** maximum, which might be less than requested.
+  */
+  case PragTyp_THREADS: {
+    sqlite3_int64 N;
+    if( zRight
+     && sqlite3DecOrHexToI64(zRight, &N)==SQLITE_OK
+     && N>=0
+    ){
+      sqlite3_limit(db, SQLITE_LIMIT_WORKER_THREADS, (int)(N&0x7fffffff));
+    }
+    returnSingleInt(pParse, "threads",
+                    sqlite3_limit(db, SQLITE_LIMIT_WORKER_THREADS, -1));
+    break;
+  }
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  /*
+  ** Report the current state of file logs for all databases
+  */
+  case PragTyp_LOCK_STATUS: {
+    static const char *const azLockName[] = {
+      "unlocked", "shared", "reserved", "pending", "exclusive"
+    };
+    int i;
+    sqlite3VdbeSetNumCols(v, 2);
+    pParse->nMem = 2;
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "database", SQLITE_STATIC);
+    sqlite3VdbeSetColName(v, 1, COLNAME_NAME, "status", SQLITE_STATIC);
+    for(i=0; i<db->nDb; i++){
+      Btree *pBt;
+      const char *zState = "unknown";
+      int j;
+      if( db->aDb[i].zName==0 ) continue;
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, db->aDb[i].zName, P4_STATIC);
+      pBt = db->aDb[i].pBt;
+      if( pBt==0 || sqlite3BtreePager(pBt)==0 ){
+        zState = "closed";
+      }else if( sqlite3_file_control(db, i ? db->aDb[i].zName : 0, 
+                                     SQLITE_FCNTL_LOCKSTATE, &j)==SQLITE_OK ){
+         zState = azLockName[j];
+      }
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 2, 0, zState, P4_STATIC);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 2);
+    }
+    break;
+  }
+#endif
+
+#ifdef SQLITE_HAS_CODEC
+  case PragTyp_KEY: {
+    if( zRight ) sqlite3_key_v2(db, zDb, zRight, sqlite3Strlen30(zRight));
+    break;
+  }
+  case PragTyp_REKEY: {
+    if( zRight ) sqlite3_rekey_v2(db, zDb, zRight, sqlite3Strlen30(zRight));
+    break;
