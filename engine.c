@@ -104312,3 +104312,223 @@ SQLITE_PRIVATE void sqlite3Pragma(
   case PragTyp_REKEY: {
     if( zRight ) sqlite3_rekey_v2(db, zDb, zRight, sqlite3Strlen30(zRight));
     break;
+  }
+  case PragTyp_HEXKEY: {
+    if( zRight ){
+      u8 iByte;
+      int i;
+      char zKey[40];
+      for(i=0, iByte=0; i<sizeof(zKey)*2 && sqlite3Isxdigit(zRight[i]); i++){
+        iByte = (iByte<<4) + sqlite3HexToInt(zRight[i]);
+        if( (i&1)!=0 ) zKey[i/2] = iByte;
+      }
+      if( (zLeft[3] & 0xf)==0xb ){
+        sqlite3_key_v2(db, zDb, zKey, i/2);
+      }else{
+        sqlite3_rekey_v2(db, zDb, zKey, i/2);
+      }
+    }
+    break;
+  }
+#endif
+#if defined(SQLITE_HAS_CODEC) || defined(SQLITE_ENABLE_CEROD)
+  case PragTyp_ACTIVATE_EXTENSIONS: if( zRight ){
+#ifdef SQLITE_HAS_CODEC
+    if( sqlite3StrNICmp(zRight, "see-", 4)==0 ){
+      sqlite3_activate_see(&zRight[4]);
+    }
+#endif
+#ifdef SQLITE_ENABLE_CEROD
+    if( sqlite3StrNICmp(zRight, "cerod-", 6)==0 ){
+      sqlite3_activate_cerod(&zRight[6]);
+    }
+#endif
+  }
+  break;
+#endif
+
+  } /* End of the PRAGMA switch */
+
+pragma_out:
+  sqlite3DbFree(db, zLeft);
+  sqlite3DbFree(db, zRight);
+}
+
+#endif /* SQLITE_OMIT_PRAGMA */
+
+/************** End of pragma.c **********************************************/
+/************** Begin file prepare.c *****************************************/
+/*
+** 2005 May 25
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the implementation of the sqlite3_prepare()
+** interface, and routines that contribute to loading the database schema
+** from disk.
+*/
+
+/*
+** Fill the InitData structure with an error message that indicates
+** that the database is corrupt.
+*/
+static void corruptSchema(
+  InitData *pData,     /* Initialization context */
+  const char *zObj,    /* Object being parsed at the point of error */
+  const char *zExtra   /* Error information */
+){
+  sqlite3 *db = pData->db;
+  if( !db->mallocFailed && (db->flags & SQLITE_RecoveryMode)==0 ){
+    if( zObj==0 ) zObj = "?";
+    sqlite3SetString(pData->pzErrMsg, db,
+      "malformed database schema (%s)", zObj);
+    if( zExtra ){
+      *pData->pzErrMsg = sqlite3MAppendf(db, *pData->pzErrMsg, 
+                                 "%s - %s", *pData->pzErrMsg, zExtra);
+    }
+  }
+  pData->rc = db->mallocFailed ? SQLITE_NOMEM : SQLITE_CORRUPT_BKPT;
+}
+
+/*
+** This is the callback routine for the code that initializes the
+** database.  See sqlite3Init() below for additional information.
+** This routine is also called from the OP_ParseSchema opcode of the VDBE.
+**
+** Each callback contains the following information:
+**
+**     argv[0] = name of thing being created
+**     argv[1] = root page number for table or index. 0 for trigger or view.
+**     argv[2] = SQL text for the CREATE statement.
+**
+*/
+SQLITE_PRIVATE int sqlite3InitCallback(void *pInit, int argc, char **argv, char **NotUsed){
+  InitData *pData = (InitData*)pInit;
+  sqlite3 *db = pData->db;
+  int iDb = pData->iDb;
+
+  assert( argc==3 );
+  UNUSED_PARAMETER2(NotUsed, argc);
+  assert( sqlite3_mutex_held(db->mutex) );
+  DbClearProperty(db, iDb, DB_Empty);
+  if( db->mallocFailed ){
+    corruptSchema(pData, argv[0], 0);
+    return 1;
+  }
+
+  assert( iDb>=0 && iDb<db->nDb );
+  if( argv==0 ) return 0;   /* Might happen if EMPTY_RESULT_CALLBACKS are on */
+  if( argv[1]==0 ){
+    corruptSchema(pData, argv[0], 0);
+  }else if( argv[2] && argv[2][0] ){
+    /* Call the parser to process a CREATE TABLE, INDEX or VIEW.
+    ** But because db->init.busy is set to 1, no VDBE code is generated
+    ** or executed.  All the parser does is build the internal data
+    ** structures that describe the table, index, or view.
+    */
+    int rc;
+    sqlite3_stmt *pStmt;
+    TESTONLY(int rcp);            /* Return code from sqlite3_prepare() */
+
+    assert( db->init.busy );
+    db->init.iDb = iDb;
+    db->init.newTnum = sqlite3Atoi(argv[1]);
+    db->init.orphanTrigger = 0;
+    TESTONLY(rcp = ) sqlite3_prepare(db, argv[2], -1, &pStmt, 0);
+    rc = db->errCode;
+    assert( (rc&0xFF)==(rcp&0xFF) );
+    db->init.iDb = 0;
+    if( SQLITE_OK!=rc ){
+      if( db->init.orphanTrigger ){
+        assert( iDb==1 );
+      }else{
+        pData->rc = rc;
+        if( rc==SQLITE_NOMEM ){
+          db->mallocFailed = 1;
+        }else if( rc!=SQLITE_INTERRUPT && (rc&0xFF)!=SQLITE_LOCKED ){
+          corruptSchema(pData, argv[0], sqlite3_errmsg(db));
+        }
+      }
+    }
+    sqlite3_finalize(pStmt);
+  }else if( argv[0]==0 ){
+    corruptSchema(pData, 0, 0);
+  }else{
+    /* If the SQL column is blank it means this is an index that
+    ** was created to be the PRIMARY KEY or to fulfill a UNIQUE
+    ** constraint for a CREATE TABLE.  The index should have already
+    ** been created when we processed the CREATE TABLE.  All we have
+    ** to do here is record the root page number for that index.
+    */
+    Index *pIndex;
+    pIndex = sqlite3FindIndex(db, argv[0], db->aDb[iDb].zName);
+    if( pIndex==0 ){
+      /* This can occur if there exists an index on a TEMP table which
+      ** has the same name as another index on a permanent index.  Since
+      ** the permanent table is hidden by the TEMP table, we can also
+      ** safely ignore the index on the permanent table.
+      */
+      /* Do Nothing */;
+    }else if( sqlite3GetInt32(argv[1], &pIndex->tnum)==0 ){
+      corruptSchema(pData, argv[0], "invalid rootpage");
+    }
+  }
+  return 0;
+}
+
+/*
+** Attempt to read the database schema and initialize internal
+** data structures for a single database file.  The index of the
+** database file is given by iDb.  iDb==0 is used for the main
+** database.  iDb==1 should never be used.  iDb>=2 is used for
+** auxiliary databases.  Return one of the SQLITE_ error codes to
+** indicate success or failure.
+*/
+static int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg){
+  int rc;
+  int i;
+#ifndef SQLITE_OMIT_DEPRECATED
+  int size;
+#endif
+  Table *pTab;
+  Db *pDb;
+  char const *azArg[4];
+  int meta[5];
+  InitData initData;
+  char const *zMasterSchema;
+  char const *zMasterName;
+  int openedTransaction = 0;
+
+  /*
+  ** The master database table has a structure like this
+  */
+  static const char master_schema[] = 
+     "CREATE TABLE sqlite_master(\n"
+     "  type text,\n"
+     "  name text,\n"
+     "  tbl_name text,\n"
+     "  rootpage integer,\n"
+     "  sql text\n"
+     ")"
+  ;
+#ifndef SQLITE_OMIT_TEMPDB
+  static const char temp_master_schema[] = 
+     "CREATE TEMP TABLE sqlite_temp_master(\n"
+     "  type text,\n"
+     "  name text,\n"
+     "  tbl_name text,\n"
+     "  rootpage integer,\n"
+     "  sql text\n"
+     ")"
+  ;
+#else
+  #define temp_master_schema 0
+#endif
+
+  assert( iDb>=0 && iDb<db->nDb );
