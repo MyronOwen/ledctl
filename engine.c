@@ -104767,3 +104767,266 @@ SQLITE_PRIVATE int sqlite3Init(sqlite3 *db, char **pzErrMsg){
   }
 
   /* Once all the other databases have been initialized, load the schema
+  ** for the TEMP database. This is loaded last, as the TEMP database
+  ** schema may contain references to objects in other databases.
+  */
+#ifndef SQLITE_OMIT_TEMPDB
+  assert( db->nDb>1 );
+  if( rc==SQLITE_OK && !DbHasProperty(db, 1, DB_SchemaLoaded) ){
+    rc = sqlite3InitOne(db, 1, pzErrMsg);
+    if( rc ){
+      sqlite3ResetOneSchema(db, 1);
+    }
+  }
+#endif
+
+  db->init.busy = 0;
+  if( rc==SQLITE_OK && commit_internal ){
+    sqlite3CommitInternalChanges(db);
+  }
+
+  return rc; 
+}
+
+/*
+** This routine is a no-op if the database schema is already initialized.
+** Otherwise, the schema is loaded. An error code is returned.
+*/
+SQLITE_PRIVATE int sqlite3ReadSchema(Parse *pParse){
+  int rc = SQLITE_OK;
+  sqlite3 *db = pParse->db;
+  assert( sqlite3_mutex_held(db->mutex) );
+  if( !db->init.busy ){
+    rc = sqlite3Init(db, &pParse->zErrMsg);
+  }
+  if( rc!=SQLITE_OK ){
+    pParse->rc = rc;
+    pParse->nErr++;
+  }
+  return rc;
+}
+
+
+/*
+** Check schema cookies in all databases.  If any cookie is out
+** of date set pParse->rc to SQLITE_SCHEMA.  If all schema cookies
+** make no changes to pParse->rc.
+*/
+static void schemaIsValid(Parse *pParse){
+  sqlite3 *db = pParse->db;
+  int iDb;
+  int rc;
+  int cookie;
+
+  assert( pParse->checkSchema );
+  assert( sqlite3_mutex_held(db->mutex) );
+  for(iDb=0; iDb<db->nDb; iDb++){
+    int openedTransaction = 0;         /* True if a transaction is opened */
+    Btree *pBt = db->aDb[iDb].pBt;     /* Btree database to read cookie from */
+    if( pBt==0 ) continue;
+
+    /* If there is not already a read-only (or read-write) transaction opened
+    ** on the b-tree database, open one now. If a transaction is opened, it 
+    ** will be closed immediately after reading the meta-value. */
+    if( !sqlite3BtreeIsInReadTrans(pBt) ){
+      rc = sqlite3BtreeBeginTrans(pBt, 0);
+      if( rc==SQLITE_NOMEM || rc==SQLITE_IOERR_NOMEM ){
+        db->mallocFailed = 1;
+      }
+      if( rc!=SQLITE_OK ) return;
+      openedTransaction = 1;
+    }
+
+    /* Read the schema cookie from the database. If it does not match the 
+    ** value stored as part of the in-memory schema representation,
+    ** set Parse.rc to SQLITE_SCHEMA. */
+    sqlite3BtreeGetMeta(pBt, BTREE_SCHEMA_VERSION, (u32 *)&cookie);
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    if( cookie!=db->aDb[iDb].pSchema->schema_cookie ){
+      sqlite3ResetOneSchema(db, iDb);
+      pParse->rc = SQLITE_SCHEMA;
+    }
+
+    /* Close the transaction, if one was opened. */
+    if( openedTransaction ){
+      sqlite3BtreeCommit(pBt);
+    }
+  }
+}
+
+/*
+** Convert a schema pointer into the iDb index that indicates
+** which database file in db->aDb[] the schema refers to.
+**
+** If the same database is attached more than once, the first
+** attached database is returned.
+*/
+SQLITE_PRIVATE int sqlite3SchemaToIndex(sqlite3 *db, Schema *pSchema){
+  int i = -1000000;
+
+  /* If pSchema is NULL, then return -1000000. This happens when code in 
+  ** expr.c is trying to resolve a reference to a transient table (i.e. one
+  ** created by a sub-select). In this case the return value of this 
+  ** function should never be used.
+  **
+  ** We return -1000000 instead of the more usual -1 simply because using
+  ** -1000000 as the incorrect index into db->aDb[] is much 
+  ** more likely to cause a segfault than -1 (of course there are assert()
+  ** statements too, but it never hurts to play the odds).
+  */
+  assert( sqlite3_mutex_held(db->mutex) );
+  if( pSchema ){
+    for(i=0; ALWAYS(i<db->nDb); i++){
+      if( db->aDb[i].pSchema==pSchema ){
+        break;
+      }
+    }
+    assert( i>=0 && i<db->nDb );
+  }
+  return i;
+}
+
+/*
+** Free all memory allocations in the pParse object
+*/
+SQLITE_PRIVATE void sqlite3ParserReset(Parse *pParse){
+  if( pParse ){
+    sqlite3 *db = pParse->db;
+    sqlite3DbFree(db, pParse->aLabel);
+    sqlite3ExprListDelete(db, pParse->pConstExpr);
+  }
+}
+
+/*
+** Compile the UTF-8 encoded SQL statement zSql into a statement handle.
+*/
+static int sqlite3Prepare(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  int saveSqlFlag,          /* True to copy SQL text into the sqlite3_stmt */
+  Vdbe *pReprepare,         /* VM being reprepared */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+){
+  Parse *pParse;            /* Parsing context */
+  char *zErrMsg = 0;        /* Error message */
+  int rc = SQLITE_OK;       /* Result code */
+  int i;                    /* Loop counter */
+
+  /* Allocate the parsing context */
+  pParse = sqlite3StackAllocZero(db, sizeof(*pParse));
+  if( pParse==0 ){
+    rc = SQLITE_NOMEM;
+    goto end_prepare;
+  }
+  pParse->pReprepare = pReprepare;
+  assert( ppStmt && *ppStmt==0 );
+  assert( !db->mallocFailed );
+  assert( sqlite3_mutex_held(db->mutex) );
+
+  /* Check to verify that it is possible to get a read lock on all
+  ** database schemas.  The inability to get a read lock indicates that
+  ** some other database connection is holding a write-lock, which in
+  ** turn means that the other connection has made uncommitted changes
+  ** to the schema.
+  **
+  ** Were we to proceed and prepare the statement against the uncommitted
+  ** schema changes and if those schema changes are subsequently rolled
+  ** back and different changes are made in their place, then when this
+  ** prepared statement goes to run the schema cookie would fail to detect
+  ** the schema change.  Disaster would follow.
+  **
+  ** This thread is currently holding mutexes on all Btrees (because
+  ** of the sqlite3BtreeEnterAll() in sqlite3LockAndPrepare()) so it
+  ** is not possible for another thread to start a new schema change
+  ** while this routine is running.  Hence, we do not need to hold 
+  ** locks on the schema, we just need to make sure nobody else is 
+  ** holding them.
+  **
+  ** Note that setting READ_UNCOMMITTED overrides most lock detection,
+  ** but it does *not* override schema lock detection, so this all still
+  ** works even if READ_UNCOMMITTED is set.
+  */
+  for(i=0; i<db->nDb; i++) {
+    Btree *pBt = db->aDb[i].pBt;
+    if( pBt ){
+      assert( sqlite3BtreeHoldsMutex(pBt) );
+      rc = sqlite3BtreeSchemaLocked(pBt);
+      if( rc ){
+        const char *zDb = db->aDb[i].zName;
+        sqlite3ErrorWithMsg(db, rc, "database schema is locked: %s", zDb);
+        testcase( db->flags & SQLITE_ReadUncommitted );
+        goto end_prepare;
+      }
+    }
+  }
+
+  sqlite3VtabUnlockList(db);
+
+  pParse->db = db;
+  pParse->nQueryLoop = 0;  /* Logarithmic, so 0 really means 1 */
+  if( nBytes>=0 && (nBytes==0 || zSql[nBytes-1]!=0) ){
+    char *zSqlCopy;
+    int mxLen = db->aLimit[SQLITE_LIMIT_SQL_LENGTH];
+    testcase( nBytes==mxLen );
+    testcase( nBytes==mxLen+1 );
+    if( nBytes>mxLen ){
+      sqlite3ErrorWithMsg(db, SQLITE_TOOBIG, "statement too long");
+      rc = sqlite3ApiExit(db, SQLITE_TOOBIG);
+      goto end_prepare;
+    }
+    zSqlCopy = sqlite3DbStrNDup(db, zSql, nBytes);
+    if( zSqlCopy ){
+      sqlite3RunParser(pParse, zSqlCopy, &zErrMsg);
+      sqlite3DbFree(db, zSqlCopy);
+      pParse->zTail = &zSql[pParse->zTail-zSqlCopy];
+    }else{
+      pParse->zTail = &zSql[nBytes];
+    }
+  }else{
+    sqlite3RunParser(pParse, zSql, &zErrMsg);
+  }
+  assert( 0==pParse->nQueryLoop );
+
+  if( db->mallocFailed ){
+    pParse->rc = SQLITE_NOMEM;
+  }
+  if( pParse->rc==SQLITE_DONE ) pParse->rc = SQLITE_OK;
+  if( pParse->checkSchema ){
+    schemaIsValid(pParse);
+  }
+  if( db->mallocFailed ){
+    pParse->rc = SQLITE_NOMEM;
+  }
+  if( pzTail ){
+    *pzTail = pParse->zTail;
+  }
+  rc = pParse->rc;
+
+#ifndef SQLITE_OMIT_EXPLAIN
+  if( rc==SQLITE_OK && pParse->pVdbe && pParse->explain ){
+    static const char * const azColName[] = {
+       "addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment",
+       "selectid", "order", "from", "detail"
+    };
+    int iFirst, mx;
+    if( pParse->explain==2 ){
+      sqlite3VdbeSetNumCols(pParse->pVdbe, 4);
+      iFirst = 8;
+      mx = 12;
+    }else{
+      sqlite3VdbeSetNumCols(pParse->pVdbe, 8);
+      iFirst = 0;
+      mx = 8;
+    }
+    for(i=iFirst; i<mx; i++){
+      sqlite3VdbeSetColName(pParse->pVdbe, i-iFirst, COLNAME_NAME,
+                            azColName[i], SQLITE_STATIC);
+    }
+  }
+#endif
+
+  if( db->init.busy==0 ){
+    Vdbe *pVdbe = pParse->pVdbe;
+    sqlite3VdbeSetSql(pVdbe, zSql, (int)(pParse->zTail-zSql), saveSqlFlag);
