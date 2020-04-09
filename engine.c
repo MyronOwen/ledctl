@@ -105250,3 +105250,211 @@ SQLITE_API int sqlite3_prepare16_v2(
 }
 
 #endif /* SQLITE_OMIT_UTF16 */
+
+/************** End of prepare.c *********************************************/
+/************** Begin file select.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains C code routines that are called by the parser
+** to handle SELECT statements in SQLite.
+*/
+
+/*
+** Trace output macros
+*/
+#if SELECTTRACE_ENABLED
+/***/ int sqlite3SelectTrace = 0;
+# define SELECTTRACE(K,P,S,X)  \
+  if(sqlite3SelectTrace&(K))   \
+    sqlite3DebugPrintf("%*s%s.%p: ",(P)->nSelectIndent*2-2,"",(S)->zSelName,(S)),\
+    sqlite3DebugPrintf X
+#else
+# define SELECTTRACE(K,P,S,X)
+#endif
+
+
+/*
+** An instance of the following object is used to record information about
+** how to process the DISTINCT keyword, to simplify passing that information
+** into the selectInnerLoop() routine.
+*/
+typedef struct DistinctCtx DistinctCtx;
+struct DistinctCtx {
+  u8 isTnct;      /* True if the DISTINCT keyword is present */
+  u8 eTnctType;   /* One of the WHERE_DISTINCT_* operators */
+  int tabTnct;    /* Ephemeral table used for DISTINCT processing */
+  int addrTnct;   /* Address of OP_OpenEphemeral opcode for tabTnct */
+};
+
+/*
+** An instance of the following object is used to record information about
+** the ORDER BY (or GROUP BY) clause of query is being coded.
+*/
+typedef struct SortCtx SortCtx;
+struct SortCtx {
+  ExprList *pOrderBy;   /* The ORDER BY (or GROUP BY clause) */
+  int nOBSat;           /* Number of ORDER BY terms satisfied by indices */
+  int iECursor;         /* Cursor number for the sorter */
+  int regReturn;        /* Register holding block-output return address */
+  int labelBkOut;       /* Start label for the block-output subroutine */
+  int addrSortIndex;    /* Address of the OP_SorterOpen or OP_OpenEphemeral */
+  u8 sortFlags;         /* Zero or more SORTFLAG_* bits */
+};
+#define SORTFLAG_UseSorter  0x01   /* Use SorterOpen instead of OpenEphemeral */
+
+/*
+** Delete all the content of a Select structure.  Deallocate the structure
+** itself only if bFree is true.
+*/
+static void clearSelect(sqlite3 *db, Select *p, int bFree){
+  while( p ){
+    Select *pPrior = p->pPrior;
+    sqlite3ExprListDelete(db, p->pEList);
+    sqlite3SrcListDelete(db, p->pSrc);
+    sqlite3ExprDelete(db, p->pWhere);
+    sqlite3ExprListDelete(db, p->pGroupBy);
+    sqlite3ExprDelete(db, p->pHaving);
+    sqlite3ExprListDelete(db, p->pOrderBy);
+    sqlite3ExprDelete(db, p->pLimit);
+    sqlite3ExprDelete(db, p->pOffset);
+    sqlite3WithDelete(db, p->pWith);
+    if( bFree ) sqlite3DbFree(db, p);
+    p = pPrior;
+    bFree = 1;
+  }
+}
+
+/*
+** Initialize a SelectDest structure.
+*/
+SQLITE_PRIVATE void sqlite3SelectDestInit(SelectDest *pDest, int eDest, int iParm){
+  pDest->eDest = (u8)eDest;
+  pDest->iSDParm = iParm;
+  pDest->affSdst = 0;
+  pDest->iSdst = 0;
+  pDest->nSdst = 0;
+}
+
+
+/*
+** Allocate a new Select structure and return a pointer to that
+** structure.
+*/
+SQLITE_PRIVATE Select *sqlite3SelectNew(
+  Parse *pParse,        /* Parsing context */
+  ExprList *pEList,     /* which columns to include in the result */
+  SrcList *pSrc,        /* the FROM clause -- which tables to scan */
+  Expr *pWhere,         /* the WHERE clause */
+  ExprList *pGroupBy,   /* the GROUP BY clause */
+  Expr *pHaving,        /* the HAVING clause */
+  ExprList *pOrderBy,   /* the ORDER BY clause */
+  u16 selFlags,         /* Flag parameters, such as SF_Distinct */
+  Expr *pLimit,         /* LIMIT value.  NULL means not used */
+  Expr *pOffset         /* OFFSET value.  NULL means no offset */
+){
+  Select *pNew;
+  Select standin;
+  sqlite3 *db = pParse->db;
+  pNew = sqlite3DbMallocZero(db, sizeof(*pNew) );
+  assert( db->mallocFailed || !pOffset || pLimit ); /* OFFSET implies LIMIT */
+  if( pNew==0 ){
+    assert( db->mallocFailed );
+    pNew = &standin;
+    memset(pNew, 0, sizeof(*pNew));
+  }
+  if( pEList==0 ){
+    pEList = sqlite3ExprListAppend(pParse, 0, sqlite3Expr(db,TK_ALL,0));
+  }
+  pNew->pEList = pEList;
+  if( pSrc==0 ) pSrc = sqlite3DbMallocZero(db, sizeof(*pSrc));
+  pNew->pSrc = pSrc;
+  pNew->pWhere = pWhere;
+  pNew->pGroupBy = pGroupBy;
+  pNew->pHaving = pHaving;
+  pNew->pOrderBy = pOrderBy;
+  pNew->selFlags = selFlags;
+  pNew->op = TK_SELECT;
+  pNew->pLimit = pLimit;
+  pNew->pOffset = pOffset;
+  assert( pOffset==0 || pLimit!=0 );
+  pNew->addrOpenEphm[0] = -1;
+  pNew->addrOpenEphm[1] = -1;
+  if( db->mallocFailed ) {
+    clearSelect(db, pNew, pNew!=&standin);
+    pNew = 0;
+  }else{
+    assert( pNew->pSrc!=0 || pParse->nErr>0 );
+  }
+  assert( pNew!=&standin );
+  return pNew;
+}
+
+#if SELECTTRACE_ENABLED
+/*
+** Set the name of a Select object
+*/
+SQLITE_PRIVATE void sqlite3SelectSetName(Select *p, const char *zName){
+  if( p && zName ){
+    sqlite3_snprintf(sizeof(p->zSelName), p->zSelName, "%s", zName);
+  }
+}
+#endif
+
+
+/*
+** Delete the given Select structure and all of its substructures.
+*/
+SQLITE_PRIVATE void sqlite3SelectDelete(sqlite3 *db, Select *p){
+  clearSelect(db, p, 1);
+}
+
+/*
+** Return a pointer to the right-most SELECT statement in a compound.
+*/
+static Select *findRightmost(Select *p){
+  while( p->pNext ) p = p->pNext;
+  return p;
+}
+
+/*
+** Given 1 to 3 identifiers preceding the JOIN keyword, determine the
+** type of join.  Return an integer constant that expresses that type
+** in terms of the following bit values:
+**
+**     JT_INNER
+**     JT_CROSS
+**     JT_OUTER
+**     JT_NATURAL
+**     JT_LEFT
+**     JT_RIGHT
+**
+** A full outer join is the combination of JT_LEFT and JT_RIGHT.
+**
+** If an illegal or unsupported join type is seen, then still return
+** a join type, but put an error in the pParse structure.
+*/
+SQLITE_PRIVATE int sqlite3JoinType(Parse *pParse, Token *pA, Token *pB, Token *pC){
+  int jointype = 0;
+  Token *apAll[3];
+  Token *p;
+                             /*   0123456789 123456789 123456789 123 */
+  static const char zKeyText[] = "naturaleftouterightfullinnercross";
+  static const struct {
+    u8 i;        /* Beginning of keyword text in zKeyText[] */
+    u8 nChar;    /* Length of the keyword in characters */
+    u8 code;     /* Join type mask */
+  } aKeyword[] = {
+    /* natural */ { 0,  7, JT_NATURAL                },
+    /* left    */ { 6,  4, JT_LEFT|JT_OUTER          },
+    /* outer   */ { 10, 5, JT_OUTER                  },
+    /* right   */ { 14, 5, JT_RIGHT|JT_OUTER         },
+    /* full    */ { 19, 4, JT_LEFT|JT_RIGHT|JT_OUTER },
