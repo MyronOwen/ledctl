@@ -105458,3 +105458,219 @@ SQLITE_PRIVATE int sqlite3JoinType(Parse *pParse, Token *pA, Token *pB, Token *p
     /* outer   */ { 10, 5, JT_OUTER                  },
     /* right   */ { 14, 5, JT_RIGHT|JT_OUTER         },
     /* full    */ { 19, 4, JT_LEFT|JT_RIGHT|JT_OUTER },
+    /* inner   */ { 23, 5, JT_INNER                  },
+    /* cross   */ { 28, 5, JT_INNER|JT_CROSS         },
+  };
+  int i, j;
+  apAll[0] = pA;
+  apAll[1] = pB;
+  apAll[2] = pC;
+  for(i=0; i<3 && apAll[i]; i++){
+    p = apAll[i];
+    for(j=0; j<ArraySize(aKeyword); j++){
+      if( p->n==aKeyword[j].nChar 
+          && sqlite3StrNICmp((char*)p->z, &zKeyText[aKeyword[j].i], p->n)==0 ){
+        jointype |= aKeyword[j].code;
+        break;
+      }
+    }
+    testcase( j==0 || j==1 || j==2 || j==3 || j==4 || j==5 || j==6 );
+    if( j>=ArraySize(aKeyword) ){
+      jointype |= JT_ERROR;
+      break;
+    }
+  }
+  if(
+     (jointype & (JT_INNER|JT_OUTER))==(JT_INNER|JT_OUTER) ||
+     (jointype & JT_ERROR)!=0
+  ){
+    const char *zSp = " ";
+    assert( pB!=0 );
+    if( pC==0 ){ zSp++; }
+    sqlite3ErrorMsg(pParse, "unknown or unsupported join type: "
+       "%T %T%s%T", pA, pB, zSp, pC);
+    jointype = JT_INNER;
+  }else if( (jointype & JT_OUTER)!=0 
+         && (jointype & (JT_LEFT|JT_RIGHT))!=JT_LEFT ){
+    sqlite3ErrorMsg(pParse, 
+      "RIGHT and FULL OUTER JOINs are not currently supported");
+    jointype = JT_INNER;
+  }
+  return jointype;
+}
+
+/*
+** Return the index of a column in a table.  Return -1 if the column
+** is not contained in the table.
+*/
+static int columnIndex(Table *pTab, const char *zCol){
+  int i;
+  for(i=0; i<pTab->nCol; i++){
+    if( sqlite3StrICmp(pTab->aCol[i].zName, zCol)==0 ) return i;
+  }
+  return -1;
+}
+
+/*
+** Search the first N tables in pSrc, from left to right, looking for a
+** table that has a column named zCol.  
+**
+** When found, set *piTab and *piCol to the table index and column index
+** of the matching column and return TRUE.
+**
+** If not found, return FALSE.
+*/
+static int tableAndColumnIndex(
+  SrcList *pSrc,       /* Array of tables to search */
+  int N,               /* Number of tables in pSrc->a[] to search */
+  const char *zCol,    /* Name of the column we are looking for */
+  int *piTab,          /* Write index of pSrc->a[] here */
+  int *piCol           /* Write index of pSrc->a[*piTab].pTab->aCol[] here */
+){
+  int i;               /* For looping over tables in pSrc */
+  int iCol;            /* Index of column matching zCol */
+
+  assert( (piTab==0)==(piCol==0) );  /* Both or neither are NULL */
+  for(i=0; i<N; i++){
+    iCol = columnIndex(pSrc->a[i].pTab, zCol);
+    if( iCol>=0 ){
+      if( piTab ){
+        *piTab = i;
+        *piCol = iCol;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** This function is used to add terms implied by JOIN syntax to the
+** WHERE clause expression of a SELECT statement. The new term, which
+** is ANDed with the existing WHERE clause, is of the form:
+**
+**    (tab1.col1 = tab2.col2)
+**
+** where tab1 is the iSrc'th table in SrcList pSrc and tab2 is the 
+** (iSrc+1)'th. Column col1 is column iColLeft of tab1, and col2 is
+** column iColRight of tab2.
+*/
+static void addWhereTerm(
+  Parse *pParse,                  /* Parsing context */
+  SrcList *pSrc,                  /* List of tables in FROM clause */
+  int iLeft,                      /* Index of first table to join in pSrc */
+  int iColLeft,                   /* Index of column in first table */
+  int iRight,                     /* Index of second table in pSrc */
+  int iColRight,                  /* Index of column in second table */
+  int isOuterJoin,                /* True if this is an OUTER join */
+  Expr **ppWhere                  /* IN/OUT: The WHERE clause to add to */
+){
+  sqlite3 *db = pParse->db;
+  Expr *pE1;
+  Expr *pE2;
+  Expr *pEq;
+
+  assert( iLeft<iRight );
+  assert( pSrc->nSrc>iRight );
+  assert( pSrc->a[iLeft].pTab );
+  assert( pSrc->a[iRight].pTab );
+
+  pE1 = sqlite3CreateColumnExpr(db, pSrc, iLeft, iColLeft);
+  pE2 = sqlite3CreateColumnExpr(db, pSrc, iRight, iColRight);
+
+  pEq = sqlite3PExpr(pParse, TK_EQ, pE1, pE2, 0);
+  if( pEq && isOuterJoin ){
+    ExprSetProperty(pEq, EP_FromJoin);
+    assert( !ExprHasProperty(pEq, EP_TokenOnly|EP_Reduced) );
+    ExprSetVVAProperty(pEq, EP_NoReduce);
+    pEq->iRightJoinTable = (i16)pE2->iTable;
+  }
+  *ppWhere = sqlite3ExprAnd(db, *ppWhere, pEq);
+}
+
+/*
+** Set the EP_FromJoin property on all terms of the given expression.
+** And set the Expr.iRightJoinTable to iTable for every term in the
+** expression.
+**
+** The EP_FromJoin property is used on terms of an expression to tell
+** the LEFT OUTER JOIN processing logic that this term is part of the
+** join restriction specified in the ON or USING clause and not a part
+** of the more general WHERE clause.  These terms are moved over to the
+** WHERE clause during join processing but we need to remember that they
+** originated in the ON or USING clause.
+**
+** The Expr.iRightJoinTable tells the WHERE clause processing that the
+** expression depends on table iRightJoinTable even if that table is not
+** explicitly mentioned in the expression.  That information is needed
+** for cases like this:
+**
+**    SELECT * FROM t1 LEFT JOIN t2 ON t1.a=t2.b AND t1.x=5
+**
+** The where clause needs to defer the handling of the t1.x=5
+** term until after the t2 loop of the join.  In that way, a
+** NULL t2 row will be inserted whenever t1.x!=5.  If we do not
+** defer the handling of t1.x=5, it will be processed immediately
+** after the t1 loop and rows with t1.x!=5 will never appear in
+** the output, which is incorrect.
+*/
+static void setJoinExpr(Expr *p, int iTable){
+  while( p ){
+    ExprSetProperty(p, EP_FromJoin);
+    assert( !ExprHasProperty(p, EP_TokenOnly|EP_Reduced) );
+    ExprSetVVAProperty(p, EP_NoReduce);
+    p->iRightJoinTable = (i16)iTable;
+    setJoinExpr(p->pLeft, iTable);
+    p = p->pRight;
+  } 
+}
+
+/*
+** This routine processes the join information for a SELECT statement.
+** ON and USING clauses are converted into extra terms of the WHERE clause.
+** NATURAL joins also create extra WHERE clause terms.
+**
+** The terms of a FROM clause are contained in the Select.pSrc structure.
+** The left most table is the first entry in Select.pSrc.  The right-most
+** table is the last entry.  The join operator is held in the entry to
+** the left.  Thus entry 0 contains the join operator for the join between
+** entries 0 and 1.  Any ON or USING clauses associated with the join are
+** also attached to the left entry.
+**
+** This routine returns the number of errors encountered.
+*/
+static int sqliteProcessJoin(Parse *pParse, Select *p){
+  SrcList *pSrc;                  /* All tables in the FROM clause */
+  int i, j;                       /* Loop counters */
+  struct SrcList_item *pLeft;     /* Left table being joined */
+  struct SrcList_item *pRight;    /* Right table being joined */
+
+  pSrc = p->pSrc;
+  pLeft = &pSrc->a[0];
+  pRight = &pLeft[1];
+  for(i=0; i<pSrc->nSrc-1; i++, pRight++, pLeft++){
+    Table *pLeftTab = pLeft->pTab;
+    Table *pRightTab = pRight->pTab;
+    int isOuter;
+
+    if( NEVER(pLeftTab==0 || pRightTab==0) ) continue;
+    isOuter = (pRight->jointype & JT_OUTER)!=0;
+
+    /* When the NATURAL keyword is present, add WHERE clause terms for
+    ** every column that the two tables have in common.
+    */
+    if( pRight->jointype & JT_NATURAL ){
+      if( pRight->pOn || pRight->pUsing ){
+        sqlite3ErrorMsg(pParse, "a NATURAL join may not have "
+           "an ON or USING clause", 0);
+        return 1;
+      }
+      for(j=0; j<pRightTab->nCol; j++){
+        char *zName;   /* Name of column in the right table */
+        int iLeft;     /* Matching left table */
+        int iLeftCol;  /* Matching column in the left table */
+
+        zName = pRightTab->aCol[j].zName;
+        if( tableAndColumnIndex(pSrc, i+1, zName, &iLeft, &iLeftCol) ){
+          addWhereTerm(pParse, pSrc, iLeft, iLeftCol, i+1, j,
+                       isOuter, &p->pWhere);
