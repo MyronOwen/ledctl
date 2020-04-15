@@ -105674,3 +105674,246 @@ static int sqliteProcessJoin(Parse *pParse, Select *p){
         if( tableAndColumnIndex(pSrc, i+1, zName, &iLeft, &iLeftCol) ){
           addWhereTerm(pParse, pSrc, iLeft, iLeftCol, i+1, j,
                        isOuter, &p->pWhere);
+        }
+      }
+    }
+
+    /* Disallow both ON and USING clauses in the same join
+    */
+    if( pRight->pOn && pRight->pUsing ){
+      sqlite3ErrorMsg(pParse, "cannot have both ON and USING "
+        "clauses in the same join");
+      return 1;
+    }
+
+    /* Add the ON clause to the end of the WHERE clause, connected by
+    ** an AND operator.
+    */
+    if( pRight->pOn ){
+      if( isOuter ) setJoinExpr(pRight->pOn, pRight->iCursor);
+      p->pWhere = sqlite3ExprAnd(pParse->db, p->pWhere, pRight->pOn);
+      pRight->pOn = 0;
+    }
+
+    /* Create extra terms on the WHERE clause for each column named
+    ** in the USING clause.  Example: If the two tables to be joined are 
+    ** A and B and the USING clause names X, Y, and Z, then add this
+    ** to the WHERE clause:    A.X=B.X AND A.Y=B.Y AND A.Z=B.Z
+    ** Report an error if any column mentioned in the USING clause is
+    ** not contained in both tables to be joined.
+    */
+    if( pRight->pUsing ){
+      IdList *pList = pRight->pUsing;
+      for(j=0; j<pList->nId; j++){
+        char *zName;     /* Name of the term in the USING clause */
+        int iLeft;       /* Table on the left with matching column name */
+        int iLeftCol;    /* Column number of matching column on the left */
+        int iRightCol;   /* Column number of matching column on the right */
+
+        zName = pList->a[j].zName;
+        iRightCol = columnIndex(pRightTab, zName);
+        if( iRightCol<0
+         || !tableAndColumnIndex(pSrc, i+1, zName, &iLeft, &iLeftCol)
+        ){
+          sqlite3ErrorMsg(pParse, "cannot join using column %s - column "
+            "not present in both tables", zName);
+          return 1;
+        }
+        addWhereTerm(pParse, pSrc, iLeft, iLeftCol, i+1, iRightCol,
+                     isOuter, &p->pWhere);
+      }
+    }
+  }
+  return 0;
+}
+
+/* Forward reference */
+static KeyInfo *keyInfoFromExprList(
+  Parse *pParse,       /* Parsing context */
+  ExprList *pList,     /* Form the KeyInfo object from this ExprList */
+  int iStart,          /* Begin with this column of pList */
+  int nExtra           /* Add this many extra columns to the end */
+);
+
+/*
+** Generate code that will push the record in registers regData
+** through regData+nData-1 onto the sorter.
+*/
+static void pushOntoSorter(
+  Parse *pParse,         /* Parser context */
+  SortCtx *pSort,        /* Information about the ORDER BY clause */
+  Select *pSelect,       /* The whole SELECT statement */
+  int regData,           /* First register holding data to be sorted */
+  int nData,             /* Number of elements in the data array */
+  int nPrefixReg         /* No. of reg prior to regData available for use */
+){
+  Vdbe *v = pParse->pVdbe;                         /* Stmt under construction */
+  int bSeq = ((pSort->sortFlags & SORTFLAG_UseSorter)==0);
+  int nExpr = pSort->pOrderBy->nExpr;              /* No. of ORDER BY terms */
+  int nBase = nExpr + bSeq + nData;                /* Fields in sorter record */
+  int regBase;                                     /* Regs for sorter record */
+  int regRecord = ++pParse->nMem;                  /* Assembled sorter record */
+  int nOBSat = pSort->nOBSat;                      /* ORDER BY terms to skip */
+  int op;                            /* Opcode to add sorter record to sorter */
+
+  assert( bSeq==0 || bSeq==1 );
+  if( nPrefixReg ){
+    assert( nPrefixReg==nExpr+bSeq );
+    regBase = regData - nExpr - bSeq;
+  }else{
+    regBase = pParse->nMem + 1;
+    pParse->nMem += nBase;
+  }
+  sqlite3ExprCodeExprList(pParse, pSort->pOrderBy, regBase, SQLITE_ECEL_DUP);
+  if( bSeq ){
+    sqlite3VdbeAddOp2(v, OP_Sequence, pSort->iECursor, regBase+nExpr);
+  }
+  if( nPrefixReg==0 ){
+    sqlite3ExprCodeMove(pParse, regData, regBase+nExpr+bSeq, nData);
+  }
+
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase+nOBSat, nBase-nOBSat, regRecord);
+  if( nOBSat>0 ){
+    int regPrevKey;   /* The first nOBSat columns of the previous row */
+    int addrFirst;    /* Address of the OP_IfNot opcode */
+    int addrJmp;      /* Address of the OP_Jump opcode */
+    VdbeOp *pOp;      /* Opcode that opens the sorter */
+    int nKey;         /* Number of sorting key columns, including OP_Sequence */
+    KeyInfo *pKI;     /* Original KeyInfo on the sorter table */
+
+    regPrevKey = pParse->nMem+1;
+    pParse->nMem += pSort->nOBSat;
+    nKey = nExpr - pSort->nOBSat + bSeq;
+    if( bSeq ){
+      addrFirst = sqlite3VdbeAddOp1(v, OP_IfNot, regBase+nExpr); 
+    }else{
+      addrFirst = sqlite3VdbeAddOp1(v, OP_SequenceTest, pSort->iECursor);
+    }
+    VdbeCoverage(v);
+    sqlite3VdbeAddOp3(v, OP_Compare, regPrevKey, regBase, pSort->nOBSat);
+    pOp = sqlite3VdbeGetOp(v, pSort->addrSortIndex);
+    if( pParse->db->mallocFailed ) return;
+    pOp->p2 = nKey + nData;
+    pKI = pOp->p4.pKeyInfo;
+    memset(pKI->aSortOrder, 0, pKI->nField); /* Makes OP_Jump below testable */
+    sqlite3VdbeChangeP4(v, -1, (char*)pKI, P4_KEYINFO);
+    pOp->p4.pKeyInfo = keyInfoFromExprList(pParse, pSort->pOrderBy, nOBSat, 1);
+    addrJmp = sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp3(v, OP_Jump, addrJmp+1, 0, addrJmp+1); VdbeCoverage(v);
+    pSort->labelBkOut = sqlite3VdbeMakeLabel(v);
+    pSort->regReturn = ++pParse->nMem;
+    sqlite3VdbeAddOp2(v, OP_Gosub, pSort->regReturn, pSort->labelBkOut);
+    sqlite3VdbeAddOp1(v, OP_ResetSorter, pSort->iECursor);
+    sqlite3VdbeJumpHere(v, addrFirst);
+    sqlite3ExprCodeMove(pParse, regBase, regPrevKey, pSort->nOBSat);
+    sqlite3VdbeJumpHere(v, addrJmp);
+  }
+  if( pSort->sortFlags & SORTFLAG_UseSorter ){
+    op = OP_SorterInsert;
+  }else{
+    op = OP_IdxInsert;
+  }
+  sqlite3VdbeAddOp2(v, op, pSort->iECursor, regRecord);
+  if( pSelect->iLimit ){
+    int addr1, addr2;
+    int iLimit;
+    if( pSelect->iOffset ){
+      iLimit = pSelect->iOffset+1;
+    }else{
+      iLimit = pSelect->iLimit;
+    }
+    addr1 = sqlite3VdbeAddOp1(v, OP_IfZero, iLimit); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_AddImm, iLimit, -1);
+    addr2 = sqlite3VdbeAddOp0(v, OP_Goto);
+    sqlite3VdbeJumpHere(v, addr1);
+    sqlite3VdbeAddOp1(v, OP_Last, pSort->iECursor);
+    sqlite3VdbeAddOp1(v, OP_Delete, pSort->iECursor);
+    sqlite3VdbeJumpHere(v, addr2);
+  }
+}
+
+/*
+** Add code to implement the OFFSET
+*/
+static void codeOffset(
+  Vdbe *v,          /* Generate code into this VM */
+  int iOffset,      /* Register holding the offset counter */
+  int iContinue     /* Jump here to skip the current record */
+){
+  if( iOffset>0 ){
+    int addr;
+    addr = sqlite3VdbeAddOp3(v, OP_IfNeg, iOffset, 0, -1); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, iContinue);
+    VdbeComment((v, "skip OFFSET records"));
+    sqlite3VdbeJumpHere(v, addr);
+  }
+}
+
+/*
+** Add code that will check to make sure the N registers starting at iMem
+** form a distinct entry.  iTab is a sorting index that holds previously
+** seen combinations of the N values.  A new entry is made in iTab
+** if the current N values are new.
+**
+** A jump to addrRepeat is made and the N+1 values are popped from the
+** stack if the top N elements are not distinct.
+*/
+static void codeDistinct(
+  Parse *pParse,     /* Parsing and code generating context */
+  int iTab,          /* A sorting index used to test for distinctness */
+  int addrRepeat,    /* Jump to here if not distinct */
+  int N,             /* Number of elements */
+  int iMem           /* First element */
+){
+  Vdbe *v;
+  int r1;
+
+  v = pParse->pVdbe;
+  r1 = sqlite3GetTempReg(pParse);
+  sqlite3VdbeAddOp4Int(v, OP_Found, iTab, addrRepeat, iMem, N); VdbeCoverage(v);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, iMem, N, r1);
+  sqlite3VdbeAddOp2(v, OP_IdxInsert, iTab, r1);
+  sqlite3ReleaseTempReg(pParse, r1);
+}
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Generate an error message when a SELECT is used within a subexpression
+** (example:  "a IN (SELECT * FROM table)") but it has more than 1 result
+** column.  We do this in a subroutine because the error used to occur
+** in multiple places.  (The error only occurs in one place now, but we
+** retain the subroutine to minimize code disruption.)
+*/
+static int checkForMultiColumnSelectError(
+  Parse *pParse,       /* Parse context. */
+  SelectDest *pDest,   /* Destination of SELECT results */
+  int nExpr            /* Number of result columns returned by SELECT */
+){
+  int eDest = pDest->eDest;
+  if( nExpr>1 && (eDest==SRT_Mem || eDest==SRT_Set) ){
+    sqlite3ErrorMsg(pParse, "only a single result allowed for "
+       "a SELECT that is part of an expression");
+    return 1;
+  }else{
+    return 0;
+  }
+}
+#endif
+
+/*
+** This routine generates the code for the inside of the inner loop
+** of a SELECT.
+**
+** If srcTab is negative, then the pEList expressions
+** are evaluated in order to get the data for this row.  If srcTab is
+** zero or more, then data is pulled from srcTab and pEList is used only 
+** to get number columns and the datatype for each column.
+*/
+static void selectInnerLoop(
+  Parse *pParse,          /* The parser context */
+  Select *p,              /* The complete select statement being coded */
+  ExprList *pEList,       /* List of values being extracted */
+  int srcTab,             /* Pull data from this table */
+  SortCtx *pSort,         /* If not NULL, info on how to process ORDER BY */
+  DistinctCtx *pDistinct, /* If not NULL, info on how to process DISTINCT */
+  SelectDest *pDest,      /* How to dispose of the results */
