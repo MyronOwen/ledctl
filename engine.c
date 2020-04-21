@@ -105917,3 +105917,233 @@ static void selectInnerLoop(
   SortCtx *pSort,         /* If not NULL, info on how to process ORDER BY */
   DistinctCtx *pDistinct, /* If not NULL, info on how to process DISTINCT */
   SelectDest *pDest,      /* How to dispose of the results */
+  int iContinue,          /* Jump here to continue with next row */
+  int iBreak              /* Jump here to break out of the inner loop */
+){
+  Vdbe *v = pParse->pVdbe;
+  int i;
+  int hasDistinct;        /* True if the DISTINCT keyword is present */
+  int regResult;              /* Start of memory holding result set */
+  int eDest = pDest->eDest;   /* How to dispose of results */
+  int iParm = pDest->iSDParm; /* First argument to disposal method */
+  int nResultCol;             /* Number of result columns */
+  int nPrefixReg = 0;         /* Number of extra registers before regResult */
+
+  assert( v );
+  assert( pEList!=0 );
+  hasDistinct = pDistinct ? pDistinct->eTnctType : WHERE_DISTINCT_NOOP;
+  if( pSort && pSort->pOrderBy==0 ) pSort = 0;
+  if( pSort==0 && !hasDistinct ){
+    assert( iContinue!=0 );
+    codeOffset(v, p->iOffset, iContinue);
+  }
+
+  /* Pull the requested columns.
+  */
+  nResultCol = pEList->nExpr;
+
+  if( pDest->iSdst==0 ){
+    if( pSort ){
+      nPrefixReg = pSort->pOrderBy->nExpr;
+      if( !(pSort->sortFlags & SORTFLAG_UseSorter) ) nPrefixReg++;
+      pParse->nMem += nPrefixReg;
+    }
+    pDest->iSdst = pParse->nMem+1;
+    pParse->nMem += nResultCol;
+  }else if( pDest->iSdst+nResultCol > pParse->nMem ){
+    /* This is an error condition that can result, for example, when a SELECT
+    ** on the right-hand side of an INSERT contains more result columns than
+    ** there are columns in the table on the left.  The error will be caught
+    ** and reported later.  But we need to make sure enough memory is allocated
+    ** to avoid other spurious errors in the meantime. */
+    pParse->nMem += nResultCol;
+  }
+  pDest->nSdst = nResultCol;
+  regResult = pDest->iSdst;
+  if( srcTab>=0 ){
+    for(i=0; i<nResultCol; i++){
+      sqlite3VdbeAddOp3(v, OP_Column, srcTab, i, regResult+i);
+      VdbeComment((v, "%s", pEList->a[i].zName));
+    }
+  }else if( eDest!=SRT_Exists ){
+    /* If the destination is an EXISTS(...) expression, the actual
+    ** values returned by the SELECT are not required.
+    */
+    sqlite3ExprCodeExprList(pParse, pEList, regResult,
+                  (eDest==SRT_Output||eDest==SRT_Coroutine)?SQLITE_ECEL_DUP:0);
+  }
+
+  /* If the DISTINCT keyword was present on the SELECT statement
+  ** and this row has been seen before, then do not make this row
+  ** part of the result.
+  */
+  if( hasDistinct ){
+    switch( pDistinct->eTnctType ){
+      case WHERE_DISTINCT_ORDERED: {
+        VdbeOp *pOp;            /* No longer required OpenEphemeral instr. */
+        int iJump;              /* Jump destination */
+        int regPrev;            /* Previous row content */
+
+        /* Allocate space for the previous row */
+        regPrev = pParse->nMem+1;
+        pParse->nMem += nResultCol;
+
+        /* Change the OP_OpenEphemeral coded earlier to an OP_Null
+        ** sets the MEM_Cleared bit on the first register of the
+        ** previous value.  This will cause the OP_Ne below to always
+        ** fail on the first iteration of the loop even if the first
+        ** row is all NULLs.
+        */
+        sqlite3VdbeChangeToNoop(v, pDistinct->addrTnct);
+        pOp = sqlite3VdbeGetOp(v, pDistinct->addrTnct);
+        pOp->opcode = OP_Null;
+        pOp->p1 = 1;
+        pOp->p2 = regPrev;
+
+        iJump = sqlite3VdbeCurrentAddr(v) + nResultCol;
+        for(i=0; i<nResultCol; i++){
+          CollSeq *pColl = sqlite3ExprCollSeq(pParse, pEList->a[i].pExpr);
+          if( i<nResultCol-1 ){
+            sqlite3VdbeAddOp3(v, OP_Ne, regResult+i, iJump, regPrev+i);
+            VdbeCoverage(v);
+          }else{
+            sqlite3VdbeAddOp3(v, OP_Eq, regResult+i, iContinue, regPrev+i);
+            VdbeCoverage(v);
+           }
+          sqlite3VdbeChangeP4(v, -1, (const char *)pColl, P4_COLLSEQ);
+          sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+        }
+        assert( sqlite3VdbeCurrentAddr(v)==iJump || pParse->db->mallocFailed );
+        sqlite3VdbeAddOp3(v, OP_Copy, regResult, regPrev, nResultCol-1);
+        break;
+      }
+
+      case WHERE_DISTINCT_UNIQUE: {
+        sqlite3VdbeChangeToNoop(v, pDistinct->addrTnct);
+        break;
+      }
+
+      default: {
+        assert( pDistinct->eTnctType==WHERE_DISTINCT_UNORDERED );
+        codeDistinct(pParse, pDistinct->tabTnct, iContinue, nResultCol, regResult);
+        break;
+      }
+    }
+    if( pSort==0 ){
+      codeOffset(v, p->iOffset, iContinue);
+    }
+  }
+
+  switch( eDest ){
+    /* In this mode, write each query result to the key of the temporary
+    ** table iParm.
+    */
+#ifndef SQLITE_OMIT_COMPOUND_SELECT
+    case SRT_Union: {
+      int r1;
+      r1 = sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regResult, nResultCol, r1);
+      sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm, r1);
+      sqlite3ReleaseTempReg(pParse, r1);
+      break;
+    }
+
+    /* Construct a record from the query result, but instead of
+    ** saving that record, use it as a key to delete elements from
+    ** the temporary table iParm.
+    */
+    case SRT_Except: {
+      sqlite3VdbeAddOp3(v, OP_IdxDelete, iParm, regResult, nResultCol);
+      break;
+    }
+#endif /* SQLITE_OMIT_COMPOUND_SELECT */
+
+    /* Store the result as data using a unique key.
+    */
+    case SRT_Fifo:
+    case SRT_DistFifo:
+    case SRT_Table:
+    case SRT_EphemTab: {
+      int r1 = sqlite3GetTempRange(pParse, nPrefixReg+1);
+      testcase( eDest==SRT_Table );
+      testcase( eDest==SRT_EphemTab );
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regResult, nResultCol, r1+nPrefixReg);
+#ifndef SQLITE_OMIT_CTE
+      if( eDest==SRT_DistFifo ){
+        /* If the destination is DistFifo, then cursor (iParm+1) is open
+        ** on an ephemeral index. If the current row is already present
+        ** in the index, do not write it to the output. If not, add the
+        ** current row to the index and proceed with writing it to the
+        ** output table as well.  */
+        int addr = sqlite3VdbeCurrentAddr(v) + 4;
+        sqlite3VdbeAddOp4Int(v, OP_Found, iParm+1, addr, r1, 0); VdbeCoverage(v);
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm+1, r1);
+        assert( pSort==0 );
+      }
+#endif
+      if( pSort ){
+        pushOntoSorter(pParse, pSort, p, r1+nPrefixReg, 1, nPrefixReg);
+      }else{
+        int r2 = sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp2(v, OP_NewRowid, iParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert, iParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+      }
+      sqlite3ReleaseTempRange(pParse, r1, nPrefixReg+1);
+      break;
+    }
+
+#ifndef SQLITE_OMIT_SUBQUERY
+    /* If we are creating a set for an "expr IN (SELECT ...)" construct,
+    ** then there should be a single item on the stack.  Write this
+    ** item into the set table with bogus data.
+    */
+    case SRT_Set: {
+      assert( nResultCol==1 );
+      pDest->affSdst =
+                  sqlite3CompareAffinity(pEList->a[0].pExpr, pDest->affSdst);
+      if( pSort ){
+        /* At first glance you would think we could optimize out the
+        ** ORDER BY in this case since the order of entries in the set
+        ** does not matter.  But there might be a LIMIT clause, in which
+        ** case the order does matter */
+        pushOntoSorter(pParse, pSort, p, regResult, 1, nPrefixReg);
+      }else{
+        int r1 = sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, regResult,1,r1, &pDest->affSdst, 1);
+        sqlite3ExprCacheAffinityChange(pParse, regResult, 1);
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm, r1);
+        sqlite3ReleaseTempReg(pParse, r1);
+      }
+      break;
+    }
+
+    /* If any row exist in the result set, record that fact and abort.
+    */
+    case SRT_Exists: {
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, iParm);
+      /* The LIMIT clause will terminate the loop for us */
+      break;
+    }
+
+    /* If this is a scalar select that is part of an expression, then
+    ** store the results in the appropriate memory cell and break out
+    ** of the scan loop.
+    */
+    case SRT_Mem: {
+      assert( nResultCol==1 );
+      if( pSort ){
+        pushOntoSorter(pParse, pSort, p, regResult, 1, nPrefixReg);
+      }else{
+        assert( regResult==iParm );
+        /* The LIMIT clause will jump out of the loop for us */
+      }
+      break;
+    }
+#endif /* #ifndef SQLITE_OMIT_SUBQUERY */
+
+    case SRT_Coroutine:       /* Send data to a co-routine */
+    case SRT_Output: {        /* Return the results */
+      testcase( eDest==SRT_Coroutine );
+      testcase( eDest==SRT_Output );
