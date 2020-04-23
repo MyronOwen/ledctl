@@ -106147,3 +106147,250 @@ static void selectInnerLoop(
     case SRT_Output: {        /* Return the results */
       testcase( eDest==SRT_Coroutine );
       testcase( eDest==SRT_Output );
+      if( pSort ){
+        pushOntoSorter(pParse, pSort, p, regResult, nResultCol, nPrefixReg);
+      }else if( eDest==SRT_Coroutine ){
+        sqlite3VdbeAddOp1(v, OP_Yield, pDest->iSDParm);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_ResultRow, regResult, nResultCol);
+        sqlite3ExprCacheAffinityChange(pParse, regResult, nResultCol);
+      }
+      break;
+    }
+
+#ifndef SQLITE_OMIT_CTE
+    /* Write the results into a priority queue that is order according to
+    ** pDest->pOrderBy (in pSO).  pDest->iSDParm (in iParm) is the cursor for an
+    ** index with pSO->nExpr+2 columns.  Build a key using pSO for the first
+    ** pSO->nExpr columns, then make sure all keys are unique by adding a
+    ** final OP_Sequence column.  The last column is the record as a blob.
+    */
+    case SRT_DistQueue:
+    case SRT_Queue: {
+      int nKey;
+      int r1, r2, r3;
+      int addrTest = 0;
+      ExprList *pSO;
+      pSO = pDest->pOrderBy;
+      assert( pSO );
+      nKey = pSO->nExpr;
+      r1 = sqlite3GetTempReg(pParse);
+      r2 = sqlite3GetTempRange(pParse, nKey+2);
+      r3 = r2+nKey+1;
+      if( eDest==SRT_DistQueue ){
+        /* If the destination is DistQueue, then cursor (iParm+1) is open
+        ** on a second ephemeral index that holds all values every previously
+        ** added to the queue. */
+        addrTest = sqlite3VdbeAddOp4Int(v, OP_Found, iParm+1, 0, 
+                                        regResult, nResultCol);
+        VdbeCoverage(v);
+      }
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regResult, nResultCol, r3);
+      if( eDest==SRT_DistQueue ){
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm+1, r3);
+        sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+      }
+      for(i=0; i<nKey; i++){
+        sqlite3VdbeAddOp2(v, OP_SCopy,
+                          regResult + pSO->a[i].u.x.iOrderByCol - 1,
+                          r2+i);
+      }
+      sqlite3VdbeAddOp2(v, OP_Sequence, iParm, r2+nKey);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, r2, nKey+2, r1);
+      sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm, r1);
+      if( addrTest ) sqlite3VdbeJumpHere(v, addrTest);
+      sqlite3ReleaseTempReg(pParse, r1);
+      sqlite3ReleaseTempRange(pParse, r2, nKey+2);
+      break;
+    }
+#endif /* SQLITE_OMIT_CTE */
+
+
+
+#if !defined(SQLITE_OMIT_TRIGGER)
+    /* Discard the results.  This is used for SELECT statements inside
+    ** the body of a TRIGGER.  The purpose of such selects is to call
+    ** user-defined functions that have side effects.  We do not care
+    ** about the actual results of the select.
+    */
+    default: {
+      assert( eDest==SRT_Discard );
+      break;
+    }
+#endif
+  }
+
+  /* Jump to the end of the loop if the LIMIT is reached.  Except, if
+  ** there is a sorter, in which case the sorter has already limited
+  ** the output for us.
+  */
+  if( pSort==0 && p->iLimit ){
+    sqlite3VdbeAddOp3(v, OP_IfZero, p->iLimit, iBreak, -1); VdbeCoverage(v);
+  }
+}
+
+/*
+** Allocate a KeyInfo object sufficient for an index of N key columns and
+** X extra columns.
+*/
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoAlloc(sqlite3 *db, int N, int X){
+  KeyInfo *p = sqlite3DbMallocZero(0, 
+                   sizeof(KeyInfo) + (N+X)*(sizeof(CollSeq*)+1));
+  if( p ){
+    p->aSortOrder = (u8*)&p->aColl[N+X];
+    p->nField = (u16)N;
+    p->nXField = (u16)X;
+    p->enc = ENC(db);
+    p->db = db;
+    p->nRef = 1;
+  }else{
+    db->mallocFailed = 1;
+  }
+  return p;
+}
+
+/*
+** Deallocate a KeyInfo object
+*/
+SQLITE_PRIVATE void sqlite3KeyInfoUnref(KeyInfo *p){
+  if( p ){
+    assert( p->nRef>0 );
+    p->nRef--;
+    if( p->nRef==0 ) sqlite3DbFree(0, p);
+  }
+}
+
+/*
+** Make a new pointer to a KeyInfo object
+*/
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoRef(KeyInfo *p){
+  if( p ){
+    assert( p->nRef>0 );
+    p->nRef++;
+  }
+  return p;
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Return TRUE if a KeyInfo object can be change.  The KeyInfo object
+** can only be changed if this is just a single reference to the object.
+**
+** This routine is used only inside of assert() statements.
+*/
+SQLITE_PRIVATE int sqlite3KeyInfoIsWriteable(KeyInfo *p){ return p->nRef==1; }
+#endif /* SQLITE_DEBUG */
+
+/*
+** Given an expression list, generate a KeyInfo structure that records
+** the collating sequence for each expression in that expression list.
+**
+** If the ExprList is an ORDER BY or GROUP BY clause then the resulting
+** KeyInfo structure is appropriate for initializing a virtual index to
+** implement that clause.  If the ExprList is the result set of a SELECT
+** then the KeyInfo structure is appropriate for initializing a virtual
+** index to implement a DISTINCT test.
+**
+** Space to hold the KeyInfo structure is obtained from malloc.  The calling
+** function is responsible for seeing that this structure is eventually
+** freed.
+*/
+static KeyInfo *keyInfoFromExprList(
+  Parse *pParse,       /* Parsing context */
+  ExprList *pList,     /* Form the KeyInfo object from this ExprList */
+  int iStart,          /* Begin with this column of pList */
+  int nExtra           /* Add this many extra columns to the end */
+){
+  int nExpr;
+  KeyInfo *pInfo;
+  struct ExprList_item *pItem;
+  sqlite3 *db = pParse->db;
+  int i;
+
+  nExpr = pList->nExpr;
+  pInfo = sqlite3KeyInfoAlloc(db, nExpr+nExtra-iStart, 1);
+  if( pInfo ){
+    assert( sqlite3KeyInfoIsWriteable(pInfo) );
+    for(i=iStart, pItem=pList->a+iStart; i<nExpr; i++, pItem++){
+      CollSeq *pColl;
+      pColl = sqlite3ExprCollSeq(pParse, pItem->pExpr);
+      if( !pColl ) pColl = db->pDfltColl;
+      pInfo->aColl[i-iStart] = pColl;
+      pInfo->aSortOrder[i-iStart] = pItem->sortOrder;
+    }
+  }
+  return pInfo;
+}
+
+#ifndef SQLITE_OMIT_COMPOUND_SELECT
+/*
+** Name of the connection operator, used for error messages.
+*/
+static const char *selectOpName(int id){
+  char *z;
+  switch( id ){
+    case TK_ALL:       z = "UNION ALL";   break;
+    case TK_INTERSECT: z = "INTERSECT";   break;
+    case TK_EXCEPT:    z = "EXCEPT";      break;
+    default:           z = "UNION";       break;
+  }
+  return z;
+}
+#endif /* SQLITE_OMIT_COMPOUND_SELECT */
+
+#ifndef SQLITE_OMIT_EXPLAIN
+/*
+** Unless an "EXPLAIN QUERY PLAN" command is being processed, this function
+** is a no-op. Otherwise, it adds a single row of output to the EQP result,
+** where the caption is of the form:
+**
+**   "USE TEMP B-TREE FOR xxx"
+**
+** where xxx is one of "DISTINCT", "ORDER BY" or "GROUP BY". Exactly which
+** is determined by the zUsage argument.
+*/
+static void explainTempTable(Parse *pParse, const char *zUsage){
+  if( pParse->explain==2 ){
+    Vdbe *v = pParse->pVdbe;
+    char *zMsg = sqlite3MPrintf(pParse->db, "USE TEMP B-TREE FOR %s", zUsage);
+    sqlite3VdbeAddOp4(v, OP_Explain, pParse->iSelectId, 0, 0, zMsg, P4_DYNAMIC);
+  }
+}
+
+/*
+** Assign expression b to lvalue a. A second, no-op, version of this macro
+** is provided when SQLITE_OMIT_EXPLAIN is defined. This allows the code
+** in sqlite3Select() to assign values to structure member variables that
+** only exist if SQLITE_OMIT_EXPLAIN is not defined without polluting the
+** code with #ifndef directives.
+*/
+# define explainSetInteger(a, b) a = b
+
+#else
+/* No-op versions of the explainXXX() functions and macros. */
+# define explainTempTable(y,z)
+# define explainSetInteger(y,z)
+#endif
+
+#if !defined(SQLITE_OMIT_EXPLAIN) && !defined(SQLITE_OMIT_COMPOUND_SELECT)
+/*
+** Unless an "EXPLAIN QUERY PLAN" command is being processed, this function
+** is a no-op. Otherwise, it adds a single row of output to the EQP result,
+** where the caption is of one of the two forms:
+**
+**   "COMPOSITE SUBQUERIES iSub1 and iSub2 (op)"
+**   "COMPOSITE SUBQUERIES iSub1 and iSub2 USING TEMP B-TREE (op)"
+**
+** where iSub1 and iSub2 are the integers passed as the corresponding
+** function parameters, and op is the text representation of the parameter
+** of the same name. The parameter "op" must be one of TK_UNION, TK_EXCEPT,
+** TK_INTERSECT or TK_ALL. The first form is used if argument bUseTmp is 
+** false, or the second form if it is true.
+*/
+static void explainComposite(
+  Parse *pParse,                  /* Parse context */
+  int op,                         /* One of TK_UNION, TK_EXCEPT etc. */
+  int iSub1,                      /* Subquery id 1 */
+  int iSub2,                      /* Subquery id 2 */
+  int bUseTmp                     /* True if a temp table was used */
+){
