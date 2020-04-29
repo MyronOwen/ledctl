@@ -106614,3 +106614,241 @@ static const char *columnTypeImpl(
         ** cause this condition to run.  Since then, we have restructured how
         ** trigger code is generated and so this condition is no longer 
         ** possible. However, it can still be true for statements like
+        ** the following:
+        **
+        **   CREATE TABLE t1(col INTEGER);
+        **   SELECT (SELECT t1.col) FROM FROM t1;
+        **
+        ** when columnType() is called on the expression "t1.col" in the 
+        ** sub-select. In this case, set the column type to NULL, even
+        ** though it should really be "INTEGER".
+        **
+        ** This is not a problem, as the column type of "t1.col" is never
+        ** used. When columnType() is called on the expression 
+        ** "(SELECT t1.col)", the correct type is returned (see the TK_SELECT
+        ** branch below.  */
+        break;
+      }
+
+      assert( pTab && pExpr->pTab==pTab );
+      if( pS ){
+        /* The "table" is actually a sub-select or a view in the FROM clause
+        ** of the SELECT statement. Return the declaration type and origin
+        ** data for the result-set column of the sub-select.
+        */
+        if( iCol>=0 && ALWAYS(iCol<pS->pEList->nExpr) ){
+          /* If iCol is less than zero, then the expression requests the
+          ** rowid of the sub-select or view. This expression is legal (see 
+          ** test case misc2.2.2) - it always evaluates to NULL.
+          */
+          NameContext sNC;
+          Expr *p = pS->pEList->a[iCol].pExpr;
+          sNC.pSrcList = pS->pSrc;
+          sNC.pNext = pNC;
+          sNC.pParse = pNC->pParse;
+          zType = columnType(&sNC, p,&zOrigDb,&zOrigTab,&zOrigCol, &estWidth); 
+        }
+      }else if( pTab->pSchema ){
+        /* A real table */
+        assert( !pS );
+        if( iCol<0 ) iCol = pTab->iPKey;
+        assert( iCol==-1 || (iCol>=0 && iCol<pTab->nCol) );
+#ifdef SQLITE_ENABLE_COLUMN_METADATA
+        if( iCol<0 ){
+          zType = "INTEGER";
+          zOrigCol = "rowid";
+        }else{
+          zType = pTab->aCol[iCol].zType;
+          zOrigCol = pTab->aCol[iCol].zName;
+          estWidth = pTab->aCol[iCol].szEst;
+        }
+        zOrigTab = pTab->zName;
+        if( pNC->pParse ){
+          int iDb = sqlite3SchemaToIndex(pNC->pParse->db, pTab->pSchema);
+          zOrigDb = pNC->pParse->db->aDb[iDb].zName;
+        }
+#else
+        if( iCol<0 ){
+          zType = "INTEGER";
+        }else{
+          zType = pTab->aCol[iCol].zType;
+          estWidth = pTab->aCol[iCol].szEst;
+        }
+#endif
+      }
+      break;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case TK_SELECT: {
+      /* The expression is a sub-select. Return the declaration type and
+      ** origin info for the single column in the result set of the SELECT
+      ** statement.
+      */
+      NameContext sNC;
+      Select *pS = pExpr->x.pSelect;
+      Expr *p = pS->pEList->a[0].pExpr;
+      assert( ExprHasProperty(pExpr, EP_xIsSelect) );
+      sNC.pSrcList = pS->pSrc;
+      sNC.pNext = pNC;
+      sNC.pParse = pNC->pParse;
+      zType = columnType(&sNC, p, &zOrigDb, &zOrigTab, &zOrigCol, &estWidth); 
+      break;
+    }
+#endif
+  }
+
+#ifdef SQLITE_ENABLE_COLUMN_METADATA  
+  if( pzOrigDb ){
+    assert( pzOrigTab && pzOrigCol );
+    *pzOrigDb = zOrigDb;
+    *pzOrigTab = zOrigTab;
+    *pzOrigCol = zOrigCol;
+  }
+#endif
+  if( pEstWidth ) *pEstWidth = estWidth;
+  return zType;
+}
+
+/*
+** Generate code that will tell the VDBE the declaration types of columns
+** in the result set.
+*/
+static void generateColumnTypes(
+  Parse *pParse,      /* Parser context */
+  SrcList *pTabList,  /* List of tables */
+  ExprList *pEList    /* Expressions defining the result set */
+){
+#ifndef SQLITE_OMIT_DECLTYPE
+  Vdbe *v = pParse->pVdbe;
+  int i;
+  NameContext sNC;
+  sNC.pSrcList = pTabList;
+  sNC.pParse = pParse;
+  for(i=0; i<pEList->nExpr; i++){
+    Expr *p = pEList->a[i].pExpr;
+    const char *zType;
+#ifdef SQLITE_ENABLE_COLUMN_METADATA
+    const char *zOrigDb = 0;
+    const char *zOrigTab = 0;
+    const char *zOrigCol = 0;
+    zType = columnType(&sNC, p, &zOrigDb, &zOrigTab, &zOrigCol, 0);
+
+    /* The vdbe must make its own copy of the column-type and other 
+    ** column specific strings, in case the schema is reset before this
+    ** virtual machine is deleted.
+    */
+    sqlite3VdbeSetColName(v, i, COLNAME_DATABASE, zOrigDb, SQLITE_TRANSIENT);
+    sqlite3VdbeSetColName(v, i, COLNAME_TABLE, zOrigTab, SQLITE_TRANSIENT);
+    sqlite3VdbeSetColName(v, i, COLNAME_COLUMN, zOrigCol, SQLITE_TRANSIENT);
+#else
+    zType = columnType(&sNC, p, 0, 0, 0, 0);
+#endif
+    sqlite3VdbeSetColName(v, i, COLNAME_DECLTYPE, zType, SQLITE_TRANSIENT);
+  }
+#endif /* !defined(SQLITE_OMIT_DECLTYPE) */
+}
+
+/*
+** Generate code that will tell the VDBE the names of columns
+** in the result set.  This information is used to provide the
+** azCol[] values in the callback.
+*/
+static void generateColumnNames(
+  Parse *pParse,      /* Parser context */
+  SrcList *pTabList,  /* List of tables */
+  ExprList *pEList    /* Expressions defining the result set */
+){
+  Vdbe *v = pParse->pVdbe;
+  int i, j;
+  sqlite3 *db = pParse->db;
+  int fullNames, shortNames;
+
+#ifndef SQLITE_OMIT_EXPLAIN
+  /* If this is an EXPLAIN, skip this step */
+  if( pParse->explain ){
+    return;
+  }
+#endif
+
+  if( pParse->colNamesSet || NEVER(v==0) || db->mallocFailed ) return;
+  pParse->colNamesSet = 1;
+  fullNames = (db->flags & SQLITE_FullColNames)!=0;
+  shortNames = (db->flags & SQLITE_ShortColNames)!=0;
+  sqlite3VdbeSetNumCols(v, pEList->nExpr);
+  for(i=0; i<pEList->nExpr; i++){
+    Expr *p;
+    p = pEList->a[i].pExpr;
+    if( NEVER(p==0) ) continue;
+    if( pEList->a[i].zName ){
+      char *zName = pEList->a[i].zName;
+      sqlite3VdbeSetColName(v, i, COLNAME_NAME, zName, SQLITE_TRANSIENT);
+    }else if( (p->op==TK_COLUMN || p->op==TK_AGG_COLUMN) && pTabList ){
+      Table *pTab;
+      char *zCol;
+      int iCol = p->iColumn;
+      for(j=0; ALWAYS(j<pTabList->nSrc); j++){
+        if( pTabList->a[j].iCursor==p->iTable ) break;
+      }
+      assert( j<pTabList->nSrc );
+      pTab = pTabList->a[j].pTab;
+      if( iCol<0 ) iCol = pTab->iPKey;
+      assert( iCol==-1 || (iCol>=0 && iCol<pTab->nCol) );
+      if( iCol<0 ){
+        zCol = "rowid";
+      }else{
+        zCol = pTab->aCol[iCol].zName;
+      }
+      if( !shortNames && !fullNames ){
+        sqlite3VdbeSetColName(v, i, COLNAME_NAME, 
+            sqlite3DbStrDup(db, pEList->a[i].zSpan), SQLITE_DYNAMIC);
+      }else if( fullNames ){
+        char *zName = 0;
+        zName = sqlite3MPrintf(db, "%s.%s", pTab->zName, zCol);
+        sqlite3VdbeSetColName(v, i, COLNAME_NAME, zName, SQLITE_DYNAMIC);
+      }else{
+        sqlite3VdbeSetColName(v, i, COLNAME_NAME, zCol, SQLITE_TRANSIENT);
+      }
+    }else{
+      const char *z = pEList->a[i].zSpan;
+      z = z==0 ? sqlite3MPrintf(db, "column%d", i+1) : sqlite3DbStrDup(db, z);
+      sqlite3VdbeSetColName(v, i, COLNAME_NAME, z, SQLITE_DYNAMIC);
+    }
+  }
+  generateColumnTypes(pParse, pTabList, pEList);
+}
+
+/*
+** Given an expression list (which is really the list of expressions
+** that form the result set of a SELECT statement) compute appropriate
+** column names for a table that would hold the expression list.
+**
+** All column names will be unique.
+**
+** Only the column names are computed.  Column.zType, Column.zColl,
+** and other fields of Column are zeroed.
+**
+** Return SQLITE_OK on success.  If a memory allocation error occurs,
+** store NULL in *paCol and 0 in *pnCol and return SQLITE_NOMEM.
+*/
+static int selectColumnsFromExprList(
+  Parse *pParse,          /* Parsing context */
+  ExprList *pEList,       /* Expr list from which to derive column names */
+  i16 *pnCol,             /* Write the number of columns here */
+  Column **paCol          /* Write the new column list here */
+){
+  sqlite3 *db = pParse->db;   /* Database connection */
+  int i, j;                   /* Loop counters */
+  int cnt;                    /* Index added to make the name unique */
+  Column *aCol, *pCol;        /* For looping over result columns */
+  int nCol;                   /* Number of columns in the result set */
+  Expr *p;                    /* Expression for a single result column */
+  char *zName;                /* Column name */
+  int nName;                  /* Size of name in zName[] */
+
+  if( pEList ){
+    nCol = pEList->nExpr;
+    aCol = sqlite3DbMallocZero(db, sizeof(aCol[0])*nCol);
+    testcase( aCol==0 );
+  }else{
+    nCol = 0;
+    aCol = 0;
