@@ -106394,3 +106394,223 @@ static void explainComposite(
   int iSub2,                      /* Subquery id 2 */
   int bUseTmp                     /* True if a temp table was used */
 ){
+  assert( op==TK_UNION || op==TK_EXCEPT || op==TK_INTERSECT || op==TK_ALL );
+  if( pParse->explain==2 ){
+    Vdbe *v = pParse->pVdbe;
+    char *zMsg = sqlite3MPrintf(
+        pParse->db, "COMPOUND SUBQUERIES %d AND %d %s(%s)", iSub1, iSub2,
+        bUseTmp?"USING TEMP B-TREE ":"", selectOpName(op)
+    );
+    sqlite3VdbeAddOp4(v, OP_Explain, pParse->iSelectId, 0, 0, zMsg, P4_DYNAMIC);
+  }
+}
+#else
+/* No-op versions of the explainXXX() functions and macros. */
+# define explainComposite(v,w,x,y,z)
+#endif
+
+/*
+** If the inner loop was generated using a non-null pOrderBy argument,
+** then the results were placed in a sorter.  After the loop is terminated
+** we need to run the sorter and output the results.  The following
+** routine generates the code needed to do that.
+*/
+static void generateSortTail(
+  Parse *pParse,    /* Parsing context */
+  Select *p,        /* The SELECT statement */
+  SortCtx *pSort,   /* Information on the ORDER BY clause */
+  int nColumn,      /* Number of columns of data */
+  SelectDest *pDest /* Write the sorted results here */
+){
+  Vdbe *v = pParse->pVdbe;                     /* The prepared statement */
+  int addrBreak = sqlite3VdbeMakeLabel(v);     /* Jump here to exit loop */
+  int addrContinue = sqlite3VdbeMakeLabel(v);  /* Jump here for next cycle */
+  int addr;
+  int addrOnce = 0;
+  int iTab;
+  ExprList *pOrderBy = pSort->pOrderBy;
+  int eDest = pDest->eDest;
+  int iParm = pDest->iSDParm;
+  int regRow;
+  int regRowid;
+  int nKey;
+  int iSortTab;                   /* Sorter cursor to read from */
+  int nSortData;                  /* Trailing values to read from sorter */
+  int i;
+  int bSeq;                       /* True if sorter record includes seq. no. */
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+  struct ExprList_item *aOutEx = p->pEList->a;
+#endif
+
+  if( pSort->labelBkOut ){
+    sqlite3VdbeAddOp2(v, OP_Gosub, pSort->regReturn, pSort->labelBkOut);
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addrBreak);
+    sqlite3VdbeResolveLabel(v, pSort->labelBkOut);
+  }
+  iTab = pSort->iECursor;
+  if( eDest==SRT_Output || eDest==SRT_Coroutine ){
+    regRowid = 0;
+    regRow = pDest->iSdst;
+    nSortData = nColumn;
+  }else{
+    regRowid = sqlite3GetTempReg(pParse);
+    regRow = sqlite3GetTempReg(pParse);
+    nSortData = 1;
+  }
+  nKey = pOrderBy->nExpr - pSort->nOBSat;
+  if( pSort->sortFlags & SORTFLAG_UseSorter ){
+    int regSortOut = ++pParse->nMem;
+    iSortTab = pParse->nTab++;
+    if( pSort->labelBkOut ){
+      addrOnce = sqlite3CodeOnce(pParse); VdbeCoverage(v);
+    }
+    sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut, nKey+1+nSortData);
+    if( addrOnce ) sqlite3VdbeJumpHere(v, addrOnce);
+    addr = 1 + sqlite3VdbeAddOp2(v, OP_SorterSort, iTab, addrBreak);
+    VdbeCoverage(v);
+    codeOffset(v, p->iOffset, addrContinue);
+    sqlite3VdbeAddOp3(v, OP_SorterData, iTab, regSortOut, iSortTab);
+    bSeq = 0;
+  }else{
+    addr = 1 + sqlite3VdbeAddOp2(v, OP_Sort, iTab, addrBreak); VdbeCoverage(v);
+    codeOffset(v, p->iOffset, addrContinue);
+    iSortTab = iTab;
+    bSeq = 1;
+  }
+  for(i=0; i<nSortData; i++){
+    sqlite3VdbeAddOp3(v, OP_Column, iSortTab, nKey+bSeq+i, regRow+i);
+    VdbeComment((v, "%s", aOutEx[i].zName ? aOutEx[i].zName : aOutEx[i].zSpan));
+  }
+  switch( eDest ){
+    case SRT_Table:
+    case SRT_EphemTab: {
+      testcase( eDest==SRT_Table );
+      testcase( eDest==SRT_EphemTab );
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iParm, regRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, iParm, regRow, regRowid);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      break;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case SRT_Set: {
+      assert( nColumn==1 );
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, regRow, 1, regRowid,
+                        &pDest->affSdst, 1);
+      sqlite3ExprCacheAffinityChange(pParse, regRow, 1);
+      sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm, regRowid);
+      break;
+    }
+    case SRT_Mem: {
+      assert( nColumn==1 );
+      sqlite3ExprCodeMove(pParse, regRow, iParm, 1);
+      /* The LIMIT clause will terminate the loop for us */
+      break;
+    }
+#endif
+    default: {
+      assert( eDest==SRT_Output || eDest==SRT_Coroutine ); 
+      testcase( eDest==SRT_Output );
+      testcase( eDest==SRT_Coroutine );
+      if( eDest==SRT_Output ){
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest->iSdst, nColumn);
+        sqlite3ExprCacheAffinityChange(pParse, pDest->iSdst, nColumn);
+      }else{
+        sqlite3VdbeAddOp1(v, OP_Yield, pDest->iSDParm);
+      }
+      break;
+    }
+  }
+  if( regRowid ){
+    sqlite3ReleaseTempReg(pParse, regRow);
+    sqlite3ReleaseTempReg(pParse, regRowid);
+  }
+  /* The bottom of the loop
+  */
+  sqlite3VdbeResolveLabel(v, addrContinue);
+  if( pSort->sortFlags & SORTFLAG_UseSorter ){
+    sqlite3VdbeAddOp2(v, OP_SorterNext, iTab, addr); VdbeCoverage(v);
+  }else{
+    sqlite3VdbeAddOp2(v, OP_Next, iTab, addr); VdbeCoverage(v);
+  }
+  if( pSort->regReturn ) sqlite3VdbeAddOp1(v, OP_Return, pSort->regReturn);
+  sqlite3VdbeResolveLabel(v, addrBreak);
+}
+
+/*
+** Return a pointer to a string containing the 'declaration type' of the
+** expression pExpr. The string may be treated as static by the caller.
+**
+** Also try to estimate the size of the returned value and return that
+** result in *pEstWidth.
+**
+** The declaration type is the exact datatype definition extracted from the
+** original CREATE TABLE statement if the expression is a column. The
+** declaration type for a ROWID field is INTEGER. Exactly when an expression
+** is considered a column can be complex in the presence of subqueries. The
+** result-set expression in all of the following SELECT statements is 
+** considered a column by this function.
+**
+**   SELECT col FROM tbl;
+**   SELECT (SELECT col FROM tbl;
+**   SELECT (SELECT col FROM tbl);
+**   SELECT abc FROM (SELECT col AS abc FROM tbl);
+** 
+** The declaration type for any expression other than a column is NULL.
+**
+** This routine has either 3 or 6 parameters depending on whether or not
+** the SQLITE_ENABLE_COLUMN_METADATA compile-time option is used.
+*/
+#ifdef SQLITE_ENABLE_COLUMN_METADATA
+# define columnType(A,B,C,D,E,F) columnTypeImpl(A,B,C,D,E,F)
+static const char *columnTypeImpl(
+  NameContext *pNC, 
+  Expr *pExpr,
+  const char **pzOrigDb,
+  const char **pzOrigTab,
+  const char **pzOrigCol,
+  u8 *pEstWidth
+){
+  char const *zOrigDb = 0;
+  char const *zOrigTab = 0;
+  char const *zOrigCol = 0;
+#else /* if !defined(SQLITE_ENABLE_COLUMN_METADATA) */
+# define columnType(A,B,C,D,E,F) columnTypeImpl(A,B,F)
+static const char *columnTypeImpl(
+  NameContext *pNC, 
+  Expr *pExpr,
+  u8 *pEstWidth
+){
+#endif /* !defined(SQLITE_ENABLE_COLUMN_METADATA) */
+  char const *zType = 0;
+  int j;
+  u8 estWidth = 1;
+
+  if( NEVER(pExpr==0) || pNC->pSrcList==0 ) return 0;
+  switch( pExpr->op ){
+    case TK_AGG_COLUMN:
+    case TK_COLUMN: {
+      /* The expression is a column. Locate the table the column is being
+      ** extracted from in NameContext.pSrcList. This table may be real
+      ** database table or a subquery.
+      */
+      Table *pTab = 0;            /* Table structure column is extracted from */
+      Select *pS = 0;             /* Select the column is extracted from */
+      int iCol = pExpr->iColumn;  /* Index of column in pTab */
+      testcase( pExpr->op==TK_AGG_COLUMN );
+      testcase( pExpr->op==TK_COLUMN );
+      while( pNC && !pTab ){
+        SrcList *pTabList = pNC->pSrcList;
+        for(j=0;j<pTabList->nSrc && pTabList->a[j].iCursor!=pExpr->iTable;j++);
+        if( j<pTabList->nSrc ){
+          pTab = pTabList->a[j].pTab;
+          pS = pTabList->a[j].pSelect;
+        }else{
+          pNC = pNC->pNext;
+        }
+      }
+
+      if( pTab==0 ){
+        /* At one time, code such as "SELECT new.x" within a trigger would
+        ** cause this condition to run.  Since then, we have restructured how
+        ** trigger code is generated and so this condition is no longer 
+        ** possible. However, it can still be true for statements like
