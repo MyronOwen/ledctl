@@ -106852,3 +106852,208 @@ static int selectColumnsFromExprList(
   }else{
     nCol = 0;
     aCol = 0;
+  }
+  *pnCol = nCol;
+  *paCol = aCol;
+
+  for(i=0, pCol=aCol; i<nCol; i++, pCol++){
+    /* Get an appropriate name for the column
+    */
+    p = sqlite3ExprSkipCollate(pEList->a[i].pExpr);
+    if( (zName = pEList->a[i].zName)!=0 ){
+      /* If the column contains an "AS <name>" phrase, use <name> as the name */
+      zName = sqlite3DbStrDup(db, zName);
+    }else{
+      Expr *pColExpr = p;  /* The expression that is the result column name */
+      Table *pTab;         /* Table associated with this expression */
+      while( pColExpr->op==TK_DOT ){
+        pColExpr = pColExpr->pRight;
+        assert( pColExpr!=0 );
+      }
+      if( pColExpr->op==TK_COLUMN && ALWAYS(pColExpr->pTab!=0) ){
+        /* For columns use the column name name */
+        int iCol = pColExpr->iColumn;
+        pTab = pColExpr->pTab;
+        if( iCol<0 ) iCol = pTab->iPKey;
+        zName = sqlite3MPrintf(db, "%s",
+                 iCol>=0 ? pTab->aCol[iCol].zName : "rowid");
+      }else if( pColExpr->op==TK_ID ){
+        assert( !ExprHasProperty(pColExpr, EP_IntValue) );
+        zName = sqlite3MPrintf(db, "%s", pColExpr->u.zToken);
+      }else{
+        /* Use the original text of the column expression as its name */
+        zName = sqlite3MPrintf(db, "%s", pEList->a[i].zSpan);
+      }
+    }
+    if( db->mallocFailed ){
+      sqlite3DbFree(db, zName);
+      break;
+    }
+
+    /* Make sure the column name is unique.  If the name is not unique,
+    ** append an integer to the name so that it becomes unique.
+    */
+    nName = sqlite3Strlen30(zName);
+    for(j=cnt=0; j<i; j++){
+      if( sqlite3StrICmp(aCol[j].zName, zName)==0 ){
+        char *zNewName;
+        int k;
+        for(k=nName-1; k>1 && sqlite3Isdigit(zName[k]); k--){}
+        if( k>=0 && zName[k]==':' ) nName = k;
+        zName[nName] = 0;
+        zNewName = sqlite3MPrintf(db, "%s:%d", zName, ++cnt);
+        sqlite3DbFree(db, zName);
+        zName = zNewName;
+        j = -1;
+        if( zName==0 ) break;
+      }
+    }
+    pCol->zName = zName;
+  }
+  if( db->mallocFailed ){
+    for(j=0; j<i; j++){
+      sqlite3DbFree(db, aCol[j].zName);
+    }
+    sqlite3DbFree(db, aCol);
+    *paCol = 0;
+    *pnCol = 0;
+    return SQLITE_NOMEM;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Add type and collation information to a column list based on
+** a SELECT statement.
+** 
+** The column list presumably came from selectColumnNamesFromExprList().
+** The column list has only names, not types or collations.  This
+** routine goes through and adds the types and collations.
+**
+** This routine requires that all identifiers in the SELECT
+** statement be resolved.
+*/
+static void selectAddColumnTypeAndCollation(
+  Parse *pParse,        /* Parsing contexts */
+  Table *pTab,          /* Add column type information to this table */
+  Select *pSelect       /* SELECT used to determine types and collations */
+){
+  sqlite3 *db = pParse->db;
+  NameContext sNC;
+  Column *pCol;
+  CollSeq *pColl;
+  int i;
+  Expr *p;
+  struct ExprList_item *a;
+  u64 szAll = 0;
+
+  assert( pSelect!=0 );
+  assert( (pSelect->selFlags & SF_Resolved)!=0 );
+  assert( pTab->nCol==pSelect->pEList->nExpr || db->mallocFailed );
+  if( db->mallocFailed ) return;
+  memset(&sNC, 0, sizeof(sNC));
+  sNC.pSrcList = pSelect->pSrc;
+  a = pSelect->pEList->a;
+  for(i=0, pCol=pTab->aCol; i<pTab->nCol; i++, pCol++){
+    p = a[i].pExpr;
+    pCol->zType = sqlite3DbStrDup(db, columnType(&sNC, p,0,0,0, &pCol->szEst));
+    szAll += pCol->szEst;
+    pCol->affinity = sqlite3ExprAffinity(p);
+    if( pCol->affinity==0 ) pCol->affinity = SQLITE_AFF_NONE;
+    pColl = sqlite3ExprCollSeq(pParse, p);
+    if( pColl ){
+      pCol->zColl = sqlite3DbStrDup(db, pColl->zName);
+    }
+  }
+  pTab->szTabRow = sqlite3LogEst(szAll*4);
+}
+
+/*
+** Given a SELECT statement, generate a Table structure that describes
+** the result set of that SELECT.
+*/
+SQLITE_PRIVATE Table *sqlite3ResultSetOfSelect(Parse *pParse, Select *pSelect){
+  Table *pTab;
+  sqlite3 *db = pParse->db;
+  int savedFlags;
+
+  savedFlags = db->flags;
+  db->flags &= ~SQLITE_FullColNames;
+  db->flags |= SQLITE_ShortColNames;
+  sqlite3SelectPrep(pParse, pSelect, 0);
+  if( pParse->nErr ) return 0;
+  while( pSelect->pPrior ) pSelect = pSelect->pPrior;
+  db->flags = savedFlags;
+  pTab = sqlite3DbMallocZero(db, sizeof(Table) );
+  if( pTab==0 ){
+    return 0;
+  }
+  /* The sqlite3ResultSetOfSelect() is only used n contexts where lookaside
+  ** is disabled */
+  assert( db->lookaside.bEnabled==0 );
+  pTab->nRef = 1;
+  pTab->zName = 0;
+  pTab->nRowLogEst = 200; assert( 200==sqlite3LogEst(1048576) );
+  selectColumnsFromExprList(pParse, pSelect->pEList, &pTab->nCol, &pTab->aCol);
+  selectAddColumnTypeAndCollation(pParse, pTab, pSelect);
+  pTab->iPKey = -1;
+  if( db->mallocFailed ){
+    sqlite3DeleteTable(db, pTab);
+    return 0;
+  }
+  return pTab;
+}
+
+/*
+** Get a VDBE for the given parser context.  Create a new one if necessary.
+** If an error occurs, return NULL and leave a message in pParse.
+*/
+SQLITE_PRIVATE Vdbe *sqlite3GetVdbe(Parse *pParse){
+  Vdbe *v = pParse->pVdbe;
+  if( v==0 ){
+    v = pParse->pVdbe = sqlite3VdbeCreate(pParse);
+    if( v ) sqlite3VdbeAddOp0(v, OP_Init);
+    if( pParse->pToplevel==0
+     && OptimizationEnabled(pParse->db,SQLITE_FactorOutConst)
+    ){
+      pParse->okConstFactor = 1;
+    }
+
+  }
+  return v;
+}
+
+
+/*
+** Compute the iLimit and iOffset fields of the SELECT based on the
+** pLimit and pOffset expressions.  pLimit and pOffset hold the expressions
+** that appear in the original SQL statement after the LIMIT and OFFSET
+** keywords.  Or NULL if those keywords are omitted. iLimit and iOffset 
+** are the integer memory register numbers for counters used to compute 
+** the limit and offset.  If there is no limit and/or offset, then 
+** iLimit and iOffset are negative.
+**
+** This routine changes the values of iLimit and iOffset only if
+** a limit or offset is defined by pLimit and pOffset.  iLimit and
+** iOffset should have been preset to appropriate default values (zero)
+** prior to calling this routine.
+**
+** The iOffset register (if it exists) is initialized to the value
+** of the OFFSET.  The iLimit register is initialized to LIMIT.  Register
+** iOffset+1 is initialized to LIMIT+OFFSET.
+**
+** Only if pLimit!=0 or pOffset!=0 do the limit registers get
+** redefined.  The UNION ALL operator uses this property to force
+** the reuse of the same limit and offset registers across multiple
+** SELECT statements.
+*/
+static void computeLimitRegisters(Parse *pParse, Select *p, int iBreak){
+  Vdbe *v = 0;
+  int iLimit = 0;
+  int iOffset;
+  int addr1, n;
+  if( p->iLimit ) return;
+
+  /* 
+  ** "LIMIT -1" always shows all rows.  There is some
+  ** controversy about what the correct behavior should be.
