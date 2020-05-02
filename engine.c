@@ -107269,3 +107269,249 @@ static void generateWithRecursiveQuery(
     p->addrOpenEphm[0] = sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iDistinct, 0);
     p->selFlags |= SF_UsesEphemeral;
   }
+
+  /* Detach the ORDER BY clause from the compound SELECT */
+  p->pOrderBy = 0;
+
+  /* Store the results of the setup-query in Queue. */
+  pSetup->pNext = 0;
+  rc = sqlite3Select(pParse, pSetup, &destQueue);
+  pSetup->pNext = p;
+  if( rc ) goto end_of_recursive_query;
+
+  /* Find the next row in the Queue and output that row */
+  addrTop = sqlite3VdbeAddOp2(v, OP_Rewind, iQueue, addrBreak); VdbeCoverage(v);
+
+  /* Transfer the next row in Queue over to Current */
+  sqlite3VdbeAddOp1(v, OP_NullRow, iCurrent); /* To reset column cache */
+  if( pOrderBy ){
+    sqlite3VdbeAddOp3(v, OP_Column, iQueue, pOrderBy->nExpr+1, regCurrent);
+  }else{
+    sqlite3VdbeAddOp2(v, OP_RowData, iQueue, regCurrent);
+  }
+  sqlite3VdbeAddOp1(v, OP_Delete, iQueue);
+
+  /* Output the single row in Current */
+  addrCont = sqlite3VdbeMakeLabel(v);
+  codeOffset(v, regOffset, addrCont);
+  selectInnerLoop(pParse, p, p->pEList, iCurrent,
+      0, 0, pDest, addrCont, addrBreak);
+  if( regLimit ){
+    sqlite3VdbeAddOp3(v, OP_IfZero, regLimit, addrBreak, -1);
+    VdbeCoverage(v);
+  }
+  sqlite3VdbeResolveLabel(v, addrCont);
+
+  /* Execute the recursive SELECT taking the single row in Current as
+  ** the value for the recursive-table. Store the results in the Queue.
+  */
+  p->pPrior = 0;
+  sqlite3Select(pParse, p, &destQueue);
+  assert( p->pPrior==0 );
+  p->pPrior = pSetup;
+
+  /* Keep running the loop until the Queue is empty */
+  sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTop);
+  sqlite3VdbeResolveLabel(v, addrBreak);
+
+end_of_recursive_query:
+  sqlite3ExprListDelete(pParse->db, p->pOrderBy);
+  p->pOrderBy = pOrderBy;
+  p->pLimit = pLimit;
+  p->pOffset = pOffset;
+  return;
+}
+#endif /* SQLITE_OMIT_CTE */
+
+/* Forward references */
+static int multiSelectOrderBy(
+  Parse *pParse,        /* Parsing context */
+  Select *p,            /* The right-most of SELECTs to be coded */
+  SelectDest *pDest     /* What to do with query results */
+);
+
+/*
+** Error message for when two or more terms of a compound select have different
+** size result sets.
+*/
+static void selectWrongNumTermsError(Parse *pParse, Select *p){
+  if( p->selFlags & SF_Values ){
+    sqlite3ErrorMsg(pParse, "all VALUES must have the same number of terms");
+  }else{
+    sqlite3ErrorMsg(pParse, "SELECTs to the left and right of %s"
+      " do not have the same number of result columns", selectOpName(p->op));
+  }
+}
+
+/*
+** Handle the special case of a compound-select that originates from a
+** VALUES clause.  By handling this as a special case, we avoid deep
+** recursion, and thus do not need to enforce the SQLITE_LIMIT_COMPOUND_SELECT
+** on a VALUES clause.
+**
+** Because the Select object originates from a VALUES clause:
+**   (1) It has no LIMIT or OFFSET
+**   (2) All terms are UNION ALL
+**   (3) There is no ORDER BY clause
+*/
+static int multiSelectValues(
+  Parse *pParse,        /* Parsing context */
+  Select *p,            /* The right-most of SELECTs to be coded */
+  SelectDest *pDest     /* What to do with query results */
+){
+  Select *pPrior;
+  int nExpr = p->pEList->nExpr;
+  int nRow = 1;
+  int rc = 0;
+  assert( p->pNext==0 );
+  assert( p->selFlags & SF_AllValues );
+  do{
+    assert( p->selFlags & SF_Values );
+    assert( p->op==TK_ALL || (p->op==TK_SELECT && p->pPrior==0) );
+    assert( p->pLimit==0 );
+    assert( p->pOffset==0 );
+    if( p->pEList->nExpr!=nExpr ){
+      selectWrongNumTermsError(pParse, p);
+      return 1;
+    }
+    if( p->pPrior==0 ) break;
+    assert( p->pPrior->pNext==p );
+    p = p->pPrior;
+    nRow++;
+  }while(1);
+  while( p ){
+    pPrior = p->pPrior;
+    p->pPrior = 0;
+    rc = sqlite3Select(pParse, p, pDest);
+    p->pPrior = pPrior;
+    if( rc ) break;
+    p->nSelectRow = nRow;
+    p = p->pNext;
+  }
+  return rc;
+}
+
+/*
+** This routine is called to process a compound query form from
+** two or more separate queries using UNION, UNION ALL, EXCEPT, or
+** INTERSECT
+**
+** "p" points to the right-most of the two queries.  the query on the
+** left is p->pPrior.  The left query could also be a compound query
+** in which case this routine will be called recursively. 
+**
+** The results of the total query are to be written into a destination
+** of type eDest with parameter iParm.
+**
+** Example 1:  Consider a three-way compound SQL statement.
+**
+**     SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3
+**
+** This statement is parsed up as follows:
+**
+**     SELECT c FROM t3
+**      |
+**      `----->  SELECT b FROM t2
+**                |
+**                `------>  SELECT a FROM t1
+**
+** The arrows in the diagram above represent the Select.pPrior pointer.
+** So if this routine is called with p equal to the t3 query, then
+** pPrior will be the t2 query.  p->op will be TK_UNION in this case.
+**
+** Notice that because of the way SQLite parses compound SELECTs, the
+** individual selects always group from left to right.
+*/
+static int multiSelect(
+  Parse *pParse,        /* Parsing context */
+  Select *p,            /* The right-most of SELECTs to be coded */
+  SelectDest *pDest     /* What to do with query results */
+){
+  int rc = SQLITE_OK;   /* Success code from a subroutine */
+  Select *pPrior;       /* Another SELECT immediately to our left */
+  Vdbe *v;              /* Generate code to this VDBE */
+  SelectDest dest;      /* Alternative data destination */
+  Select *pDelete = 0;  /* Chain of simple selects to delete */
+  sqlite3 *db;          /* Database connection */
+#ifndef SQLITE_OMIT_EXPLAIN
+  int iSub1 = 0;        /* EQP id of left-hand query */
+  int iSub2 = 0;        /* EQP id of right-hand query */
+#endif
+
+  /* Make sure there is no ORDER BY or LIMIT clause on prior SELECTs.  Only
+  ** the last (right-most) SELECT in the series may have an ORDER BY or LIMIT.
+  */
+  assert( p && p->pPrior );  /* Calling function guarantees this much */
+  assert( (p->selFlags & SF_Recursive)==0 || p->op==TK_ALL || p->op==TK_UNION );
+  db = pParse->db;
+  pPrior = p->pPrior;
+  dest = *pDest;
+  if( pPrior->pOrderBy ){
+    sqlite3ErrorMsg(pParse,"ORDER BY clause should come after %s not before",
+      selectOpName(p->op));
+    rc = 1;
+    goto multi_select_end;
+  }
+  if( pPrior->pLimit ){
+    sqlite3ErrorMsg(pParse,"LIMIT clause should come after %s not before",
+      selectOpName(p->op));
+    rc = 1;
+    goto multi_select_end;
+  }
+
+  v = sqlite3GetVdbe(pParse);
+  assert( v!=0 );  /* The VDBE already created by calling function */
+
+  /* Create the destination temporary table if necessary
+  */
+  if( dest.eDest==SRT_EphemTab ){
+    assert( p->pEList );
+    sqlite3VdbeAddOp2(v, OP_OpenEphemeral, dest.iSDParm, p->pEList->nExpr);
+    sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
+    dest.eDest = SRT_Table;
+  }
+
+  /* Special handling for a compound-select that originates as a VALUES clause.
+  */
+  if( p->selFlags & SF_AllValues ){
+    rc = multiSelectValues(pParse, p, &dest);
+    goto multi_select_end;
+  }
+
+  /* Make sure all SELECTs in the statement have the same number of elements
+  ** in their result sets.
+  */
+  assert( p->pEList && pPrior->pEList );
+  if( p->pEList->nExpr!=pPrior->pEList->nExpr ){
+    selectWrongNumTermsError(pParse, p);
+    rc = 1;
+    goto multi_select_end;
+  }
+
+#ifndef SQLITE_OMIT_CTE
+  if( p->selFlags & SF_Recursive ){
+    generateWithRecursiveQuery(pParse, p, &dest);
+  }else
+#endif
+
+  /* Compound SELECTs that have an ORDER BY clause are handled separately.
+  */
+  if( p->pOrderBy ){
+    return multiSelectOrderBy(pParse, p, pDest);
+  }else
+
+  /* Generate code for the left and right SELECT statements.
+  */
+  switch( p->op ){
+    case TK_ALL: {
+      int addr = 0;
+      int nLimit;
+      assert( !pPrior->pLimit );
+      pPrior->iLimit = p->iLimit;
+      pPrior->iOffset = p->iOffset;
+      pPrior->pLimit = p->pLimit;
+      pPrior->pOffset = p->pOffset;
+      explainSetInteger(iSub1, pParse->iNextSelectId);
+      rc = sqlite3Select(pParse, pPrior, &dest);
+      p->pLimit = 0;
+      p->pOffset = 0;
