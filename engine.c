@@ -107057,3 +107057,215 @@ static void computeLimitRegisters(Parse *pParse, Select *p, int iBreak){
   /* 
   ** "LIMIT -1" always shows all rows.  There is some
   ** controversy about what the correct behavior should be.
+  ** The current implementation interprets "LIMIT 0" to mean
+  ** no rows.
+  */
+  sqlite3ExprCacheClear(pParse);
+  assert( p->pOffset==0 || p->pLimit!=0 );
+  if( p->pLimit ){
+    p->iLimit = iLimit = ++pParse->nMem;
+    v = sqlite3GetVdbe(pParse);
+    assert( v!=0 );
+    if( sqlite3ExprIsInteger(p->pLimit, &n) ){
+      sqlite3VdbeAddOp2(v, OP_Integer, n, iLimit);
+      VdbeComment((v, "LIMIT counter"));
+      if( n==0 ){
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, iBreak);
+      }else if( n>=0 && p->nSelectRow>(u64)n ){
+        p->nSelectRow = n;
+      }
+    }else{
+      sqlite3ExprCode(pParse, p->pLimit, iLimit);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, iLimit); VdbeCoverage(v);
+      VdbeComment((v, "LIMIT counter"));
+      sqlite3VdbeAddOp2(v, OP_IfZero, iLimit, iBreak); VdbeCoverage(v);
+    }
+    if( p->pOffset ){
+      p->iOffset = iOffset = ++pParse->nMem;
+      pParse->nMem++;   /* Allocate an extra register for limit+offset */
+      sqlite3ExprCode(pParse, p->pOffset, iOffset);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, iOffset); VdbeCoverage(v);
+      VdbeComment((v, "OFFSET counter"));
+      addr1 = sqlite3VdbeAddOp1(v, OP_IfPos, iOffset); VdbeCoverage(v);
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, iOffset);
+      sqlite3VdbeJumpHere(v, addr1);
+      sqlite3VdbeAddOp3(v, OP_Add, iLimit, iOffset, iOffset+1);
+      VdbeComment((v, "LIMIT+OFFSET"));
+      addr1 = sqlite3VdbeAddOp1(v, OP_IfPos, iLimit); VdbeCoverage(v);
+      sqlite3VdbeAddOp2(v, OP_Integer, -1, iOffset+1);
+      sqlite3VdbeJumpHere(v, addr1);
+    }
+  }
+}
+
+#ifndef SQLITE_OMIT_COMPOUND_SELECT
+/*
+** Return the appropriate collating sequence for the iCol-th column of
+** the result set for the compound-select statement "p".  Return NULL if
+** the column has no default collating sequence.
+**
+** The collating sequence for the compound select is taken from the
+** left-most term of the select that has a collating sequence.
+*/
+static CollSeq *multiSelectCollSeq(Parse *pParse, Select *p, int iCol){
+  CollSeq *pRet;
+  if( p->pPrior ){
+    pRet = multiSelectCollSeq(pParse, p->pPrior, iCol);
+  }else{
+    pRet = 0;
+  }
+  assert( iCol>=0 );
+  if( pRet==0 && iCol<p->pEList->nExpr ){
+    pRet = sqlite3ExprCollSeq(pParse, p->pEList->a[iCol].pExpr);
+  }
+  return pRet;
+}
+
+/*
+** The select statement passed as the second parameter is a compound SELECT
+** with an ORDER BY clause. This function allocates and returns a KeyInfo
+** structure suitable for implementing the ORDER BY.
+**
+** Space to hold the KeyInfo structure is obtained from malloc. The calling
+** function is responsible for ensuring that this structure is eventually
+** freed.
+*/
+static KeyInfo *multiSelectOrderByKeyInfo(Parse *pParse, Select *p, int nExtra){
+  ExprList *pOrderBy = p->pOrderBy;
+  int nOrderBy = p->pOrderBy->nExpr;
+  sqlite3 *db = pParse->db;
+  KeyInfo *pRet = sqlite3KeyInfoAlloc(db, nOrderBy+nExtra, 1);
+  if( pRet ){
+    int i;
+    for(i=0; i<nOrderBy; i++){
+      struct ExprList_item *pItem = &pOrderBy->a[i];
+      Expr *pTerm = pItem->pExpr;
+      CollSeq *pColl;
+
+      if( pTerm->flags & EP_Collate ){
+        pColl = sqlite3ExprCollSeq(pParse, pTerm);
+      }else{
+        pColl = multiSelectCollSeq(pParse, p, pItem->u.x.iOrderByCol-1);
+        if( pColl==0 ) pColl = db->pDfltColl;
+        pOrderBy->a[i].pExpr =
+          sqlite3ExprAddCollateString(pParse, pTerm, pColl->zName);
+      }
+      assert( sqlite3KeyInfoIsWriteable(pRet) );
+      pRet->aColl[i] = pColl;
+      pRet->aSortOrder[i] = pOrderBy->a[i].sortOrder;
+    }
+  }
+
+  return pRet;
+}
+
+#ifndef SQLITE_OMIT_CTE
+/*
+** This routine generates VDBE code to compute the content of a WITH RECURSIVE
+** query of the form:
+**
+**   <recursive-table> AS (<setup-query> UNION [ALL] <recursive-query>)
+**                         \___________/             \_______________/
+**                           p->pPrior                      p
+**
+**
+** There is exactly one reference to the recursive-table in the FROM clause
+** of recursive-query, marked with the SrcList->a[].isRecursive flag.
+**
+** The setup-query runs once to generate an initial set of rows that go
+** into a Queue table.  Rows are extracted from the Queue table one by
+** one.  Each row extracted from Queue is output to pDest.  Then the single
+** extracted row (now in the iCurrent table) becomes the content of the
+** recursive-table for a recursive-query run.  The output of the recursive-query
+** is added back into the Queue table.  Then another row is extracted from Queue
+** and the iteration continues until the Queue table is empty.
+**
+** If the compound query operator is UNION then no duplicate rows are ever
+** inserted into the Queue table.  The iDistinct table keeps a copy of all rows
+** that have ever been inserted into Queue and causes duplicates to be
+** discarded.  If the operator is UNION ALL, then duplicates are allowed.
+** 
+** If the query has an ORDER BY, then entries in the Queue table are kept in
+** ORDER BY order and the first entry is extracted for each cycle.  Without
+** an ORDER BY, the Queue table is just a FIFO.
+**
+** If a LIMIT clause is provided, then the iteration stops after LIMIT rows
+** have been output to pDest.  A LIMIT of zero means to output no rows and a
+** negative LIMIT means to output all rows.  If there is also an OFFSET clause
+** with a positive value, then the first OFFSET outputs are discarded rather
+** than being sent to pDest.  The LIMIT count does not begin until after OFFSET
+** rows have been skipped.
+*/
+static void generateWithRecursiveQuery(
+  Parse *pParse,        /* Parsing context */
+  Select *p,            /* The recursive SELECT to be coded */
+  SelectDest *pDest     /* What to do with query results */
+){
+  SrcList *pSrc = p->pSrc;      /* The FROM clause of the recursive query */
+  int nCol = p->pEList->nExpr;  /* Number of columns in the recursive table */
+  Vdbe *v = pParse->pVdbe;      /* The prepared statement under construction */
+  Select *pSetup = p->pPrior;   /* The setup query */
+  int addrTop;                  /* Top of the loop */
+  int addrCont, addrBreak;      /* CONTINUE and BREAK addresses */
+  int iCurrent = 0;             /* The Current table */
+  int regCurrent;               /* Register holding Current table */
+  int iQueue;                   /* The Queue table */
+  int iDistinct = 0;            /* To ensure unique results if UNION */
+  int eDest = SRT_Fifo;         /* How to write to Queue */
+  SelectDest destQueue;         /* SelectDest targetting the Queue table */
+  int i;                        /* Loop counter */
+  int rc;                       /* Result code */
+  ExprList *pOrderBy;           /* The ORDER BY clause */
+  Expr *pLimit, *pOffset;       /* Saved LIMIT and OFFSET */
+  int regLimit, regOffset;      /* Registers used by LIMIT and OFFSET */
+
+  /* Obtain authorization to do a recursive query */
+  if( sqlite3AuthCheck(pParse, SQLITE_RECURSIVE, 0, 0, 0) ) return;
+
+  /* Process the LIMIT and OFFSET clauses, if they exist */
+  addrBreak = sqlite3VdbeMakeLabel(v);
+  computeLimitRegisters(pParse, p, addrBreak);
+  pLimit = p->pLimit;
+  pOffset = p->pOffset;
+  regLimit = p->iLimit;
+  regOffset = p->iOffset;
+  p->pLimit = p->pOffset = 0;
+  p->iLimit = p->iOffset = 0;
+  pOrderBy = p->pOrderBy;
+
+  /* Locate the cursor number of the Current table */
+  for(i=0; ALWAYS(i<pSrc->nSrc); i++){
+    if( pSrc->a[i].isRecursive ){
+      iCurrent = pSrc->a[i].iCursor;
+      break;
+    }
+  }
+
+  /* Allocate cursors numbers for Queue and Distinct.  The cursor number for
+  ** the Distinct table must be exactly one greater than Queue in order
+  ** for the SRT_DistFifo and SRT_DistQueue destinations to work. */
+  iQueue = pParse->nTab++;
+  if( p->op==TK_UNION ){
+    eDest = pOrderBy ? SRT_DistQueue : SRT_DistFifo;
+    iDistinct = pParse->nTab++;
+  }else{
+    eDest = pOrderBy ? SRT_Queue : SRT_Fifo;
+  }
+  sqlite3SelectDestInit(&destQueue, eDest, iQueue);
+
+  /* Allocate cursors for Current, Queue, and Distinct. */
+  regCurrent = ++pParse->nMem;
+  sqlite3VdbeAddOp3(v, OP_OpenPseudo, iCurrent, regCurrent, nCol);
+  if( pOrderBy ){
+    KeyInfo *pKeyInfo = multiSelectOrderByKeyInfo(pParse, p, 1);
+    sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iQueue, pOrderBy->nExpr+2, 0,
+                      (char*)pKeyInfo, P4_KEYINFO);
+    destQueue.pOrderBy = pOrderBy;
+  }else{
+    sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iQueue, nCol);
+  }
+  VdbeComment((v, "Queue table"));
+  if( iDistinct ){
+    p->addrOpenEphm[0] = sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iDistinct, 0);
+    p->selFlags |= SF_UsesEphemeral;
+  }
