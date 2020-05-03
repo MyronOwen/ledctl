@@ -108183,3 +108183,231 @@ static int multiSelectOrderBy(
   sqlite3SelectDestInit(&destA, SRT_Coroutine, regAddrA);
   sqlite3SelectDestInit(&destB, SRT_Coroutine, regAddrB);
 
+  /* Generate a coroutine to evaluate the SELECT statement to the
+  ** left of the compound operator - the "A" select.
+  */
+  addrSelectA = sqlite3VdbeCurrentAddr(v) + 1;
+  j1 = sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrA, 0, addrSelectA);
+  VdbeComment((v, "left SELECT"));
+  pPrior->iLimit = regLimitA;
+  explainSetInteger(iSub1, pParse->iNextSelectId);
+  sqlite3Select(pParse, pPrior, &destA);
+  sqlite3VdbeAddOp1(v, OP_EndCoroutine, regAddrA);
+  sqlite3VdbeJumpHere(v, j1);
+
+  /* Generate a coroutine to evaluate the SELECT statement on 
+  ** the right - the "B" select
+  */
+  addrSelectB = sqlite3VdbeCurrentAddr(v) + 1;
+  j1 = sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrB, 0, addrSelectB);
+  VdbeComment((v, "right SELECT"));
+  savedLimit = p->iLimit;
+  savedOffset = p->iOffset;
+  p->iLimit = regLimitB;
+  p->iOffset = 0;  
+  explainSetInteger(iSub2, pParse->iNextSelectId);
+  sqlite3Select(pParse, p, &destB);
+  p->iLimit = savedLimit;
+  p->iOffset = savedOffset;
+  sqlite3VdbeAddOp1(v, OP_EndCoroutine, regAddrB);
+
+  /* Generate a subroutine that outputs the current row of the A
+  ** select as the next output row of the compound select.
+  */
+  VdbeNoopComment((v, "Output routine for A"));
+  addrOutA = generateOutputSubroutine(pParse,
+                 p, &destA, pDest, regOutA,
+                 regPrev, pKeyDup, labelEnd);
+  
+  /* Generate a subroutine that outputs the current row of the B
+  ** select as the next output row of the compound select.
+  */
+  if( op==TK_ALL || op==TK_UNION ){
+    VdbeNoopComment((v, "Output routine for B"));
+    addrOutB = generateOutputSubroutine(pParse,
+                 p, &destB, pDest, regOutB,
+                 regPrev, pKeyDup, labelEnd);
+  }
+  sqlite3KeyInfoUnref(pKeyDup);
+
+  /* Generate a subroutine to run when the results from select A
+  ** are exhausted and only data in select B remains.
+  */
+  if( op==TK_EXCEPT || op==TK_INTERSECT ){
+    addrEofA_noB = addrEofA = labelEnd;
+  }else{  
+    VdbeNoopComment((v, "eof-A subroutine"));
+    addrEofA = sqlite3VdbeAddOp2(v, OP_Gosub, regOutB, addrOutB);
+    addrEofA_noB = sqlite3VdbeAddOp2(v, OP_Yield, regAddrB, labelEnd);
+                                     VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addrEofA);
+    p->nSelectRow += pPrior->nSelectRow;
+  }
+
+  /* Generate a subroutine to run when the results from select B
+  ** are exhausted and only data in select A remains.
+  */
+  if( op==TK_INTERSECT ){
+    addrEofB = addrEofA;
+    if( p->nSelectRow > pPrior->nSelectRow ) p->nSelectRow = pPrior->nSelectRow;
+  }else{  
+    VdbeNoopComment((v, "eof-B subroutine"));
+    addrEofB = sqlite3VdbeAddOp2(v, OP_Gosub, regOutA, addrOutA);
+    sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, labelEnd); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addrEofB);
+  }
+
+  /* Generate code to handle the case of A<B
+  */
+  VdbeNoopComment((v, "A-lt-B subroutine"));
+  addrAltB = sqlite3VdbeAddOp2(v, OP_Gosub, regOutA, addrOutA);
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, addrEofA); VdbeCoverage(v);
+  sqlite3VdbeAddOp2(v, OP_Goto, 0, labelCmpr);
+
+  /* Generate code to handle the case of A==B
+  */
+  if( op==TK_ALL ){
+    addrAeqB = addrAltB;
+  }else if( op==TK_INTERSECT ){
+    addrAeqB = addrAltB;
+    addrAltB++;
+  }else{
+    VdbeNoopComment((v, "A-eq-B subroutine"));
+    addrAeqB =
+    sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, addrEofA); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, labelCmpr);
+  }
+
+  /* Generate code to handle the case of A>B
+  */
+  VdbeNoopComment((v, "A-gt-B subroutine"));
+  addrAgtB = sqlite3VdbeCurrentAddr(v);
+  if( op==TK_ALL || op==TK_UNION ){
+    sqlite3VdbeAddOp2(v, OP_Gosub, regOutB, addrOutB);
+  }
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrB, addrEofB); VdbeCoverage(v);
+  sqlite3VdbeAddOp2(v, OP_Goto, 0, labelCmpr);
+
+  /* This code runs once to initialize everything.
+  */
+  sqlite3VdbeJumpHere(v, j1);
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, addrEofA_noB); VdbeCoverage(v);
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrB, addrEofB); VdbeCoverage(v);
+
+  /* Implement the main merge loop
+  */
+  sqlite3VdbeResolveLabel(v, labelCmpr);
+  sqlite3VdbeAddOp4(v, OP_Permutation, 0, 0, 0, (char*)aPermute, P4_INTARRAY);
+  sqlite3VdbeAddOp4(v, OP_Compare, destA.iSdst, destB.iSdst, nOrderBy,
+                         (char*)pKeyMerge, P4_KEYINFO);
+  sqlite3VdbeChangeP5(v, OPFLAG_PERMUTE);
+  sqlite3VdbeAddOp3(v, OP_Jump, addrAltB, addrAeqB, addrAgtB); VdbeCoverage(v);
+
+  /* Jump to the this point in order to terminate the query.
+  */
+  sqlite3VdbeResolveLabel(v, labelEnd);
+
+  /* Set the number of output columns
+  */
+  if( pDest->eDest==SRT_Output ){
+    Select *pFirst = pPrior;
+    while( pFirst->pPrior ) pFirst = pFirst->pPrior;
+    generateColumnNames(pParse, 0, pFirst->pEList);
+  }
+
+  /* Reassembly the compound query so that it will be freed correctly
+  ** by the calling function */
+  if( p->pPrior ){
+    sqlite3SelectDelete(db, p->pPrior);
+  }
+  p->pPrior = pPrior;
+  pPrior->pNext = p;
+
+  /*** TBD:  Insert subroutine calls to close cursors on incomplete
+  **** subqueries ****/
+  explainComposite(pParse, p->op, iSub1, iSub2, 0);
+  return SQLITE_OK;
+}
+#endif
+
+#if !defined(SQLITE_OMIT_SUBQUERY) || !defined(SQLITE_OMIT_VIEW)
+/* Forward Declarations */
+static void substExprList(sqlite3*, ExprList*, int, ExprList*);
+static void substSelect(sqlite3*, Select *, int, ExprList *);
+
+/*
+** Scan through the expression pExpr.  Replace every reference to
+** a column in table number iTable with a copy of the iColumn-th
+** entry in pEList.  (But leave references to the ROWID column 
+** unchanged.)
+**
+** This routine is part of the flattening procedure.  A subquery
+** whose result set is defined by pEList appears as entry in the
+** FROM clause of a SELECT such that the VDBE cursor assigned to that
+** FORM clause entry is iTable.  This routine make the necessary 
+** changes to pExpr so that it refers directly to the source table
+** of the subquery rather the result set of the subquery.
+*/
+static Expr *substExpr(
+  sqlite3 *db,        /* Report malloc errors to this connection */
+  Expr *pExpr,        /* Expr in which substitution occurs */
+  int iTable,         /* Table to be substituted */
+  ExprList *pEList    /* Substitute expressions */
+){
+  if( pExpr==0 ) return 0;
+  if( pExpr->op==TK_COLUMN && pExpr->iTable==iTable ){
+    if( pExpr->iColumn<0 ){
+      pExpr->op = TK_NULL;
+    }else{
+      Expr *pNew;
+      assert( pEList!=0 && pExpr->iColumn<pEList->nExpr );
+      assert( pExpr->pLeft==0 && pExpr->pRight==0 );
+      pNew = sqlite3ExprDup(db, pEList->a[pExpr->iColumn].pExpr, 0);
+      sqlite3ExprDelete(db, pExpr);
+      pExpr = pNew;
+    }
+  }else{
+    pExpr->pLeft = substExpr(db, pExpr->pLeft, iTable, pEList);
+    pExpr->pRight = substExpr(db, pExpr->pRight, iTable, pEList);
+    if( ExprHasProperty(pExpr, EP_xIsSelect) ){
+      substSelect(db, pExpr->x.pSelect, iTable, pEList);
+    }else{
+      substExprList(db, pExpr->x.pList, iTable, pEList);
+    }
+  }
+  return pExpr;
+}
+static void substExprList(
+  sqlite3 *db,         /* Report malloc errors here */
+  ExprList *pList,     /* List to scan and in which to make substitutes */
+  int iTable,          /* Table to be substituted */
+  ExprList *pEList     /* Substitute values */
+){
+  int i;
+  if( pList==0 ) return;
+  for(i=0; i<pList->nExpr; i++){
+    pList->a[i].pExpr = substExpr(db, pList->a[i].pExpr, iTable, pEList);
+  }
+}
+static void substSelect(
+  sqlite3 *db,         /* Report malloc errors here */
+  Select *p,           /* SELECT statement in which to make substitutions */
+  int iTable,          /* Table to be replaced */
+  ExprList *pEList     /* Substitute values */
+){
+  SrcList *pSrc;
+  struct SrcList_item *pItem;
+  int i;
+  if( !p ) return;
+  substExprList(db, p->pEList, iTable, pEList);
+  substExprList(db, p->pGroupBy, iTable, pEList);
+  substExprList(db, p->pOrderBy, iTable, pEList);
+  p->pHaving = substExpr(db, p->pHaving, iTable, pEList);
+  p->pWhere = substExpr(db, p->pWhere, iTable, pEList);
+  substSelect(db, p->pPrior, iTable, pEList);
+  pSrc = p->pSrc;
+  assert( pSrc );  /* Even for (SELECT 1) we have: pSrc!=0 but pSrc->nSrc==0 */
+  if( ALWAYS(pSrc) ){
+    for(i=pSrc->nSrc, pItem=pSrc->a; i>0; i--, pItem++){
+      substSelect(db, pItem->pSelect, iTable, pEList);
+    }
