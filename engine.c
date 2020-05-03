@@ -107747,3 +107747,205 @@ static int multiSelect(
     }
     for(i=0, apColl=pKeyInfo->aColl; i<nCol; i++, apColl++){
       *apColl = multiSelectCollSeq(pParse, p, i);
+      if( 0==*apColl ){
+        *apColl = db->pDfltColl;
+      }
+    }
+
+    for(pLoop=p; pLoop; pLoop=pLoop->pPrior){
+      for(i=0; i<2; i++){
+        int addr = pLoop->addrOpenEphm[i];
+        if( addr<0 ){
+          /* If [0] is unused then [1] is also unused.  So we can
+          ** always safely abort as soon as the first unused slot is found */
+          assert( pLoop->addrOpenEphm[1]<0 );
+          break;
+        }
+        sqlite3VdbeChangeP2(v, addr, nCol);
+        sqlite3VdbeChangeP4(v, addr, (char*)sqlite3KeyInfoRef(pKeyInfo),
+                            P4_KEYINFO);
+        pLoop->addrOpenEphm[i] = -1;
+      }
+    }
+    sqlite3KeyInfoUnref(pKeyInfo);
+  }
+
+multi_select_end:
+  pDest->iSdst = dest.iSdst;
+  pDest->nSdst = dest.nSdst;
+  sqlite3SelectDelete(db, pDelete);
+  return rc;
+}
+#endif /* SQLITE_OMIT_COMPOUND_SELECT */
+
+/*
+** Code an output subroutine for a coroutine implementation of a
+** SELECT statment.
+**
+** The data to be output is contained in pIn->iSdst.  There are
+** pIn->nSdst columns to be output.  pDest is where the output should
+** be sent.
+**
+** regReturn is the number of the register holding the subroutine
+** return address.
+**
+** If regPrev>0 then it is the first register in a vector that
+** records the previous output.  mem[regPrev] is a flag that is false
+** if there has been no previous output.  If regPrev>0 then code is
+** generated to suppress duplicates.  pKeyInfo is used for comparing
+** keys.
+**
+** If the LIMIT found in p->iLimit is reached, jump immediately to
+** iBreak.
+*/
+static int generateOutputSubroutine(
+  Parse *pParse,          /* Parsing context */
+  Select *p,              /* The SELECT statement */
+  SelectDest *pIn,        /* Coroutine supplying data */
+  SelectDest *pDest,      /* Where to send the data */
+  int regReturn,          /* The return address register */
+  int regPrev,            /* Previous result register.  No uniqueness if 0 */
+  KeyInfo *pKeyInfo,      /* For comparing with previous entry */
+  int iBreak              /* Jump here if we hit the LIMIT */
+){
+  Vdbe *v = pParse->pVdbe;
+  int iContinue;
+  int addr;
+
+  addr = sqlite3VdbeCurrentAddr(v);
+  iContinue = sqlite3VdbeMakeLabel(v);
+
+  /* Suppress duplicates for UNION, EXCEPT, and INTERSECT 
+  */
+  if( regPrev ){
+    int j1, j2;
+    j1 = sqlite3VdbeAddOp1(v, OP_IfNot, regPrev); VdbeCoverage(v);
+    j2 = sqlite3VdbeAddOp4(v, OP_Compare, pIn->iSdst, regPrev+1, pIn->nSdst,
+                              (char*)sqlite3KeyInfoRef(pKeyInfo), P4_KEYINFO);
+    sqlite3VdbeAddOp3(v, OP_Jump, j2+2, iContinue, j2+2); VdbeCoverage(v);
+    sqlite3VdbeJumpHere(v, j1);
+    sqlite3VdbeAddOp3(v, OP_Copy, pIn->iSdst, regPrev+1, pIn->nSdst-1);
+    sqlite3VdbeAddOp2(v, OP_Integer, 1, regPrev);
+  }
+  if( pParse->db->mallocFailed ) return 0;
+
+  /* Suppress the first OFFSET entries if there is an OFFSET clause
+  */
+  codeOffset(v, p->iOffset, iContinue);
+
+  switch( pDest->eDest ){
+    /* Store the result as data using a unique key.
+    */
+    case SRT_Table:
+    case SRT_EphemTab: {
+      int r1 = sqlite3GetTempReg(pParse);
+      int r2 = sqlite3GetTempReg(pParse);
+      testcase( pDest->eDest==SRT_Table );
+      testcase( pDest->eDest==SRT_EphemTab );
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pIn->iSdst, pIn->nSdst, r1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest->iSDParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert, pDest->iSDParm, r1, r2);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
+      break;
+    }
+
+#ifndef SQLITE_OMIT_SUBQUERY
+    /* If we are creating a set for an "expr IN (SELECT ...)" construct,
+    ** then there should be a single item on the stack.  Write this
+    ** item into the set table with bogus data.
+    */
+    case SRT_Set: {
+      int r1;
+      assert( pIn->nSdst==1 );
+      pDest->affSdst = 
+         sqlite3CompareAffinity(p->pEList->a[0].pExpr, pDest->affSdst);
+      r1 = sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, pIn->iSdst, 1, r1, &pDest->affSdst,1);
+      sqlite3ExprCacheAffinityChange(pParse, pIn->iSdst, 1);
+      sqlite3VdbeAddOp2(v, OP_IdxInsert, pDest->iSDParm, r1);
+      sqlite3ReleaseTempReg(pParse, r1);
+      break;
+    }
+
+#if 0  /* Never occurs on an ORDER BY query */
+    /* If any row exist in the result set, record that fact and abort.
+    */
+    case SRT_Exists: {
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest->iSDParm);
+      /* The LIMIT clause will terminate the loop for us */
+      break;
+    }
+#endif
+
+    /* If this is a scalar select that is part of an expression, then
+    ** store the results in the appropriate memory cell and break out
+    ** of the scan loop.
+    */
+    case SRT_Mem: {
+      assert( pIn->nSdst==1 );
+      sqlite3ExprCodeMove(pParse, pIn->iSdst, pDest->iSDParm, 1);
+      /* The LIMIT clause will jump out of the loop for us */
+      break;
+    }
+#endif /* #ifndef SQLITE_OMIT_SUBQUERY */
+
+    /* The results are stored in a sequence of registers
+    ** starting at pDest->iSdst.  Then the co-routine yields.
+    */
+    case SRT_Coroutine: {
+      if( pDest->iSdst==0 ){
+        pDest->iSdst = sqlite3GetTempRange(pParse, pIn->nSdst);
+        pDest->nSdst = pIn->nSdst;
+      }
+      sqlite3ExprCodeMove(pParse, pIn->iSdst, pDest->iSdst, pDest->nSdst);
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest->iSDParm);
+      break;
+    }
+
+    /* If none of the above, then the result destination must be
+    ** SRT_Output.  This routine is never called with any other
+    ** destination other than the ones handled above or SRT_Output.
+    **
+    ** For SRT_Output, results are stored in a sequence of registers.  
+    ** Then the OP_ResultRow opcode is used to cause sqlite3_step() to
+    ** return the next row of result.
+    */
+    default: {
+      assert( pDest->eDest==SRT_Output );
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pIn->iSdst, pIn->nSdst);
+      sqlite3ExprCacheAffinityChange(pParse, pIn->iSdst, pIn->nSdst);
+      break;
+    }
+  }
+
+  /* Jump to the end of the loop if the LIMIT is reached.
+  */
+  if( p->iLimit ){
+    sqlite3VdbeAddOp3(v, OP_IfZero, p->iLimit, iBreak, -1); VdbeCoverage(v);
+  }
+
+  /* Generate the subroutine return
+  */
+  sqlite3VdbeResolveLabel(v, iContinue);
+  sqlite3VdbeAddOp1(v, OP_Return, regReturn);
+
+  return addr;
+}
+
+/*
+** Alternative compound select code generator for cases when there
+** is an ORDER BY clause.
+**
+** We assume a query of the following form:
+**
+**      <selectA>  <operator>  <selectB>  ORDER BY <orderbylist>
+**
+** <operator> is one of UNION ALL, UNION, EXCEPT, or INTERSECT.  The idea
+** is to code both <selectA> and <selectB> with the ORDER BY clause as
+** co-routines.  Then run the co-routines in parallel and merge the results
+** into the output.  In addition to the two coroutines (called selectA and
+** selectB) there are 7 subroutines:
+**
+**    outA:    Move the output of the selectA coroutine into the output
