@@ -108411,3 +108411,234 @@ static void substSelect(
     for(i=pSrc->nSrc, pItem=pSrc->a; i>0; i--, pItem++){
       substSelect(db, pItem->pSelect, iTable, pEList);
     }
+  }
+}
+#endif /* !defined(SQLITE_OMIT_SUBQUERY) || !defined(SQLITE_OMIT_VIEW) */
+
+#if !defined(SQLITE_OMIT_SUBQUERY) || !defined(SQLITE_OMIT_VIEW)
+/*
+** This routine attempts to flatten subqueries as a performance optimization.
+** This routine returns 1 if it makes changes and 0 if no flattening occurs.
+**
+** To understand the concept of flattening, consider the following
+** query:
+**
+**     SELECT a FROM (SELECT x+y AS a FROM t1 WHERE z<100) WHERE a>5
+**
+** The default way of implementing this query is to execute the
+** subquery first and store the results in a temporary table, then
+** run the outer query on that temporary table.  This requires two
+** passes over the data.  Furthermore, because the temporary table
+** has no indices, the WHERE clause on the outer query cannot be
+** optimized.
+**
+** This routine attempts to rewrite queries such as the above into
+** a single flat select, like this:
+**
+**     SELECT x+y AS a FROM t1 WHERE z<100 AND a>5
+**
+** The code generated for this simplification gives the same result
+** but only has to scan the data once.  And because indices might 
+** exist on the table t1, a complete scan of the data might be
+** avoided.
+**
+** Flattening is only attempted if all of the following are true:
+**
+**   (1)  The subquery and the outer query do not both use aggregates.
+**
+**   (2)  The subquery is not an aggregate or the outer query is not a join.
+**
+**   (3)  The subquery is not the right operand of a left outer join
+**        (Originally ticket #306.  Strengthened by ticket #3300)
+**
+**   (4)  The subquery is not DISTINCT.
+**
+**  (**)  At one point restrictions (4) and (5) defined a subset of DISTINCT
+**        sub-queries that were excluded from this optimization. Restriction 
+**        (4) has since been expanded to exclude all DISTINCT subqueries.
+**
+**   (6)  The subquery does not use aggregates or the outer query is not
+**        DISTINCT.
+**
+**   (7)  The subquery has a FROM clause.  TODO:  For subqueries without
+**        A FROM clause, consider adding a FROM close with the special
+**        table sqlite_once that consists of a single row containing a
+**        single NULL.
+**
+**   (8)  The subquery does not use LIMIT or the outer query is not a join.
+**
+**   (9)  The subquery does not use LIMIT or the outer query does not use
+**        aggregates.
+**
+**  (**)  Restriction (10) was removed from the code on 2005-02-05 but we
+**        accidently carried the comment forward until 2014-09-15.  Original
+**        text: "The subquery does not use aggregates or the outer query does not
+**        use LIMIT."
+**
+**  (11)  The subquery and the outer query do not both have ORDER BY clauses.
+**
+**  (**)  Not implemented.  Subsumed into restriction (3).  Was previously
+**        a separate restriction deriving from ticket #350.
+**
+**  (13)  The subquery and outer query do not both use LIMIT.
+**
+**  (14)  The subquery does not use OFFSET.
+**
+**  (15)  The outer query is not part of a compound select or the
+**        subquery does not have a LIMIT clause.
+**        (See ticket #2339 and ticket [02a8e81d44]).
+**
+**  (16)  The outer query is not an aggregate or the subquery does
+**        not contain ORDER BY.  (Ticket #2942)  This used to not matter
+**        until we introduced the group_concat() function.  
+**
+**  (17)  The sub-query is not a compound select, or it is a UNION ALL 
+**        compound clause made up entirely of non-aggregate queries, and 
+**        the parent query:
+**
+**          * is not itself part of a compound select,
+**          * is not an aggregate or DISTINCT query, and
+**          * is not a join
+**
+**        The parent and sub-query may contain WHERE clauses. Subject to
+**        rules (11), (13) and (14), they may also contain ORDER BY,
+**        LIMIT and OFFSET clauses.  The subquery cannot use any compound
+**        operator other than UNION ALL because all the other compound
+**        operators have an implied DISTINCT which is disallowed by
+**        restriction (4).
+**
+**        Also, each component of the sub-query must return the same number
+**        of result columns. This is actually a requirement for any compound
+**        SELECT statement, but all the code here does is make sure that no
+**        such (illegal) sub-query is flattened. The caller will detect the
+**        syntax error and return a detailed message.
+**
+**  (18)  If the sub-query is a compound select, then all terms of the
+**        ORDER by clause of the parent must be simple references to 
+**        columns of the sub-query.
+**
+**  (19)  The subquery does not use LIMIT or the outer query does not
+**        have a WHERE clause.
+**
+**  (20)  If the sub-query is a compound select, then it must not use
+**        an ORDER BY clause.  Ticket #3773.  We could relax this constraint
+**        somewhat by saying that the terms of the ORDER BY clause must
+**        appear as unmodified result columns in the outer query.  But we
+**        have other optimizations in mind to deal with that case.
+**
+**  (21)  The subquery does not use LIMIT or the outer query is not
+**        DISTINCT.  (See ticket [752e1646fc]).
+**
+**  (22)  The subquery is not a recursive CTE.
+**
+**  (23)  The parent is not a recursive CTE, or the sub-query is not a
+**        compound query. This restriction is because transforming the
+**        parent to a compound query confuses the code that handles
+**        recursive queries in multiSelect().
+**
+**  (24)  The subquery is not an aggregate that uses the built-in min() or 
+**        or max() functions.  (Without this restriction, a query like:
+**        "SELECT x FROM (SELECT max(y), x FROM t1)" would not necessarily
+**        return the value X for which Y was maximal.)
+**
+**
+** In this routine, the "p" parameter is a pointer to the outer query.
+** The subquery is p->pSrc->a[iFrom].  isAgg is true if the outer query
+** uses aggregates and subqueryIsAgg is true if the subquery uses aggregates.
+**
+** If flattening is not attempted, this routine is a no-op and returns 0.
+** If flattening is attempted this routine returns 1.
+**
+** All of the expression analysis must occur on both the outer query and
+** the subquery before this routine runs.
+*/
+static int flattenSubquery(
+  Parse *pParse,       /* Parsing context */
+  Select *p,           /* The parent or outer SELECT statement */
+  int iFrom,           /* Index in p->pSrc->a[] of the inner subquery */
+  int isAgg,           /* True if outer SELECT uses aggregate functions */
+  int subqueryIsAgg    /* True if the subquery uses aggregate functions */
+){
+  const char *zSavedAuthContext = pParse->zAuthContext;
+  Select *pParent;
+  Select *pSub;       /* The inner query or "subquery" */
+  Select *pSub1;      /* Pointer to the rightmost select in sub-query */
+  SrcList *pSrc;      /* The FROM clause of the outer query */
+  SrcList *pSubSrc;   /* The FROM clause of the subquery */
+  ExprList *pList;    /* The result set of the outer query */
+  int iParent;        /* VDBE cursor number of the pSub result set temp table */
+  int i;              /* Loop counter */
+  Expr *pWhere;                    /* The WHERE clause */
+  struct SrcList_item *pSubitem;   /* The subquery */
+  sqlite3 *db = pParse->db;
+
+  /* Check to see if flattening is permitted.  Return 0 if not.
+  */
+  assert( p!=0 );
+  assert( p->pPrior==0 );  /* Unable to flatten compound queries */
+  if( OptimizationDisabled(db, SQLITE_QueryFlattener) ) return 0;
+  pSrc = p->pSrc;
+  assert( pSrc && iFrom>=0 && iFrom<pSrc->nSrc );
+  pSubitem = &pSrc->a[iFrom];
+  iParent = pSubitem->iCursor;
+  pSub = pSubitem->pSelect;
+  assert( pSub!=0 );
+  if( isAgg && subqueryIsAgg ) return 0;                 /* Restriction (1)  */
+  if( subqueryIsAgg && pSrc->nSrc>1 ) return 0;          /* Restriction (2)  */
+  pSubSrc = pSub->pSrc;
+  assert( pSubSrc );
+  /* Prior to version 3.1.2, when LIMIT and OFFSET had to be simple constants,
+  ** not arbitrary expressions, we allowed some combining of LIMIT and OFFSET
+  ** because they could be computed at compile-time.  But when LIMIT and OFFSET
+  ** became arbitrary expressions, we were forced to add restrictions (13)
+  ** and (14). */
+  if( pSub->pLimit && p->pLimit ) return 0;              /* Restriction (13) */
+  if( pSub->pOffset ) return 0;                          /* Restriction (14) */
+  if( (p->selFlags & SF_Compound)!=0 && pSub->pLimit ){
+    return 0;                                            /* Restriction (15) */
+  }
+  if( pSubSrc->nSrc==0 ) return 0;                       /* Restriction (7)  */
+  if( pSub->selFlags & SF_Distinct ) return 0;           /* Restriction (5)  */
+  if( pSub->pLimit && (pSrc->nSrc>1 || isAgg) ){
+     return 0;         /* Restrictions (8)(9) */
+  }
+  if( (p->selFlags & SF_Distinct)!=0 && subqueryIsAgg ){
+     return 0;         /* Restriction (6)  */
+  }
+  if( p->pOrderBy && pSub->pOrderBy ){
+     return 0;                                           /* Restriction (11) */
+  }
+  if( isAgg && pSub->pOrderBy ) return 0;                /* Restriction (16) */
+  if( pSub->pLimit && p->pWhere ) return 0;              /* Restriction (19) */
+  if( pSub->pLimit && (p->selFlags & SF_Distinct)!=0 ){
+     return 0;         /* Restriction (21) */
+  }
+  testcase( pSub->selFlags & SF_Recursive );
+  testcase( pSub->selFlags & SF_MinMaxAgg );
+  if( pSub->selFlags & (SF_Recursive|SF_MinMaxAgg) ){
+    return 0; /* Restrictions (22) and (24) */
+  }
+  if( (p->selFlags & SF_Recursive) && pSub->pPrior ){
+    return 0; /* Restriction (23) */
+  }
+
+  /* OBSOLETE COMMENT 1:
+  ** Restriction 3:  If the subquery is a join, make sure the subquery is 
+  ** not used as the right operand of an outer join.  Examples of why this
+  ** is not allowed:
+  **
+  **         t1 LEFT OUTER JOIN (t2 JOIN t3)
+  **
+  ** If we flatten the above, we would get
+  **
+  **         (t1 LEFT OUTER JOIN t2) JOIN t3
+  **
+  ** which is not at all the same thing.
+  **
+  ** OBSOLETE COMMENT 2:
+  ** Restriction 12:  If the subquery is the right operand of a left outer
+  ** join, make sure the subquery has no WHERE clause.
+  ** An examples of why this is not allowed:
+  **
+  **         t1 LEFT OUTER JOIN (SELECT * FROM t2 WHERE t2.x>0)
+  **
