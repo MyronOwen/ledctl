@@ -108642,3 +108642,244 @@ static int flattenSubquery(
   **
   **         t1 LEFT OUTER JOIN (SELECT * FROM t2 WHERE t2.x>0)
   **
+  ** If we flatten the above, we would get
+  **
+  **         (t1 LEFT OUTER JOIN t2) WHERE t2.x>0
+  **
+  ** But the t2.x>0 test will always fail on a NULL row of t2, which
+  ** effectively converts the OUTER JOIN into an INNER JOIN.
+  **
+  ** THIS OVERRIDES OBSOLETE COMMENTS 1 AND 2 ABOVE:
+  ** Ticket #3300 shows that flattening the right term of a LEFT JOIN
+  ** is fraught with danger.  Best to avoid the whole thing.  If the
+  ** subquery is the right term of a LEFT JOIN, then do not flatten.
+  */
+  if( (pSubitem->jointype & JT_OUTER)!=0 ){
+    return 0;
+  }
+
+  /* Restriction 17: If the sub-query is a compound SELECT, then it must
+  ** use only the UNION ALL operator. And none of the simple select queries
+  ** that make up the compound SELECT are allowed to be aggregate or distinct
+  ** queries.
+  */
+  if( pSub->pPrior ){
+    if( pSub->pOrderBy ){
+      return 0;  /* Restriction 20 */
+    }
+    if( isAgg || (p->selFlags & SF_Distinct)!=0 || pSrc->nSrc!=1 ){
+      return 0;
+    }
+    for(pSub1=pSub; pSub1; pSub1=pSub1->pPrior){
+      testcase( (pSub1->selFlags & (SF_Distinct|SF_Aggregate))==SF_Distinct );
+      testcase( (pSub1->selFlags & (SF_Distinct|SF_Aggregate))==SF_Aggregate );
+      assert( pSub->pSrc!=0 );
+      if( (pSub1->selFlags & (SF_Distinct|SF_Aggregate))!=0
+       || (pSub1->pPrior && pSub1->op!=TK_ALL) 
+       || pSub1->pSrc->nSrc<1
+       || pSub->pEList->nExpr!=pSub1->pEList->nExpr
+      ){
+        return 0;
+      }
+      testcase( pSub1->pSrc->nSrc>1 );
+    }
+
+    /* Restriction 18. */
+    if( p->pOrderBy ){
+      int ii;
+      for(ii=0; ii<p->pOrderBy->nExpr; ii++){
+        if( p->pOrderBy->a[ii].u.x.iOrderByCol==0 ) return 0;
+      }
+    }
+  }
+
+  /***** If we reach this point, flattening is permitted. *****/
+  SELECTTRACE(1,pParse,p,("flatten %s.%p from term %d\n",
+                   pSub->zSelName, pSub, iFrom));
+
+  /* Authorize the subquery */
+  pParse->zAuthContext = pSubitem->zName;
+  TESTONLY(i =) sqlite3AuthCheck(pParse, SQLITE_SELECT, 0, 0, 0);
+  testcase( i==SQLITE_DENY );
+  pParse->zAuthContext = zSavedAuthContext;
+
+  /* If the sub-query is a compound SELECT statement, then (by restrictions
+  ** 17 and 18 above) it must be a UNION ALL and the parent query must 
+  ** be of the form:
+  **
+  **     SELECT <expr-list> FROM (<sub-query>) <where-clause> 
+  **
+  ** followed by any ORDER BY, LIMIT and/or OFFSET clauses. This block
+  ** creates N-1 copies of the parent query without any ORDER BY, LIMIT or 
+  ** OFFSET clauses and joins them to the left-hand-side of the original
+  ** using UNION ALL operators. In this case N is the number of simple
+  ** select statements in the compound sub-query.
+  **
+  ** Example:
+  **
+  **     SELECT a+1 FROM (
+  **        SELECT x FROM tab
+  **        UNION ALL
+  **        SELECT y FROM tab
+  **        UNION ALL
+  **        SELECT abs(z*2) FROM tab2
+  **     ) WHERE a!=5 ORDER BY 1
+  **
+  ** Transformed into:
+  **
+  **     SELECT x+1 FROM tab WHERE x+1!=5
+  **     UNION ALL
+  **     SELECT y+1 FROM tab WHERE y+1!=5
+  **     UNION ALL
+  **     SELECT abs(z*2)+1 FROM tab2 WHERE abs(z*2)+1!=5
+  **     ORDER BY 1
+  **
+  ** We call this the "compound-subquery flattening".
+  */
+  for(pSub=pSub->pPrior; pSub; pSub=pSub->pPrior){
+    Select *pNew;
+    ExprList *pOrderBy = p->pOrderBy;
+    Expr *pLimit = p->pLimit;
+    Expr *pOffset = p->pOffset;
+    Select *pPrior = p->pPrior;
+    p->pOrderBy = 0;
+    p->pSrc = 0;
+    p->pPrior = 0;
+    p->pLimit = 0;
+    p->pOffset = 0;
+    pNew = sqlite3SelectDup(db, p, 0);
+    sqlite3SelectSetName(pNew, pSub->zSelName);
+    p->pOffset = pOffset;
+    p->pLimit = pLimit;
+    p->pOrderBy = pOrderBy;
+    p->pSrc = pSrc;
+    p->op = TK_ALL;
+    if( pNew==0 ){
+      p->pPrior = pPrior;
+    }else{
+      pNew->pPrior = pPrior;
+      if( pPrior ) pPrior->pNext = pNew;
+      pNew->pNext = p;
+      p->pPrior = pNew;
+      SELECTTRACE(2,pParse,p,
+         ("compound-subquery flattener creates %s.%p as peer\n",
+         pNew->zSelName, pNew));
+    }
+    if( db->mallocFailed ) return 1;
+  }
+
+  /* Begin flattening the iFrom-th entry of the FROM clause 
+  ** in the outer query.
+  */
+  pSub = pSub1 = pSubitem->pSelect;
+
+  /* Delete the transient table structure associated with the
+  ** subquery
+  */
+  sqlite3DbFree(db, pSubitem->zDatabase);
+  sqlite3DbFree(db, pSubitem->zName);
+  sqlite3DbFree(db, pSubitem->zAlias);
+  pSubitem->zDatabase = 0;
+  pSubitem->zName = 0;
+  pSubitem->zAlias = 0;
+  pSubitem->pSelect = 0;
+
+  /* Defer deleting the Table object associated with the
+  ** subquery until code generation is
+  ** complete, since there may still exist Expr.pTab entries that
+  ** refer to the subquery even after flattening.  Ticket #3346.
+  **
+  ** pSubitem->pTab is always non-NULL by test restrictions and tests above.
+  */
+  if( ALWAYS(pSubitem->pTab!=0) ){
+    Table *pTabToDel = pSubitem->pTab;
+    if( pTabToDel->nRef==1 ){
+      Parse *pToplevel = sqlite3ParseToplevel(pParse);
+      pTabToDel->pNextZombie = pToplevel->pZombieTab;
+      pToplevel->pZombieTab = pTabToDel;
+    }else{
+      pTabToDel->nRef--;
+    }
+    pSubitem->pTab = 0;
+  }
+
+  /* The following loop runs once for each term in a compound-subquery
+  ** flattening (as described above).  If we are doing a different kind
+  ** of flattening - a flattening other than a compound-subquery flattening -
+  ** then this loop only runs once.
+  **
+  ** This loop moves all of the FROM elements of the subquery into the
+  ** the FROM clause of the outer query.  Before doing this, remember
+  ** the cursor number for the original outer query FROM element in
+  ** iParent.  The iParent cursor will never be used.  Subsequent code
+  ** will scan expressions looking for iParent references and replace
+  ** those references with expressions that resolve to the subquery FROM
+  ** elements we are now copying in.
+  */
+  for(pParent=p; pParent; pParent=pParent->pPrior, pSub=pSub->pPrior){
+    int nSubSrc;
+    u8 jointype = 0;
+    pSubSrc = pSub->pSrc;     /* FROM clause of subquery */
+    nSubSrc = pSubSrc->nSrc;  /* Number of terms in subquery FROM clause */
+    pSrc = pParent->pSrc;     /* FROM clause of the outer query */
+
+    if( pSrc ){
+      assert( pParent==p );  /* First time through the loop */
+      jointype = pSubitem->jointype;
+    }else{
+      assert( pParent!=p );  /* 2nd and subsequent times through the loop */
+      pSrc = pParent->pSrc = sqlite3SrcListAppend(db, 0, 0, 0);
+      if( pSrc==0 ){
+        assert( db->mallocFailed );
+        break;
+      }
+    }
+
+    /* The subquery uses a single slot of the FROM clause of the outer
+    ** query.  If the subquery has more than one element in its FROM clause,
+    ** then expand the outer query to make space for it to hold all elements
+    ** of the subquery.
+    **
+    ** Example:
+    **
+    **    SELECT * FROM tabA, (SELECT * FROM sub1, sub2), tabB;
+    **
+    ** The outer query has 3 slots in its FROM clause.  One slot of the
+    ** outer query (the middle slot) is used by the subquery.  The next
+    ** block of code will expand the out query to 4 slots.  The middle
+    ** slot is expanded to two slots in order to make space for the
+    ** two elements in the FROM clause of the subquery.
+    */
+    if( nSubSrc>1 ){
+      pParent->pSrc = pSrc = sqlite3SrcListEnlarge(db, pSrc, nSubSrc-1,iFrom+1);
+      if( db->mallocFailed ){
+        break;
+      }
+    }
+
+    /* Transfer the FROM clause terms from the subquery into the
+    ** outer query.
+    */
+    for(i=0; i<nSubSrc; i++){
+      sqlite3IdListDelete(db, pSrc->a[i+iFrom].pUsing);
+      pSrc->a[i+iFrom] = pSubSrc->a[i];
+      memset(&pSubSrc->a[i], 0, sizeof(pSubSrc->a[i]));
+    }
+    pSrc->a[iFrom].jointype = jointype;
+  
+    /* Now begin substituting subquery result set expressions for 
+    ** references to the iParent in the outer query.
+    ** 
+    ** Example:
+    **
+    **   SELECT a+5, b*10 FROM (SELECT x*3 AS a, y+10 AS b FROM t1) WHERE a>b;
+    **   \                     \_____________ subquery __________/          /
+    **    \_____________________ outer query ______________________________/
+    **
+    ** We look at every expression in the outer query and every place we see
+    ** "a" we substitute "x*3" and every place we see "b" we substitute "y+10".
+    */
+    pList = pParent->pEList;
+    for(i=0; i<pList->nExpr; i++){
+      if( pList->a[i].zName==0 ){
+        char *zName = sqlite3DbStrDup(db, pList->a[i].zSpan);
