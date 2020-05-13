@@ -108883,3 +108883,238 @@ static int flattenSubquery(
     for(i=0; i<pList->nExpr; i++){
       if( pList->a[i].zName==0 ){
         char *zName = sqlite3DbStrDup(db, pList->a[i].zSpan);
+        sqlite3Dequote(zName);
+        pList->a[i].zName = zName;
+      }
+    }
+    substExprList(db, pParent->pEList, iParent, pSub->pEList);
+    if( isAgg ){
+      substExprList(db, pParent->pGroupBy, iParent, pSub->pEList);
+      pParent->pHaving = substExpr(db, pParent->pHaving, iParent, pSub->pEList);
+    }
+    if( pSub->pOrderBy ){
+      /* At this point, any non-zero iOrderByCol values indicate that the
+      ** ORDER BY column expression is identical to the iOrderByCol'th
+      ** expression returned by SELECT statement pSub. Since these values
+      ** do not necessarily correspond to columns in SELECT statement pParent,
+      ** zero them before transfering the ORDER BY clause.
+      **
+      ** Not doing this may cause an error if a subsequent call to this
+      ** function attempts to flatten a compound sub-query into pParent
+      ** (the only way this can happen is if the compound sub-query is
+      ** currently part of pSub->pSrc). See ticket [d11a6e908f].  */
+      ExprList *pOrderBy = pSub->pOrderBy;
+      for(i=0; i<pOrderBy->nExpr; i++){
+        pOrderBy->a[i].u.x.iOrderByCol = 0;
+      }
+      assert( pParent->pOrderBy==0 );
+      assert( pSub->pPrior==0 );
+      pParent->pOrderBy = pOrderBy;
+      pSub->pOrderBy = 0;
+    }else if( pParent->pOrderBy ){
+      substExprList(db, pParent->pOrderBy, iParent, pSub->pEList);
+    }
+    if( pSub->pWhere ){
+      pWhere = sqlite3ExprDup(db, pSub->pWhere, 0);
+    }else{
+      pWhere = 0;
+    }
+    if( subqueryIsAgg ){
+      assert( pParent->pHaving==0 );
+      pParent->pHaving = pParent->pWhere;
+      pParent->pWhere = pWhere;
+      pParent->pHaving = substExpr(db, pParent->pHaving, iParent, pSub->pEList);
+      pParent->pHaving = sqlite3ExprAnd(db, pParent->pHaving, 
+                                  sqlite3ExprDup(db, pSub->pHaving, 0));
+      assert( pParent->pGroupBy==0 );
+      pParent->pGroupBy = sqlite3ExprListDup(db, pSub->pGroupBy, 0);
+    }else{
+      pParent->pWhere = substExpr(db, pParent->pWhere, iParent, pSub->pEList);
+      pParent->pWhere = sqlite3ExprAnd(db, pParent->pWhere, pWhere);
+    }
+  
+    /* The flattened query is distinct if either the inner or the
+    ** outer query is distinct. 
+    */
+    pParent->selFlags |= pSub->selFlags & SF_Distinct;
+  
+    /*
+    ** SELECT ... FROM (SELECT ... LIMIT a OFFSET b) LIMIT x OFFSET y;
+    **
+    ** One is tempted to try to add a and b to combine the limits.  But this
+    ** does not work if either limit is negative.
+    */
+    if( pSub->pLimit ){
+      pParent->pLimit = pSub->pLimit;
+      pSub->pLimit = 0;
+    }
+  }
+
+  /* Finially, delete what is left of the subquery and return
+  ** success.
+  */
+  sqlite3SelectDelete(db, pSub1);
+
+#if SELECTTRACE_ENABLED
+  if( sqlite3SelectTrace & 0x100 ){
+    sqlite3DebugPrintf("After flattening:\n");
+    sqlite3TreeViewSelect(0, p, 0);
+  }
+#endif
+
+  return 1;
+}
+#endif /* !defined(SQLITE_OMIT_SUBQUERY) || !defined(SQLITE_OMIT_VIEW) */
+
+/*
+** Based on the contents of the AggInfo structure indicated by the first
+** argument, this function checks if the following are true:
+**
+**    * the query contains just a single aggregate function,
+**    * the aggregate function is either min() or max(), and
+**    * the argument to the aggregate function is a column value.
+**
+** If all of the above are true, then WHERE_ORDERBY_MIN or WHERE_ORDERBY_MAX
+** is returned as appropriate. Also, *ppMinMax is set to point to the 
+** list of arguments passed to the aggregate before returning.
+**
+** Or, if the conditions above are not met, *ppMinMax is set to 0 and
+** WHERE_ORDERBY_NORMAL is returned.
+*/
+static u8 minMaxQuery(AggInfo *pAggInfo, ExprList **ppMinMax){
+  int eRet = WHERE_ORDERBY_NORMAL;          /* Return value */
+
+  *ppMinMax = 0;
+  if( pAggInfo->nFunc==1 ){
+    Expr *pExpr = pAggInfo->aFunc[0].pExpr; /* Aggregate function */
+    ExprList *pEList = pExpr->x.pList;      /* Arguments to agg function */
+
+    assert( pExpr->op==TK_AGG_FUNCTION );
+    if( pEList && pEList->nExpr==1 && pEList->a[0].pExpr->op==TK_AGG_COLUMN ){
+      const char *zFunc = pExpr->u.zToken;
+      if( sqlite3StrICmp(zFunc, "min")==0 ){
+        eRet = WHERE_ORDERBY_MIN;
+        *ppMinMax = pEList;
+      }else if( sqlite3StrICmp(zFunc, "max")==0 ){
+        eRet = WHERE_ORDERBY_MAX;
+        *ppMinMax = pEList;
+      }
+    }
+  }
+
+  assert( *ppMinMax==0 || (*ppMinMax)->nExpr==1 );
+  return eRet;
+}
+
+/*
+** The select statement passed as the first argument is an aggregate query.
+** The second argument is the associated aggregate-info object. This 
+** function tests if the SELECT is of the form:
+**
+**   SELECT count(*) FROM <tbl>
+**
+** where table is a database table, not a sub-select or view. If the query
+** does match this pattern, then a pointer to the Table object representing
+** <tbl> is returned. Otherwise, 0 is returned.
+*/
+static Table *isSimpleCount(Select *p, AggInfo *pAggInfo){
+  Table *pTab;
+  Expr *pExpr;
+
+  assert( !p->pGroupBy );
+
+  if( p->pWhere || p->pEList->nExpr!=1 
+   || p->pSrc->nSrc!=1 || p->pSrc->a[0].pSelect
+  ){
+    return 0;
+  }
+  pTab = p->pSrc->a[0].pTab;
+  pExpr = p->pEList->a[0].pExpr;
+  assert( pTab && !pTab->pSelect && pExpr );
+
+  if( IsVirtual(pTab) ) return 0;
+  if( pExpr->op!=TK_AGG_FUNCTION ) return 0;
+  if( NEVER(pAggInfo->nFunc==0) ) return 0;
+  if( (pAggInfo->aFunc[0].pFunc->funcFlags&SQLITE_FUNC_COUNT)==0 ) return 0;
+  if( pExpr->flags&EP_Distinct ) return 0;
+
+  return pTab;
+}
+
+/*
+** If the source-list item passed as an argument was augmented with an
+** INDEXED BY clause, then try to locate the specified index. If there
+** was such a clause and the named index cannot be found, return 
+** SQLITE_ERROR and leave an error in pParse. Otherwise, populate 
+** pFrom->pIndex and return SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3IndexedByLookup(Parse *pParse, struct SrcList_item *pFrom){
+  if( pFrom->pTab && pFrom->zIndex ){
+    Table *pTab = pFrom->pTab;
+    char *zIndex = pFrom->zIndex;
+    Index *pIdx;
+    for(pIdx=pTab->pIndex; 
+        pIdx && sqlite3StrICmp(pIdx->zName, zIndex); 
+        pIdx=pIdx->pNext
+    );
+    if( !pIdx ){
+      sqlite3ErrorMsg(pParse, "no such index: %s", zIndex, 0);
+      pParse->checkSchema = 1;
+      return SQLITE_ERROR;
+    }
+    pFrom->pIndex = pIdx;
+  }
+  return SQLITE_OK;
+}
+/*
+** Detect compound SELECT statements that use an ORDER BY clause with 
+** an alternative collating sequence.
+**
+**    SELECT ... FROM t1 EXCEPT SELECT ... FROM t2 ORDER BY .. COLLATE ...
+**
+** These are rewritten as a subquery:
+**
+**    SELECT * FROM (SELECT ... FROM t1 EXCEPT SELECT ... FROM t2)
+**     ORDER BY ... COLLATE ...
+**
+** This transformation is necessary because the multiSelectOrderBy() routine
+** above that generates the code for a compound SELECT with an ORDER BY clause
+** uses a merge algorithm that requires the same collating sequence on the
+** result columns as on the ORDER BY clause.  See ticket
+** http://www.sqlite.org/src/info/6709574d2a
+**
+** This transformation is only needed for EXCEPT, INTERSECT, and UNION.
+** The UNION ALL operator works fine with multiSelectOrderBy() even when
+** there are COLLATE terms in the ORDER BY.
+*/
+static int convertCompoundSelectToSubquery(Walker *pWalker, Select *p){
+  int i;
+  Select *pNew;
+  Select *pX;
+  sqlite3 *db;
+  struct ExprList_item *a;
+  SrcList *pNewSrc;
+  Parse *pParse;
+  Token dummy;
+
+  if( p->pPrior==0 ) return WRC_Continue;
+  if( p->pOrderBy==0 ) return WRC_Continue;
+  for(pX=p; pX && (pX->op==TK_ALL || pX->op==TK_SELECT); pX=pX->pPrior){}
+  if( pX==0 ) return WRC_Continue;
+  a = p->pOrderBy->a;
+  for(i=p->pOrderBy->nExpr-1; i>=0; i--){
+    if( a[i].pExpr->flags & EP_Collate ) break;
+  }
+  if( i<0 ) return WRC_Continue;
+
+  /* If we reach this point, that means the transformation is required. */
+
+  pParse = pWalker->pParse;
+  db = pParse->db;
+  pNew = sqlite3DbMallocZero(db, sizeof(*pNew) );
+  if( pNew==0 ) return WRC_Abort;
+  memset(&dummy, 0, sizeof(dummy));
+  pNewSrc = sqlite3SrcListAppendFromTerm(pParse,0,0,0,&dummy,pNew,0,0);
+  if( pNewSrc==0 ) return WRC_Abort;
+  *pNew = *p;
+  p->pSrc = pNewSrc;
