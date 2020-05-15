@@ -109327,3 +109327,226 @@ static void selectPopWith(Walker *pWalker, Select *p){
 #endif
 
 /*
+** This routine is a Walker callback for "expanding" a SELECT statement.
+** "Expanding" means to do the following:
+**
+**    (1)  Make sure VDBE cursor numbers have been assigned to every
+**         element of the FROM clause.
+**
+**    (2)  Fill in the pTabList->a[].pTab fields in the SrcList that 
+**         defines FROM clause.  When views appear in the FROM clause,
+**         fill pTabList->a[].pSelect with a copy of the SELECT statement
+**         that implements the view.  A copy is made of the view's SELECT
+**         statement so that we can freely modify or delete that statement
+**         without worrying about messing up the persistent representation
+**         of the view.
+**
+**    (3)  Add terms to the WHERE clause to accommodate the NATURAL keyword
+**         on joins and the ON and USING clause of joins.
+**
+**    (4)  Scan the list of columns in the result set (pEList) looking
+**         for instances of the "*" operator or the TABLE.* operator.
+**         If found, expand each "*" to be every column in every table
+**         and TABLE.* to be every column in TABLE.
+**
+*/
+static int selectExpander(Walker *pWalker, Select *p){
+  Parse *pParse = pWalker->pParse;
+  int i, j, k;
+  SrcList *pTabList;
+  ExprList *pEList;
+  struct SrcList_item *pFrom;
+  sqlite3 *db = pParse->db;
+  Expr *pE, *pRight, *pExpr;
+  u16 selFlags = p->selFlags;
+
+  p->selFlags |= SF_Expanded;
+  if( db->mallocFailed  ){
+    return WRC_Abort;
+  }
+  if( NEVER(p->pSrc==0) || (selFlags & SF_Expanded)!=0 ){
+    return WRC_Prune;
+  }
+  pTabList = p->pSrc;
+  pEList = p->pEList;
+  if( pWalker->xSelectCallback2==selectPopWith ){
+    sqlite3WithPush(pParse, findRightmost(p)->pWith, 0);
+  }
+
+  /* Make sure cursor numbers have been assigned to all entries in
+  ** the FROM clause of the SELECT statement.
+  */
+  sqlite3SrcListAssignCursors(pParse, pTabList);
+
+  /* Look up every table named in the FROM clause of the select.  If
+  ** an entry of the FROM clause is a subquery instead of a table or view,
+  ** then create a transient table structure to describe the subquery.
+  */
+  for(i=0, pFrom=pTabList->a; i<pTabList->nSrc; i++, pFrom++){
+    Table *pTab;
+    assert( pFrom->isRecursive==0 || pFrom->pTab );
+    if( pFrom->isRecursive ) continue;
+    if( pFrom->pTab!=0 ){
+      /* This statement has already been prepared.  There is no need
+      ** to go further. */
+      assert( i==0 );
+#ifndef SQLITE_OMIT_CTE
+      selectPopWith(pWalker, p);
+#endif
+      return WRC_Prune;
+    }
+#ifndef SQLITE_OMIT_CTE
+    if( withExpand(pWalker, pFrom) ) return WRC_Abort;
+    if( pFrom->pTab ) {} else
+#endif
+    if( pFrom->zName==0 ){
+#ifndef SQLITE_OMIT_SUBQUERY
+      Select *pSel = pFrom->pSelect;
+      /* A sub-query in the FROM clause of a SELECT */
+      assert( pSel!=0 );
+      assert( pFrom->pTab==0 );
+      sqlite3WalkSelect(pWalker, pSel);
+      pFrom->pTab = pTab = sqlite3DbMallocZero(db, sizeof(Table));
+      if( pTab==0 ) return WRC_Abort;
+      pTab->nRef = 1;
+      pTab->zName = sqlite3MPrintf(db, "sqlite_sq_%p", (void*)pTab);
+      while( pSel->pPrior ){ pSel = pSel->pPrior; }
+      selectColumnsFromExprList(pParse, pSel->pEList, &pTab->nCol, &pTab->aCol);
+      pTab->iPKey = -1;
+      pTab->nRowLogEst = 200; assert( 200==sqlite3LogEst(1048576) );
+      pTab->tabFlags |= TF_Ephemeral;
+#endif
+    }else{
+      /* An ordinary table or view name in the FROM clause */
+      assert( pFrom->pTab==0 );
+      pFrom->pTab = pTab = sqlite3LocateTableItem(pParse, 0, pFrom);
+      if( pTab==0 ) return WRC_Abort;
+      if( pTab->nRef==0xffff ){
+        sqlite3ErrorMsg(pParse, "too many references to \"%s\": max 65535",
+           pTab->zName);
+        pFrom->pTab = 0;
+        return WRC_Abort;
+      }
+      pTab->nRef++;
+#if !defined(SQLITE_OMIT_VIEW) || !defined (SQLITE_OMIT_VIRTUALTABLE)
+      if( pTab->pSelect || IsVirtual(pTab) ){
+        /* We reach here if the named table is a really a view */
+        if( sqlite3ViewGetColumnNames(pParse, pTab) ) return WRC_Abort;
+        assert( pFrom->pSelect==0 );
+        pFrom->pSelect = sqlite3SelectDup(db, pTab->pSelect, 0);
+        sqlite3SelectSetName(pFrom->pSelect, pTab->zName);
+        sqlite3WalkSelect(pWalker, pFrom->pSelect);
+      }
+#endif
+    }
+
+    /* Locate the index named by the INDEXED BY clause, if any. */
+    if( sqlite3IndexedByLookup(pParse, pFrom) ){
+      return WRC_Abort;
+    }
+  }
+
+  /* Process NATURAL keywords, and ON and USING clauses of joins.
+  */
+  if( db->mallocFailed || sqliteProcessJoin(pParse, p) ){
+    return WRC_Abort;
+  }
+
+  /* For every "*" that occurs in the column list, insert the names of
+  ** all columns in all tables.  And for every TABLE.* insert the names
+  ** of all columns in TABLE.  The parser inserted a special expression
+  ** with the TK_ALL operator for each "*" that it found in the column list.
+  ** The following code just has to locate the TK_ALL expressions and expand
+  ** each one to the list of all columns in all tables.
+  **
+  ** The first loop just checks to see if there are any "*" operators
+  ** that need expanding.
+  */
+  for(k=0; k<pEList->nExpr; k++){
+    pE = pEList->a[k].pExpr;
+    if( pE->op==TK_ALL ) break;
+    assert( pE->op!=TK_DOT || pE->pRight!=0 );
+    assert( pE->op!=TK_DOT || (pE->pLeft!=0 && pE->pLeft->op==TK_ID) );
+    if( pE->op==TK_DOT && pE->pRight->op==TK_ALL ) break;
+  }
+  if( k<pEList->nExpr ){
+    /*
+    ** If we get here it means the result set contains one or more "*"
+    ** operators that need to be expanded.  Loop through each expression
+    ** in the result set and expand them one by one.
+    */
+    struct ExprList_item *a = pEList->a;
+    ExprList *pNew = 0;
+    int flags = pParse->db->flags;
+    int longNames = (flags & SQLITE_FullColNames)!=0
+                      && (flags & SQLITE_ShortColNames)==0;
+
+    /* When processing FROM-clause subqueries, it is always the case
+    ** that full_column_names=OFF and short_column_names=ON.  The
+    ** sqlite3ResultSetOfSelect() routine makes it so. */
+    assert( (p->selFlags & SF_NestedFrom)==0
+          || ((flags & SQLITE_FullColNames)==0 &&
+              (flags & SQLITE_ShortColNames)!=0) );
+
+    for(k=0; k<pEList->nExpr; k++){
+      pE = a[k].pExpr;
+      pRight = pE->pRight;
+      assert( pE->op!=TK_DOT || pRight!=0 );
+      if( pE->op!=TK_ALL && (pE->op!=TK_DOT || pRight->op!=TK_ALL) ){
+        /* This particular expression does not need to be expanded.
+        */
+        pNew = sqlite3ExprListAppend(pParse, pNew, a[k].pExpr);
+        if( pNew ){
+          pNew->a[pNew->nExpr-1].zName = a[k].zName;
+          pNew->a[pNew->nExpr-1].zSpan = a[k].zSpan;
+          a[k].zName = 0;
+          a[k].zSpan = 0;
+        }
+        a[k].pExpr = 0;
+      }else{
+        /* This expression is a "*" or a "TABLE.*" and needs to be
+        ** expanded. */
+        int tableSeen = 0;      /* Set to 1 when TABLE matches */
+        char *zTName = 0;       /* text of name of TABLE */
+        if( pE->op==TK_DOT ){
+          assert( pE->pLeft!=0 );
+          assert( !ExprHasProperty(pE->pLeft, EP_IntValue) );
+          zTName = pE->pLeft->u.zToken;
+        }
+        for(i=0, pFrom=pTabList->a; i<pTabList->nSrc; i++, pFrom++){
+          Table *pTab = pFrom->pTab;
+          Select *pSub = pFrom->pSelect;
+          char *zTabName = pFrom->zAlias;
+          const char *zSchemaName = 0;
+          int iDb;
+          if( zTabName==0 ){
+            zTabName = pTab->zName;
+          }
+          if( db->mallocFailed ) break;
+          if( pSub==0 || (pSub->selFlags & SF_NestedFrom)==0 ){
+            pSub = 0;
+            if( zTName && sqlite3StrICmp(zTName, zTabName)!=0 ){
+              continue;
+            }
+            iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+            zSchemaName = iDb>=0 ? db->aDb[iDb].zName : "*";
+          }
+          for(j=0; j<pTab->nCol; j++){
+            char *zName = pTab->aCol[j].zName;
+            char *zColname;  /* The computed column name */
+            char *zToFree;   /* Malloced string that needs to be freed */
+            Token sColname;  /* Computed column name as a token */
+
+            assert( zName );
+            if( zTName && pSub
+             && sqlite3MatchSpanName(pSub->pEList->a[j].zSpan, 0, zTName, 0)==0
+            ){
+              continue;
+            }
+
+            /* If a column is marked as 'hidden' (currently only possible
+            ** for virtual tables), do not include it in the expanded
+            ** result-set list.
+            */
+            if( IsHiddenColumn(&pTab->aCol[j]) ){
+              assert(IsVirtual(pTab));
