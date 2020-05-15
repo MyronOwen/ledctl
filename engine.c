@@ -109118,3 +109118,212 @@ static int convertCompoundSelectToSubquery(Walker *pWalker, Select *p){
   if( pNewSrc==0 ) return WRC_Abort;
   *pNew = *p;
   p->pSrc = pNewSrc;
+  p->pEList = sqlite3ExprListAppend(pParse, 0, sqlite3Expr(db, TK_ALL, 0));
+  p->op = TK_SELECT;
+  p->pWhere = 0;
+  pNew->pGroupBy = 0;
+  pNew->pHaving = 0;
+  pNew->pOrderBy = 0;
+  p->pPrior = 0;
+  p->pNext = 0;
+  p->selFlags &= ~SF_Compound;
+  assert( pNew->pPrior!=0 );
+  pNew->pPrior->pNext = pNew;
+  pNew->pLimit = 0;
+  pNew->pOffset = 0;
+  return WRC_Continue;
+}
+
+#ifndef SQLITE_OMIT_CTE
+/*
+** Argument pWith (which may be NULL) points to a linked list of nested 
+** WITH contexts, from inner to outermost. If the table identified by 
+** FROM clause element pItem is really a common-table-expression (CTE) 
+** then return a pointer to the CTE definition for that table. Otherwise
+** return NULL.
+**
+** If a non-NULL value is returned, set *ppContext to point to the With
+** object that the returned CTE belongs to.
+*/
+static struct Cte *searchWith(
+  With *pWith,                    /* Current outermost WITH clause */
+  struct SrcList_item *pItem,     /* FROM clause element to resolve */
+  With **ppContext                /* OUT: WITH clause return value belongs to */
+){
+  const char *zName;
+  if( pItem->zDatabase==0 && (zName = pItem->zName)!=0 ){
+    With *p;
+    for(p=pWith; p; p=p->pOuter){
+      int i;
+      for(i=0; i<p->nCte; i++){
+        if( sqlite3StrICmp(zName, p->a[i].zName)==0 ){
+          *ppContext = p;
+          return &p->a[i];
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+/* The code generator maintains a stack of active WITH clauses
+** with the inner-most WITH clause being at the top of the stack.
+**
+** This routine pushes the WITH clause passed as the second argument
+** onto the top of the stack. If argument bFree is true, then this
+** WITH clause will never be popped from the stack. In this case it
+** should be freed along with the Parse object. In other cases, when
+** bFree==0, the With object will be freed along with the SELECT 
+** statement with which it is associated.
+*/
+SQLITE_PRIVATE void sqlite3WithPush(Parse *pParse, With *pWith, u8 bFree){
+  assert( bFree==0 || pParse->pWith==0 );
+  if( pWith ){
+    pWith->pOuter = pParse->pWith;
+    pParse->pWith = pWith;
+    pParse->bFreeWith = bFree;
+  }
+}
+
+/*
+** This function checks if argument pFrom refers to a CTE declared by 
+** a WITH clause on the stack currently maintained by the parser. And,
+** if currently processing a CTE expression, if it is a recursive
+** reference to the current CTE.
+**
+** If pFrom falls into either of the two categories above, pFrom->pTab
+** and other fields are populated accordingly. The caller should check
+** (pFrom->pTab!=0) to determine whether or not a successful match
+** was found.
+**
+** Whether or not a match is found, SQLITE_OK is returned if no error
+** occurs. If an error does occur, an error message is stored in the
+** parser and some error code other than SQLITE_OK returned.
+*/
+static int withExpand(
+  Walker *pWalker, 
+  struct SrcList_item *pFrom
+){
+  Parse *pParse = pWalker->pParse;
+  sqlite3 *db = pParse->db;
+  struct Cte *pCte;               /* Matched CTE (or NULL if no match) */
+  With *pWith;                    /* WITH clause that pCte belongs to */
+
+  assert( pFrom->pTab==0 );
+
+  pCte = searchWith(pParse->pWith, pFrom, &pWith);
+  if( pCte ){
+    Table *pTab;
+    ExprList *pEList;
+    Select *pSel;
+    Select *pLeft;                /* Left-most SELECT statement */
+    int bMayRecursive;            /* True if compound joined by UNION [ALL] */
+    With *pSavedWith;             /* Initial value of pParse->pWith */
+
+    /* If pCte->zErr is non-NULL at this point, then this is an illegal
+    ** recursive reference to CTE pCte. Leave an error in pParse and return
+    ** early. If pCte->zErr is NULL, then this is not a recursive reference.
+    ** In this case, proceed.  */
+    if( pCte->zErr ){
+      sqlite3ErrorMsg(pParse, pCte->zErr, pCte->zName);
+      return SQLITE_ERROR;
+    }
+
+    assert( pFrom->pTab==0 );
+    pFrom->pTab = pTab = sqlite3DbMallocZero(db, sizeof(Table));
+    if( pTab==0 ) return WRC_Abort;
+    pTab->nRef = 1;
+    pTab->zName = sqlite3DbStrDup(db, pCte->zName);
+    pTab->iPKey = -1;
+    pTab->nRowLogEst = 200; assert( 200==sqlite3LogEst(1048576) );
+    pTab->tabFlags |= TF_Ephemeral;
+    pFrom->pSelect = sqlite3SelectDup(db, pCte->pSelect, 0);
+    if( db->mallocFailed ) return SQLITE_NOMEM;
+    assert( pFrom->pSelect );
+
+    /* Check if this is a recursive CTE. */
+    pSel = pFrom->pSelect;
+    bMayRecursive = ( pSel->op==TK_ALL || pSel->op==TK_UNION );
+    if( bMayRecursive ){
+      int i;
+      SrcList *pSrc = pFrom->pSelect->pSrc;
+      for(i=0; i<pSrc->nSrc; i++){
+        struct SrcList_item *pItem = &pSrc->a[i];
+        if( pItem->zDatabase==0 
+         && pItem->zName!=0 
+         && 0==sqlite3StrICmp(pItem->zName, pCte->zName)
+          ){
+          pItem->pTab = pTab;
+          pItem->isRecursive = 1;
+          pTab->nRef++;
+          pSel->selFlags |= SF_Recursive;
+        }
+      }
+    }
+
+    /* Only one recursive reference is permitted. */ 
+    if( pTab->nRef>2 ){
+      sqlite3ErrorMsg(
+          pParse, "multiple references to recursive table: %s", pCte->zName
+      );
+      return SQLITE_ERROR;
+    }
+    assert( pTab->nRef==1 || ((pSel->selFlags&SF_Recursive) && pTab->nRef==2 ));
+
+    pCte->zErr = "circular reference: %s";
+    pSavedWith = pParse->pWith;
+    pParse->pWith = pWith;
+    sqlite3WalkSelect(pWalker, bMayRecursive ? pSel->pPrior : pSel);
+
+    for(pLeft=pSel; pLeft->pPrior; pLeft=pLeft->pPrior);
+    pEList = pLeft->pEList;
+    if( pCte->pCols ){
+      if( pEList->nExpr!=pCte->pCols->nExpr ){
+        sqlite3ErrorMsg(pParse, "table %s has %d values for %d columns",
+            pCte->zName, pEList->nExpr, pCte->pCols->nExpr
+        );
+        pParse->pWith = pSavedWith;
+        return SQLITE_ERROR;
+      }
+      pEList = pCte->pCols;
+    }
+
+    selectColumnsFromExprList(pParse, pEList, &pTab->nCol, &pTab->aCol);
+    if( bMayRecursive ){
+      if( pSel->selFlags & SF_Recursive ){
+        pCte->zErr = "multiple recursive references: %s";
+      }else{
+        pCte->zErr = "recursive reference in a subquery: %s";
+      }
+      sqlite3WalkSelect(pWalker, pSel);
+    }
+    pCte->zErr = 0;
+    pParse->pWith = pSavedWith;
+  }
+
+  return SQLITE_OK;
+}
+#endif
+
+#ifndef SQLITE_OMIT_CTE
+/*
+** If the SELECT passed as the second argument has an associated WITH 
+** clause, pop it from the stack stored as part of the Parse object.
+**
+** This function is used as the xSelectCallback2() callback by
+** sqlite3SelectExpand() when walking a SELECT tree to resolve table
+** names and other FROM clause elements. 
+*/
+static void selectPopWith(Walker *pWalker, Select *p){
+  Parse *pParse = pWalker->pParse;
+  With *pWith = findRightmost(p)->pWith;
+  if( pWith!=0 ){
+    assert( pParse->pWith==pWith );
+    pParse->pWith = pWith->pOuter;
+  }
+}
+#else
+#define selectPopWith 0
+#endif
+
+/*
