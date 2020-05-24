@@ -109758,3 +109758,256 @@ SQLITE_PRIVATE void sqlite3SelectPrep(
   sqlite3SelectAddTypeInfo(pParse, p);
 }
 
+/*
+** Reset the aggregate accumulator.
+**
+** The aggregate accumulator is a set of memory cells that hold
+** intermediate results while calculating an aggregate.  This
+** routine generates code that stores NULLs in all of those memory
+** cells.
+*/
+static void resetAccumulator(Parse *pParse, AggInfo *pAggInfo){
+  Vdbe *v = pParse->pVdbe;
+  int i;
+  struct AggInfo_func *pFunc;
+  int nReg = pAggInfo->nFunc + pAggInfo->nColumn;
+  if( nReg==0 ) return;
+#ifdef SQLITE_DEBUG
+  /* Verify that all AggInfo registers are within the range specified by
+  ** AggInfo.mnReg..AggInfo.mxReg */
+  assert( nReg==pAggInfo->mxReg-pAggInfo->mnReg+1 );
+  for(i=0; i<pAggInfo->nColumn; i++){
+    assert( pAggInfo->aCol[i].iMem>=pAggInfo->mnReg
+         && pAggInfo->aCol[i].iMem<=pAggInfo->mxReg );
+  }
+  for(i=0; i<pAggInfo->nFunc; i++){
+    assert( pAggInfo->aFunc[i].iMem>=pAggInfo->mnReg
+         && pAggInfo->aFunc[i].iMem<=pAggInfo->mxReg );
+  }
+#endif
+  sqlite3VdbeAddOp3(v, OP_Null, 0, pAggInfo->mnReg, pAggInfo->mxReg);
+  for(pFunc=pAggInfo->aFunc, i=0; i<pAggInfo->nFunc; i++, pFunc++){
+    if( pFunc->iDistinct>=0 ){
+      Expr *pE = pFunc->pExpr;
+      assert( !ExprHasProperty(pE, EP_xIsSelect) );
+      if( pE->x.pList==0 || pE->x.pList->nExpr!=1 ){
+        sqlite3ErrorMsg(pParse, "DISTINCT aggregates must have exactly one "
+           "argument");
+        pFunc->iDistinct = -1;
+      }else{
+        KeyInfo *pKeyInfo = keyInfoFromExprList(pParse, pE->x.pList, 0, 0);
+        sqlite3VdbeAddOp4(v, OP_OpenEphemeral, pFunc->iDistinct, 0, 0,
+                          (char*)pKeyInfo, P4_KEYINFO);
+      }
+    }
+  }
+}
+
+/*
+** Invoke the OP_AggFinalize opcode for every aggregate function
+** in the AggInfo structure.
+*/
+static void finalizeAggFunctions(Parse *pParse, AggInfo *pAggInfo){
+  Vdbe *v = pParse->pVdbe;
+  int i;
+  struct AggInfo_func *pF;
+  for(i=0, pF=pAggInfo->aFunc; i<pAggInfo->nFunc; i++, pF++){
+    ExprList *pList = pF->pExpr->x.pList;
+    assert( !ExprHasProperty(pF->pExpr, EP_xIsSelect) );
+    sqlite3VdbeAddOp4(v, OP_AggFinal, pF->iMem, pList ? pList->nExpr : 0, 0,
+                      (void*)pF->pFunc, P4_FUNCDEF);
+  }
+}
+
+/*
+** Update the accumulator memory cells for an aggregate based on
+** the current cursor position.
+*/
+static void updateAccumulator(Parse *pParse, AggInfo *pAggInfo){
+  Vdbe *v = pParse->pVdbe;
+  int i;
+  int regHit = 0;
+  int addrHitTest = 0;
+  struct AggInfo_func *pF;
+  struct AggInfo_col *pC;
+
+  pAggInfo->directMode = 1;
+  for(i=0, pF=pAggInfo->aFunc; i<pAggInfo->nFunc; i++, pF++){
+    int nArg;
+    int addrNext = 0;
+    int regAgg;
+    ExprList *pList = pF->pExpr->x.pList;
+    assert( !ExprHasProperty(pF->pExpr, EP_xIsSelect) );
+    if( pList ){
+      nArg = pList->nExpr;
+      regAgg = sqlite3GetTempRange(pParse, nArg);
+      sqlite3ExprCodeExprList(pParse, pList, regAgg, SQLITE_ECEL_DUP);
+    }else{
+      nArg = 0;
+      regAgg = 0;
+    }
+    if( pF->iDistinct>=0 ){
+      addrNext = sqlite3VdbeMakeLabel(v);
+      assert( nArg==1 );
+      codeDistinct(pParse, pF->iDistinct, addrNext, 1, regAgg);
+    }
+    if( pF->pFunc->funcFlags & SQLITE_FUNC_NEEDCOLL ){
+      CollSeq *pColl = 0;
+      struct ExprList_item *pItem;
+      int j;
+      assert( pList!=0 );  /* pList!=0 if pF->pFunc has NEEDCOLL */
+      for(j=0, pItem=pList->a; !pColl && j<nArg; j++, pItem++){
+        pColl = sqlite3ExprCollSeq(pParse, pItem->pExpr);
+      }
+      if( !pColl ){
+        pColl = pParse->db->pDfltColl;
+      }
+      if( regHit==0 && pAggInfo->nAccumulator ) regHit = ++pParse->nMem;
+      sqlite3VdbeAddOp4(v, OP_CollSeq, regHit, 0, 0, (char *)pColl, P4_COLLSEQ);
+    }
+    sqlite3VdbeAddOp4(v, OP_AggStep, 0, regAgg, pF->iMem,
+                      (void*)pF->pFunc, P4_FUNCDEF);
+    sqlite3VdbeChangeP5(v, (u8)nArg);
+    sqlite3ExprCacheAffinityChange(pParse, regAgg, nArg);
+    sqlite3ReleaseTempRange(pParse, regAgg, nArg);
+    if( addrNext ){
+      sqlite3VdbeResolveLabel(v, addrNext);
+      sqlite3ExprCacheClear(pParse);
+    }
+  }
+
+  /* Before populating the accumulator registers, clear the column cache.
+  ** Otherwise, if any of the required column values are already present 
+  ** in registers, sqlite3ExprCode() may use OP_SCopy to copy the value
+  ** to pC->iMem. But by the time the value is used, the original register
+  ** may have been used, invalidating the underlying buffer holding the
+  ** text or blob value. See ticket [883034dcb5].
+  **
+  ** Another solution would be to change the OP_SCopy used to copy cached
+  ** values to an OP_Copy.
+  */
+  if( regHit ){
+    addrHitTest = sqlite3VdbeAddOp1(v, OP_If, regHit); VdbeCoverage(v);
+  }
+  sqlite3ExprCacheClear(pParse);
+  for(i=0, pC=pAggInfo->aCol; i<pAggInfo->nAccumulator; i++, pC++){
+    sqlite3ExprCode(pParse, pC->pExpr, pC->iMem);
+  }
+  pAggInfo->directMode = 0;
+  sqlite3ExprCacheClear(pParse);
+  if( addrHitTest ){
+    sqlite3VdbeJumpHere(v, addrHitTest);
+  }
+}
+
+/*
+** Add a single OP_Explain instruction to the VDBE to explain a simple
+** count(*) query ("SELECT count(*) FROM pTab").
+*/
+#ifndef SQLITE_OMIT_EXPLAIN
+static void explainSimpleCount(
+  Parse *pParse,                  /* Parse context */
+  Table *pTab,                    /* Table being queried */
+  Index *pIdx                     /* Index used to optimize scan, or NULL */
+){
+  if( pParse->explain==2 ){
+    int bCover = (pIdx!=0 && (HasRowid(pTab) || !IsPrimaryKeyIndex(pIdx)));
+    char *zEqp = sqlite3MPrintf(pParse->db, "SCAN TABLE %s%s%s",
+        pTab->zName,
+        bCover ? " USING COVERING INDEX " : "",
+        bCover ? pIdx->zName : ""
+    );
+    sqlite3VdbeAddOp4(
+        pParse->pVdbe, OP_Explain, pParse->iSelectId, 0, 0, zEqp, P4_DYNAMIC
+    );
+  }
+}
+#else
+# define explainSimpleCount(a,b,c)
+#endif
+
+/*
+** Generate code for the SELECT statement given in the p argument.  
+**
+** The results are returned according to the SelectDest structure.
+** See comments in sqliteInt.h for further information.
+**
+** This routine returns the number of errors.  If any errors are
+** encountered, then an appropriate error message is left in
+** pParse->zErrMsg.
+**
+** This routine does NOT free the Select structure passed in.  The
+** calling function needs to do that.
+*/
+SQLITE_PRIVATE int sqlite3Select(
+  Parse *pParse,         /* The parser context */
+  Select *p,             /* The SELECT statement being coded. */
+  SelectDest *pDest      /* What to do with the query results */
+){
+  int i, j;              /* Loop counters */
+  WhereInfo *pWInfo;     /* Return from sqlite3WhereBegin() */
+  Vdbe *v;               /* The virtual machine under construction */
+  int isAgg;             /* True for select lists like "count(*)" */
+  ExprList *pEList;      /* List of columns to extract. */
+  SrcList *pTabList;     /* List of tables to select from */
+  Expr *pWhere;          /* The WHERE clause.  May be NULL */
+  ExprList *pGroupBy;    /* The GROUP BY clause.  May be NULL */
+  Expr *pHaving;         /* The HAVING clause.  May be NULL */
+  int rc = 1;            /* Value to return from this function */
+  DistinctCtx sDistinct; /* Info on how to code the DISTINCT keyword */
+  SortCtx sSort;         /* Info on how to code the ORDER BY clause */
+  AggInfo sAggInfo;      /* Information used by aggregate queries */
+  int iEnd;              /* Address of the end of the query */
+  sqlite3 *db;           /* The database connection */
+
+#ifndef SQLITE_OMIT_EXPLAIN
+  int iRestoreSelectId = pParse->iSelectId;
+  pParse->iSelectId = pParse->iNextSelectId++;
+#endif
+
+  db = pParse->db;
+  if( p==0 || db->mallocFailed || pParse->nErr ){
+    return 1;
+  }
+  if( sqlite3AuthCheck(pParse, SQLITE_SELECT, 0, 0, 0) ) return 1;
+  memset(&sAggInfo, 0, sizeof(sAggInfo));
+#if SELECTTRACE_ENABLED
+  pParse->nSelectIndent++;
+  SELECTTRACE(1,pParse,p, ("begin processing:\n"));
+  if( sqlite3SelectTrace & 0x100 ){
+    sqlite3TreeViewSelect(0, p, 0);
+  }
+#endif
+
+  assert( p->pOrderBy==0 || pDest->eDest!=SRT_DistFifo );
+  assert( p->pOrderBy==0 || pDest->eDest!=SRT_Fifo );
+  assert( p->pOrderBy==0 || pDest->eDest!=SRT_DistQueue );
+  assert( p->pOrderBy==0 || pDest->eDest!=SRT_Queue );
+  if( IgnorableOrderby(pDest) ){
+    assert(pDest->eDest==SRT_Exists || pDest->eDest==SRT_Union || 
+           pDest->eDest==SRT_Except || pDest->eDest==SRT_Discard ||
+           pDest->eDest==SRT_Queue  || pDest->eDest==SRT_DistFifo ||
+           pDest->eDest==SRT_DistQueue || pDest->eDest==SRT_Fifo);
+    /* If ORDER BY makes no difference in the output then neither does
+    ** DISTINCT so it can be removed too. */
+    sqlite3ExprListDelete(db, p->pOrderBy);
+    p->pOrderBy = 0;
+    p->selFlags &= ~SF_Distinct;
+  }
+  sqlite3SelectPrep(pParse, p, 0);
+  memset(&sSort, 0, sizeof(sSort));
+  sSort.pOrderBy = p->pOrderBy;
+  pTabList = p->pSrc;
+  pEList = p->pEList;
+  if( pParse->nErr || db->mallocFailed ){
+    goto select_end;
+  }
+  isAgg = (p->selFlags & SF_Aggregate)!=0;
+  assert( pEList!=0 );
+
+  /* Begin generating code.
+  */
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 ) goto select_end;
+
+  /* If writing to memory or generating a set
