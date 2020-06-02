@@ -110011,3 +110011,251 @@ SQLITE_PRIVATE int sqlite3Select(
   if( v==0 ) goto select_end;
 
   /* If writing to memory or generating a set
+  ** only a single column may be output.
+  */
+#ifndef SQLITE_OMIT_SUBQUERY
+  if( checkForMultiColumnSelectError(pParse, pDest, pEList->nExpr) ){
+    goto select_end;
+  }
+#endif
+
+  /* Generate code for all sub-queries in the FROM clause
+  */
+#if !defined(SQLITE_OMIT_SUBQUERY) || !defined(SQLITE_OMIT_VIEW)
+  for(i=0; !p->pPrior && i<pTabList->nSrc; i++){
+    struct SrcList_item *pItem = &pTabList->a[i];
+    SelectDest dest;
+    Select *pSub = pItem->pSelect;
+    int isAggSub;
+
+    if( pSub==0 ) continue;
+
+    /* Sometimes the code for a subquery will be generated more than
+    ** once, if the subquery is part of the WHERE clause in a LEFT JOIN,
+    ** for example.  In that case, do not regenerate the code to manifest
+    ** a view or the co-routine to implement a view.  The first instance
+    ** is sufficient, though the subroutine to manifest the view does need
+    ** to be invoked again. */
+    if( pItem->addrFillSub ){
+      if( pItem->viaCoroutine==0 ){
+        sqlite3VdbeAddOp2(v, OP_Gosub, pItem->regReturn, pItem->addrFillSub);
+      }
+      continue;
+    }
+
+    /* Increment Parse.nHeight by the height of the largest expression
+    ** tree referred to by this, the parent select. The child select
+    ** may contain expression trees of at most
+    ** (SQLITE_MAX_EXPR_DEPTH-Parse.nHeight) height. This is a bit
+    ** more conservative than necessary, but much easier than enforcing
+    ** an exact limit.
+    */
+    pParse->nHeight += sqlite3SelectExprHeight(p);
+
+    isAggSub = (pSub->selFlags & SF_Aggregate)!=0;
+    if( flattenSubquery(pParse, p, i, isAgg, isAggSub) ){
+      /* This subquery can be absorbed into its parent. */
+      if( isAggSub ){
+        isAgg = 1;
+        p->selFlags |= SF_Aggregate;
+      }
+      i = -1;
+    }else if( pTabList->nSrc==1
+           && OptimizationEnabled(db, SQLITE_SubqCoroutine)
+    ){
+      /* Implement a co-routine that will return a single row of the result
+      ** set on each invocation.
+      */
+      int addrTop = sqlite3VdbeCurrentAddr(v)+1;
+      pItem->regReturn = ++pParse->nMem;
+      sqlite3VdbeAddOp3(v, OP_InitCoroutine, pItem->regReturn, 0, addrTop);
+      VdbeComment((v, "%s", pItem->pTab->zName));
+      pItem->addrFillSub = addrTop;
+      sqlite3SelectDestInit(&dest, SRT_Coroutine, pItem->regReturn);
+      explainSetInteger(pItem->iSelectId, (u8)pParse->iNextSelectId);
+      sqlite3Select(pParse, pSub, &dest);
+      pItem->pTab->nRowLogEst = sqlite3LogEst(pSub->nSelectRow);
+      pItem->viaCoroutine = 1;
+      pItem->regResult = dest.iSdst;
+      sqlite3VdbeAddOp1(v, OP_EndCoroutine, pItem->regReturn);
+      sqlite3VdbeJumpHere(v, addrTop-1);
+      sqlite3ClearTempRegCache(pParse);
+    }else{
+      /* Generate a subroutine that will fill an ephemeral table with
+      ** the content of this subquery.  pItem->addrFillSub will point
+      ** to the address of the generated subroutine.  pItem->regReturn
+      ** is a register allocated to hold the subroutine return address
+      */
+      int topAddr;
+      int onceAddr = 0;
+      int retAddr;
+      assert( pItem->addrFillSub==0 );
+      pItem->regReturn = ++pParse->nMem;
+      topAddr = sqlite3VdbeAddOp2(v, OP_Integer, 0, pItem->regReturn);
+      pItem->addrFillSub = topAddr+1;
+      if( pItem->isCorrelated==0 ){
+        /* If the subquery is not correlated and if we are not inside of
+        ** a trigger, then we only need to compute the value of the subquery
+        ** once. */
+        onceAddr = sqlite3CodeOnce(pParse); VdbeCoverage(v);
+        VdbeComment((v, "materialize \"%s\"", pItem->pTab->zName));
+      }else{
+        VdbeNoopComment((v, "materialize \"%s\"", pItem->pTab->zName));
+      }
+      sqlite3SelectDestInit(&dest, SRT_EphemTab, pItem->iCursor);
+      explainSetInteger(pItem->iSelectId, (u8)pParse->iNextSelectId);
+      sqlite3Select(pParse, pSub, &dest);
+      pItem->pTab->nRowLogEst = sqlite3LogEst(pSub->nSelectRow);
+      if( onceAddr ) sqlite3VdbeJumpHere(v, onceAddr);
+      retAddr = sqlite3VdbeAddOp1(v, OP_Return, pItem->regReturn);
+      VdbeComment((v, "end %s", pItem->pTab->zName));
+      sqlite3VdbeChangeP1(v, topAddr, retAddr);
+      sqlite3ClearTempRegCache(pParse);
+    }
+    if( /*pParse->nErr ||*/ db->mallocFailed ){
+      goto select_end;
+    }
+    pParse->nHeight -= sqlite3SelectExprHeight(p);
+    pTabList = p->pSrc;
+    if( !IgnorableOrderby(pDest) ){
+      sSort.pOrderBy = p->pOrderBy;
+    }
+  }
+  pEList = p->pEList;
+#endif
+  pWhere = p->pWhere;
+  pGroupBy = p->pGroupBy;
+  pHaving = p->pHaving;
+  sDistinct.isTnct = (p->selFlags & SF_Distinct)!=0;
+
+#ifndef SQLITE_OMIT_COMPOUND_SELECT
+  /* If there is are a sequence of queries, do the earlier ones first.
+  */
+  if( p->pPrior ){
+    rc = multiSelect(pParse, p, pDest);
+    explainSetInteger(pParse->iSelectId, iRestoreSelectId);
+#if SELECTTRACE_ENABLED
+    SELECTTRACE(1,pParse,p,("end compound-select processing\n"));
+    pParse->nSelectIndent--;
+#endif
+    return rc;
+  }
+#endif
+
+  /* If the query is DISTINCT with an ORDER BY but is not an aggregate, and 
+  ** if the select-list is the same as the ORDER BY list, then this query
+  ** can be rewritten as a GROUP BY. In other words, this:
+  **
+  **     SELECT DISTINCT xyz FROM ... ORDER BY xyz
+  **
+  ** is transformed to:
+  **
+  **     SELECT xyz FROM ... GROUP BY xyz ORDER BY xyz
+  **
+  ** The second form is preferred as a single index (or temp-table) may be 
+  ** used for both the ORDER BY and DISTINCT processing. As originally 
+  ** written the query must use a temp-table for at least one of the ORDER 
+  ** BY and DISTINCT, and an index or separate temp-table for the other.
+  */
+  if( (p->selFlags & (SF_Distinct|SF_Aggregate))==SF_Distinct 
+   && sqlite3ExprListCompare(sSort.pOrderBy, p->pEList, -1)==0
+  ){
+    p->selFlags &= ~SF_Distinct;
+    p->pGroupBy = sqlite3ExprListDup(db, p->pEList, 0);
+    pGroupBy = p->pGroupBy;
+    /* Notice that even thought SF_Distinct has been cleared from p->selFlags,
+    ** the sDistinct.isTnct is still set.  Hence, isTnct represents the
+    ** original setting of the SF_Distinct flag, not the current setting */
+    assert( sDistinct.isTnct );
+  }
+
+  /* If there is an ORDER BY clause, then this sorting
+  ** index might end up being unused if the data can be 
+  ** extracted in pre-sorted order.  If that is the case, then the
+  ** OP_OpenEphemeral instruction will be changed to an OP_Noop once
+  ** we figure out that the sorting index is not needed.  The addrSortIndex
+  ** variable is used to facilitate that change.
+  */
+  if( sSort.pOrderBy ){
+    KeyInfo *pKeyInfo;
+    pKeyInfo = keyInfoFromExprList(pParse, sSort.pOrderBy, 0, 0);
+    sSort.iECursor = pParse->nTab++;
+    sSort.addrSortIndex =
+      sqlite3VdbeAddOp4(v, OP_OpenEphemeral,
+          sSort.iECursor, sSort.pOrderBy->nExpr+1+pEList->nExpr, 0,
+          (char*)pKeyInfo, P4_KEYINFO
+      );
+  }else{
+    sSort.addrSortIndex = -1;
+  }
+
+  /* If the output is destined for a temporary table, open that table.
+  */
+  if( pDest->eDest==SRT_EphemTab ){
+    sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pDest->iSDParm, pEList->nExpr);
+  }
+
+  /* Set the limiter.
+  */
+  iEnd = sqlite3VdbeMakeLabel(v);
+  p->nSelectRow = LARGEST_INT64;
+  computeLimitRegisters(pParse, p, iEnd);
+  if( p->iLimit==0 && sSort.addrSortIndex>=0 ){
+    sqlite3VdbeGetOp(v, sSort.addrSortIndex)->opcode = OP_SorterOpen;
+    sSort.sortFlags |= SORTFLAG_UseSorter;
+  }
+
+  /* Open a virtual index to use for the distinct set.
+  */
+  if( p->selFlags & SF_Distinct ){
+    sDistinct.tabTnct = pParse->nTab++;
+    sDistinct.addrTnct = sqlite3VdbeAddOp4(v, OP_OpenEphemeral,
+                                sDistinct.tabTnct, 0, 0,
+                                (char*)keyInfoFromExprList(pParse, p->pEList,0,0),
+                                P4_KEYINFO);
+    sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
+    sDistinct.eTnctType = WHERE_DISTINCT_UNORDERED;
+  }else{
+    sDistinct.eTnctType = WHERE_DISTINCT_NOOP;
+  }
+
+  if( !isAgg && pGroupBy==0 ){
+    /* No aggregate functions and no GROUP BY clause */
+    u16 wctrlFlags = (sDistinct.isTnct ? WHERE_WANT_DISTINCT : 0);
+
+    /* Begin the database scan. */
+    pWInfo = sqlite3WhereBegin(pParse, pTabList, pWhere, sSort.pOrderBy,
+                               p->pEList, wctrlFlags, 0);
+    if( pWInfo==0 ) goto select_end;
+    if( sqlite3WhereOutputRowCount(pWInfo) < p->nSelectRow ){
+      p->nSelectRow = sqlite3WhereOutputRowCount(pWInfo);
+    }
+    if( sDistinct.isTnct && sqlite3WhereIsDistinct(pWInfo) ){
+      sDistinct.eTnctType = sqlite3WhereIsDistinct(pWInfo);
+    }
+    if( sSort.pOrderBy ){
+      sSort.nOBSat = sqlite3WhereIsOrdered(pWInfo);
+      if( sSort.nOBSat==sSort.pOrderBy->nExpr ){
+        sSort.pOrderBy = 0;
+      }
+    }
+
+    /* If sorting index that was created by a prior OP_OpenEphemeral 
+    ** instruction ended up not being needed, then change the OP_OpenEphemeral
+    ** into an OP_Noop.
+    */
+    if( sSort.addrSortIndex>=0 && sSort.pOrderBy==0 ){
+      sqlite3VdbeChangeToNoop(v, sSort.addrSortIndex);
+    }
+
+    /* Use the standard inner loop. */
+    selectInnerLoop(pParse, p, pEList, -1, &sSort, &sDistinct, pDest,
+                    sqlite3WhereContinueLabel(pWInfo),
+                    sqlite3WhereBreakLabel(pWInfo));
+
+    /* End the database scan loop.
+    */
+    sqlite3WhereEnd(pWInfo);
+  }else{
+    /* This case when there exist aggregate functions or a GROUP BY clause
+    ** or both */
