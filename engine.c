@@ -110259,3 +110259,234 @@ SQLITE_PRIVATE int sqlite3Select(
   }else{
     /* This case when there exist aggregate functions or a GROUP BY clause
     ** or both */
+    NameContext sNC;    /* Name context for processing aggregate information */
+    int iAMem;          /* First Mem address for storing current GROUP BY */
+    int iBMem;          /* First Mem address for previous GROUP BY */
+    int iUseFlag;       /* Mem address holding flag indicating that at least
+                        ** one row of the input to the aggregator has been
+                        ** processed */
+    int iAbortFlag;     /* Mem address which causes query abort if positive */
+    int groupBySort;    /* Rows come from source in GROUP BY order */
+    int addrEnd;        /* End of processing for this SELECT */
+    int sortPTab = 0;   /* Pseudotable used to decode sorting results */
+    int sortOut = 0;    /* Output register from the sorter */
+    int orderByGrp = 0; /* True if the GROUP BY and ORDER BY are the same */
+
+    /* Remove any and all aliases between the result set and the
+    ** GROUP BY clause.
+    */
+    if( pGroupBy ){
+      int k;                        /* Loop counter */
+      struct ExprList_item *pItem;  /* For looping over expression in a list */
+
+      for(k=p->pEList->nExpr, pItem=p->pEList->a; k>0; k--, pItem++){
+        pItem->u.x.iAlias = 0;
+      }
+      for(k=pGroupBy->nExpr, pItem=pGroupBy->a; k>0; k--, pItem++){
+        pItem->u.x.iAlias = 0;
+      }
+      if( p->nSelectRow>100 ) p->nSelectRow = 100;
+    }else{
+      p->nSelectRow = 1;
+    }
+
+
+    /* If there is both a GROUP BY and an ORDER BY clause and they are
+    ** identical, then it may be possible to disable the ORDER BY clause 
+    ** on the grounds that the GROUP BY will cause elements to come out 
+    ** in the correct order. It also may not - the GROUP BY may use a
+    ** database index that causes rows to be grouped together as required
+    ** but not actually sorted. Either way, record the fact that the
+    ** ORDER BY and GROUP BY clauses are the same by setting the orderByGrp
+    ** variable.  */
+    if( sqlite3ExprListCompare(pGroupBy, sSort.pOrderBy, -1)==0 ){
+      orderByGrp = 1;
+    }
+ 
+    /* Create a label to jump to when we want to abort the query */
+    addrEnd = sqlite3VdbeMakeLabel(v);
+
+    /* Convert TK_COLUMN nodes into TK_AGG_COLUMN and make entries in
+    ** sAggInfo for all TK_AGG_FUNCTION nodes in expressions of the
+    ** SELECT statement.
+    */
+    memset(&sNC, 0, sizeof(sNC));
+    sNC.pParse = pParse;
+    sNC.pSrcList = pTabList;
+    sNC.pAggInfo = &sAggInfo;
+    sAggInfo.mnReg = pParse->nMem+1;
+    sAggInfo.nSortingColumn = pGroupBy ? pGroupBy->nExpr : 0;
+    sAggInfo.pGroupBy = pGroupBy;
+    sqlite3ExprAnalyzeAggList(&sNC, pEList);
+    sqlite3ExprAnalyzeAggList(&sNC, sSort.pOrderBy);
+    if( pHaving ){
+      sqlite3ExprAnalyzeAggregates(&sNC, pHaving);
+    }
+    sAggInfo.nAccumulator = sAggInfo.nColumn;
+    for(i=0; i<sAggInfo.nFunc; i++){
+      assert( !ExprHasProperty(sAggInfo.aFunc[i].pExpr, EP_xIsSelect) );
+      sNC.ncFlags |= NC_InAggFunc;
+      sqlite3ExprAnalyzeAggList(&sNC, sAggInfo.aFunc[i].pExpr->x.pList);
+      sNC.ncFlags &= ~NC_InAggFunc;
+    }
+    sAggInfo.mxReg = pParse->nMem;
+    if( db->mallocFailed ) goto select_end;
+
+    /* Processing for aggregates with GROUP BY is very different and
+    ** much more complex than aggregates without a GROUP BY.
+    */
+    if( pGroupBy ){
+      KeyInfo *pKeyInfo;  /* Keying information for the group by clause */
+      int j1;             /* A-vs-B comparision jump */
+      int addrOutputRow;  /* Start of subroutine that outputs a result row */
+      int regOutputRow;   /* Return address register for output subroutine */
+      int addrSetAbort;   /* Set the abort flag and return */
+      int addrTopOfLoop;  /* Top of the input loop */
+      int addrSortingIdx; /* The OP_OpenEphemeral for the sorting index */
+      int addrReset;      /* Subroutine for resetting the accumulator */
+      int regReset;       /* Return address register for reset subroutine */
+
+      /* If there is a GROUP BY clause we might need a sorting index to
+      ** implement it.  Allocate that sorting index now.  If it turns out
+      ** that we do not need it after all, the OP_SorterOpen instruction
+      ** will be converted into a Noop.  
+      */
+      sAggInfo.sortingIdx = pParse->nTab++;
+      pKeyInfo = keyInfoFromExprList(pParse, pGroupBy, 0, 0);
+      addrSortingIdx = sqlite3VdbeAddOp4(v, OP_SorterOpen, 
+          sAggInfo.sortingIdx, sAggInfo.nSortingColumn, 
+          0, (char*)pKeyInfo, P4_KEYINFO);
+
+      /* Initialize memory locations used by GROUP BY aggregate processing
+      */
+      iUseFlag = ++pParse->nMem;
+      iAbortFlag = ++pParse->nMem;
+      regOutputRow = ++pParse->nMem;
+      addrOutputRow = sqlite3VdbeMakeLabel(v);
+      regReset = ++pParse->nMem;
+      addrReset = sqlite3VdbeMakeLabel(v);
+      iAMem = pParse->nMem + 1;
+      pParse->nMem += pGroupBy->nExpr;
+      iBMem = pParse->nMem + 1;
+      pParse->nMem += pGroupBy->nExpr;
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, iAbortFlag);
+      VdbeComment((v, "clear abort flag"));
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, iUseFlag);
+      VdbeComment((v, "indicate accumulator empty"));
+      sqlite3VdbeAddOp3(v, OP_Null, 0, iAMem, iAMem+pGroupBy->nExpr-1);
+
+      /* Begin a loop that will extract all source rows in GROUP BY order.
+      ** This might involve two separate loops with an OP_Sort in between, or
+      ** it might be a single loop that uses an index to extract information
+      ** in the right order to begin with.
+      */
+      sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
+      pWInfo = sqlite3WhereBegin(pParse, pTabList, pWhere, pGroupBy, 0,
+          WHERE_GROUPBY | (orderByGrp ? WHERE_SORTBYGROUP : 0), 0
+      );
+      if( pWInfo==0 ) goto select_end;
+      if( sqlite3WhereIsOrdered(pWInfo)==pGroupBy->nExpr ){
+        /* The optimizer is able to deliver rows in group by order so
+        ** we do not have to sort.  The OP_OpenEphemeral table will be
+        ** cancelled later because we still need to use the pKeyInfo
+        */
+        groupBySort = 0;
+      }else{
+        /* Rows are coming out in undetermined order.  We have to push
+        ** each row into a sorting index, terminate the first loop,
+        ** then loop over the sorting index in order to get the output
+        ** in sorted order
+        */
+        int regBase;
+        int regRecord;
+        int nCol;
+        int nGroupBy;
+
+        explainTempTable(pParse, 
+            (sDistinct.isTnct && (p->selFlags&SF_Distinct)==0) ?
+                    "DISTINCT" : "GROUP BY");
+
+        groupBySort = 1;
+        nGroupBy = pGroupBy->nExpr;
+        nCol = nGroupBy;
+        j = nGroupBy;
+        for(i=0; i<sAggInfo.nColumn; i++){
+          if( sAggInfo.aCol[i].iSorterColumn>=j ){
+            nCol++;
+            j++;
+          }
+        }
+        regBase = sqlite3GetTempRange(pParse, nCol);
+        sqlite3ExprCacheClear(pParse);
+        sqlite3ExprCodeExprList(pParse, pGroupBy, regBase, 0);
+        j = nGroupBy;
+        for(i=0; i<sAggInfo.nColumn; i++){
+          struct AggInfo_col *pCol = &sAggInfo.aCol[i];
+          if( pCol->iSorterColumn>=j ){
+            int r1 = j + regBase;
+            int r2;
+
+            r2 = sqlite3ExprCodeGetColumn(pParse, 
+                               pCol->pTab, pCol->iColumn, pCol->iTable, r1, 0);
+            if( r1!=r2 ){
+              sqlite3VdbeAddOp2(v, OP_SCopy, r2, r1);
+            }
+            j++;
+          }
+        }
+        regRecord = sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nCol, regRecord);
+        sqlite3VdbeAddOp2(v, OP_SorterInsert, sAggInfo.sortingIdx, regRecord);
+        sqlite3ReleaseTempReg(pParse, regRecord);
+        sqlite3ReleaseTempRange(pParse, regBase, nCol);
+        sqlite3WhereEnd(pWInfo);
+        sAggInfo.sortingIdxPTab = sortPTab = pParse->nTab++;
+        sortOut = sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_OpenPseudo, sortPTab, sortOut, nCol);
+        sqlite3VdbeAddOp2(v, OP_SorterSort, sAggInfo.sortingIdx, addrEnd);
+        VdbeComment((v, "GROUP BY sort")); VdbeCoverage(v);
+        sAggInfo.useSortingIdx = 1;
+        sqlite3ExprCacheClear(pParse);
+
+      }
+
+      /* If the index or temporary table used by the GROUP BY sort
+      ** will naturally deliver rows in the order required by the ORDER BY
+      ** clause, cancel the ephemeral table open coded earlier.
+      **
+      ** This is an optimization - the correct answer should result regardless.
+      ** Use the SQLITE_GroupByOrder flag with SQLITE_TESTCTRL_OPTIMIZER to 
+      ** disable this optimization for testing purposes.  */
+      if( orderByGrp && OptimizationEnabled(db, SQLITE_GroupByOrder) 
+       && (groupBySort || sqlite3WhereIsSorted(pWInfo))
+      ){
+        sSort.pOrderBy = 0;
+        sqlite3VdbeChangeToNoop(v, sSort.addrSortIndex);
+      }
+
+      /* Evaluate the current GROUP BY terms and store in b0, b1, b2...
+      ** (b0 is memory location iBMem+0, b1 is iBMem+1, and so forth)
+      ** Then compare the current GROUP BY terms against the GROUP BY terms
+      ** from the previous row currently stored in a0, a1, a2...
+      */
+      addrTopOfLoop = sqlite3VdbeCurrentAddr(v);
+      sqlite3ExprCacheClear(pParse);
+      if( groupBySort ){
+        sqlite3VdbeAddOp3(v, OP_SorterData, sAggInfo.sortingIdx, sortOut,sortPTab);
+      }
+      for(j=0; j<pGroupBy->nExpr; j++){
+        if( groupBySort ){
+          sqlite3VdbeAddOp3(v, OP_Column, sortPTab, j, iBMem+j);
+        }else{
+          sAggInfo.directMode = 1;
+          sqlite3ExprCode(pParse, pGroupBy->a[j].pExpr, iBMem+j);
+        }
+      }
+      sqlite3VdbeAddOp4(v, OP_Compare, iAMem, iBMem, pGroupBy->nExpr,
+                          (char*)sqlite3KeyInfoRef(pKeyInfo), P4_KEYINFO);
+      j1 = sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_Jump, j1+1, 0, j1+1); VdbeCoverage(v);
+
+      /* Generate code that runs whenever the GROUP BY changes.
+      ** Changes in the GROUP BY are detected by the previous code
+      ** block.  If there were no changes, this block is skipped.
