@@ -110490,3 +110490,270 @@ SQLITE_PRIVATE int sqlite3Select(
       /* Generate code that runs whenever the GROUP BY changes.
       ** Changes in the GROUP BY are detected by the previous code
       ** block.  If there were no changes, this block is skipped.
+      **
+      ** This code copies current group by terms in b0,b1,b2,...
+      ** over to a0,a1,a2.  It then calls the output subroutine
+      ** and resets the aggregate accumulator registers in preparation
+      ** for the next GROUP BY batch.
+      */
+      sqlite3ExprCodeMove(pParse, iBMem, iAMem, pGroupBy->nExpr);
+      sqlite3VdbeAddOp2(v, OP_Gosub, regOutputRow, addrOutputRow);
+      VdbeComment((v, "output one row"));
+      sqlite3VdbeAddOp2(v, OP_IfPos, iAbortFlag, addrEnd); VdbeCoverage(v);
+      VdbeComment((v, "check abort flag"));
+      sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
+      VdbeComment((v, "reset accumulator"));
+
+      /* Update the aggregate accumulators based on the content of
+      ** the current row
+      */
+      sqlite3VdbeJumpHere(v, j1);
+      updateAccumulator(pParse, &sAggInfo);
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, iUseFlag);
+      VdbeComment((v, "indicate data in accumulator"));
+
+      /* End of the loop
+      */
+      if( groupBySort ){
+        sqlite3VdbeAddOp2(v, OP_SorterNext, sAggInfo.sortingIdx, addrTopOfLoop);
+        VdbeCoverage(v);
+      }else{
+        sqlite3WhereEnd(pWInfo);
+        sqlite3VdbeChangeToNoop(v, addrSortingIdx);
+      }
+
+      /* Output the final row of result
+      */
+      sqlite3VdbeAddOp2(v, OP_Gosub, regOutputRow, addrOutputRow);
+      VdbeComment((v, "output final row"));
+
+      /* Jump over the subroutines
+      */
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrEnd);
+
+      /* Generate a subroutine that outputs a single row of the result
+      ** set.  This subroutine first looks at the iUseFlag.  If iUseFlag
+      ** is less than or equal to zero, the subroutine is a no-op.  If
+      ** the processing calls for the query to abort, this subroutine
+      ** increments the iAbortFlag memory location before returning in
+      ** order to signal the caller to abort.
+      */
+      addrSetAbort = sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, iAbortFlag);
+      VdbeComment((v, "set abort flag"));
+      sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
+      sqlite3VdbeResolveLabel(v, addrOutputRow);
+      addrOutputRow = sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp2(v, OP_IfPos, iUseFlag, addrOutputRow+2); VdbeCoverage(v);
+      VdbeComment((v, "Groupby result generator entry point"));
+      sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
+      finalizeAggFunctions(pParse, &sAggInfo);
+      sqlite3ExprIfFalse(pParse, pHaving, addrOutputRow+1, SQLITE_JUMPIFNULL);
+      selectInnerLoop(pParse, p, p->pEList, -1, &sSort,
+                      &sDistinct, pDest,
+                      addrOutputRow+1, addrSetAbort);
+      sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
+      VdbeComment((v, "end groupby result generator"));
+
+      /* Generate a subroutine that will reset the group-by accumulator
+      */
+      sqlite3VdbeResolveLabel(v, addrReset);
+      resetAccumulator(pParse, &sAggInfo);
+      sqlite3VdbeAddOp1(v, OP_Return, regReset);
+     
+    } /* endif pGroupBy.  Begin aggregate queries without GROUP BY: */
+    else {
+      ExprList *pDel = 0;
+#ifndef SQLITE_OMIT_BTREECOUNT
+      Table *pTab;
+      if( (pTab = isSimpleCount(p, &sAggInfo))!=0 ){
+        /* If isSimpleCount() returns a pointer to a Table structure, then
+        ** the SQL statement is of the form:
+        **
+        **   SELECT count(*) FROM <tbl>
+        **
+        ** where the Table structure returned represents table <tbl>.
+        **
+        ** This statement is so common that it is optimized specially. The
+        ** OP_Count instruction is executed either on the intkey table that
+        ** contains the data for table <tbl> or on one of its indexes. It
+        ** is better to execute the op on an index, as indexes are almost
+        ** always spread across less pages than their corresponding tables.
+        */
+        const int iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+        const int iCsr = pParse->nTab++;     /* Cursor to scan b-tree */
+        Index *pIdx;                         /* Iterator variable */
+        KeyInfo *pKeyInfo = 0;               /* Keyinfo for scanned index */
+        Index *pBest = 0;                    /* Best index found so far */
+        int iRoot = pTab->tnum;              /* Root page of scanned b-tree */
+
+        sqlite3CodeVerifySchema(pParse, iDb);
+        sqlite3TableLock(pParse, iDb, pTab->tnum, 0, pTab->zName);
+
+        /* Search for the index that has the lowest scan cost.
+        **
+        ** (2011-04-15) Do not do a full scan of an unordered index.
+        **
+        ** (2013-10-03) Do not count the entries in a partial index.
+        **
+        ** In practice the KeyInfo structure will not be used. It is only 
+        ** passed to keep OP_OpenRead happy.
+        */
+        if( !HasRowid(pTab) ) pBest = sqlite3PrimaryKeyIndex(pTab);
+        for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+          if( pIdx->bUnordered==0
+           && pIdx->szIdxRow<pTab->szTabRow
+           && pIdx->pPartIdxWhere==0
+           && (!pBest || pIdx->szIdxRow<pBest->szIdxRow)
+          ){
+            pBest = pIdx;
+          }
+        }
+        if( pBest ){
+          iRoot = pBest->tnum;
+          pKeyInfo = sqlite3KeyInfoOfIndex(pParse, pBest);
+        }
+
+        /* Open a read-only cursor, execute the OP_Count, close the cursor. */
+        sqlite3VdbeAddOp4Int(v, OP_OpenRead, iCsr, iRoot, iDb, 1);
+        if( pKeyInfo ){
+          sqlite3VdbeChangeP4(v, -1, (char *)pKeyInfo, P4_KEYINFO);
+        }
+        sqlite3VdbeAddOp2(v, OP_Count, iCsr, sAggInfo.aFunc[0].iMem);
+        sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+        explainSimpleCount(pParse, pTab, pBest);
+      }else
+#endif /* SQLITE_OMIT_BTREECOUNT */
+      {
+        /* Check if the query is of one of the following forms:
+        **
+        **   SELECT min(x) FROM ...
+        **   SELECT max(x) FROM ...
+        **
+        ** If it is, then ask the code in where.c to attempt to sort results
+        ** as if there was an "ORDER ON x" or "ORDER ON x DESC" clause. 
+        ** If where.c is able to produce results sorted in this order, then
+        ** add vdbe code to break out of the processing loop after the 
+        ** first iteration (since the first iteration of the loop is 
+        ** guaranteed to operate on the row with the minimum or maximum 
+        ** value of x, the only row required).
+        **
+        ** A special flag must be passed to sqlite3WhereBegin() to slightly
+        ** modify behavior as follows:
+        **
+        **   + If the query is a "SELECT min(x)", then the loop coded by
+        **     where.c should not iterate over any values with a NULL value
+        **     for x.
+        **
+        **   + The optimizer code in where.c (the thing that decides which
+        **     index or indices to use) should place a different priority on 
+        **     satisfying the 'ORDER BY' clause than it does in other cases.
+        **     Refer to code and comments in where.c for details.
+        */
+        ExprList *pMinMax = 0;
+        u8 flag = WHERE_ORDERBY_NORMAL;
+        
+        assert( p->pGroupBy==0 );
+        assert( flag==0 );
+        if( p->pHaving==0 ){
+          flag = minMaxQuery(&sAggInfo, &pMinMax);
+        }
+        assert( flag==0 || (pMinMax!=0 && pMinMax->nExpr==1) );
+
+        if( flag ){
+          pMinMax = sqlite3ExprListDup(db, pMinMax, 0);
+          pDel = pMinMax;
+          if( pMinMax && !db->mallocFailed ){
+            pMinMax->a[0].sortOrder = flag!=WHERE_ORDERBY_MIN ?1:0;
+            pMinMax->a[0].pExpr->op = TK_COLUMN;
+          }
+        }
+  
+        /* This case runs if the aggregate has no GROUP BY clause.  The
+        ** processing is much simpler since there is only a single row
+        ** of output.
+        */
+        resetAccumulator(pParse, &sAggInfo);
+        pWInfo = sqlite3WhereBegin(pParse, pTabList, pWhere, pMinMax,0,flag,0);
+        if( pWInfo==0 ){
+          sqlite3ExprListDelete(db, pDel);
+          goto select_end;
+        }
+        updateAccumulator(pParse, &sAggInfo);
+        assert( pMinMax==0 || pMinMax->nExpr==1 );
+        if( sqlite3WhereIsOrdered(pWInfo)>0 ){
+          sqlite3VdbeAddOp2(v, OP_Goto, 0, sqlite3WhereBreakLabel(pWInfo));
+          VdbeComment((v, "%s() by index",
+                (flag==WHERE_ORDERBY_MIN?"min":"max")));
+        }
+        sqlite3WhereEnd(pWInfo);
+        finalizeAggFunctions(pParse, &sAggInfo);
+      }
+
+      sSort.pOrderBy = 0;
+      sqlite3ExprIfFalse(pParse, pHaving, addrEnd, SQLITE_JUMPIFNULL);
+      selectInnerLoop(pParse, p, p->pEList, -1, 0, 0, 
+                      pDest, addrEnd, addrEnd);
+      sqlite3ExprListDelete(db, pDel);
+    }
+    sqlite3VdbeResolveLabel(v, addrEnd);
+    
+  } /* endif aggregate query */
+
+  if( sDistinct.eTnctType==WHERE_DISTINCT_UNORDERED ){
+    explainTempTable(pParse, "DISTINCT");
+  }
+
+  /* If there is an ORDER BY clause, then we need to sort the results
+  ** and send them to the callback one by one.
+  */
+  if( sSort.pOrderBy ){
+    explainTempTable(pParse, sSort.nOBSat>0 ? "RIGHT PART OF ORDER BY":"ORDER BY");
+    generateSortTail(pParse, p, &sSort, pEList->nExpr, pDest);
+  }
+
+  /* Jump here to skip this query
+  */
+  sqlite3VdbeResolveLabel(v, iEnd);
+
+  /* The SELECT was successfully coded.   Set the return code to 0
+  ** to indicate no errors.
+  */
+  rc = 0;
+
+  /* Control jumps to here if an error is encountered above, or upon
+  ** successful coding of the SELECT.
+  */
+select_end:
+  explainSetInteger(pParse->iSelectId, iRestoreSelectId);
+
+  /* Identify column names if results of the SELECT are to be output.
+  */
+  if( rc==SQLITE_OK && pDest->eDest==SRT_Output ){
+    generateColumnNames(pParse, pTabList, pEList);
+  }
+
+  sqlite3DbFree(db, sAggInfo.aCol);
+  sqlite3DbFree(db, sAggInfo.aFunc);
+#if SELECTTRACE_ENABLED
+  SELECTTRACE(1,pParse,p,("end processing\n"));
+  pParse->nSelectIndent--;
+#endif
+  return rc;
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Generate a human-readable description of a the Select object.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewSelect(TreeView *pView, const Select *p, u8 moreToFollow){
+  int n = 0;
+  pView = sqlite3TreeViewPush(pView, moreToFollow);
+  sqlite3TreeViewLine(pView, "SELECT%s%s",
+    ((p->selFlags & SF_Distinct) ? " DISTINCT" : ""),
+    ((p->selFlags & SF_Aggregate) ? " agg_flag" : "")
+  );
+  if( p->pSrc && p->pSrc->nSrc ) n++;
+  if( p->pWhere ) n++;
+  if( p->pGroupBy ) n++;
+  if( p->pHaving ) n++;
