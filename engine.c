@@ -111007,3 +111007,232 @@ SQLITE_API int sqlite3_get_table(
   if( res.nAlloc>res.nData ){
     char **azNew;
     azNew = sqlite3_realloc( res.azResult, sizeof(char*)*res.nData );
+    if( azNew==0 ){
+      sqlite3_free_table(&res.azResult[1]);
+      db->errCode = SQLITE_NOMEM;
+      return SQLITE_NOMEM;
+    }
+    res.azResult = azNew;
+  }
+  *pazResult = &res.azResult[1];
+  if( pnColumn ) *pnColumn = res.nColumn;
+  if( pnRow ) *pnRow = res.nRow;
+  return rc;
+}
+
+/*
+** This routine frees the space the sqlite3_get_table() malloced.
+*/
+SQLITE_API void sqlite3_free_table(
+  char **azResult            /* Result returned from sqlite3_get_table() */
+){
+  if( azResult ){
+    int i, n;
+    azResult--;
+    assert( azResult!=0 );
+    n = SQLITE_PTR_TO_INT(azResult[0]);
+    for(i=1; i<n; i++){ if( azResult[i] ) sqlite3_free(azResult[i]); }
+    sqlite3_free(azResult);
+  }
+}
+
+#endif /* SQLITE_OMIT_GET_TABLE */
+
+/************** End of table.c ***********************************************/
+/************** Begin file trigger.c *****************************************/
+/*
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the implementation for TRIGGERs
+*/
+
+#ifndef SQLITE_OMIT_TRIGGER
+/*
+** Delete a linked list of TriggerStep structures.
+*/
+SQLITE_PRIVATE void sqlite3DeleteTriggerStep(sqlite3 *db, TriggerStep *pTriggerStep){
+  while( pTriggerStep ){
+    TriggerStep * pTmp = pTriggerStep;
+    pTriggerStep = pTriggerStep->pNext;
+
+    sqlite3ExprDelete(db, pTmp->pWhere);
+    sqlite3ExprListDelete(db, pTmp->pExprList);
+    sqlite3SelectDelete(db, pTmp->pSelect);
+    sqlite3IdListDelete(db, pTmp->pIdList);
+
+    sqlite3DbFree(db, pTmp);
+  }
+}
+
+/*
+** Given table pTab, return a list of all the triggers attached to 
+** the table. The list is connected by Trigger.pNext pointers.
+**
+** All of the triggers on pTab that are in the same database as pTab
+** are already attached to pTab->pTrigger.  But there might be additional
+** triggers on pTab in the TEMP schema.  This routine prepends all
+** TEMP triggers on pTab to the beginning of the pTab->pTrigger list
+** and returns the combined list.
+**
+** To state it another way:  This routine returns a list of all triggers
+** that fire off of pTab.  The list will include any TEMP triggers on
+** pTab as well as the triggers lised in pTab->pTrigger.
+*/
+SQLITE_PRIVATE Trigger *sqlite3TriggerList(Parse *pParse, Table *pTab){
+  Schema * const pTmpSchema = pParse->db->aDb[1].pSchema;
+  Trigger *pList = 0;                  /* List of triggers to return */
+
+  if( pParse->disableTriggers ){
+    return 0;
+  }
+
+  if( pTmpSchema!=pTab->pSchema ){
+    HashElem *p;
+    assert( sqlite3SchemaMutexHeld(pParse->db, 0, pTmpSchema) );
+    for(p=sqliteHashFirst(&pTmpSchema->trigHash); p; p=sqliteHashNext(p)){
+      Trigger *pTrig = (Trigger *)sqliteHashData(p);
+      if( pTrig->pTabSchema==pTab->pSchema
+       && 0==sqlite3StrICmp(pTrig->table, pTab->zName) 
+      ){
+        pTrig->pNext = (pList ? pList : pTab->pTrigger);
+        pList = pTrig;
+      }
+    }
+  }
+
+  return (pList ? pList : pTab->pTrigger);
+}
+
+/*
+** This is called by the parser when it sees a CREATE TRIGGER statement
+** up to the point of the BEGIN before the trigger actions.  A Trigger
+** structure is generated based on the information available and stored
+** in pParse->pNewTrigger.  After the trigger actions have been parsed, the
+** sqlite3FinishTrigger() function is called to complete the trigger
+** construction process.
+*/
+SQLITE_PRIVATE void sqlite3BeginTrigger(
+  Parse *pParse,      /* The parse context of the CREATE TRIGGER statement */
+  Token *pName1,      /* The name of the trigger */
+  Token *pName2,      /* The name of the trigger */
+  int tr_tm,          /* One of TK_BEFORE, TK_AFTER, TK_INSTEAD */
+  int op,             /* One of TK_INSERT, TK_UPDATE, TK_DELETE */
+  IdList *pColumns,   /* column list if this is an UPDATE OF trigger */
+  SrcList *pTableName,/* The name of the table/view the trigger applies to */
+  Expr *pWhen,        /* WHEN clause */
+  int isTemp,         /* True if the TEMPORARY keyword is present */
+  int noErr           /* Suppress errors if the trigger already exists */
+){
+  Trigger *pTrigger = 0;  /* The new trigger */
+  Table *pTab;            /* Table that the trigger fires off of */
+  char *zName = 0;        /* Name of the trigger */
+  sqlite3 *db = pParse->db;  /* The database connection */
+  int iDb;                /* The database to store the trigger in */
+  Token *pName;           /* The unqualified db name */
+  DbFixer sFix;           /* State vector for the DB fixer */
+  int iTabDb;             /* Index of the database holding pTab */
+
+  assert( pName1!=0 );   /* pName1->z might be NULL, but not pName1 itself */
+  assert( pName2!=0 );
+  assert( op==TK_INSERT || op==TK_UPDATE || op==TK_DELETE );
+  assert( op>0 && op<0xff );
+  if( isTemp ){
+    /* If TEMP was specified, then the trigger name may not be qualified. */
+    if( pName2->n>0 ){
+      sqlite3ErrorMsg(pParse, "temporary trigger may not have qualified name");
+      goto trigger_cleanup;
+    }
+    iDb = 1;
+    pName = pName1;
+  }else{
+    /* Figure out the db that the trigger will be created in */
+    iDb = sqlite3TwoPartName(pParse, pName1, pName2, &pName);
+    if( iDb<0 ){
+      goto trigger_cleanup;
+    }
+  }
+  if( !pTableName || db->mallocFailed ){
+    goto trigger_cleanup;
+  }
+
+  /* A long-standing parser bug is that this syntax was allowed:
+  **
+  **    CREATE TRIGGER attached.demo AFTER INSERT ON attached.tab ....
+  **                                                 ^^^^^^^^
+  **
+  ** To maintain backwards compatibility, ignore the database
+  ** name on pTableName if we are reparsing out of SQLITE_MASTER.
+  */
+  if( db->init.busy && iDb!=1 ){
+    sqlite3DbFree(db, pTableName->a[0].zDatabase);
+    pTableName->a[0].zDatabase = 0;
+  }
+
+  /* If the trigger name was unqualified, and the table is a temp table,
+  ** then set iDb to 1 to create the trigger in the temporary database.
+  ** If sqlite3SrcListLookup() returns 0, indicating the table does not
+  ** exist, the error is caught by the block below.
+  */
+  pTab = sqlite3SrcListLookup(pParse, pTableName);
+  if( db->init.busy==0 && pName2->n==0 && pTab
+        && pTab->pSchema==db->aDb[1].pSchema ){
+    iDb = 1;
+  }
+
+  /* Ensure the table name matches database name and that the table exists */
+  if( db->mallocFailed ) goto trigger_cleanup;
+  assert( pTableName->nSrc==1 );
+  sqlite3FixInit(&sFix, pParse, iDb, "trigger", pName);
+  if( sqlite3FixSrcList(&sFix, pTableName) ){
+    goto trigger_cleanup;
+  }
+  pTab = sqlite3SrcListLookup(pParse, pTableName);
+  if( !pTab ){
+    /* The table does not exist. */
+    if( db->init.iDb==1 ){
+      /* Ticket #3810.
+      ** Normally, whenever a table is dropped, all associated triggers are
+      ** dropped too.  But if a TEMP trigger is created on a non-TEMP table
+      ** and the table is dropped by a different database connection, the
+      ** trigger is not visible to the database connection that does the
+      ** drop so the trigger cannot be dropped.  This results in an
+      ** "orphaned trigger" - a trigger whose associated table is missing.
+      */
+      db->init.orphanTrigger = 1;
+    }
+    goto trigger_cleanup;
+  }
+  if( IsVirtual(pTab) ){
+    sqlite3ErrorMsg(pParse, "cannot create triggers on virtual tables");
+    goto trigger_cleanup;
+  }
+
+  /* Check that the trigger name is not reserved and that no trigger of the
+  ** specified name exists */
+  zName = sqlite3NameFromToken(db, pName);
+  if( !zName || SQLITE_OK!=sqlite3CheckObjectName(pParse, zName) ){
+    goto trigger_cleanup;
+  }
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  if( sqlite3HashFind(&(db->aDb[iDb].pSchema->trigHash),zName) ){
+    if( !noErr ){
+      sqlite3ErrorMsg(pParse, "trigger %T already exists", pName);
+    }else{
+      assert( !db->init.busy );
+      sqlite3CodeVerifySchema(pParse, iDb);
+    }
+    goto trigger_cleanup;
+  }
+
+  /* Do not create a trigger on a system table */
+  if( sqlite3StrNICmp(pTab->zName, "sqlite_", 7)==0 ){
+    sqlite3ErrorMsg(pParse, "cannot create trigger on system table");
+    pParse->nErr++;
+    goto trigger_cleanup;
