@@ -111723,3 +111723,214 @@ static SrcList *targetSrcList(
     assert( pSrc->nSrc>0 );
     assert( pSrc->a!=0 );
     iDb = sqlite3SchemaToIndex(pParse->db, pStep->pTrig->pSchema);
+    if( iDb==0 || iDb>=2 ){
+      sqlite3 *db = pParse->db;
+      assert( iDb<pParse->db->nDb );
+      pSrc->a[pSrc->nSrc-1].zDatabase = sqlite3DbStrDup(db, db->aDb[iDb].zName);
+    }
+  }
+  return pSrc;
+}
+
+/*
+** Generate VDBE code for the statements inside the body of a single 
+** trigger.
+*/
+static int codeTriggerProgram(
+  Parse *pParse,            /* The parser context */
+  TriggerStep *pStepList,   /* List of statements inside the trigger body */
+  int orconf                /* Conflict algorithm. (OE_Abort, etc) */  
+){
+  TriggerStep *pStep;
+  Vdbe *v = pParse->pVdbe;
+  sqlite3 *db = pParse->db;
+
+  assert( pParse->pTriggerTab && pParse->pToplevel );
+  assert( pStepList );
+  assert( v!=0 );
+  for(pStep=pStepList; pStep; pStep=pStep->pNext){
+    /* Figure out the ON CONFLICT policy that will be used for this step
+    ** of the trigger program. If the statement that caused this trigger
+    ** to fire had an explicit ON CONFLICT, then use it. Otherwise, use
+    ** the ON CONFLICT policy that was specified as part of the trigger
+    ** step statement. Example:
+    **
+    **   CREATE TRIGGER AFTER INSERT ON t1 BEGIN;
+    **     INSERT OR REPLACE INTO t2 VALUES(new.a, new.b);
+    **   END;
+    **
+    **   INSERT INTO t1 ... ;            -- insert into t2 uses REPLACE policy
+    **   INSERT OR IGNORE INTO t1 ... ;  -- insert into t2 uses IGNORE policy
+    */
+    pParse->eOrconf = (orconf==OE_Default)?pStep->orconf:(u8)orconf;
+    assert( pParse->okConstFactor==0 );
+
+    switch( pStep->op ){
+      case TK_UPDATE: {
+        sqlite3Update(pParse, 
+          targetSrcList(pParse, pStep),
+          sqlite3ExprListDup(db, pStep->pExprList, 0), 
+          sqlite3ExprDup(db, pStep->pWhere, 0), 
+          pParse->eOrconf
+        );
+        break;
+      }
+      case TK_INSERT: {
+        sqlite3Insert(pParse, 
+          targetSrcList(pParse, pStep),
+          sqlite3SelectDup(db, pStep->pSelect, 0), 
+          sqlite3IdListDup(db, pStep->pIdList), 
+          pParse->eOrconf
+        );
+        break;
+      }
+      case TK_DELETE: {
+        sqlite3DeleteFrom(pParse, 
+          targetSrcList(pParse, pStep),
+          sqlite3ExprDup(db, pStep->pWhere, 0)
+        );
+        break;
+      }
+      default: assert( pStep->op==TK_SELECT ); {
+        SelectDest sDest;
+        Select *pSelect = sqlite3SelectDup(db, pStep->pSelect, 0);
+        sqlite3SelectDestInit(&sDest, SRT_Discard, 0);
+        sqlite3Select(pParse, pSelect, &sDest);
+        sqlite3SelectDelete(db, pSelect);
+        break;
+      }
+    } 
+    if( pStep->op!=TK_SELECT ){
+      sqlite3VdbeAddOp0(v, OP_ResetCount);
+    }
+  }
+
+  return 0;
+}
+
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+/*
+** This function is used to add VdbeComment() annotations to a VDBE
+** program. It is not used in production code, only for debugging.
+*/
+static const char *onErrorText(int onError){
+  switch( onError ){
+    case OE_Abort:    return "abort";
+    case OE_Rollback: return "rollback";
+    case OE_Fail:     return "fail";
+    case OE_Replace:  return "replace";
+    case OE_Ignore:   return "ignore";
+    case OE_Default:  return "default";
+  }
+  return "n/a";
+}
+#endif
+
+/*
+** Parse context structure pFrom has just been used to create a sub-vdbe
+** (trigger program). If an error has occurred, transfer error information
+** from pFrom to pTo.
+*/
+static void transferParseError(Parse *pTo, Parse *pFrom){
+  assert( pFrom->zErrMsg==0 || pFrom->nErr );
+  assert( pTo->zErrMsg==0 || pTo->nErr );
+  if( pTo->nErr==0 ){
+    pTo->zErrMsg = pFrom->zErrMsg;
+    pTo->nErr = pFrom->nErr;
+  }else{
+    sqlite3DbFree(pFrom->db, pFrom->zErrMsg);
+  }
+}
+
+/*
+** Create and populate a new TriggerPrg object with a sub-program 
+** implementing trigger pTrigger with ON CONFLICT policy orconf.
+*/
+static TriggerPrg *codeRowTrigger(
+  Parse *pParse,       /* Current parse context */
+  Trigger *pTrigger,   /* Trigger to code */
+  Table *pTab,         /* The table pTrigger is attached to */
+  int orconf           /* ON CONFLICT policy to code trigger program with */
+){
+  Parse *pTop = sqlite3ParseToplevel(pParse);
+  sqlite3 *db = pParse->db;   /* Database handle */
+  TriggerPrg *pPrg;           /* Value to return */
+  Expr *pWhen = 0;            /* Duplicate of trigger WHEN expression */
+  Vdbe *v;                    /* Temporary VM */
+  NameContext sNC;            /* Name context for sub-vdbe */
+  SubProgram *pProgram = 0;   /* Sub-vdbe for trigger program */
+  Parse *pSubParse;           /* Parse context for sub-vdbe */
+  int iEndTrigger = 0;        /* Label to jump to if WHEN is false */
+
+  assert( pTrigger->zName==0 || pTab==tableOfTrigger(pTrigger) );
+  assert( pTop->pVdbe );
+
+  /* Allocate the TriggerPrg and SubProgram objects. To ensure that they
+  ** are freed if an error occurs, link them into the Parse.pTriggerPrg 
+  ** list of the top-level Parse object sooner rather than later.  */
+  pPrg = sqlite3DbMallocZero(db, sizeof(TriggerPrg));
+  if( !pPrg ) return 0;
+  pPrg->pNext = pTop->pTriggerPrg;
+  pTop->pTriggerPrg = pPrg;
+  pPrg->pProgram = pProgram = sqlite3DbMallocZero(db, sizeof(SubProgram));
+  if( !pProgram ) return 0;
+  sqlite3VdbeLinkSubProgram(pTop->pVdbe, pProgram);
+  pPrg->pTrigger = pTrigger;
+  pPrg->orconf = orconf;
+  pPrg->aColmask[0] = 0xffffffff;
+  pPrg->aColmask[1] = 0xffffffff;
+
+  /* Allocate and populate a new Parse context to use for coding the 
+  ** trigger sub-program.  */
+  pSubParse = sqlite3StackAllocZero(db, sizeof(Parse));
+  if( !pSubParse ) return 0;
+  memset(&sNC, 0, sizeof(sNC));
+  sNC.pParse = pSubParse;
+  pSubParse->db = db;
+  pSubParse->pTriggerTab = pTab;
+  pSubParse->pToplevel = pTop;
+  pSubParse->zAuthContext = pTrigger->zName;
+  pSubParse->eTriggerOp = pTrigger->op;
+  pSubParse->nQueryLoop = pParse->nQueryLoop;
+
+  v = sqlite3GetVdbe(pSubParse);
+  if( v ){
+    VdbeComment((v, "Start: %s.%s (%s %s%s%s ON %s)", 
+      pTrigger->zName, onErrorText(orconf),
+      (pTrigger->tr_tm==TRIGGER_BEFORE ? "BEFORE" : "AFTER"),
+        (pTrigger->op==TK_UPDATE ? "UPDATE" : ""),
+        (pTrigger->op==TK_INSERT ? "INSERT" : ""),
+        (pTrigger->op==TK_DELETE ? "DELETE" : ""),
+      pTab->zName
+    ));
+#ifndef SQLITE_OMIT_TRACE
+    sqlite3VdbeChangeP4(v, -1, 
+      sqlite3MPrintf(db, "-- TRIGGER %s", pTrigger->zName), P4_DYNAMIC
+    );
+#endif
+
+    /* If one was specified, code the WHEN clause. If it evaluates to false
+    ** (or NULL) the sub-vdbe is immediately halted by jumping to the 
+    ** OP_Halt inserted at the end of the program.  */
+    if( pTrigger->pWhen ){
+      pWhen = sqlite3ExprDup(db, pTrigger->pWhen, 0);
+      if( SQLITE_OK==sqlite3ResolveExprNames(&sNC, pWhen) 
+       && db->mallocFailed==0 
+      ){
+        iEndTrigger = sqlite3VdbeMakeLabel(v);
+        sqlite3ExprIfFalse(pSubParse, pWhen, iEndTrigger, SQLITE_JUMPIFNULL);
+      }
+      sqlite3ExprDelete(db, pWhen);
+    }
+
+    /* Code the trigger program into the sub-vdbe. */
+    codeTriggerProgram(pSubParse, pTrigger->step_list, orconf);
+
+    /* Insert an OP_Halt at the end of the sub-program. */
+    if( iEndTrigger ){
+      sqlite3VdbeResolveLabel(v, iEndTrigger);
+    }
+    sqlite3VdbeAddOp0(v, OP_Halt);
+    VdbeComment((v, "End: %s.%s", pTrigger->zName, onErrorText(orconf)));
+
+    transferParseError(pParse, pSubParse);
