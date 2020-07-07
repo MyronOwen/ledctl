@@ -111236,3 +111236,250 @@ SQLITE_PRIVATE void sqlite3BeginTrigger(
     sqlite3ErrorMsg(pParse, "cannot create trigger on system table");
     pParse->nErr++;
     goto trigger_cleanup;
+  }
+
+  /* INSTEAD of triggers are only for views and views only support INSTEAD
+  ** of triggers.
+  */
+  if( pTab->pSelect && tr_tm!=TK_INSTEAD ){
+    sqlite3ErrorMsg(pParse, "cannot create %s trigger on view: %S", 
+        (tr_tm == TK_BEFORE)?"BEFORE":"AFTER", pTableName, 0);
+    goto trigger_cleanup;
+  }
+  if( !pTab->pSelect && tr_tm==TK_INSTEAD ){
+    sqlite3ErrorMsg(pParse, "cannot create INSTEAD OF"
+        " trigger on table: %S", pTableName, 0);
+    goto trigger_cleanup;
+  }
+  iTabDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  {
+    int code = SQLITE_CREATE_TRIGGER;
+    const char *zDb = db->aDb[iTabDb].zName;
+    const char *zDbTrig = isTemp ? db->aDb[1].zName : zDb;
+    if( iTabDb==1 || isTemp ) code = SQLITE_CREATE_TEMP_TRIGGER;
+    if( sqlite3AuthCheck(pParse, code, zName, pTab->zName, zDbTrig) ){
+      goto trigger_cleanup;
+    }
+    if( sqlite3AuthCheck(pParse, SQLITE_INSERT, SCHEMA_TABLE(iTabDb),0,zDb)){
+      goto trigger_cleanup;
+    }
+  }
+#endif
+
+  /* INSTEAD OF triggers can only appear on views and BEFORE triggers
+  ** cannot appear on views.  So we might as well translate every
+  ** INSTEAD OF trigger into a BEFORE trigger.  It simplifies code
+  ** elsewhere.
+  */
+  if (tr_tm == TK_INSTEAD){
+    tr_tm = TK_BEFORE;
+  }
+
+  /* Build the Trigger object */
+  pTrigger = (Trigger*)sqlite3DbMallocZero(db, sizeof(Trigger));
+  if( pTrigger==0 ) goto trigger_cleanup;
+  pTrigger->zName = zName;
+  zName = 0;
+  pTrigger->table = sqlite3DbStrDup(db, pTableName->a[0].zName);
+  pTrigger->pSchema = db->aDb[iDb].pSchema;
+  pTrigger->pTabSchema = pTab->pSchema;
+  pTrigger->op = (u8)op;
+  pTrigger->tr_tm = tr_tm==TK_BEFORE ? TRIGGER_BEFORE : TRIGGER_AFTER;
+  pTrigger->pWhen = sqlite3ExprDup(db, pWhen, EXPRDUP_REDUCE);
+  pTrigger->pColumns = sqlite3IdListDup(db, pColumns);
+  assert( pParse->pNewTrigger==0 );
+  pParse->pNewTrigger = pTrigger;
+
+trigger_cleanup:
+  sqlite3DbFree(db, zName);
+  sqlite3SrcListDelete(db, pTableName);
+  sqlite3IdListDelete(db, pColumns);
+  sqlite3ExprDelete(db, pWhen);
+  if( !pParse->pNewTrigger ){
+    sqlite3DeleteTrigger(db, pTrigger);
+  }else{
+    assert( pParse->pNewTrigger==pTrigger );
+  }
+}
+
+/*
+** This routine is called after all of the trigger actions have been parsed
+** in order to complete the process of building the trigger.
+*/
+SQLITE_PRIVATE void sqlite3FinishTrigger(
+  Parse *pParse,          /* Parser context */
+  TriggerStep *pStepList, /* The triggered program */
+  Token *pAll             /* Token that describes the complete CREATE TRIGGER */
+){
+  Trigger *pTrig = pParse->pNewTrigger;   /* Trigger being finished */
+  char *zName;                            /* Name of trigger */
+  sqlite3 *db = pParse->db;               /* The database */
+  DbFixer sFix;                           /* Fixer object */
+  int iDb;                                /* Database containing the trigger */
+  Token nameToken;                        /* Trigger name for error reporting */
+
+  pParse->pNewTrigger = 0;
+  if( NEVER(pParse->nErr) || !pTrig ) goto triggerfinish_cleanup;
+  zName = pTrig->zName;
+  iDb = sqlite3SchemaToIndex(pParse->db, pTrig->pSchema);
+  pTrig->step_list = pStepList;
+  while( pStepList ){
+    pStepList->pTrig = pTrig;
+    pStepList = pStepList->pNext;
+  }
+  nameToken.z = pTrig->zName;
+  nameToken.n = sqlite3Strlen30(nameToken.z);
+  sqlite3FixInit(&sFix, pParse, iDb, "trigger", &nameToken);
+  if( sqlite3FixTriggerStep(&sFix, pTrig->step_list) 
+   || sqlite3FixExpr(&sFix, pTrig->pWhen) 
+  ){
+    goto triggerfinish_cleanup;
+  }
+
+  /* if we are not initializing,
+  ** build the sqlite_master entry
+  */
+  if( !db->init.busy ){
+    Vdbe *v;
+    char *z;
+
+    /* Make an entry in the sqlite_master table */
+    v = sqlite3GetVdbe(pParse);
+    if( v==0 ) goto triggerfinish_cleanup;
+    sqlite3BeginWriteOperation(pParse, 0, iDb);
+    z = sqlite3DbStrNDup(db, (char*)pAll->z, pAll->n);
+    sqlite3NestedParse(pParse,
+       "INSERT INTO %Q.%s VALUES('trigger',%Q,%Q,0,'CREATE TRIGGER %q')",
+       db->aDb[iDb].zName, SCHEMA_TABLE(iDb), zName,
+       pTrig->table, z);
+    sqlite3DbFree(db, z);
+    sqlite3ChangeCookie(pParse, iDb);
+    sqlite3VdbeAddParseSchemaOp(v, iDb,
+        sqlite3MPrintf(db, "type='trigger' AND name='%q'", zName));
+  }
+
+  if( db->init.busy ){
+    Trigger *pLink = pTrig;
+    Hash *pHash = &db->aDb[iDb].pSchema->trigHash;
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    pTrig = sqlite3HashInsert(pHash, zName, pTrig);
+    if( pTrig ){
+      db->mallocFailed = 1;
+    }else if( pLink->pSchema==pLink->pTabSchema ){
+      Table *pTab;
+      pTab = sqlite3HashFind(&pLink->pTabSchema->tblHash, pLink->table);
+      assert( pTab!=0 );
+      pLink->pNext = pTab->pTrigger;
+      pTab->pTrigger = pLink;
+    }
+  }
+
+triggerfinish_cleanup:
+  sqlite3DeleteTrigger(db, pTrig);
+  assert( !pParse->pNewTrigger );
+  sqlite3DeleteTriggerStep(db, pStepList);
+}
+
+/*
+** Turn a SELECT statement (that the pSelect parameter points to) into
+** a trigger step.  Return a pointer to a TriggerStep structure.
+**
+** The parser calls this routine when it finds a SELECT statement in
+** body of a TRIGGER.  
+*/
+SQLITE_PRIVATE TriggerStep *sqlite3TriggerSelectStep(sqlite3 *db, Select *pSelect){
+  TriggerStep *pTriggerStep = sqlite3DbMallocZero(db, sizeof(TriggerStep));
+  if( pTriggerStep==0 ) {
+    sqlite3SelectDelete(db, pSelect);
+    return 0;
+  }
+  pTriggerStep->op = TK_SELECT;
+  pTriggerStep->pSelect = pSelect;
+  pTriggerStep->orconf = OE_Default;
+  return pTriggerStep;
+}
+
+/*
+** Allocate space to hold a new trigger step.  The allocated space
+** holds both the TriggerStep object and the TriggerStep.target.z string.
+**
+** If an OOM error occurs, NULL is returned and db->mallocFailed is set.
+*/
+static TriggerStep *triggerStepAllocate(
+  sqlite3 *db,                /* Database connection */
+  u8 op,                      /* Trigger opcode */
+  Token *pName                /* The target name */
+){
+  TriggerStep *pTriggerStep;
+
+  pTriggerStep = sqlite3DbMallocZero(db, sizeof(TriggerStep) + pName->n);
+  if( pTriggerStep ){
+    char *z = (char*)&pTriggerStep[1];
+    memcpy(z, pName->z, pName->n);
+    pTriggerStep->target.z = z;
+    pTriggerStep->target.n = pName->n;
+    pTriggerStep->op = op;
+  }
+  return pTriggerStep;
+}
+
+/*
+** Build a trigger step out of an INSERT statement.  Return a pointer
+** to the new trigger step.
+**
+** The parser calls this routine when it sees an INSERT inside the
+** body of a trigger.
+*/
+SQLITE_PRIVATE TriggerStep *sqlite3TriggerInsertStep(
+  sqlite3 *db,        /* The database connection */
+  Token *pTableName,  /* Name of the table into which we insert */
+  IdList *pColumn,    /* List of columns in pTableName to insert into */
+  Select *pSelect,    /* A SELECT statement that supplies values */
+  u8 orconf           /* The conflict algorithm (OE_Abort, OE_Replace, etc.) */
+){
+  TriggerStep *pTriggerStep;
+
+  assert(pSelect != 0 || db->mallocFailed);
+
+  pTriggerStep = triggerStepAllocate(db, TK_INSERT, pTableName);
+  if( pTriggerStep ){
+    pTriggerStep->pSelect = sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
+    pTriggerStep->pIdList = pColumn;
+    pTriggerStep->orconf = orconf;
+  }else{
+    sqlite3IdListDelete(db, pColumn);
+  }
+  sqlite3SelectDelete(db, pSelect);
+
+  return pTriggerStep;
+}
+
+/*
+** Construct a trigger step that implements an UPDATE statement and return
+** a pointer to that trigger step.  The parser calls this routine when it
+** sees an UPDATE statement inside the body of a CREATE TRIGGER.
+*/
+SQLITE_PRIVATE TriggerStep *sqlite3TriggerUpdateStep(
+  sqlite3 *db,         /* The database connection */
+  Token *pTableName,   /* Name of the table to be updated */
+  ExprList *pEList,    /* The SET clause: list of column and new values */
+  Expr *pWhere,        /* The WHERE clause */
+  u8 orconf            /* The conflict algorithm. (OE_Abort, OE_Ignore, etc) */
+){
+  TriggerStep *pTriggerStep;
+
+  pTriggerStep = triggerStepAllocate(db, TK_UPDATE, pTableName);
+  if( pTriggerStep ){
+    pTriggerStep->pExprList = sqlite3ExprListDup(db, pEList, EXPRDUP_REDUCE);
+    pTriggerStep->pWhere = sqlite3ExprDup(db, pWhere, EXPRDUP_REDUCE);
+    pTriggerStep->orconf = orconf;
+  }
+  sqlite3ExprListDelete(db, pEList);
+  sqlite3ExprDelete(db, pWhere);
+  return pTriggerStep;
+}
+
+/*
+** Construct a trigger step that implements a DELETE statement and return
