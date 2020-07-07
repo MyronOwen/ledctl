@@ -111483,3 +111483,243 @@ SQLITE_PRIVATE TriggerStep *sqlite3TriggerUpdateStep(
 
 /*
 ** Construct a trigger step that implements a DELETE statement and return
+** a pointer to that trigger step.  The parser calls this routine when it
+** sees a DELETE statement inside the body of a CREATE TRIGGER.
+*/
+SQLITE_PRIVATE TriggerStep *sqlite3TriggerDeleteStep(
+  sqlite3 *db,            /* Database connection */
+  Token *pTableName,      /* The table from which rows are deleted */
+  Expr *pWhere            /* The WHERE clause */
+){
+  TriggerStep *pTriggerStep;
+
+  pTriggerStep = triggerStepAllocate(db, TK_DELETE, pTableName);
+  if( pTriggerStep ){
+    pTriggerStep->pWhere = sqlite3ExprDup(db, pWhere, EXPRDUP_REDUCE);
+    pTriggerStep->orconf = OE_Default;
+  }
+  sqlite3ExprDelete(db, pWhere);
+  return pTriggerStep;
+}
+
+/* 
+** Recursively delete a Trigger structure
+*/
+SQLITE_PRIVATE void sqlite3DeleteTrigger(sqlite3 *db, Trigger *pTrigger){
+  if( pTrigger==0 ) return;
+  sqlite3DeleteTriggerStep(db, pTrigger->step_list);
+  sqlite3DbFree(db, pTrigger->zName);
+  sqlite3DbFree(db, pTrigger->table);
+  sqlite3ExprDelete(db, pTrigger->pWhen);
+  sqlite3IdListDelete(db, pTrigger->pColumns);
+  sqlite3DbFree(db, pTrigger);
+}
+
+/*
+** This function is called to drop a trigger from the database schema. 
+**
+** This may be called directly from the parser and therefore identifies
+** the trigger by name.  The sqlite3DropTriggerPtr() routine does the
+** same job as this routine except it takes a pointer to the trigger
+** instead of the trigger name.
+**/
+SQLITE_PRIVATE void sqlite3DropTrigger(Parse *pParse, SrcList *pName, int noErr){
+  Trigger *pTrigger = 0;
+  int i;
+  const char *zDb;
+  const char *zName;
+  sqlite3 *db = pParse->db;
+
+  if( db->mallocFailed ) goto drop_trigger_cleanup;
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    goto drop_trigger_cleanup;
+  }
+
+  assert( pName->nSrc==1 );
+  zDb = pName->a[0].zDatabase;
+  zName = pName->a[0].zName;
+  assert( zDb!=0 || sqlite3BtreeHoldsAllMutexes(db) );
+  for(i=OMIT_TEMPDB; i<db->nDb; i++){
+    int j = (i<2) ? i^1 : i;  /* Search TEMP before MAIN */
+    if( zDb && sqlite3StrICmp(db->aDb[j].zName, zDb) ) continue;
+    assert( sqlite3SchemaMutexHeld(db, j, 0) );
+    pTrigger = sqlite3HashFind(&(db->aDb[j].pSchema->trigHash), zName);
+    if( pTrigger ) break;
+  }
+  if( !pTrigger ){
+    if( !noErr ){
+      sqlite3ErrorMsg(pParse, "no such trigger: %S", pName, 0);
+    }else{
+      sqlite3CodeVerifyNamedSchema(pParse, zDb);
+    }
+    pParse->checkSchema = 1;
+    goto drop_trigger_cleanup;
+  }
+  sqlite3DropTriggerPtr(pParse, pTrigger);
+
+drop_trigger_cleanup:
+  sqlite3SrcListDelete(db, pName);
+}
+
+/*
+** Return a pointer to the Table structure for the table that a trigger
+** is set on.
+*/
+static Table *tableOfTrigger(Trigger *pTrigger){
+  return sqlite3HashFind(&pTrigger->pTabSchema->tblHash, pTrigger->table);
+}
+
+
+/*
+** Drop a trigger given a pointer to that trigger. 
+*/
+SQLITE_PRIVATE void sqlite3DropTriggerPtr(Parse *pParse, Trigger *pTrigger){
+  Table   *pTable;
+  Vdbe *v;
+  sqlite3 *db = pParse->db;
+  int iDb;
+
+  iDb = sqlite3SchemaToIndex(pParse->db, pTrigger->pSchema);
+  assert( iDb>=0 && iDb<db->nDb );
+  pTable = tableOfTrigger(pTrigger);
+  assert( pTable );
+  assert( pTable->pSchema==pTrigger->pSchema || iDb==1 );
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  {
+    int code = SQLITE_DROP_TRIGGER;
+    const char *zDb = db->aDb[iDb].zName;
+    const char *zTab = SCHEMA_TABLE(iDb);
+    if( iDb==1 ) code = SQLITE_DROP_TEMP_TRIGGER;
+    if( sqlite3AuthCheck(pParse, code, pTrigger->zName, pTable->zName, zDb) ||
+      sqlite3AuthCheck(pParse, SQLITE_DELETE, zTab, 0, zDb) ){
+      return;
+    }
+  }
+#endif
+
+  /* Generate code to destroy the database record of the trigger.
+  */
+  assert( pTable!=0 );
+  if( (v = sqlite3GetVdbe(pParse))!=0 ){
+    int base;
+    static const int iLn = VDBE_OFFSET_LINENO(2);
+    static const VdbeOpList dropTrigger[] = {
+      { OP_Rewind,     0, ADDR(9),  0},
+      { OP_String8,    0, 1,        0}, /* 1 */
+      { OP_Column,     0, 1,        2},
+      { OP_Ne,         2, ADDR(8),  1},
+      { OP_String8,    0, 1,        0}, /* 4: "trigger" */
+      { OP_Column,     0, 0,        2},
+      { OP_Ne,         2, ADDR(8),  1},
+      { OP_Delete,     0, 0,        0},
+      { OP_Next,       0, ADDR(1),  0}, /* 8 */
+    };
+
+    sqlite3BeginWriteOperation(pParse, 0, iDb);
+    sqlite3OpenMasterTable(pParse, iDb);
+    base = sqlite3VdbeAddOpList(v,  ArraySize(dropTrigger), dropTrigger, iLn);
+    sqlite3VdbeChangeP4(v, base+1, pTrigger->zName, P4_TRANSIENT);
+    sqlite3VdbeChangeP4(v, base+4, "trigger", P4_STATIC);
+    sqlite3ChangeCookie(pParse, iDb);
+    sqlite3VdbeAddOp2(v, OP_Close, 0, 0);
+    sqlite3VdbeAddOp4(v, OP_DropTrigger, iDb, 0, 0, pTrigger->zName, 0);
+    if( pParse->nMem<3 ){
+      pParse->nMem = 3;
+    }
+  }
+}
+
+/*
+** Remove a trigger from the hash tables of the sqlite* pointer.
+*/
+SQLITE_PRIVATE void sqlite3UnlinkAndDeleteTrigger(sqlite3 *db, int iDb, const char *zName){
+  Trigger *pTrigger;
+  Hash *pHash;
+
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  pHash = &(db->aDb[iDb].pSchema->trigHash);
+  pTrigger = sqlite3HashInsert(pHash, zName, 0);
+  if( ALWAYS(pTrigger) ){
+    if( pTrigger->pSchema==pTrigger->pTabSchema ){
+      Table *pTab = tableOfTrigger(pTrigger);
+      Trigger **pp;
+      for(pp=&pTab->pTrigger; *pp!=pTrigger; pp=&((*pp)->pNext));
+      *pp = (*pp)->pNext;
+    }
+    sqlite3DeleteTrigger(db, pTrigger);
+    db->flags |= SQLITE_InternChanges;
+  }
+}
+
+/*
+** pEList is the SET clause of an UPDATE statement.  Each entry
+** in pEList is of the format <id>=<expr>.  If any of the entries
+** in pEList have an <id> which matches an identifier in pIdList,
+** then return TRUE.  If pIdList==NULL, then it is considered a
+** wildcard that matches anything.  Likewise if pEList==NULL then
+** it matches anything so always return true.  Return false only
+** if there is no match.
+*/
+static int checkColumnOverlap(IdList *pIdList, ExprList *pEList){
+  int e;
+  if( pIdList==0 || NEVER(pEList==0) ) return 1;
+  for(e=0; e<pEList->nExpr; e++){
+    if( sqlite3IdListIndex(pIdList, pEList->a[e].zName)>=0 ) return 1;
+  }
+  return 0; 
+}
+
+/*
+** Return a list of all triggers on table pTab if there exists at least
+** one trigger that must be fired when an operation of type 'op' is 
+** performed on the table, and, if that operation is an UPDATE, if at
+** least one of the columns in pChanges is being modified.
+*/
+SQLITE_PRIVATE Trigger *sqlite3TriggersExist(
+  Parse *pParse,          /* Parse context */
+  Table *pTab,            /* The table the contains the triggers */
+  int op,                 /* one of TK_DELETE, TK_INSERT, TK_UPDATE */
+  ExprList *pChanges,     /* Columns that change in an UPDATE statement */
+  int *pMask              /* OUT: Mask of TRIGGER_BEFORE|TRIGGER_AFTER */
+){
+  int mask = 0;
+  Trigger *pList = 0;
+  Trigger *p;
+
+  if( (pParse->db->flags & SQLITE_EnableTrigger)!=0 ){
+    pList = sqlite3TriggerList(pParse, pTab);
+  }
+  assert( pList==0 || IsVirtual(pTab)==0 );
+  for(p=pList; p; p=p->pNext){
+    if( p->op==op && checkColumnOverlap(p->pColumns, pChanges) ){
+      mask |= p->tr_tm;
+    }
+  }
+  if( pMask ){
+    *pMask = mask;
+  }
+  return (mask ? pList : 0);
+}
+
+/*
+** Convert the pStep->target token into a SrcList and return a pointer
+** to that SrcList.
+**
+** This routine adds a specific database name, if needed, to the target when
+** forming the SrcList.  This prevents a trigger in one database from
+** referring to a target in another database.  An exception is when the
+** trigger is in TEMP in which case it can refer to any other database it
+** wants.
+*/
+static SrcList *targetSrcList(
+  Parse *pParse,       /* The parsing context */
+  TriggerStep *pStep   /* The trigger containing the target token */
+){
+  int iDb;             /* Index of the database to use */
+  SrcList *pSrc;       /* SrcList to be returned */
+
+  pSrc = sqlite3SrcListAppend(pParse->db, 0, &pStep->target, 0);
+  if( pSrc ){
+    assert( pSrc->nSrc>0 );
+    assert( pSrc->a!=0 );
+    iDb = sqlite3SchemaToIndex(pParse->db, pStep->pTrig->pSchema);
