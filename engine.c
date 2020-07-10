@@ -112802,3 +112802,209 @@ SQLITE_PRIVATE void sqlite3Update(
   }
   if( iDataCur<iIdxCur ) sqlite3VdbeAddOp2(v, OP_Close, iDataCur, 0);
 
+  /* Update the sqlite_sequence table by storing the content of the
+  ** maximum rowid counter values recorded while inserting into
+  ** autoincrement tables.
+  */
+  if( pParse->nested==0 && pParse->pTriggerTab==0 ){
+    sqlite3AutoincrementEnd(pParse);
+  }
+
+  /*
+  ** Return the number of rows that were changed. If this routine is 
+  ** generating code because of a call to sqlite3NestedParse(), do not
+  ** invoke the callback function.
+  */
+  if( (db->flags&SQLITE_CountRows) && !pParse->pTriggerTab && !pParse->nested ){
+    sqlite3VdbeAddOp2(v, OP_ResultRow, regRowCount, 1);
+    sqlite3VdbeSetNumCols(v, 1);
+    sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "rows updated", SQLITE_STATIC);
+  }
+
+update_cleanup:
+  sqlite3AuthContextPop(&sContext);
+  sqlite3DbFree(db, aXRef); /* Also frees aRegIdx[] and aToOpen[] */
+  sqlite3SrcListDelete(db, pTabList);
+  sqlite3ExprListDelete(db, pChanges);
+  sqlite3ExprDelete(db, pWhere);
+  return;
+}
+/* Make sure "isView" and other macros defined above are undefined. Otherwise
+** they may interfere with compilation of other functions in this file
+** (or in another file, if this file becomes part of the amalgamation).  */
+#ifdef isView
+ #undef isView
+#endif
+#ifdef pTrigger
+ #undef pTrigger
+#endif
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/*
+** Generate code for an UPDATE of a virtual table.
+**
+** The strategy is that we create an ephemeral table that contains
+** for each row to be changed:
+**
+**   (A)  The original rowid of that row.
+**   (B)  The revised rowid for the row. (note1)
+**   (C)  The content of every column in the row.
+**
+** Then we loop over this ephemeral table and for each row in
+** the ephemeral table call VUpdate.
+**
+** When finished, drop the ephemeral table.
+**
+** (note1) Actually, if we know in advance that (A) is always the same
+** as (B) we only store (A), then duplicate (A) when pulling
+** it out of the ephemeral table before calling VUpdate.
+*/
+static void updateVirtualTable(
+  Parse *pParse,       /* The parsing context */
+  SrcList *pSrc,       /* The virtual table to be modified */
+  Table *pTab,         /* The virtual table */
+  ExprList *pChanges,  /* The columns to change in the UPDATE statement */
+  Expr *pRowid,        /* Expression used to recompute the rowid */
+  int *aXRef,          /* Mapping from columns of pTab to entries in pChanges */
+  Expr *pWhere,        /* WHERE clause of the UPDATE statement */
+  int onError          /* ON CONFLICT strategy */
+){
+  Vdbe *v = pParse->pVdbe;  /* Virtual machine under construction */
+  ExprList *pEList = 0;     /* The result set of the SELECT statement */
+  Select *pSelect = 0;      /* The SELECT statement */
+  Expr *pExpr;              /* Temporary expression */
+  int ephemTab;             /* Table holding the result of the SELECT */
+  int i;                    /* Loop counter */
+  int addr;                 /* Address of top of loop */
+  int iReg;                 /* First register in set passed to OP_VUpdate */
+  sqlite3 *db = pParse->db; /* Database connection */
+  const char *pVTab = (const char*)sqlite3GetVTable(db, pTab);
+  SelectDest dest;
+
+  /* Construct the SELECT statement that will find the new values for
+  ** all updated rows. 
+  */
+  pEList = sqlite3ExprListAppend(pParse, 0, sqlite3Expr(db, TK_ID, "_rowid_"));
+  if( pRowid ){
+    pEList = sqlite3ExprListAppend(pParse, pEList,
+                                   sqlite3ExprDup(db, pRowid, 0));
+  }
+  assert( pTab->iPKey<0 );
+  for(i=0; i<pTab->nCol; i++){
+    if( aXRef[i]>=0 ){
+      pExpr = sqlite3ExprDup(db, pChanges->a[aXRef[i]].pExpr, 0);
+    }else{
+      pExpr = sqlite3Expr(db, TK_ID, pTab->aCol[i].zName);
+    }
+    pEList = sqlite3ExprListAppend(pParse, pEList, pExpr);
+  }
+  pSelect = sqlite3SelectNew(pParse, pEList, pSrc, pWhere, 0, 0, 0, 0, 0, 0);
+  
+  /* Create the ephemeral table into which the update results will
+  ** be stored.
+  */
+  assert( v );
+  ephemTab = pParse->nTab++;
+  sqlite3VdbeAddOp2(v, OP_OpenEphemeral, ephemTab, pTab->nCol+1+(pRowid!=0));
+  sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
+
+  /* fill the ephemeral table 
+  */
+  sqlite3SelectDestInit(&dest, SRT_Table, ephemTab);
+  sqlite3Select(pParse, pSelect, &dest);
+
+  /* Generate code to scan the ephemeral table and call VUpdate. */
+  iReg = ++pParse->nMem;
+  pParse->nMem += pTab->nCol+1;
+  addr = sqlite3VdbeAddOp2(v, OP_Rewind, ephemTab, 0); VdbeCoverage(v);
+  sqlite3VdbeAddOp3(v, OP_Column,  ephemTab, 0, iReg);
+  sqlite3VdbeAddOp3(v, OP_Column, ephemTab, (pRowid?1:0), iReg+1);
+  for(i=0; i<pTab->nCol; i++){
+    sqlite3VdbeAddOp3(v, OP_Column, ephemTab, i+1+(pRowid!=0), iReg+2+i);
+  }
+  sqlite3VtabMakeWritable(pParse, pTab);
+  sqlite3VdbeAddOp4(v, OP_VUpdate, 0, pTab->nCol+2, iReg, pVTab, P4_VTAB);
+  sqlite3VdbeChangeP5(v, onError==OE_Default ? OE_Abort : onError);
+  sqlite3MayAbort(pParse);
+  sqlite3VdbeAddOp2(v, OP_Next, ephemTab, addr+1); VdbeCoverage(v);
+  sqlite3VdbeJumpHere(v, addr);
+  sqlite3VdbeAddOp2(v, OP_Close, ephemTab, 0);
+
+  /* Cleanup */
+  sqlite3SelectDelete(db, pSelect);  
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+/************** End of update.c **********************************************/
+/************** Begin file vacuum.c ******************************************/
+/*
+** 2003 April 6
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code used to implement the VACUUM command.
+**
+** Most of the code in this file may be omitted by defining the
+** SQLITE_OMIT_VACUUM macro.
+*/
+
+#if !defined(SQLITE_OMIT_VACUUM) && !defined(SQLITE_OMIT_ATTACH)
+/*
+** Finalize a prepared statement.  If there was an error, store the
+** text of the error message in *pzErrMsg.  Return the result code.
+*/
+static int vacuumFinalize(sqlite3 *db, sqlite3_stmt *pStmt, char **pzErrMsg){
+  int rc;
+  rc = sqlite3VdbeFinalize((Vdbe*)pStmt);
+  if( rc ){
+    sqlite3SetString(pzErrMsg, db, sqlite3_errmsg(db));
+  }
+  return rc;
+}
+
+/*
+** Execute zSql on database db. Return an error code.
+*/
+static int execSql(sqlite3 *db, char **pzErrMsg, const char *zSql){
+  sqlite3_stmt *pStmt;
+  VVA_ONLY( int rc; )
+  if( !zSql ){
+    return SQLITE_NOMEM;
+  }
+  if( SQLITE_OK!=sqlite3_prepare(db, zSql, -1, &pStmt, 0) ){
+    sqlite3SetString(pzErrMsg, db, sqlite3_errmsg(db));
+    return sqlite3_errcode(db);
+  }
+  VVA_ONLY( rc = ) sqlite3_step(pStmt);
+  assert( rc!=SQLITE_ROW || (db->flags&SQLITE_CountRows) );
+  return vacuumFinalize(db, pStmt, pzErrMsg);
+}
+
+/*
+** Execute zSql on database db. The statement returns exactly
+** one column. Execute this as SQL on the same database.
+*/
+static int execExecSql(sqlite3 *db, char **pzErrMsg, const char *zSql){
+  sqlite3_stmt *pStmt;
+  int rc;
+
+  rc = sqlite3_prepare(db, zSql, -1, &pStmt, 0);
+  if( rc!=SQLITE_OK ) return rc;
+
+  while( SQLITE_ROW==sqlite3_step(pStmt) ){
+    rc = execSql(db, pzErrMsg, (char*)sqlite3_column_text(pStmt, 0));
+    if( rc!=SQLITE_OK ){
+      vacuumFinalize(db, pStmt, pzErrMsg);
+      return rc;
+    }
+  }
+
+  return vacuumFinalize(db, pStmt, pzErrMsg);
+}
+
