@@ -112358,3 +112358,224 @@ SQLITE_PRIVATE void sqlite3Update(
 
   /* Allocate space for aXRef[], aRegIdx[], and aToOpen[].  
   ** Initialize aXRef[] and aToOpen[] to their default values.
+  */
+  aXRef = sqlite3DbMallocRaw(db, sizeof(int) * (pTab->nCol+nIdx) + nIdx+2 );
+  if( aXRef==0 ) goto update_cleanup;
+  aRegIdx = aXRef+pTab->nCol;
+  aToOpen = (u8*)(aRegIdx+nIdx);
+  memset(aToOpen, 1, nIdx+1);
+  aToOpen[nIdx+1] = 0;
+  for(i=0; i<pTab->nCol; i++) aXRef[i] = -1;
+
+  /* Initialize the name-context */
+  memset(&sNC, 0, sizeof(sNC));
+  sNC.pParse = pParse;
+  sNC.pSrcList = pTabList;
+
+  /* Resolve the column names in all the expressions of the
+  ** of the UPDATE statement.  Also find the column index
+  ** for each column to be updated in the pChanges array.  For each
+  ** column to be updated, make sure we have authorization to change
+  ** that column.
+  */
+  chngRowid = chngPk = 0;
+  for(i=0; i<pChanges->nExpr; i++){
+    if( sqlite3ResolveExprNames(&sNC, pChanges->a[i].pExpr) ){
+      goto update_cleanup;
+    }
+    for(j=0; j<pTab->nCol; j++){
+      if( sqlite3StrICmp(pTab->aCol[j].zName, pChanges->a[i].zName)==0 ){
+        if( j==pTab->iPKey ){
+          chngRowid = 1;
+          pRowidExpr = pChanges->a[i].pExpr;
+        }else if( pPk && (pTab->aCol[j].colFlags & COLFLAG_PRIMKEY)!=0 ){
+          chngPk = 1;
+        }
+        aXRef[j] = i;
+        break;
+      }
+    }
+    if( j>=pTab->nCol ){
+      if( pPk==0 && sqlite3IsRowid(pChanges->a[i].zName) ){
+        j = -1;
+        chngRowid = 1;
+        pRowidExpr = pChanges->a[i].pExpr;
+      }else{
+        sqlite3ErrorMsg(pParse, "no such column: %s", pChanges->a[i].zName);
+        pParse->checkSchema = 1;
+        goto update_cleanup;
+      }
+    }
+#ifndef SQLITE_OMIT_AUTHORIZATION
+    {
+      int rc;
+      rc = sqlite3AuthCheck(pParse, SQLITE_UPDATE, pTab->zName,
+                            j<0 ? "ROWID" : pTab->aCol[j].zName,
+                            db->aDb[iDb].zName);
+      if( rc==SQLITE_DENY ){
+        goto update_cleanup;
+      }else if( rc==SQLITE_IGNORE ){
+        aXRef[j] = -1;
+      }
+    }
+#endif
+  }
+  assert( (chngRowid & chngPk)==0 );
+  assert( chngRowid==0 || chngRowid==1 );
+  assert( chngPk==0 || chngPk==1 );
+  chngKey = chngRowid + chngPk;
+
+  /* The SET expressions are not actually used inside the WHERE loop.
+  ** So reset the colUsed mask
+  */
+  pTabList->a[0].colUsed = 0;
+
+  hasFK = sqlite3FkRequired(pParse, pTab, aXRef, chngKey);
+
+  /* There is one entry in the aRegIdx[] array for each index on the table
+  ** being updated.  Fill in aRegIdx[] with a register number that will hold
+  ** the key for accessing each index.  
+  */
+  for(j=0, pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext, j++){
+    int reg;
+    if( chngKey || hasFK || pIdx->pPartIdxWhere || pIdx==pPk ){
+      reg = ++pParse->nMem;
+    }else{
+      reg = 0;
+      for(i=0; i<pIdx->nKeyCol; i++){
+        if( aXRef[pIdx->aiColumn[i]]>=0 ){
+          reg = ++pParse->nMem;
+          break;
+        }
+      }
+    }
+    if( reg==0 ) aToOpen[j+1] = 0;
+    aRegIdx[j] = reg;
+  }
+
+  /* Begin generating code. */
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 ) goto update_cleanup;
+  if( pParse->nested==0 ) sqlite3VdbeCountChanges(v);
+  sqlite3BeginWriteOperation(pParse, 1, iDb);
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  /* Virtual tables must be handled separately */
+  if( IsVirtual(pTab) ){
+    updateVirtualTable(pParse, pTabList, pTab, pChanges, pRowidExpr, aXRef,
+                       pWhere, onError);
+    pWhere = 0;
+    pTabList = 0;
+    goto update_cleanup;
+  }
+#endif
+
+  /* Allocate required registers. */
+  regRowSet = ++pParse->nMem;
+  regOldRowid = regNewRowid = ++pParse->nMem;
+  if( chngPk || pTrigger || hasFK ){
+    regOld = pParse->nMem + 1;
+    pParse->nMem += pTab->nCol;
+  }
+  if( chngKey || pTrigger || hasFK ){
+    regNewRowid = ++pParse->nMem;
+  }
+  regNew = pParse->nMem + 1;
+  pParse->nMem += pTab->nCol;
+
+  /* Start the view context. */
+  if( isView ){
+    sqlite3AuthContextPush(pParse, &sContext, pTab->zName);
+  }
+
+  /* If we are trying to update a view, realize that view into
+  ** an ephemeral table.
+  */
+#if !defined(SQLITE_OMIT_VIEW) && !defined(SQLITE_OMIT_TRIGGER)
+  if( isView ){
+    sqlite3MaterializeView(pParse, pTab, pWhere, iDataCur);
+  }
+#endif
+
+  /* Resolve the column names in all the expressions in the
+  ** WHERE clause.
+  */
+  if( sqlite3ResolveExprNames(&sNC, pWhere) ){
+    goto update_cleanup;
+  }
+
+  /* Begin the database scan
+  */
+  if( HasRowid(pTab) ){
+    sqlite3VdbeAddOp3(v, OP_Null, 0, regRowSet, regOldRowid);
+    pWInfo = sqlite3WhereBegin(
+        pParse, pTabList, pWhere, 0, 0, WHERE_ONEPASS_DESIRED, iIdxCur
+    );
+    if( pWInfo==0 ) goto update_cleanup;
+    okOnePass = sqlite3WhereOkOnePass(pWInfo, aiCurOnePass);
+  
+    /* Remember the rowid of every item to be updated.
+    */
+    sqlite3VdbeAddOp2(v, OP_Rowid, iDataCur, regOldRowid);
+    if( !okOnePass ){
+      sqlite3VdbeAddOp2(v, OP_RowSetAdd, regRowSet, regOldRowid);
+    }
+  
+    /* End the database scan loop.
+    */
+    sqlite3WhereEnd(pWInfo);
+  }else{
+    int iPk;         /* First of nPk memory cells holding PRIMARY KEY value */
+    i16 nPk;         /* Number of components of the PRIMARY KEY */
+    int addrOpen;    /* Address of the OpenEphemeral instruction */
+
+    assert( pPk!=0 );
+    nPk = pPk->nKeyCol;
+    iPk = pParse->nMem+1;
+    pParse->nMem += nPk;
+    regKey = ++pParse->nMem;
+    iEph = pParse->nTab++;
+    sqlite3VdbeAddOp2(v, OP_Null, 0, iPk);
+    addrOpen = sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iEph, nPk);
+    sqlite3VdbeSetP4KeyInfo(pParse, pPk);
+    pWInfo = sqlite3WhereBegin(pParse, pTabList, pWhere, 0, 0, 
+                               WHERE_ONEPASS_DESIRED, iIdxCur);
+    if( pWInfo==0 ) goto update_cleanup;
+    okOnePass = sqlite3WhereOkOnePass(pWInfo, aiCurOnePass);
+    for(i=0; i<nPk; i++){
+      sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, pPk->aiColumn[i],
+                                      iPk+i);
+    }
+    if( okOnePass ){
+      sqlite3VdbeChangeToNoop(v, addrOpen);
+      nKey = nPk;
+      regKey = iPk;
+    }else{
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, nPk, regKey,
+                        sqlite3IndexAffinityStr(v, pPk), nPk);
+      sqlite3VdbeAddOp2(v, OP_IdxInsert, iEph, regKey);
+    }
+    sqlite3WhereEnd(pWInfo);
+  }
+
+  /* Initialize the count of updated rows
+  */
+  if( (db->flags & SQLITE_CountRows) && !pParse->pTriggerTab ){
+    regRowCount = ++pParse->nMem;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regRowCount);
+  }
+
+  labelBreak = sqlite3VdbeMakeLabel(v);
+  if( !isView ){
+    /* 
+    ** Open every index that needs updating.  Note that if any
+    ** index could potentially invoke a REPLACE conflict resolution 
+    ** action, then we need to open all indices because we might need
+    ** to be deleting some records.
+    */
+    if( onError==OE_Replace ){
+      memset(aToOpen, 1, nIdx+1);
+    }else{
+      for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+        if( pIdx->onError==OE_Replace ){
+          memset(aToOpen, 1, nIdx+1);
