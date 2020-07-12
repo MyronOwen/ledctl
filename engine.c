@@ -114155,3 +114155,245 @@ SQLITE_PRIVATE int sqlite3VtabSync(sqlite3 *db, Vdbe *p){
 
 /*
 ** Invoke the xRollback method of all virtual tables in the 
+** sqlite3.aVTrans array. Then clear the array itself.
+*/
+SQLITE_PRIVATE int sqlite3VtabRollback(sqlite3 *db){
+  callFinaliser(db, offsetof(sqlite3_module,xRollback));
+  return SQLITE_OK;
+}
+
+/*
+** Invoke the xCommit method of all virtual tables in the 
+** sqlite3.aVTrans array. Then clear the array itself.
+*/
+SQLITE_PRIVATE int sqlite3VtabCommit(sqlite3 *db){
+  callFinaliser(db, offsetof(sqlite3_module,xCommit));
+  return SQLITE_OK;
+}
+
+/*
+** If the virtual table pVtab supports the transaction interface
+** (xBegin/xRollback/xCommit and optionally xSync) and a transaction is
+** not currently open, invoke the xBegin method now.
+**
+** If the xBegin call is successful, place the sqlite3_vtab pointer
+** in the sqlite3.aVTrans array.
+*/
+SQLITE_PRIVATE int sqlite3VtabBegin(sqlite3 *db, VTable *pVTab){
+  int rc = SQLITE_OK;
+  const sqlite3_module *pModule;
+
+  /* Special case: If db->aVTrans is NULL and db->nVTrans is greater
+  ** than zero, then this function is being called from within a
+  ** virtual module xSync() callback. It is illegal to write to 
+  ** virtual module tables in this case, so return SQLITE_LOCKED.
+  */
+  if( sqlite3VtabInSync(db) ){
+    return SQLITE_LOCKED;
+  }
+  if( !pVTab ){
+    return SQLITE_OK;
+  } 
+  pModule = pVTab->pVtab->pModule;
+
+  if( pModule->xBegin ){
+    int i;
+
+    /* If pVtab is already in the aVTrans array, return early */
+    for(i=0; i<db->nVTrans; i++){
+      if( db->aVTrans[i]==pVTab ){
+        return SQLITE_OK;
+      }
+    }
+
+    /* Invoke the xBegin method. If successful, add the vtab to the 
+    ** sqlite3.aVTrans[] array. */
+    rc = growVTrans(db);
+    if( rc==SQLITE_OK ){
+      rc = pModule->xBegin(pVTab->pVtab);
+      if( rc==SQLITE_OK ){
+        addToVTrans(db, pVTab);
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** Invoke either the xSavepoint, xRollbackTo or xRelease method of all
+** virtual tables that currently have an open transaction. Pass iSavepoint
+** as the second argument to the virtual table method invoked.
+**
+** If op is SAVEPOINT_BEGIN, the xSavepoint method is invoked. If it is
+** SAVEPOINT_ROLLBACK, the xRollbackTo method. Otherwise, if op is 
+** SAVEPOINT_RELEASE, then the xRelease method of each virtual table with
+** an open transaction is invoked.
+**
+** If any virtual table method returns an error code other than SQLITE_OK, 
+** processing is abandoned and the error returned to the caller of this
+** function immediately. If all calls to virtual table methods are successful,
+** SQLITE_OK is returned.
+*/
+SQLITE_PRIVATE int sqlite3VtabSavepoint(sqlite3 *db, int op, int iSavepoint){
+  int rc = SQLITE_OK;
+
+  assert( op==SAVEPOINT_RELEASE||op==SAVEPOINT_ROLLBACK||op==SAVEPOINT_BEGIN );
+  assert( iSavepoint>=0 );
+  if( db->aVTrans ){
+    int i;
+    for(i=0; rc==SQLITE_OK && i<db->nVTrans; i++){
+      VTable *pVTab = db->aVTrans[i];
+      const sqlite3_module *pMod = pVTab->pMod->pModule;
+      if( pVTab->pVtab && pMod->iVersion>=2 ){
+        int (*xMethod)(sqlite3_vtab *, int);
+        switch( op ){
+          case SAVEPOINT_BEGIN:
+            xMethod = pMod->xSavepoint;
+            pVTab->iSavepoint = iSavepoint+1;
+            break;
+          case SAVEPOINT_ROLLBACK:
+            xMethod = pMod->xRollbackTo;
+            break;
+          default:
+            xMethod = pMod->xRelease;
+            break;
+        }
+        if( xMethod && pVTab->iSavepoint>iSavepoint ){
+          rc = xMethod(pVTab->pVtab, iSavepoint);
+        }
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** The first parameter (pDef) is a function implementation.  The
+** second parameter (pExpr) is the first argument to this function.
+** If pExpr is a column in a virtual table, then let the virtual
+** table implementation have an opportunity to overload the function.
+**
+** This routine is used to allow virtual table implementations to
+** overload MATCH, LIKE, GLOB, and REGEXP operators.
+**
+** Return either the pDef argument (indicating no change) or a 
+** new FuncDef structure that is marked as ephemeral using the
+** SQLITE_FUNC_EPHEM flag.
+*/
+SQLITE_PRIVATE FuncDef *sqlite3VtabOverloadFunction(
+  sqlite3 *db,    /* Database connection for reporting malloc problems */
+  FuncDef *pDef,  /* Function to possibly overload */
+  int nArg,       /* Number of arguments to the function */
+  Expr *pExpr     /* First argument to the function */
+){
+  Table *pTab;
+  sqlite3_vtab *pVtab;
+  sqlite3_module *pMod;
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**) = 0;
+  void *pArg = 0;
+  FuncDef *pNew;
+  int rc = 0;
+  char *zLowerName;
+  unsigned char *z;
+
+
+  /* Check to see the left operand is a column in a virtual table */
+  if( NEVER(pExpr==0) ) return pDef;
+  if( pExpr->op!=TK_COLUMN ) return pDef;
+  pTab = pExpr->pTab;
+  if( NEVER(pTab==0) ) return pDef;
+  if( (pTab->tabFlags & TF_Virtual)==0 ) return pDef;
+  pVtab = sqlite3GetVTable(db, pTab)->pVtab;
+  assert( pVtab!=0 );
+  assert( pVtab->pModule!=0 );
+  pMod = (sqlite3_module *)pVtab->pModule;
+  if( pMod->xFindFunction==0 ) return pDef;
+ 
+  /* Call the xFindFunction method on the virtual table implementation
+  ** to see if the implementation wants to overload this function 
+  */
+  zLowerName = sqlite3DbStrDup(db, pDef->zName);
+  if( zLowerName ){
+    for(z=(unsigned char*)zLowerName; *z; z++){
+      *z = sqlite3UpperToLower[*z];
+    }
+    rc = pMod->xFindFunction(pVtab, nArg, zLowerName, &xFunc, &pArg);
+    sqlite3DbFree(db, zLowerName);
+  }
+  if( rc==0 ){
+    return pDef;
+  }
+
+  /* Create a new ephemeral function definition for the overloaded
+  ** function */
+  pNew = sqlite3DbMallocZero(db, sizeof(*pNew)
+                             + sqlite3Strlen30(pDef->zName) + 1);
+  if( pNew==0 ){
+    return pDef;
+  }
+  *pNew = *pDef;
+  pNew->zName = (char *)&pNew[1];
+  memcpy(pNew->zName, pDef->zName, sqlite3Strlen30(pDef->zName)+1);
+  pNew->xFunc = xFunc;
+  pNew->pUserData = pArg;
+  pNew->funcFlags |= SQLITE_FUNC_EPHEM;
+  return pNew;
+}
+
+/*
+** Make sure virtual table pTab is contained in the pParse->apVirtualLock[]
+** array so that an OP_VBegin will get generated for it.  Add pTab to the
+** array if it is missing.  If pTab is already in the array, this routine
+** is a no-op.
+*/
+SQLITE_PRIVATE void sqlite3VtabMakeWritable(Parse *pParse, Table *pTab){
+  Parse *pToplevel = sqlite3ParseToplevel(pParse);
+  int i, n;
+  Table **apVtabLock;
+
+  assert( IsVirtual(pTab) );
+  for(i=0; i<pToplevel->nVtabLock; i++){
+    if( pTab==pToplevel->apVtabLock[i] ) return;
+  }
+  n = (pToplevel->nVtabLock+1)*sizeof(pToplevel->apVtabLock[0]);
+  apVtabLock = sqlite3_realloc(pToplevel->apVtabLock, n);
+  if( apVtabLock ){
+    pToplevel->apVtabLock = apVtabLock;
+    pToplevel->apVtabLock[pToplevel->nVtabLock++] = pTab;
+  }else{
+    pToplevel->db->mallocFailed = 1;
+  }
+}
+
+/*
+** Return the ON CONFLICT resolution mode in effect for the virtual
+** table update operation currently in progress.
+**
+** The results of this routine are undefined unless it is called from
+** within an xUpdate method.
+*/
+SQLITE_API int sqlite3_vtab_on_conflict(sqlite3 *db){
+  static const unsigned char aMap[] = { 
+    SQLITE_ROLLBACK, SQLITE_ABORT, SQLITE_FAIL, SQLITE_IGNORE, SQLITE_REPLACE 
+  };
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
+#endif
+  assert( OE_Rollback==1 && OE_Abort==2 && OE_Fail==3 );
+  assert( OE_Ignore==4 && OE_Replace==5 );
+  assert( db->vtabOnConflict>=1 && db->vtabOnConflict<=5 );
+  return (int)aMap[db->vtabOnConflict-1];
+}
+
+/*
+** Call from within the xCreate() or xConnect() methods to provide 
+** the SQLite core with additional information about the behavior
+** of the virtual table being implemented.
+*/
+SQLITE_API int sqlite3_vtab_config(sqlite3 *db, int op, ...){
+  va_list ap;
+  int rc = SQLITE_OK;
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
+#endif
