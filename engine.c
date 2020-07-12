@@ -115060,3 +115060,223 @@ static void whereAndInfoDelete(sqlite3 *db, WhereAndInfo *p){
 ** itself is not freed.  This routine is the inverse of whereClauseInit().
 */
 static void whereClauseClear(WhereClause *pWC){
+  int i;
+  WhereTerm *a;
+  sqlite3 *db = pWC->pWInfo->pParse->db;
+  for(i=pWC->nTerm-1, a=pWC->a; i>=0; i--, a++){
+    if( a->wtFlags & TERM_DYNAMIC ){
+      sqlite3ExprDelete(db, a->pExpr);
+    }
+    if( a->wtFlags & TERM_ORINFO ){
+      whereOrInfoDelete(db, a->u.pOrInfo);
+    }else if( a->wtFlags & TERM_ANDINFO ){
+      whereAndInfoDelete(db, a->u.pAndInfo);
+    }
+  }
+  if( pWC->a!=pWC->aStatic ){
+    sqlite3DbFree(db, pWC->a);
+  }
+}
+
+/*
+** Add a single new WhereTerm entry to the WhereClause object pWC.
+** The new WhereTerm object is constructed from Expr p and with wtFlags.
+** The index in pWC->a[] of the new WhereTerm is returned on success.
+** 0 is returned if the new WhereTerm could not be added due to a memory
+** allocation error.  The memory allocation failure will be recorded in
+** the db->mallocFailed flag so that higher-level functions can detect it.
+**
+** This routine will increase the size of the pWC->a[] array as necessary.
+**
+** If the wtFlags argument includes TERM_DYNAMIC, then responsibility
+** for freeing the expression p is assumed by the WhereClause object pWC.
+** This is true even if this routine fails to allocate a new WhereTerm.
+**
+** WARNING:  This routine might reallocate the space used to store
+** WhereTerms.  All pointers to WhereTerms should be invalidated after
+** calling this routine.  Such pointers may be reinitialized by referencing
+** the pWC->a[] array.
+*/
+static int whereClauseInsert(WhereClause *pWC, Expr *p, u8 wtFlags){
+  WhereTerm *pTerm;
+  int idx;
+  testcase( wtFlags & TERM_VIRTUAL );
+  if( pWC->nTerm>=pWC->nSlot ){
+    WhereTerm *pOld = pWC->a;
+    sqlite3 *db = pWC->pWInfo->pParse->db;
+    pWC->a = sqlite3DbMallocRaw(db, sizeof(pWC->a[0])*pWC->nSlot*2 );
+    if( pWC->a==0 ){
+      if( wtFlags & TERM_DYNAMIC ){
+        sqlite3ExprDelete(db, p);
+      }
+      pWC->a = pOld;
+      return 0;
+    }
+    memcpy(pWC->a, pOld, sizeof(pWC->a[0])*pWC->nTerm);
+    if( pOld!=pWC->aStatic ){
+      sqlite3DbFree(db, pOld);
+    }
+    pWC->nSlot = sqlite3DbMallocSize(db, pWC->a)/sizeof(pWC->a[0]);
+    memset(&pWC->a[pWC->nTerm], 0, sizeof(pWC->a[0])*(pWC->nSlot-pWC->nTerm));
+  }
+  pTerm = &pWC->a[idx = pWC->nTerm++];
+  if( p && ExprHasProperty(p, EP_Unlikely) ){
+    pTerm->truthProb = sqlite3LogEst(p->iTable) - 270;
+  }else{
+    pTerm->truthProb = 1;
+  }
+  pTerm->pExpr = sqlite3ExprSkipCollate(p);
+  pTerm->wtFlags = wtFlags;
+  pTerm->pWC = pWC;
+  pTerm->iParent = -1;
+  return idx;
+}
+
+/*
+** This routine identifies subexpressions in the WHERE clause where
+** each subexpression is separated by the AND operator or some other
+** operator specified in the op parameter.  The WhereClause structure
+** is filled with pointers to subexpressions.  For example:
+**
+**    WHERE  a=='hello' AND coalesce(b,11)<10 AND (c+12!=d OR c==22)
+**           \________/     \_______________/     \________________/
+**            slot[0]            slot[1]               slot[2]
+**
+** The original WHERE clause in pExpr is unaltered.  All this routine
+** does is make slot[] entries point to substructure within pExpr.
+**
+** In the previous sentence and in the diagram, "slot[]" refers to
+** the WhereClause.a[] array.  The slot[] array grows as needed to contain
+** all terms of the WHERE clause.
+*/
+static void whereSplit(WhereClause *pWC, Expr *pExpr, u8 op){
+  pWC->op = op;
+  if( pExpr==0 ) return;
+  if( pExpr->op!=op ){
+    whereClauseInsert(pWC, pExpr, 0);
+  }else{
+    whereSplit(pWC, pExpr->pLeft, op);
+    whereSplit(pWC, pExpr->pRight, op);
+  }
+}
+
+/*
+** Initialize a WhereMaskSet object
+*/
+#define initMaskSet(P)  (P)->n=0
+
+/*
+** Return the bitmask for the given cursor number.  Return 0 if
+** iCursor is not in the set.
+*/
+static Bitmask getMask(WhereMaskSet *pMaskSet, int iCursor){
+  int i;
+  assert( pMaskSet->n<=(int)sizeof(Bitmask)*8 );
+  for(i=0; i<pMaskSet->n; i++){
+    if( pMaskSet->ix[i]==iCursor ){
+      return MASKBIT(i);
+    }
+  }
+  return 0;
+}
+
+/*
+** Create a new mask for cursor iCursor.
+**
+** There is one cursor per table in the FROM clause.  The number of
+** tables in the FROM clause is limited by a test early in the
+** sqlite3WhereBegin() routine.  So we know that the pMaskSet->ix[]
+** array will never overflow.
+*/
+static void createMask(WhereMaskSet *pMaskSet, int iCursor){
+  assert( pMaskSet->n < ArraySize(pMaskSet->ix) );
+  pMaskSet->ix[pMaskSet->n++] = iCursor;
+}
+
+/*
+** These routines walk (recursively) an expression tree and generate
+** a bitmask indicating which tables are used in that expression
+** tree.
+*/
+static Bitmask exprListTableUsage(WhereMaskSet*, ExprList*);
+static Bitmask exprSelectTableUsage(WhereMaskSet*, Select*);
+static Bitmask exprTableUsage(WhereMaskSet *pMaskSet, Expr *p){
+  Bitmask mask = 0;
+  if( p==0 ) return 0;
+  if( p->op==TK_COLUMN ){
+    mask = getMask(pMaskSet, p->iTable);
+    return mask;
+  }
+  mask = exprTableUsage(pMaskSet, p->pRight);
+  mask |= exprTableUsage(pMaskSet, p->pLeft);
+  if( ExprHasProperty(p, EP_xIsSelect) ){
+    mask |= exprSelectTableUsage(pMaskSet, p->x.pSelect);
+  }else{
+    mask |= exprListTableUsage(pMaskSet, p->x.pList);
+  }
+  return mask;
+}
+static Bitmask exprListTableUsage(WhereMaskSet *pMaskSet, ExprList *pList){
+  int i;
+  Bitmask mask = 0;
+  if( pList ){
+    for(i=0; i<pList->nExpr; i++){
+      mask |= exprTableUsage(pMaskSet, pList->a[i].pExpr);
+    }
+  }
+  return mask;
+}
+static Bitmask exprSelectTableUsage(WhereMaskSet *pMaskSet, Select *pS){
+  Bitmask mask = 0;
+  while( pS ){
+    SrcList *pSrc = pS->pSrc;
+    mask |= exprListTableUsage(pMaskSet, pS->pEList);
+    mask |= exprListTableUsage(pMaskSet, pS->pGroupBy);
+    mask |= exprListTableUsage(pMaskSet, pS->pOrderBy);
+    mask |= exprTableUsage(pMaskSet, pS->pWhere);
+    mask |= exprTableUsage(pMaskSet, pS->pHaving);
+    if( ALWAYS(pSrc!=0) ){
+      int i;
+      for(i=0; i<pSrc->nSrc; i++){
+        mask |= exprSelectTableUsage(pMaskSet, pSrc->a[i].pSelect);
+        mask |= exprTableUsage(pMaskSet, pSrc->a[i].pOn);
+      }
+    }
+    pS = pS->pPrior;
+  }
+  return mask;
+}
+
+/*
+** Return TRUE if the given operator is one of the operators that is
+** allowed for an indexable WHERE clause term.  The allowed operators are
+** "=", "<", ">", "<=", ">=", "IN", and "IS NULL"
+*/
+static int allowedOp(int op){
+  assert( TK_GT>TK_EQ && TK_GT<TK_GE );
+  assert( TK_LT>TK_EQ && TK_LT<TK_GE );
+  assert( TK_LE>TK_EQ && TK_LE<TK_GE );
+  assert( TK_GE==TK_EQ+4 );
+  return op==TK_IN || (op>=TK_EQ && op<=TK_GE) || op==TK_ISNULL;
+}
+
+/*
+** Commute a comparison operator.  Expressions of the form "X op Y"
+** are converted into "Y op X".
+**
+** If left/right precedence rules come into play when determining the
+** collating sequence, then COLLATE operators are adjusted to ensure
+** that the collating sequence does not change.  For example:
+** "Y collate NOCASE op X" becomes "X op Y" because any collation sequence on
+** the left hand side of a comparison overrides any collation sequence 
+** attached to the right. For the same reason the EP_Collate flag
+** is not commuted.
+*/
+static void exprCommute(Parse *pParse, Expr *pExpr){
+  u16 expRight = (pExpr->pRight->flags & EP_Collate);
+  u16 expLeft = (pExpr->pLeft->flags & EP_Collate);
+  assert( allowedOp(pExpr->op) && pExpr->op!=TK_IN );
+  if( expRight==expLeft ){
+    /* Either X and Y both have COLLATE operator or neither do */
+    if( expRight ){
+      /* Both X and Y have COLLATE operators.  Make sure X is always
