@@ -114807,3 +114807,256 @@ struct WhereAndInfo {
 ** does not really matter.  What is important is that sparse cursor
 ** numbers all get mapped into bit numbers that begin with 0 and contain
 ** no gaps.
+*/
+struct WhereMaskSet {
+  int n;                        /* Number of assigned cursor values */
+  int ix[BMS];                  /* Cursor assigned to each bit */
+};
+
+/*
+** This object is a convenience wrapper holding all information needed
+** to construct WhereLoop objects for a particular query.
+*/
+struct WhereLoopBuilder {
+  WhereInfo *pWInfo;        /* Information about this WHERE */
+  WhereClause *pWC;         /* WHERE clause terms */
+  ExprList *pOrderBy;       /* ORDER BY clause */
+  WhereLoop *pNew;          /* Template WhereLoop */
+  WhereOrSet *pOrSet;       /* Record best loops here, if not NULL */
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  UnpackedRecord *pRec;     /* Probe for stat4 (if required) */
+  int nRecValid;            /* Number of valid fields currently in pRec */
+#endif
+};
+
+/*
+** The WHERE clause processing routine has two halves.  The
+** first part does the start of the WHERE loop and the second
+** half does the tail of the WHERE loop.  An instance of
+** this structure is returned by the first half and passed
+** into the second half to give some continuity.
+**
+** An instance of this object holds the complete state of the query
+** planner.
+*/
+struct WhereInfo {
+  Parse *pParse;            /* Parsing and code generating context */
+  SrcList *pTabList;        /* List of tables in the join */
+  ExprList *pOrderBy;       /* The ORDER BY clause or NULL */
+  ExprList *pResultSet;     /* Result set. DISTINCT operates on these */
+  WhereLoop *pLoops;        /* List of all WhereLoop objects */
+  Bitmask revMask;          /* Mask of ORDER BY terms that need reversing */
+  LogEst nRowOut;           /* Estimated number of output rows */
+  u16 wctrlFlags;           /* Flags originally passed to sqlite3WhereBegin() */
+  i8 nOBSat;                /* Number of ORDER BY terms satisfied by indices */
+  u8 sorted;                /* True if really sorted (not just grouped) */
+  u8 okOnePass;             /* Ok to use one-pass algorithm for UPDATE/DELETE */
+  u8 untestedTerms;         /* Not all WHERE terms resolved by outer loop */
+  u8 eDistinct;             /* One of the WHERE_DISTINCT_* values below */
+  u8 nLevel;                /* Number of nested loop */
+  int iTop;                 /* The very beginning of the WHERE loop */
+  int iContinue;            /* Jump here to continue with next record */
+  int iBreak;               /* Jump here to break out of the loop */
+  int savedNQueryLoop;      /* pParse->nQueryLoop outside the WHERE loop */
+  int aiCurOnePass[2];      /* OP_OpenWrite cursors for the ONEPASS opt */
+  WhereMaskSet sMaskSet;    /* Map cursor numbers to bitmasks */
+  WhereClause sWC;          /* Decomposition of the WHERE clause */
+  WhereLevel a[1];          /* Information about each nest loop in WHERE */
+};
+
+/*
+** Bitmasks for the operators on WhereTerm objects.  These are all
+** operators that are of interest to the query planner.  An
+** OR-ed combination of these values can be used when searching for
+** particular WhereTerms within a WhereClause.
+*/
+#define WO_IN     0x001
+#define WO_EQ     0x002
+#define WO_LT     (WO_EQ<<(TK_LT-TK_EQ))
+#define WO_LE     (WO_EQ<<(TK_LE-TK_EQ))
+#define WO_GT     (WO_EQ<<(TK_GT-TK_EQ))
+#define WO_GE     (WO_EQ<<(TK_GE-TK_EQ))
+#define WO_MATCH  0x040
+#define WO_ISNULL 0x080
+#define WO_OR     0x100       /* Two or more OR-connected terms */
+#define WO_AND    0x200       /* Two or more AND-connected terms */
+#define WO_EQUIV  0x400       /* Of the form A==B, both columns */
+#define WO_NOOP   0x800       /* This term does not restrict search space */
+
+#define WO_ALL    0xfff       /* Mask of all possible WO_* values */
+#define WO_SINGLE 0x0ff       /* Mask of all non-compound WO_* values */
+
+/*
+** These are definitions of bits in the WhereLoop.wsFlags field.
+** The particular combination of bits in each WhereLoop help to
+** determine the algorithm that WhereLoop represents.
+*/
+#define WHERE_COLUMN_EQ    0x00000001  /* x=EXPR */
+#define WHERE_COLUMN_RANGE 0x00000002  /* x<EXPR and/or x>EXPR */
+#define WHERE_COLUMN_IN    0x00000004  /* x IN (...) */
+#define WHERE_COLUMN_NULL  0x00000008  /* x IS NULL */
+#define WHERE_CONSTRAINT   0x0000000f  /* Any of the WHERE_COLUMN_xxx values */
+#define WHERE_TOP_LIMIT    0x00000010  /* x<EXPR or x<=EXPR constraint */
+#define WHERE_BTM_LIMIT    0x00000020  /* x>EXPR or x>=EXPR constraint */
+#define WHERE_BOTH_LIMIT   0x00000030  /* Both x>EXPR and x<EXPR */
+#define WHERE_IDX_ONLY     0x00000040  /* Use index only - omit table */
+#define WHERE_IPK          0x00000100  /* x is the INTEGER PRIMARY KEY */
+#define WHERE_INDEXED      0x00000200  /* WhereLoop.u.btree.pIndex is valid */
+#define WHERE_VIRTUALTABLE 0x00000400  /* WhereLoop.u.vtab is valid */
+#define WHERE_IN_ABLE      0x00000800  /* Able to support an IN operator */
+#define WHERE_ONEROW       0x00001000  /* Selects no more than one row */
+#define WHERE_MULTI_OR     0x00002000  /* OR using multiple indices */
+#define WHERE_AUTO_INDEX   0x00004000  /* Uses an ephemeral index */
+#define WHERE_SKIPSCAN     0x00008000  /* Uses the skip-scan algorithm */
+#define WHERE_UNQ_WANTED   0x00010000  /* WHERE_ONEROW would have been helpful*/
+#define WHERE_PARTIALIDX   0x00020000  /* The automatic index is partial */
+
+/************** End of whereInt.h ********************************************/
+/************** Continuing where we left off in where.c **********************/
+
+/*
+** Return the estimated number of output rows from a WHERE clause
+*/
+SQLITE_PRIVATE u64 sqlite3WhereOutputRowCount(WhereInfo *pWInfo){
+  return sqlite3LogEstToInt(pWInfo->nRowOut);
+}
+
+/*
+** Return one of the WHERE_DISTINCT_xxxxx values to indicate how this
+** WHERE clause returns outputs for DISTINCT processing.
+*/
+SQLITE_PRIVATE int sqlite3WhereIsDistinct(WhereInfo *pWInfo){
+  return pWInfo->eDistinct;
+}
+
+/*
+** Return TRUE if the WHERE clause returns rows in ORDER BY order.
+** Return FALSE if the output needs to be sorted.
+*/
+SQLITE_PRIVATE int sqlite3WhereIsOrdered(WhereInfo *pWInfo){
+  return pWInfo->nOBSat;
+}
+
+/*
+** Return the VDBE address or label to jump to in order to continue
+** immediately with the next row of a WHERE clause.
+*/
+SQLITE_PRIVATE int sqlite3WhereContinueLabel(WhereInfo *pWInfo){
+  assert( pWInfo->iContinue!=0 );
+  return pWInfo->iContinue;
+}
+
+/*
+** Return the VDBE address or label to jump to in order to break
+** out of a WHERE loop.
+*/
+SQLITE_PRIVATE int sqlite3WhereBreakLabel(WhereInfo *pWInfo){
+  return pWInfo->iBreak;
+}
+
+/*
+** Return TRUE if an UPDATE or DELETE statement can operate directly on
+** the rowids returned by a WHERE clause.  Return FALSE if doing an
+** UPDATE or DELETE might change subsequent WHERE clause results.
+**
+** If the ONEPASS optimization is used (if this routine returns true)
+** then also write the indices of open cursors used by ONEPASS
+** into aiCur[0] and aiCur[1].  iaCur[0] gets the cursor of the data
+** table and iaCur[1] gets the cursor used by an auxiliary index.
+** Either value may be -1, indicating that cursor is not used.
+** Any cursors returned will have been opened for writing.
+**
+** aiCur[0] and aiCur[1] both get -1 if the where-clause logic is
+** unable to use the ONEPASS optimization.
+*/
+SQLITE_PRIVATE int sqlite3WhereOkOnePass(WhereInfo *pWInfo, int *aiCur){
+  memcpy(aiCur, pWInfo->aiCurOnePass, sizeof(int)*2);
+  return pWInfo->okOnePass;
+}
+
+/*
+** Move the content of pSrc into pDest
+*/
+static void whereOrMove(WhereOrSet *pDest, WhereOrSet *pSrc){
+  pDest->n = pSrc->n;
+  memcpy(pDest->a, pSrc->a, pDest->n*sizeof(pDest->a[0]));
+}
+
+/*
+** Try to insert a new prerequisite/cost entry into the WhereOrSet pSet.
+**
+** The new entry might overwrite an existing entry, or it might be
+** appended, or it might be discarded.  Do whatever is the right thing
+** so that pSet keeps the N_OR_COST best entries seen so far.
+*/
+static int whereOrInsert(
+  WhereOrSet *pSet,      /* The WhereOrSet to be updated */
+  Bitmask prereq,        /* Prerequisites of the new entry */
+  LogEst rRun,           /* Run-cost of the new entry */
+  LogEst nOut            /* Number of outputs for the new entry */
+){
+  u16 i;
+  WhereOrCost *p;
+  for(i=pSet->n, p=pSet->a; i>0; i--, p++){
+    if( rRun<=p->rRun && (prereq & p->prereq)==prereq ){
+      goto whereOrInsert_done;
+    }
+    if( p->rRun<=rRun && (p->prereq & prereq)==p->prereq ){
+      return 0;
+    }
+  }
+  if( pSet->n<N_OR_COST ){
+    p = &pSet->a[pSet->n++];
+    p->nOut = nOut;
+  }else{
+    p = pSet->a;
+    for(i=1; i<pSet->n; i++){
+      if( p->rRun>pSet->a[i].rRun ) p = pSet->a + i;
+    }
+    if( p->rRun<=rRun ) return 0;
+  }
+whereOrInsert_done:
+  p->prereq = prereq;
+  p->rRun = rRun;
+  if( p->nOut>nOut ) p->nOut = nOut;
+  return 1;
+}
+
+/*
+** Initialize a preallocated WhereClause structure.
+*/
+static void whereClauseInit(
+  WhereClause *pWC,        /* The WhereClause to be initialized */
+  WhereInfo *pWInfo        /* The WHERE processing context */
+){
+  pWC->pWInfo = pWInfo;
+  pWC->pOuter = 0;
+  pWC->nTerm = 0;
+  pWC->nSlot = ArraySize(pWC->aStatic);
+  pWC->a = pWC->aStatic;
+}
+
+/* Forward reference */
+static void whereClauseClear(WhereClause*);
+
+/*
+** Deallocate all memory associated with a WhereOrInfo object.
+*/
+static void whereOrInfoDelete(sqlite3 *db, WhereOrInfo *p){
+  whereClauseClear(&p->wc);
+  sqlite3DbFree(db, p);
+}
+
+/*
+** Deallocate all memory associated with a WhereAndInfo object.
+*/
+static void whereAndInfoDelete(sqlite3 *db, WhereAndInfo *p){
+  whereClauseClear(&p->wc);
+  sqlite3DbFree(db, p);
+}
+
+/*
+** Deallocate a WhereClause structure.  The WhereClause structure
+** itself is not freed.  This routine is the inverse of whereClauseInit().
+*/
+static void whereClauseClear(WhereClause *pWC){
