@@ -114397,3 +114397,201 @@ SQLITE_API int sqlite3_vtab_config(sqlite3 *db, int op, ...){
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
 #endif
+  sqlite3_mutex_enter(db->mutex);
+  va_start(ap, op);
+  switch( op ){
+    case SQLITE_VTAB_CONSTRAINT_SUPPORT: {
+      VtabCtx *p = db->pVtabCtx;
+      if( !p ){
+        rc = SQLITE_MISUSE_BKPT;
+      }else{
+        assert( p->pTab==0 || (p->pTab->tabFlags & TF_Virtual)!=0 );
+        p->pVTable->bConstraint = (u8)va_arg(ap, int);
+      }
+      break;
+    }
+    default:
+      rc = SQLITE_MISUSE_BKPT;
+      break;
+  }
+  va_end(ap);
+
+  if( rc!=SQLITE_OK ) sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+/************** End of vtab.c ************************************************/
+/************** Begin file where.c *******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This module contains C code that generates VDBE code used to process
+** the WHERE clause of SQL statements.  This module is responsible for
+** generating the code that loops through a table looking for applicable
+** rows.  Indices are selected and used to speed the search when doing
+** so is applicable.  Because this module is responsible for selecting
+** indices, you might also think of this module as the "query optimizer".
+*/
+/************** Include whereInt.h in the middle of where.c ******************/
+/************** Begin file whereInt.h ****************************************/
+/*
+** 2013-11-12
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains structure and macro definitions for the query
+** planner logic in "where.c".  These definitions are broken out into
+** a separate source file for easier editing.
+*/
+
+/*
+** Trace output macros
+*/
+#if defined(SQLITE_TEST) || defined(SQLITE_DEBUG)
+/***/ int sqlite3WhereTrace = 0;
+#endif
+#if defined(SQLITE_DEBUG) \
+    && (defined(SQLITE_TEST) || defined(SQLITE_ENABLE_WHERETRACE))
+# define WHERETRACE(K,X)  if(sqlite3WhereTrace&(K)) sqlite3DebugPrintf X
+# define WHERETRACE_ENABLED 1
+#else
+# define WHERETRACE(K,X)
+#endif
+
+/* Forward references
+*/
+typedef struct WhereClause WhereClause;
+typedef struct WhereMaskSet WhereMaskSet;
+typedef struct WhereOrInfo WhereOrInfo;
+typedef struct WhereAndInfo WhereAndInfo;
+typedef struct WhereLevel WhereLevel;
+typedef struct WhereLoop WhereLoop;
+typedef struct WherePath WherePath;
+typedef struct WhereTerm WhereTerm;
+typedef struct WhereLoopBuilder WhereLoopBuilder;
+typedef struct WhereScan WhereScan;
+typedef struct WhereOrCost WhereOrCost;
+typedef struct WhereOrSet WhereOrSet;
+
+/*
+** This object contains information needed to implement a single nested
+** loop in WHERE clause.
+**
+** Contrast this object with WhereLoop.  This object describes the
+** implementation of the loop.  WhereLoop describes the algorithm.
+** This object contains a pointer to the WhereLoop algorithm as one of
+** its elements.
+**
+** The WhereInfo object contains a single instance of this object for
+** each term in the FROM clause (which is to say, for each of the
+** nested loops as implemented).  The order of WhereLevel objects determines
+** the loop nested order, with WhereInfo.a[0] being the outer loop and
+** WhereInfo.a[WhereInfo.nLevel-1] being the inner loop.
+*/
+struct WhereLevel {
+  int iLeftJoin;        /* Memory cell used to implement LEFT OUTER JOIN */
+  int iTabCur;          /* The VDBE cursor used to access the table */
+  int iIdxCur;          /* The VDBE cursor used to access pIdx */
+  int addrBrk;          /* Jump here to break out of the loop */
+  int addrNxt;          /* Jump here to start the next IN combination */
+  int addrSkip;         /* Jump here for next iteration of skip-scan */
+  int addrCont;         /* Jump here to continue with the next loop cycle */
+  int addrFirst;        /* First instruction of interior of the loop */
+  int addrBody;         /* Beginning of the body of this loop */
+  u8 iFrom;             /* Which entry in the FROM clause */
+  u8 op, p3, p5;        /* Opcode, P3 & P5 of the opcode that ends the loop */
+  int p1, p2;           /* Operands of the opcode used to ends the loop */
+  union {               /* Information that depends on pWLoop->wsFlags */
+    struct {
+      int nIn;              /* Number of entries in aInLoop[] */
+      struct InLoop {
+        int iCur;              /* The VDBE cursor used by this IN operator */
+        int addrInTop;         /* Top of the IN loop */
+        u8 eEndLoopOp;         /* IN Loop terminator. OP_Next or OP_Prev */
+      } *aInLoop;           /* Information about each nested IN operator */
+    } in;                 /* Used when pWLoop->wsFlags&WHERE_IN_ABLE */
+    Index *pCovidx;       /* Possible covering index for WHERE_MULTI_OR */
+  } u;
+  struct WhereLoop *pWLoop;  /* The selected WhereLoop object */
+  Bitmask notReady;          /* FROM entries not usable at this level */
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  int addrVisit;        /* Address at which row is visited */
+#endif
+};
+
+/*
+** Each instance of this object represents an algorithm for evaluating one
+** term of a join.  Every term of the FROM clause will have at least
+** one corresponding WhereLoop object (unless INDEXED BY constraints
+** prevent a query solution - which is an error) and many terms of the
+** FROM clause will have multiple WhereLoop objects, each describing a
+** potential way of implementing that FROM-clause term, together with
+** dependencies and cost estimates for using the chosen algorithm.
+**
+** Query planning consists of building up a collection of these WhereLoop
+** objects, then computing a particular sequence of WhereLoop objects, with
+** one WhereLoop object per FROM clause term, that satisfy all dependencies
+** and that minimize the overall cost.
+*/
+struct WhereLoop {
+  Bitmask prereq;       /* Bitmask of other loops that must run first */
+  Bitmask maskSelf;     /* Bitmask identifying table iTab */
+#ifdef SQLITE_DEBUG
+  char cId;             /* Symbolic ID of this loop for debugging use */
+#endif
+  u8 iTab;              /* Position in FROM clause of table for this loop */
+  u8 iSortIdx;          /* Sorting index number.  0==None */
+  LogEst rSetup;        /* One-time setup cost (ex: create transient index) */
+  LogEst rRun;          /* Cost of running each loop */
+  LogEst nOut;          /* Estimated number of output rows */
+  union {
+    struct {               /* Information for internal btree tables */
+      u16 nEq;               /* Number of equality constraints */
+      Index *pIndex;         /* Index used, or NULL */
+    } btree;
+    struct {               /* Information for virtual tables */
+      int idxNum;            /* Index number */
+      u8 needFree;           /* True if sqlite3_free(idxStr) is needed */
+      i8 isOrdered;          /* True if satisfies ORDER BY */
+      u16 omitMask;          /* Terms that may be omitted */
+      char *idxStr;          /* Index identifier string */
+    } vtab;
+  } u;
+  u32 wsFlags;          /* WHERE_* flags describing the plan */
+  u16 nLTerm;           /* Number of entries in aLTerm[] */
+  u16 nSkip;            /* Number of NULL aLTerm[] entries */
+  /**** whereLoopXfer() copies fields above ***********************/
+# define WHERE_LOOP_XFER_SZ offsetof(WhereLoop,nLSlot)
+  u16 nLSlot;           /* Number of slots allocated for aLTerm[] */
+  WhereTerm **aLTerm;   /* WhereTerms used */
+  WhereLoop *pNextLoop; /* Next WhereLoop object in the WhereClause */
+  WhereTerm *aLTermSpace[3];  /* Initial aLTerm[] space */
+};
+
+/* This object holds the prerequisites and the cost of running a
+** subquery on one operand of an OR operator in the WHERE clause.
+** See WhereOrSet for additional information 
+*/
+struct WhereOrCost {
+  Bitmask prereq;     /* Prerequisites */
+  LogEst rRun;        /* Cost of running this subquery */
+  LogEst nOut;        /* Number of outputs for this subquery */
+};
