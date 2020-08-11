@@ -115280,3 +115280,244 @@ static void exprCommute(Parse *pParse, Expr *pExpr){
     /* Either X and Y both have COLLATE operator or neither do */
     if( expRight ){
       /* Both X and Y have COLLATE operators.  Make sure X is always
+      ** used by clearing the EP_Collate flag from Y. */
+      pExpr->pRight->flags &= ~EP_Collate;
+    }else if( sqlite3ExprCollSeq(pParse, pExpr->pLeft)!=0 ){
+      /* Neither X nor Y have COLLATE operators, but X has a non-default
+      ** collating sequence.  So add the EP_Collate marker on X to cause
+      ** it to be searched first. */
+      pExpr->pLeft->flags |= EP_Collate;
+    }
+  }
+  SWAP(Expr*,pExpr->pRight,pExpr->pLeft);
+  if( pExpr->op>=TK_GT ){
+    assert( TK_LT==TK_GT+2 );
+    assert( TK_GE==TK_LE+2 );
+    assert( TK_GT>TK_EQ );
+    assert( TK_GT<TK_LE );
+    assert( pExpr->op>=TK_GT && pExpr->op<=TK_GE );
+    pExpr->op = ((pExpr->op-TK_GT)^2)+TK_GT;
+  }
+}
+
+/*
+** Translate from TK_xx operator to WO_xx bitmask.
+*/
+static u16 operatorMask(int op){
+  u16 c;
+  assert( allowedOp(op) );
+  if( op==TK_IN ){
+    c = WO_IN;
+  }else if( op==TK_ISNULL ){
+    c = WO_ISNULL;
+  }else{
+    assert( (WO_EQ<<(op-TK_EQ)) < 0x7fff );
+    c = (u16)(WO_EQ<<(op-TK_EQ));
+  }
+  assert( op!=TK_ISNULL || c==WO_ISNULL );
+  assert( op!=TK_IN || c==WO_IN );
+  assert( op!=TK_EQ || c==WO_EQ );
+  assert( op!=TK_LT || c==WO_LT );
+  assert( op!=TK_LE || c==WO_LE );
+  assert( op!=TK_GT || c==WO_GT );
+  assert( op!=TK_GE || c==WO_GE );
+  return c;
+}
+
+/*
+** Advance to the next WhereTerm that matches according to the criteria
+** established when the pScan object was initialized by whereScanInit().
+** Return NULL if there are no more matching WhereTerms.
+*/
+static WhereTerm *whereScanNext(WhereScan *pScan){
+  int iCur;            /* The cursor on the LHS of the term */
+  int iColumn;         /* The column on the LHS of the term.  -1 for IPK */
+  Expr *pX;            /* An expression being tested */
+  WhereClause *pWC;    /* Shorthand for pScan->pWC */
+  WhereTerm *pTerm;    /* The term being tested */
+  int k = pScan->k;    /* Where to start scanning */
+
+  while( pScan->iEquiv<=pScan->nEquiv ){
+    iCur = pScan->aEquiv[pScan->iEquiv-2];
+    iColumn = pScan->aEquiv[pScan->iEquiv-1];
+    while( (pWC = pScan->pWC)!=0 ){
+      for(pTerm=pWC->a+k; k<pWC->nTerm; k++, pTerm++){
+        if( pTerm->leftCursor==iCur
+         && pTerm->u.leftColumn==iColumn
+         && (pScan->iEquiv<=2 || !ExprHasProperty(pTerm->pExpr, EP_FromJoin))
+        ){
+          if( (pTerm->eOperator & WO_EQUIV)!=0
+           && pScan->nEquiv<ArraySize(pScan->aEquiv)
+          ){
+            int j;
+            pX = sqlite3ExprSkipCollate(pTerm->pExpr->pRight);
+            assert( pX->op==TK_COLUMN );
+            for(j=0; j<pScan->nEquiv; j+=2){
+              if( pScan->aEquiv[j]==pX->iTable
+               && pScan->aEquiv[j+1]==pX->iColumn ){
+                  break;
+              }
+            }
+            if( j==pScan->nEquiv ){
+              pScan->aEquiv[j] = pX->iTable;
+              pScan->aEquiv[j+1] = pX->iColumn;
+              pScan->nEquiv += 2;
+            }
+          }
+          if( (pTerm->eOperator & pScan->opMask)!=0 ){
+            /* Verify the affinity and collating sequence match */
+            if( pScan->zCollName && (pTerm->eOperator & WO_ISNULL)==0 ){
+              CollSeq *pColl;
+              Parse *pParse = pWC->pWInfo->pParse;
+              pX = pTerm->pExpr;
+              if( !sqlite3IndexAffinityOk(pX, pScan->idxaff) ){
+                continue;
+              }
+              assert(pX->pLeft);
+              pColl = sqlite3BinaryCompareCollSeq(pParse,
+                                                  pX->pLeft, pX->pRight);
+              if( pColl==0 ) pColl = pParse->db->pDfltColl;
+              if( sqlite3StrICmp(pColl->zName, pScan->zCollName) ){
+                continue;
+              }
+            }
+            if( (pTerm->eOperator & WO_EQ)!=0
+             && (pX = pTerm->pExpr->pRight)->op==TK_COLUMN
+             && pX->iTable==pScan->aEquiv[0]
+             && pX->iColumn==pScan->aEquiv[1]
+            ){
+              continue;
+            }
+            pScan->k = k+1;
+            return pTerm;
+          }
+        }
+      }
+      pScan->pWC = pScan->pWC->pOuter;
+      k = 0;
+    }
+    pScan->pWC = pScan->pOrigWC;
+    k = 0;
+    pScan->iEquiv += 2;
+  }
+  return 0;
+}
+
+/*
+** Initialize a WHERE clause scanner object.  Return a pointer to the
+** first match.  Return NULL if there are no matches.
+**
+** The scanner will be searching the WHERE clause pWC.  It will look
+** for terms of the form "X <op> <expr>" where X is column iColumn of table
+** iCur.  The <op> must be one of the operators described by opMask.
+**
+** If the search is for X and the WHERE clause contains terms of the
+** form X=Y then this routine might also return terms of the form
+** "Y <op> <expr>".  The number of levels of transitivity is limited,
+** but is enough to handle most commonly occurring SQL statements.
+**
+** If X is not the INTEGER PRIMARY KEY then X must be compatible with
+** index pIdx.
+*/
+static WhereTerm *whereScanInit(
+  WhereScan *pScan,       /* The WhereScan object being initialized */
+  WhereClause *pWC,       /* The WHERE clause to be scanned */
+  int iCur,               /* Cursor to scan for */
+  int iColumn,            /* Column to scan for */
+  u32 opMask,             /* Operator(s) to scan for */
+  Index *pIdx             /* Must be compatible with this index */
+){
+  int j;
+
+  /* memset(pScan, 0, sizeof(*pScan)); */
+  pScan->pOrigWC = pWC;
+  pScan->pWC = pWC;
+  if( pIdx && iColumn>=0 ){
+    pScan->idxaff = pIdx->pTable->aCol[iColumn].affinity;
+    for(j=0; pIdx->aiColumn[j]!=iColumn; j++){
+      if( NEVER(j>pIdx->nColumn) ) return 0;
+    }
+    pScan->zCollName = pIdx->azColl[j];
+  }else{
+    pScan->idxaff = 0;
+    pScan->zCollName = 0;
+  }
+  pScan->opMask = opMask;
+  pScan->k = 0;
+  pScan->aEquiv[0] = iCur;
+  pScan->aEquiv[1] = iColumn;
+  pScan->nEquiv = 2;
+  pScan->iEquiv = 2;
+  return whereScanNext(pScan);
+}
+
+/*
+** Search for a term in the WHERE clause that is of the form "X <op> <expr>"
+** where X is a reference to the iColumn of table iCur and <op> is one of
+** the WO_xx operator codes specified by the op parameter.
+** Return a pointer to the term.  Return 0 if not found.
+**
+** The term returned might by Y=<expr> if there is another constraint in
+** the WHERE clause that specifies that X=Y.  Any such constraints will be
+** identified by the WO_EQUIV bit in the pTerm->eOperator field.  The
+** aEquiv[] array holds X and all its equivalents, with each SQL variable
+** taking up two slots in aEquiv[].  The first slot is for the cursor number
+** and the second is for the column number.  There are 22 slots in aEquiv[]
+** so that means we can look for X plus up to 10 other equivalent values.
+** Hence a search for X will return <expr> if X=A1 and A1=A2 and A2=A3
+** and ... and A9=A10 and A10=<expr>.
+**
+** If there are multiple terms in the WHERE clause of the form "X <op> <expr>"
+** then try for the one with no dependencies on <expr> - in other words where
+** <expr> is a constant expression of some kind.  Only return entries of
+** the form "X <op> Y" where Y is a column in another table if no terms of
+** the form "X <op> <const-expr>" exist.   If no terms with a constant RHS
+** exist, try to return a term that does not use WO_EQUIV.
+*/
+static WhereTerm *findTerm(
+  WhereClause *pWC,     /* The WHERE clause to be searched */
+  int iCur,             /* Cursor number of LHS */
+  int iColumn,          /* Column number of LHS */
+  Bitmask notReady,     /* RHS must not overlap with this mask */
+  u32 op,               /* Mask of WO_xx values describing operator */
+  Index *pIdx           /* Must be compatible with this index, if not NULL */
+){
+  WhereTerm *pResult = 0;
+  WhereTerm *p;
+  WhereScan scan;
+
+  p = whereScanInit(&scan, pWC, iCur, iColumn, op, pIdx);
+  while( p ){
+    if( (p->prereqRight & notReady)==0 ){
+      if( p->prereqRight==0 && (p->eOperator&WO_EQ)!=0 ){
+        return p;
+      }
+      if( pResult==0 ) pResult = p;
+    }
+    p = whereScanNext(&scan);
+  }
+  return pResult;
+}
+
+/* Forward reference */
+static void exprAnalyze(SrcList*, WhereClause*, int);
+
+/*
+** Call exprAnalyze on all terms in a WHERE clause.  
+*/
+static void exprAnalyzeAll(
+  SrcList *pTabList,       /* the FROM clause */
+  WhereClause *pWC         /* the WHERE clause to be analyzed */
+){
+  int i;
+  for(i=pWC->nTerm-1; i>=0; i--){
+    exprAnalyze(pTabList, pWC, i);
+  }
+}
+
+#ifndef SQLITE_OMIT_LIKE_OPTIMIZATION
+/*
+** Check to see if the given expression is a LIKE or GLOB operator that
+** can be optimized using inequality constraints.  Return TRUE if it is
+** so and false if not.
+**
