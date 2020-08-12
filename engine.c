@@ -116016,3 +116016,234 @@ static void exprAnalyze(
   op = pExpr->op;
   if( op==TK_IN ){
     assert( pExpr->pRight==0 );
+    if( ExprHasProperty(pExpr, EP_xIsSelect) ){
+      pTerm->prereqRight = exprSelectTableUsage(pMaskSet, pExpr->x.pSelect);
+    }else{
+      pTerm->prereqRight = exprListTableUsage(pMaskSet, pExpr->x.pList);
+    }
+  }else if( op==TK_ISNULL ){
+    pTerm->prereqRight = 0;
+  }else{
+    pTerm->prereqRight = exprTableUsage(pMaskSet, pExpr->pRight);
+  }
+  prereqAll = exprTableUsage(pMaskSet, pExpr);
+  if( ExprHasProperty(pExpr, EP_FromJoin) ){
+    Bitmask x = getMask(pMaskSet, pExpr->iRightJoinTable);
+    prereqAll |= x;
+    extraRight = x-1;  /* ON clause terms may not be used with an index
+                       ** on left table of a LEFT JOIN.  Ticket #3015 */
+  }
+  pTerm->prereqAll = prereqAll;
+  pTerm->leftCursor = -1;
+  pTerm->iParent = -1;
+  pTerm->eOperator = 0;
+  if( allowedOp(op) ){
+    Expr *pLeft = sqlite3ExprSkipCollate(pExpr->pLeft);
+    Expr *pRight = sqlite3ExprSkipCollate(pExpr->pRight);
+    u16 opMask = (pTerm->prereqRight & prereqLeft)==0 ? WO_ALL : WO_EQUIV;
+    if( pLeft->op==TK_COLUMN ){
+      pTerm->leftCursor = pLeft->iTable;
+      pTerm->u.leftColumn = pLeft->iColumn;
+      pTerm->eOperator = operatorMask(op) & opMask;
+    }
+    if( pRight && pRight->op==TK_COLUMN ){
+      WhereTerm *pNew;
+      Expr *pDup;
+      u16 eExtraOp = 0;        /* Extra bits for pNew->eOperator */
+      if( pTerm->leftCursor>=0 ){
+        int idxNew;
+        pDup = sqlite3ExprDup(db, pExpr, 0);
+        if( db->mallocFailed ){
+          sqlite3ExprDelete(db, pDup);
+          return;
+        }
+        idxNew = whereClauseInsert(pWC, pDup, TERM_VIRTUAL|TERM_DYNAMIC);
+        if( idxNew==0 ) return;
+        pNew = &pWC->a[idxNew];
+        markTermAsChild(pWC, idxNew, idxTerm);
+        pTerm = &pWC->a[idxTerm];
+        pTerm->wtFlags |= TERM_COPIED;
+        if( pExpr->op==TK_EQ
+         && !ExprHasProperty(pExpr, EP_FromJoin)
+         && OptimizationEnabled(db, SQLITE_Transitive)
+        ){
+          pTerm->eOperator |= WO_EQUIV;
+          eExtraOp = WO_EQUIV;
+        }
+      }else{
+        pDup = pExpr;
+        pNew = pTerm;
+      }
+      exprCommute(pParse, pDup);
+      pLeft = sqlite3ExprSkipCollate(pDup->pLeft);
+      pNew->leftCursor = pLeft->iTable;
+      pNew->u.leftColumn = pLeft->iColumn;
+      testcase( (prereqLeft | extraRight) != prereqLeft );
+      pNew->prereqRight = prereqLeft | extraRight;
+      pNew->prereqAll = prereqAll;
+      pNew->eOperator = (operatorMask(pDup->op) + eExtraOp) & opMask;
+    }
+  }
+
+#ifndef SQLITE_OMIT_BETWEEN_OPTIMIZATION
+  /* If a term is the BETWEEN operator, create two new virtual terms
+  ** that define the range that the BETWEEN implements.  For example:
+  **
+  **      a BETWEEN b AND c
+  **
+  ** is converted into:
+  **
+  **      (a BETWEEN b AND c) AND (a>=b) AND (a<=c)
+  **
+  ** The two new terms are added onto the end of the WhereClause object.
+  ** The new terms are "dynamic" and are children of the original BETWEEN
+  ** term.  That means that if the BETWEEN term is coded, the children are
+  ** skipped.  Or, if the children are satisfied by an index, the original
+  ** BETWEEN term is skipped.
+  */
+  else if( pExpr->op==TK_BETWEEN && pWC->op==TK_AND ){
+    ExprList *pList = pExpr->x.pList;
+    int i;
+    static const u8 ops[] = {TK_GE, TK_LE};
+    assert( pList!=0 );
+    assert( pList->nExpr==2 );
+    for(i=0; i<2; i++){
+      Expr *pNewExpr;
+      int idxNew;
+      pNewExpr = sqlite3PExpr(pParse, ops[i], 
+                             sqlite3ExprDup(db, pExpr->pLeft, 0),
+                             sqlite3ExprDup(db, pList->a[i].pExpr, 0), 0);
+      transferJoinMarkings(pNewExpr, pExpr);
+      idxNew = whereClauseInsert(pWC, pNewExpr, TERM_VIRTUAL|TERM_DYNAMIC);
+      testcase( idxNew==0 );
+      exprAnalyze(pSrc, pWC, idxNew);
+      pTerm = &pWC->a[idxTerm];
+      markTermAsChild(pWC, idxNew, idxTerm);
+    }
+  }
+#endif /* SQLITE_OMIT_BETWEEN_OPTIMIZATION */
+
+#if !defined(SQLITE_OMIT_OR_OPTIMIZATION) && !defined(SQLITE_OMIT_SUBQUERY)
+  /* Analyze a term that is composed of two or more subterms connected by
+  ** an OR operator.
+  */
+  else if( pExpr->op==TK_OR ){
+    assert( pWC->op==TK_AND );
+    exprAnalyzeOrTerm(pSrc, pWC, idxTerm);
+    pTerm = &pWC->a[idxTerm];
+  }
+#endif /* SQLITE_OMIT_OR_OPTIMIZATION */
+
+#ifndef SQLITE_OMIT_LIKE_OPTIMIZATION
+  /* Add constraints to reduce the search space on a LIKE or GLOB
+  ** operator.
+  **
+  ** A like pattern of the form "x LIKE 'abc%'" is changed into constraints
+  **
+  **          x>='abc' AND x<'abd' AND x LIKE 'abc%'
+  **
+  ** The last character of the prefix "abc" is incremented to form the
+  ** termination condition "abd".
+  */
+  if( pWC->op==TK_AND 
+   && isLikeOrGlob(pParse, pExpr, &pStr1, &isComplete, &noCase)
+  ){
+    Expr *pLeft;       /* LHS of LIKE/GLOB operator */
+    Expr *pStr2;       /* Copy of pStr1 - RHS of LIKE/GLOB operator */
+    Expr *pNewExpr1;
+    Expr *pNewExpr2;
+    int idxNew1;
+    int idxNew2;
+    Token sCollSeqName;  /* Name of collating sequence */
+
+    pLeft = pExpr->x.pList->a[1].pExpr;
+    pStr2 = sqlite3ExprDup(db, pStr1, 0);
+    if( !db->mallocFailed ){
+      u8 c, *pC;       /* Last character before the first wildcard */
+      pC = (u8*)&pStr2->u.zToken[sqlite3Strlen30(pStr2->u.zToken)-1];
+      c = *pC;
+      if( noCase ){
+        /* The point is to increment the last character before the first
+        ** wildcard.  But if we increment '@', that will push it into the
+        ** alphabetic range where case conversions will mess up the 
+        ** inequality.  To avoid this, make sure to also run the full
+        ** LIKE on all candidate expressions by clearing the isComplete flag
+        */
+        if( c=='A'-1 ) isComplete = 0;
+        c = sqlite3UpperToLower[c];
+      }
+      *pC = c + 1;
+    }
+    sCollSeqName.z = noCase ? "NOCASE" : "BINARY";
+    sCollSeqName.n = 6;
+    pNewExpr1 = sqlite3ExprDup(db, pLeft, 0);
+    pNewExpr1 = sqlite3PExpr(pParse, TK_GE, 
+           sqlite3ExprAddCollateToken(pParse,pNewExpr1,&sCollSeqName),
+           pStr1, 0);
+    transferJoinMarkings(pNewExpr1, pExpr);
+    idxNew1 = whereClauseInsert(pWC, pNewExpr1, TERM_VIRTUAL|TERM_DYNAMIC);
+    testcase( idxNew1==0 );
+    exprAnalyze(pSrc, pWC, idxNew1);
+    pNewExpr2 = sqlite3ExprDup(db, pLeft, 0);
+    pNewExpr2 = sqlite3PExpr(pParse, TK_LT,
+           sqlite3ExprAddCollateToken(pParse,pNewExpr2,&sCollSeqName),
+           pStr2, 0);
+    transferJoinMarkings(pNewExpr2, pExpr);
+    idxNew2 = whereClauseInsert(pWC, pNewExpr2, TERM_VIRTUAL|TERM_DYNAMIC);
+    testcase( idxNew2==0 );
+    exprAnalyze(pSrc, pWC, idxNew2);
+    pTerm = &pWC->a[idxTerm];
+    if( isComplete ){
+      markTermAsChild(pWC, idxNew1, idxTerm);
+      markTermAsChild(pWC, idxNew2, idxTerm);
+    }
+  }
+#endif /* SQLITE_OMIT_LIKE_OPTIMIZATION */
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  /* Add a WO_MATCH auxiliary term to the constraint set if the
+  ** current expression is of the form:  column MATCH expr.
+  ** This information is used by the xBestIndex methods of
+  ** virtual tables.  The native query optimizer does not attempt
+  ** to do anything with MATCH functions.
+  */
+  if( isMatchOfColumn(pExpr) ){
+    int idxNew;
+    Expr *pRight, *pLeft;
+    WhereTerm *pNewTerm;
+    Bitmask prereqColumn, prereqExpr;
+
+    pRight = pExpr->x.pList->a[0].pExpr;
+    pLeft = pExpr->x.pList->a[1].pExpr;
+    prereqExpr = exprTableUsage(pMaskSet, pRight);
+    prereqColumn = exprTableUsage(pMaskSet, pLeft);
+    if( (prereqExpr & prereqColumn)==0 ){
+      Expr *pNewExpr;
+      pNewExpr = sqlite3PExpr(pParse, TK_MATCH, 
+                              0, sqlite3ExprDup(db, pRight, 0), 0);
+      idxNew = whereClauseInsert(pWC, pNewExpr, TERM_VIRTUAL|TERM_DYNAMIC);
+      testcase( idxNew==0 );
+      pNewTerm = &pWC->a[idxNew];
+      pNewTerm->prereqRight = prereqExpr;
+      pNewTerm->leftCursor = pLeft->iTable;
+      pNewTerm->u.leftColumn = pLeft->iColumn;
+      pNewTerm->eOperator = WO_MATCH;
+      markTermAsChild(pWC, idxNew, idxTerm);
+      pTerm = &pWC->a[idxTerm];
+      pTerm->wtFlags |= TERM_COPIED;
+      pNewTerm->prereqAll = pTerm->prereqAll;
+    }
+  }
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+  /* When sqlite_stat3 histogram data is available an operator of the
+  ** form "x IS NOT NULL" can sometimes be evaluated more efficiently
+  ** as "x>NULL" if x is not an INTEGER PRIMARY KEY.  So construct a
+  ** virtual term of that form.
+  **
+  ** Note that the virtual term must be tagged with TERM_VNULL.  This
+  ** TERM_VNULL tag will suppress the not-null check at the beginning
+  ** of the loop.  Without the TERM_VNULL flag, the not-null check at
+  ** the start of the loop will prevent any results from being returned.
+  */
