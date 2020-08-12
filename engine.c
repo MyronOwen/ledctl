@@ -115521,3 +115521,235 @@ static void exprAnalyzeAll(
 ** can be optimized using inequality constraints.  Return TRUE if it is
 ** so and false if not.
 **
+** In order for the operator to be optimizible, the RHS must be a string
+** literal that does not begin with a wildcard.  
+*/
+static int isLikeOrGlob(
+  Parse *pParse,    /* Parsing and code generating context */
+  Expr *pExpr,      /* Test this expression */
+  Expr **ppPrefix,  /* Pointer to TK_STRING expression with pattern prefix */
+  int *pisComplete, /* True if the only wildcard is % in the last character */
+  int *pnoCase      /* True if uppercase is equivalent to lowercase */
+){
+  const char *z = 0;         /* String on RHS of LIKE operator */
+  Expr *pRight, *pLeft;      /* Right and left size of LIKE operator */
+  ExprList *pList;           /* List of operands to the LIKE operator */
+  int c;                     /* One character in z[] */
+  int cnt;                   /* Number of non-wildcard prefix characters */
+  char wc[3];                /* Wildcard characters */
+  sqlite3 *db = pParse->db;  /* Database connection */
+  sqlite3_value *pVal = 0;
+  int op;                    /* Opcode of pRight */
+
+  if( !sqlite3IsLikeFunction(db, pExpr, pnoCase, wc) ){
+    return 0;
+  }
+#ifdef SQLITE_EBCDIC
+  if( *pnoCase ) return 0;
+#endif
+  pList = pExpr->x.pList;
+  pLeft = pList->a[1].pExpr;
+  if( pLeft->op!=TK_COLUMN 
+   || sqlite3ExprAffinity(pLeft)!=SQLITE_AFF_TEXT 
+   || IsVirtual(pLeft->pTab)
+  ){
+    /* IMP: R-02065-49465 The left-hand side of the LIKE or GLOB operator must
+    ** be the name of an indexed column with TEXT affinity. */
+    return 0;
+  }
+  assert( pLeft->iColumn!=(-1) ); /* Because IPK never has AFF_TEXT */
+
+  pRight = sqlite3ExprSkipCollate(pList->a[0].pExpr);
+  op = pRight->op;
+  if( op==TK_VARIABLE ){
+    Vdbe *pReprepare = pParse->pReprepare;
+    int iCol = pRight->iColumn;
+    pVal = sqlite3VdbeGetBoundValue(pReprepare, iCol, SQLITE_AFF_NONE);
+    if( pVal && sqlite3_value_type(pVal)==SQLITE_TEXT ){
+      z = (char *)sqlite3_value_text(pVal);
+    }
+    sqlite3VdbeSetVarmask(pParse->pVdbe, iCol);
+    assert( pRight->op==TK_VARIABLE || pRight->op==TK_REGISTER );
+  }else if( op==TK_STRING ){
+    z = pRight->u.zToken;
+  }
+  if( z ){
+    cnt = 0;
+    while( (c=z[cnt])!=0 && c!=wc[0] && c!=wc[1] && c!=wc[2] ){
+      cnt++;
+    }
+    if( cnt!=0 && 255!=(u8)z[cnt-1] ){
+      Expr *pPrefix;
+      *pisComplete = c==wc[0] && z[cnt+1]==0;
+      pPrefix = sqlite3Expr(db, TK_STRING, z);
+      if( pPrefix ) pPrefix->u.zToken[cnt] = 0;
+      *ppPrefix = pPrefix;
+      if( op==TK_VARIABLE ){
+        Vdbe *v = pParse->pVdbe;
+        sqlite3VdbeSetVarmask(v, pRight->iColumn);
+        if( *pisComplete && pRight->u.zToken[1] ){
+          /* If the rhs of the LIKE expression is a variable, and the current
+          ** value of the variable means there is no need to invoke the LIKE
+          ** function, then no OP_Variable will be added to the program.
+          ** This causes problems for the sqlite3_bind_parameter_name()
+          ** API. To work around them, add a dummy OP_Variable here.
+          */ 
+          int r1 = sqlite3GetTempReg(pParse);
+          sqlite3ExprCodeTarget(pParse, pRight, r1);
+          sqlite3VdbeChangeP3(v, sqlite3VdbeCurrentAddr(v)-1, 0);
+          sqlite3ReleaseTempReg(pParse, r1);
+        }
+      }
+    }else{
+      z = 0;
+    }
+  }
+
+  sqlite3ValueFree(pVal);
+  return (z!=0);
+}
+#endif /* SQLITE_OMIT_LIKE_OPTIMIZATION */
+
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/*
+** Check to see if the given expression is of the form
+**
+**         column MATCH expr
+**
+** If it is then return TRUE.  If not, return FALSE.
+*/
+static int isMatchOfColumn(
+  Expr *pExpr      /* Test this expression */
+){
+  ExprList *pList;
+
+  if( pExpr->op!=TK_FUNCTION ){
+    return 0;
+  }
+  if( sqlite3StrICmp(pExpr->u.zToken,"match")!=0 ){
+    return 0;
+  }
+  pList = pExpr->x.pList;
+  if( pList->nExpr!=2 ){
+    return 0;
+  }
+  if( pList->a[1].pExpr->op != TK_COLUMN ){
+    return 0;
+  }
+  return 1;
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+/*
+** If the pBase expression originated in the ON or USING clause of
+** a join, then transfer the appropriate markings over to derived.
+*/
+static void transferJoinMarkings(Expr *pDerived, Expr *pBase){
+  if( pDerived ){
+    pDerived->flags |= pBase->flags & EP_FromJoin;
+    pDerived->iRightJoinTable = pBase->iRightJoinTable;
+  }
+}
+
+/*
+** Mark term iChild as being a child of term iParent
+*/
+static void markTermAsChild(WhereClause *pWC, int iChild, int iParent){
+  pWC->a[iChild].iParent = iParent;
+  pWC->a[iChild].truthProb = pWC->a[iParent].truthProb;
+  pWC->a[iParent].nChild++;
+}
+
+#if !defined(SQLITE_OMIT_OR_OPTIMIZATION) && !defined(SQLITE_OMIT_SUBQUERY)
+/*
+** Analyze a term that consists of two or more OR-connected
+** subterms.  So in:
+**
+**     ... WHERE  (a=5) AND (b=7 OR c=9 OR d=13) AND (d=13)
+**                          ^^^^^^^^^^^^^^^^^^^^
+**
+** This routine analyzes terms such as the middle term in the above example.
+** A WhereOrTerm object is computed and attached to the term under
+** analysis, regardless of the outcome of the analysis.  Hence:
+**
+**     WhereTerm.wtFlags   |=  TERM_ORINFO
+**     WhereTerm.u.pOrInfo  =  a dynamically allocated WhereOrTerm object
+**
+** The term being analyzed must have two or more of OR-connected subterms.
+** A single subterm might be a set of AND-connected sub-subterms.
+** Examples of terms under analysis:
+**
+**     (A)     t1.x=t2.y OR t1.x=t2.z OR t1.y=15 OR t1.z=t3.a+5
+**     (B)     x=expr1 OR expr2=x OR x=expr3
+**     (C)     t1.x=t2.y OR (t1.x=t2.z AND t1.y=15)
+**     (D)     x=expr1 OR (y>11 AND y<22 AND z LIKE '*hello*')
+**     (E)     (p.a=1 AND q.b=2 AND r.c=3) OR (p.x=4 AND q.y=5 AND r.z=6)
+**
+** CASE 1:
+**
+** If all subterms are of the form T.C=expr for some single column of C and
+** a single table T (as shown in example B above) then create a new virtual
+** term that is an equivalent IN expression.  In other words, if the term
+** being analyzed is:
+**
+**      x = expr1  OR  expr2 = x  OR  x = expr3
+**
+** then create a new virtual term like this:
+**
+**      x IN (expr1,expr2,expr3)
+**
+** CASE 2:
+**
+** If all subterms are indexable by a single table T, then set
+**
+**     WhereTerm.eOperator              =  WO_OR
+**     WhereTerm.u.pOrInfo->indexable  |=  the cursor number for table T
+**
+** A subterm is "indexable" if it is of the form
+** "T.C <op> <expr>" where C is any column of table T and 
+** <op> is one of "=", "<", "<=", ">", ">=", "IS NULL", or "IN".
+** A subterm is also indexable if it is an AND of two or more
+** subsubterms at least one of which is indexable.  Indexable AND 
+** subterms have their eOperator set to WO_AND and they have
+** u.pAndInfo set to a dynamically allocated WhereAndTerm object.
+**
+** From another point of view, "indexable" means that the subterm could
+** potentially be used with an index if an appropriate index exists.
+** This analysis does not consider whether or not the index exists; that
+** is decided elsewhere.  This analysis only looks at whether subterms
+** appropriate for indexing exist.
+**
+** All examples A through E above satisfy case 2.  But if a term
+** also satisfies case 1 (such as B) we know that the optimizer will
+** always prefer case 1, so in that case we pretend that case 2 is not
+** satisfied.
+**
+** It might be the case that multiple tables are indexable.  For example,
+** (E) above is indexable on tables P, Q, and R.
+**
+** Terms that satisfy case 2 are candidates for lookup by using
+** separate indices to find rowids for each subterm and composing
+** the union of all rowids using a RowSet object.  This is similar
+** to "bitmap indices" in other database engines.
+**
+** OTHERWISE:
+**
+** If neither case 1 nor case 2 apply, then leave the eOperator set to
+** zero.  This term is not useful for search.
+*/
+static void exprAnalyzeOrTerm(
+  SrcList *pSrc,            /* the FROM clause */
+  WhereClause *pWC,         /* the complete WHERE clause */
+  int idxTerm               /* Index of the OR-term to be analyzed */
+){
+  WhereInfo *pWInfo = pWC->pWInfo;        /* WHERE clause processing context */
+  Parse *pParse = pWInfo->pParse;         /* Parser context */
+  sqlite3 *db = pParse->db;               /* Database connection */
+  WhereTerm *pTerm = &pWC->a[idxTerm];    /* The term to be analyzed */
+  Expr *pExpr = pTerm->pExpr;             /* The expression of the term */
+  int i;                                  /* Loop counters */
+  WhereClause *pOrWc;       /* Breakup of pTerm into subterms */
+  WhereTerm *pOrTerm;       /* A Sub-term within the pOrWc */
+  WhereOrInfo *pOrInfo;     /* Additional information associated with pTerm */
+  Bitmask chngToIN;         /* Tables that might satisfy case 1 */
