@@ -116679,3 +116679,211 @@ static sqlite3_index_info *allocateIndexInfo(
   if( pOrderBy ){
     int n = pOrderBy->nExpr;
     for(i=0; i<n; i++){
+      Expr *pExpr = pOrderBy->a[i].pExpr;
+      if( pExpr->op!=TK_COLUMN || pExpr->iTable!=pSrc->iCursor ) break;
+    }
+    if( i==n){
+      nOrderBy = n;
+    }
+  }
+
+  /* Allocate the sqlite3_index_info structure
+  */
+  pIdxInfo = sqlite3DbMallocZero(pParse->db, sizeof(*pIdxInfo)
+                           + (sizeof(*pIdxCons) + sizeof(*pUsage))*nTerm
+                           + sizeof(*pIdxOrderBy)*nOrderBy );
+  if( pIdxInfo==0 ){
+    sqlite3ErrorMsg(pParse, "out of memory");
+    return 0;
+  }
+
+  /* Initialize the structure.  The sqlite3_index_info structure contains
+  ** many fields that are declared "const" to prevent xBestIndex from
+  ** changing them.  We have to do some funky casting in order to
+  ** initialize those fields.
+  */
+  pIdxCons = (struct sqlite3_index_constraint*)&pIdxInfo[1];
+  pIdxOrderBy = (struct sqlite3_index_orderby*)&pIdxCons[nTerm];
+  pUsage = (struct sqlite3_index_constraint_usage*)&pIdxOrderBy[nOrderBy];
+  *(int*)&pIdxInfo->nConstraint = nTerm;
+  *(int*)&pIdxInfo->nOrderBy = nOrderBy;
+  *(struct sqlite3_index_constraint**)&pIdxInfo->aConstraint = pIdxCons;
+  *(struct sqlite3_index_orderby**)&pIdxInfo->aOrderBy = pIdxOrderBy;
+  *(struct sqlite3_index_constraint_usage**)&pIdxInfo->aConstraintUsage =
+                                                                   pUsage;
+
+  for(i=j=0, pTerm=pWC->a; i<pWC->nTerm; i++, pTerm++){
+    u8 op;
+    if( pTerm->leftCursor != pSrc->iCursor ) continue;
+    assert( IsPowerOfTwo(pTerm->eOperator & ~WO_EQUIV) );
+    testcase( pTerm->eOperator & WO_IN );
+    testcase( pTerm->eOperator & WO_ISNULL );
+    testcase( pTerm->eOperator & WO_ALL );
+    if( (pTerm->eOperator & ~(WO_ISNULL|WO_EQUIV))==0 ) continue;
+    if( pTerm->wtFlags & TERM_VNULL ) continue;
+    pIdxCons[j].iColumn = pTerm->u.leftColumn;
+    pIdxCons[j].iTermOffset = i;
+    op = (u8)pTerm->eOperator & WO_ALL;
+    if( op==WO_IN ) op = WO_EQ;
+    pIdxCons[j].op = op;
+    /* The direct assignment in the previous line is possible only because
+    ** the WO_ and SQLITE_INDEX_CONSTRAINT_ codes are identical.  The
+    ** following asserts verify this fact. */
+    assert( WO_EQ==SQLITE_INDEX_CONSTRAINT_EQ );
+    assert( WO_LT==SQLITE_INDEX_CONSTRAINT_LT );
+    assert( WO_LE==SQLITE_INDEX_CONSTRAINT_LE );
+    assert( WO_GT==SQLITE_INDEX_CONSTRAINT_GT );
+    assert( WO_GE==SQLITE_INDEX_CONSTRAINT_GE );
+    assert( WO_MATCH==SQLITE_INDEX_CONSTRAINT_MATCH );
+    assert( pTerm->eOperator & (WO_IN|WO_EQ|WO_LT|WO_LE|WO_GT|WO_GE|WO_MATCH) );
+    j++;
+  }
+  for(i=0; i<nOrderBy; i++){
+    Expr *pExpr = pOrderBy->a[i].pExpr;
+    pIdxOrderBy[i].iColumn = pExpr->iColumn;
+    pIdxOrderBy[i].desc = pOrderBy->a[i].sortOrder;
+  }
+
+  return pIdxInfo;
+}
+
+/*
+** The table object reference passed as the second argument to this function
+** must represent a virtual table. This function invokes the xBestIndex()
+** method of the virtual table with the sqlite3_index_info object that
+** comes in as the 3rd argument to this function.
+**
+** If an error occurs, pParse is populated with an error message and a
+** non-zero value is returned. Otherwise, 0 is returned and the output
+** part of the sqlite3_index_info structure is left populated.
+**
+** Whether or not an error is returned, it is the responsibility of the
+** caller to eventually free p->idxStr if p->needToFreeIdxStr indicates
+** that this is required.
+*/
+static int vtabBestIndex(Parse *pParse, Table *pTab, sqlite3_index_info *p){
+  sqlite3_vtab *pVtab = sqlite3GetVTable(pParse->db, pTab)->pVtab;
+  int i;
+  int rc;
+
+  TRACE_IDX_INPUTS(p);
+  rc = pVtab->pModule->xBestIndex(pVtab, p);
+  TRACE_IDX_OUTPUTS(p);
+
+  if( rc!=SQLITE_OK ){
+    if( rc==SQLITE_NOMEM ){
+      pParse->db->mallocFailed = 1;
+    }else if( !pVtab->zErrMsg ){
+      sqlite3ErrorMsg(pParse, "%s", sqlite3ErrStr(rc));
+    }else{
+      sqlite3ErrorMsg(pParse, "%s", pVtab->zErrMsg);
+    }
+  }
+  sqlite3_free(pVtab->zErrMsg);
+  pVtab->zErrMsg = 0;
+
+  for(i=0; i<p->nConstraint; i++){
+    if( !p->aConstraint[i].usable && p->aConstraintUsage[i].argvIndex>0 ){
+      sqlite3ErrorMsg(pParse, 
+          "table %s: xBestIndex returned an invalid plan", pTab->zName);
+    }
+  }
+
+  return pParse->nErr;
+}
+#endif /* !defined(SQLITE_OMIT_VIRTUALTABLE) */
+
+#ifdef SQLITE_ENABLE_STAT3_OR_STAT4
+/*
+** Estimate the location of a particular key among all keys in an
+** index.  Store the results in aStat as follows:
+**
+**    aStat[0]      Est. number of rows less than pVal
+**    aStat[1]      Est. number of rows equal to pVal
+**
+** Return the index of the sample that is the smallest sample that
+** is greater than or equal to pRec.
+*/
+static int whereKeyStats(
+  Parse *pParse,              /* Database connection */
+  Index *pIdx,                /* Index to consider domain of */
+  UnpackedRecord *pRec,       /* Vector of values to consider */
+  int roundUp,                /* Round up if true.  Round down if false */
+  tRowcnt *aStat              /* OUT: stats written here */
+){
+  IndexSample *aSample = pIdx->aSample;
+  int iCol;                   /* Index of required stats in anEq[] etc. */
+  int iMin = 0;               /* Smallest sample not yet tested */
+  int i = pIdx->nSample;      /* Smallest sample larger than or equal to pRec */
+  int iTest;                  /* Next sample to test */
+  int res;                    /* Result of comparison operation */
+
+#ifndef SQLITE_DEBUG
+  UNUSED_PARAMETER( pParse );
+#endif
+  assert( pRec!=0 );
+  iCol = pRec->nField - 1;
+  assert( pIdx->nSample>0 );
+  assert( pRec->nField>0 && iCol<pIdx->nSampleCol );
+  do{
+    iTest = (iMin+i)/2;
+    res = sqlite3VdbeRecordCompare(aSample[iTest].n, aSample[iTest].p, pRec);
+    if( res<0 ){
+      iMin = iTest+1;
+    }else{
+      i = iTest;
+    }
+  }while( res && iMin<i );
+
+#ifdef SQLITE_DEBUG
+  /* The following assert statements check that the binary search code
+  ** above found the right answer. This block serves no purpose other
+  ** than to invoke the asserts.  */
+  if( res==0 ){
+    /* If (res==0) is true, then sample $i must be equal to pRec */
+    assert( i<pIdx->nSample );
+    assert( 0==sqlite3VdbeRecordCompare(aSample[i].n, aSample[i].p, pRec)
+         || pParse->db->mallocFailed );
+  }else{
+    /* Otherwise, pRec must be smaller than sample $i and larger than
+    ** sample ($i-1).  */
+    assert( i==pIdx->nSample 
+         || sqlite3VdbeRecordCompare(aSample[i].n, aSample[i].p, pRec)>0
+         || pParse->db->mallocFailed );
+    assert( i==0
+         || sqlite3VdbeRecordCompare(aSample[i-1].n, aSample[i-1].p, pRec)<0
+         || pParse->db->mallocFailed );
+  }
+#endif /* ifdef SQLITE_DEBUG */
+
+  /* At this point, aSample[i] is the first sample that is greater than
+  ** or equal to pVal.  Or if i==pIdx->nSample, then all samples are less
+  ** than pVal.  If aSample[i]==pVal, then res==0.
+  */
+  if( res==0 ){
+    aStat[0] = aSample[i].anLt[iCol];
+    aStat[1] = aSample[i].anEq[iCol];
+  }else{
+    tRowcnt iLower, iUpper, iGap;
+    if( i==0 ){
+      iLower = 0;
+      iUpper = aSample[0].anLt[iCol];
+    }else{
+      i64 nRow0 = sqlite3LogEstToInt(pIdx->aiRowLogEst[0]);
+      iUpper = i>=pIdx->nSample ? nRow0 : aSample[i].anLt[iCol];
+      iLower = aSample[i-1].anEq[iCol] + aSample[i-1].anLt[iCol];
+    }
+    aStat[1] = pIdx->aAvgEq[iCol];
+    if( iLower>=iUpper ){
+      iGap = 0;
+    }else{
+      iGap = iUpper - iLower;
+    }
+    if( roundUp ){
+      iGap = (iGap*2)/3;
+    }else{
+      iGap = iGap/3;
+    }
+    aStat[0] = iLower + iGap;
+  }
+  return i;
