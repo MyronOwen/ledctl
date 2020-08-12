@@ -116247,3 +116247,234 @@ static void exprAnalyze(
   ** of the loop.  Without the TERM_VNULL flag, the not-null check at
   ** the start of the loop will prevent any results from being returned.
   */
+  if( pExpr->op==TK_NOTNULL
+   && pExpr->pLeft->op==TK_COLUMN
+   && pExpr->pLeft->iColumn>=0
+   && OptimizationEnabled(db, SQLITE_Stat34)
+  ){
+    Expr *pNewExpr;
+    Expr *pLeft = pExpr->pLeft;
+    int idxNew;
+    WhereTerm *pNewTerm;
+
+    pNewExpr = sqlite3PExpr(pParse, TK_GT,
+                            sqlite3ExprDup(db, pLeft, 0),
+                            sqlite3PExpr(pParse, TK_NULL, 0, 0, 0), 0);
+
+    idxNew = whereClauseInsert(pWC, pNewExpr,
+                              TERM_VIRTUAL|TERM_DYNAMIC|TERM_VNULL);
+    if( idxNew ){
+      pNewTerm = &pWC->a[idxNew];
+      pNewTerm->prereqRight = 0;
+      pNewTerm->leftCursor = pLeft->iTable;
+      pNewTerm->u.leftColumn = pLeft->iColumn;
+      pNewTerm->eOperator = WO_GT;
+      markTermAsChild(pWC, idxNew, idxTerm);
+      pTerm = &pWC->a[idxTerm];
+      pTerm->wtFlags |= TERM_COPIED;
+      pNewTerm->prereqAll = pTerm->prereqAll;
+    }
+  }
+#endif /* SQLITE_ENABLE_STAT3_OR_STAT4 */
+
+  /* Prevent ON clause terms of a LEFT JOIN from being used to drive
+  ** an index for tables to the left of the join.
+  */
+  pTerm->prereqRight |= extraRight;
+}
+
+/*
+** This function searches pList for an entry that matches the iCol-th column
+** of index pIdx.
+**
+** If such an expression is found, its index in pList->a[] is returned. If
+** no expression is found, -1 is returned.
+*/
+static int findIndexCol(
+  Parse *pParse,                  /* Parse context */
+  ExprList *pList,                /* Expression list to search */
+  int iBase,                      /* Cursor for table associated with pIdx */
+  Index *pIdx,                    /* Index to match column of */
+  int iCol                        /* Column of index to match */
+){
+  int i;
+  const char *zColl = pIdx->azColl[iCol];
+
+  for(i=0; i<pList->nExpr; i++){
+    Expr *p = sqlite3ExprSkipCollate(pList->a[i].pExpr);
+    if( p->op==TK_COLUMN
+     && p->iColumn==pIdx->aiColumn[iCol]
+     && p->iTable==iBase
+    ){
+      CollSeq *pColl = sqlite3ExprCollSeq(pParse, pList->a[i].pExpr);
+      if( ALWAYS(pColl) && 0==sqlite3StrICmp(pColl->zName, zColl) ){
+        return i;
+      }
+    }
+  }
+
+  return -1;
+}
+
+/*
+** Return true if the DISTINCT expression-list passed as the third argument
+** is redundant.
+**
+** A DISTINCT list is redundant if the database contains some subset of
+** columns that are unique and non-null.
+*/
+static int isDistinctRedundant(
+  Parse *pParse,            /* Parsing context */
+  SrcList *pTabList,        /* The FROM clause */
+  WhereClause *pWC,         /* The WHERE clause */
+  ExprList *pDistinct       /* The result set that needs to be DISTINCT */
+){
+  Table *pTab;
+  Index *pIdx;
+  int i;                          
+  int iBase;
+
+  /* If there is more than one table or sub-select in the FROM clause of
+  ** this query, then it will not be possible to show that the DISTINCT 
+  ** clause is redundant. */
+  if( pTabList->nSrc!=1 ) return 0;
+  iBase = pTabList->a[0].iCursor;
+  pTab = pTabList->a[0].pTab;
+
+  /* If any of the expressions is an IPK column on table iBase, then return 
+  ** true. Note: The (p->iTable==iBase) part of this test may be false if the
+  ** current SELECT is a correlated sub-query.
+  */
+  for(i=0; i<pDistinct->nExpr; i++){
+    Expr *p = sqlite3ExprSkipCollate(pDistinct->a[i].pExpr);
+    if( p->op==TK_COLUMN && p->iTable==iBase && p->iColumn<0 ) return 1;
+  }
+
+  /* Loop through all indices on the table, checking each to see if it makes
+  ** the DISTINCT qualifier redundant. It does so if:
+  **
+  **   1. The index is itself UNIQUE, and
+  **
+  **   2. All of the columns in the index are either part of the pDistinct
+  **      list, or else the WHERE clause contains a term of the form "col=X",
+  **      where X is a constant value. The collation sequences of the
+  **      comparison and select-list expressions must match those of the index.
+  **
+  **   3. All of those index columns for which the WHERE clause does not
+  **      contain a "col=X" term are subject to a NOT NULL constraint.
+  */
+  for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+    if( !IsUniqueIndex(pIdx) ) continue;
+    for(i=0; i<pIdx->nKeyCol; i++){
+      i16 iCol = pIdx->aiColumn[i];
+      if( 0==findTerm(pWC, iBase, iCol, ~(Bitmask)0, WO_EQ, pIdx) ){
+        int iIdxCol = findIndexCol(pParse, pDistinct, iBase, pIdx, i);
+        if( iIdxCol<0 || pTab->aCol[iCol].notNull==0 ){
+          break;
+        }
+      }
+    }
+    if( i==pIdx->nKeyCol ){
+      /* This index implies that the DISTINCT qualifier is redundant. */
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+
+/*
+** Estimate the logarithm of the input value to base 2.
+*/
+static LogEst estLog(LogEst N){
+  return N<=10 ? 0 : sqlite3LogEst(N) - 33;
+}
+
+/*
+** Two routines for printing the content of an sqlite3_index_info
+** structure.  Used for testing and debugging only.  If neither
+** SQLITE_TEST or SQLITE_DEBUG are defined, then these routines
+** are no-ops.
+*/
+#if !defined(SQLITE_OMIT_VIRTUALTABLE) && defined(WHERETRACE_ENABLED)
+static void TRACE_IDX_INPUTS(sqlite3_index_info *p){
+  int i;
+  if( !sqlite3WhereTrace ) return;
+  for(i=0; i<p->nConstraint; i++){
+    sqlite3DebugPrintf("  constraint[%d]: col=%d termid=%d op=%d usabled=%d\n",
+       i,
+       p->aConstraint[i].iColumn,
+       p->aConstraint[i].iTermOffset,
+       p->aConstraint[i].op,
+       p->aConstraint[i].usable);
+  }
+  for(i=0; i<p->nOrderBy; i++){
+    sqlite3DebugPrintf("  orderby[%d]: col=%d desc=%d\n",
+       i,
+       p->aOrderBy[i].iColumn,
+       p->aOrderBy[i].desc);
+  }
+}
+static void TRACE_IDX_OUTPUTS(sqlite3_index_info *p){
+  int i;
+  if( !sqlite3WhereTrace ) return;
+  for(i=0; i<p->nConstraint; i++){
+    sqlite3DebugPrintf("  usage[%d]: argvIdx=%d omit=%d\n",
+       i,
+       p->aConstraintUsage[i].argvIndex,
+       p->aConstraintUsage[i].omit);
+  }
+  sqlite3DebugPrintf("  idxNum=%d\n", p->idxNum);
+  sqlite3DebugPrintf("  idxStr=%s\n", p->idxStr);
+  sqlite3DebugPrintf("  orderByConsumed=%d\n", p->orderByConsumed);
+  sqlite3DebugPrintf("  estimatedCost=%g\n", p->estimatedCost);
+  sqlite3DebugPrintf("  estimatedRows=%lld\n", p->estimatedRows);
+}
+#else
+#define TRACE_IDX_INPUTS(A)
+#define TRACE_IDX_OUTPUTS(A)
+#endif
+
+#ifndef SQLITE_OMIT_AUTOMATIC_INDEX
+/*
+** Return TRUE if the WHERE clause term pTerm is of a form where it
+** could be used with an index to access pSrc, assuming an appropriate
+** index existed.
+*/
+static int termCanDriveIndex(
+  WhereTerm *pTerm,              /* WHERE clause term to check */
+  struct SrcList_item *pSrc,     /* Table we are trying to access */
+  Bitmask notReady               /* Tables in outer loops of the join */
+){
+  char aff;
+  if( pTerm->leftCursor!=pSrc->iCursor ) return 0;
+  if( (pTerm->eOperator & WO_EQ)==0 ) return 0;
+  if( (pTerm->prereqRight & notReady)!=0 ) return 0;
+  if( pTerm->u.leftColumn<0 ) return 0;
+  aff = pSrc->pTab->aCol[pTerm->u.leftColumn].affinity;
+  if( !sqlite3IndexAffinityOk(pTerm->pExpr, aff) ) return 0;
+  return 1;
+}
+#endif
+
+
+#ifndef SQLITE_OMIT_AUTOMATIC_INDEX
+/*
+** Generate code to construct the Index object for an automatic index
+** and to set up the WhereLevel object pLevel so that the code generator
+** makes use of the automatic index.
+*/
+static void constructAutomaticIndex(
+  Parse *pParse,              /* The parsing context */
+  WhereClause *pWC,           /* The WHERE clause */
+  struct SrcList_item *pSrc,  /* The FROM clause term to get the next index */
+  Bitmask notReady,           /* Mask of cursors that are not available */
+  WhereLevel *pLevel          /* Write new index here */
+){
+  int nKeyCol;                /* Number of columns in the constructed index */
+  WhereTerm *pTerm;           /* A single term of the WHERE clause */
+  WhereTerm *pWCEnd;          /* End of pWC->a[] */
+  Index *pIdx;                /* Object describing the transient index */
+  Vdbe *v;                    /* Prepared statement under construction */
+  int addrInit;               /* Address of the initialization bypass jump */
